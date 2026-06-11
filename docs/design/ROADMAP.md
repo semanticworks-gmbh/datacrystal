@@ -11,6 +11,9 @@ inline): frozen entities + batch hydration in item 1, unique secondary-key index
 Amended 2026-06-11 (owner request): git-like data branching/time-travel recorded as punted
 item 20; the object-store/datalake positioning clarified under item 16.
 
+Amended 2026-06-11, second (owner request): networked replication recorded as punted item 21
+(transport-agnostic, rides item 3's contract); Zyre/pyre evaluated and declined inside it.
+
 ## Core v0.x (ordered)
 
 1. **Object engine**: slots-dataclasses canonical form, msgspec msgpack records, WeakValueDictionary
@@ -94,6 +97,30 @@ item 20; the object-store/datalake positioning clarified under item 16.
     Omnigraph get branching cheap precisely because their substrate is immutable columnar
     snapshots (Lance), which for us corresponds to the v1 Arrow mirror tier, not the live
     object graph. Demand-driven; merge semantics never promised for core.
+21. **Networked replication layer** — `datacrystal[replica]` (owner request 2026-06-11;
+    transports evaluated in
+    [2026-06-11-replication-transports.md](../research/2026-06-11-replication-transports.md)).
+    The *shape* is already ratified, not new scope: exactly one writer (lease, invariant 10)
+    + N read-only followers applying the [COMMIT-DELTA-v1](COMMIT-DELTA-v1.md) stream from
+    their TID watermark + writes traveling as command fan-in to the writer (ADR-001
+    "Consequences", the held-open actor→server door). Because the delta stream is
+    deterministic, idempotent (apply-twice ≡ apply-once) and totally ordered, the durable log
+    IS the writer's store; a transport only has to be an ordered, catch-up-capable pipe —
+    item 3's contract is therefore both prerequisite and most of the design. When demand
+    arrives: reference transport = writer-served HTTP/SSE (`GET /deltas?after=<tid>` catch-up
+    + live tail; command POSTs land on `store.submit()`) — "no coordination server" falls out
+    of the single writer being the distinguished node already; broker (NATS JetStream) and
+    object-store (rides item 16 / Litestream) variants behind the same follower interface.
+    Peer discovery is out of scope: Slurm publishes the node set, Dask's scheduler knows its
+    workers, clouds have no broadcast anyway. **Zyre/pyre: evaluated and declined** — ZRE is
+    LAN-broadcast discovery plus best-effort group messaging (no durable log, no replay, no
+    late-joiner catch-up; a sequence gap disconnects the peer), beacons are inoperative on
+    cloud VPCs, and the pyre binding has had no release since 2021. A masterless
+    "all peers publish writes" queue is the multi-writer shape the Never list forecloses;
+    add the sequencer it needs and it collapses back to command fan-in over any
+    request/reply transport. Analytics fan-out (Dask/HPC) is explicitly NOT this item:
+    compute workers want the columnar tier (items 7/16, parquet-on-S3), not replicated live
+    object graphs.
 
 ## Never (all five round-2 recommendations agree, ratified)
 

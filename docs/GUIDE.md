@@ -31,7 +31,9 @@ store = dc.Store.open("cabinet.store")        # a directory; created if needed
 store.close()                                  # or: with dc.Store.open(...) as store:
 ```
 
-`Store.open(path, *, durability="interval", lock_ttl=10.0)`:
+`Store.open(path, *, durability="interval", lock_ttl=10.0, debug=False, lazy_timeout=None)`
+(async: `await dc.aopen(...)`, same keywords — see
+[Concurrency and deployment](#concurrency-and-deployment)):
 
 - The directory holds `data.sqlite` (records as msgpack blobs, riding SQLite's journal) and
   `used.lock`, the **single-writer lease**: a second process opening the same store gets a loud
@@ -44,6 +46,13 @@ store.close()                                  # or: with dc.Store.open(...) as 
   only, an OS crash can corrupt it.
 - `close()` **discards uncommitted changes** — commit first. Closing releases the lock and the
   in-memory graph.
+- `debug=True` arms the **fingerprint safety net**: every commit re-encodes the live CLEAN
+  entities and, for any that changed without the dirty tracking noticing (e.g. an
+  `object.__setattr__` bypass, or in-place mutation of a `bytearray`), emits an
+  `UntrackedMutationWarning` **and commits the change anyway** — detection plus rescue. It
+  costs O(live entities) per commit; use it in development and tests.
+- `lazy_timeout=<seconds>` enables the **LazyReferenceManager** — see
+  [Identity and memory](#identity-and-memory).
 
 ## Define entities
 
@@ -260,11 +269,14 @@ hydrating 75k hits 0.34 s; full-scan residual query +165 MB transient; unique-ke
 0.1 ms hydrating exactly one object. CI now gates these properties (peak-RSS byte budget,
 results collectable, `get()` hydrates one — `tests/fitness/test_memory_bounded.py`).
 
-What this does **not** cover yet: loaded `Lazy` references stay loaded until you drop the
-holder — automatic timeout-based demotion (the LazyReferenceManager) is `[planned — M2]`, an
-RSS-quota variant is deferred (psutil stays out of core); a hard per-store memory cap does not
-exist. For analytics-style scans, the honest answer is the Arrow/DuckDB tier `[planned — v1]`,
-not the object graph.
+Loaded `Lazy` references stay loaded until you drop the holder — **or** you open the store
+with `lazy_timeout=<seconds>`: the LazyReferenceManager then demotes handles idle past the
+timeout back to unloaded, releasing the subgraph behind the cut point (the next `.get()`
+transparently reloads, identity preserved). Demotion only ever runs on the owner — as a
+piggyback on your own store calls (sync), or as an owner-loop task (`aopen`). Timeout-only in
+v0.1; an RSS-quota variant is deferred (psutil stays out of core), and a hard per-store memory
+cap does not exist. For analytics-style scans, the honest answer is the Arrow/DuckDB tier
+`[planned — v1]`, not the object graph.
 
 ## Schema evolution
 
@@ -316,10 +328,45 @@ store and its live graph belong to the thread that opened the store.
   [SCALING.md](design/SCALING.md)).
 - If the OS pauses your process long enough for the lease to expire and be taken over, the next
   commit raises `LeaseLostError` instead of risking two writers.
-- `store.submit(fn)` (send work to the owner thread, returns a Future) and `store.snapshot()`
-  (read-only views any thread can use while the owner commits) are
-  `[planned — M2/M3, the current milestones]`. Async (`aopen`, `async with store.transaction()`)
-  is `[planned — M2]`.
+- Foreign threads **ship work to the owner** instead of touching the graph:
+  `store.submit(fn)` returns a `concurrent.futures.Future`. The owner runs pending
+  submissions whenever it next calls into the store, or explicitly via
+  `store.run_pending()`; under `aopen()` the event loop is woken instead, no owner call
+  needed. Submission results must be plain data — a live entity in the result (even nested
+  in a list/dict, or behind a `Lazy`) fails the future with `EntityEscapeError`.
+- `store.commit()` itself is three-phase: it captures and encodes on the owner, hands the
+  bytes to a dedicated IO worker thread, and finalizes on the owner. For sync stores that is
+  an internal detail (commit blocks as before); for async stores it is what keeps the loop
+  free.
+- `store.snapshot()` (read-only views any thread can use while the owner commits) is
+  `[planned — M3]`.
+
+### asyncio
+
+```python
+store = await dc.aopen("cabinet.store")     # binds the store to the running loop
+
+async with store.transaction():             # an asyncio.Lock scope per unit of work
+    store.root.entries.append(entry)        # … no other transaction interleaves …
+# the scope committed on clean exit
+
+await store.commit()                        # or commit explicitly outside scopes
+store.close()
+```
+
+- Every task on the owning loop may touch the graph (one thread by construction); foreign
+  threads still get `WrongThreadError`.
+- `await store.commit()` captures **before its first await**, then applies off-loop while the
+  loop keeps serving. A task that mutates an entity while a commit is in flight is safe by
+  contract: the write re-dirties the entity and lands in the *next* commit. Concurrent
+  `commit()` calls serialize on an internal lock.
+- The asyncio doctrine, documented from day one (ADR-001): **a critical section is the code
+  between awaits.** Mutate-and-commit with no `await` in between, or wrap the scope in
+  `transaction()`. An exception inside `transaction()` commits nothing; the in-memory
+  mutations stay buffered (live objects have no rollback) — handle the exception and decide:
+  fix and commit, or close to discard.
+- Hydration faults (`Lazy.get()`, queries) load synchronously on the loop — the explicit
+  `Lazy[T]` cut points make where that can happen visible in your model.
 
 ## Durability and crash safety
 
@@ -345,6 +392,7 @@ Everything derives from `dc.DataCrystalError`:
 | `StoreLockedError` | another live process holds the lease |
 | `LeaseLostError` | this process lost the lease (paused too long); refusing to write |
 | `WrongThreadError` | live entity/store touched from a foreign thread |
+| `EntityEscapeError` | a `submit()` result tried to carry a live entity across the owner boundary |
 | `FrozenEntityError` | mutation of an `@entity(frozen=True)` record |
 | `NotAnEntityError` | a non-entity where an entity is required |
 | `UniqueViolationError` | duplicate value for a `dc.Unique` field in a commit |
@@ -354,6 +402,10 @@ Everything derives from `dc.DataCrystalError`:
 | `CorruptRecordError` | a record failed its checksum — the file is damaged |
 | `QueryError` | malformed condition (two classes mixed, missing parentheses, …) |
 
+One warning lives outside the exception family: `UntrackedMutationWarning` (a
+`UserWarning`), emitted by the `debug=True` safety net when a mutation slipped past the
+dirty tracking — the entity is committed anyway; fix the write path it names.
+
 ## Planned features and when they land
 
 Sequencing follows the ratified [roadmap](design/ROADMAP.md) and the
@@ -362,10 +414,7 @@ Sequencing follows the ratified [roadmap](design/ROADMAP.md) and the
 
 | Feature | Where it lands |
 |---|---|
-| async three-phase commit (I/O off the owner thread), `store.submit()`, `aopen()` | M2 — current milestone |
-| `debug=True` mutation-loss tripwire, fingerprint commit safety net | M2 |
-| automatic timeout-based demotion of loaded `Lazy` refs (LazyReferenceManager) | M2 |
-| `store.snapshot()` immutable views for threads; public commit-delta/watermark contract | M3 |
+| `store.snapshot()` immutable views for threads; the commit-delta/watermark **pipeline** (the contract itself is drafted — [COMMIT-DELTA-v1](design/COMMIT-DELTA-v1.md)) | M3 — current milestone |
 | v0.1.0 tag: API freeze, PyPI publication | M4 |
 | **full-text search** — `datacrystal[fts]`, SQLite FTS5 over `dc.FullText` fields | late v0.x: it is deliberately the *first consumer* of the M3 watermark pipeline, so it follows directly after M3 |
 | **pandas / polars / DuckDB** — zero-copy via Arrow columnar mirrors | v1 (after v0.x hardening) |
