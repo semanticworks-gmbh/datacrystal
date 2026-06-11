@@ -1,0 +1,55 @@
+# PR gate (KICKOFF §7 "Runs"): lint → types → tests (incl. fitness gates +
+# SIGKILL crash test) → demo-run-twice → wheel purity. Perf trends and the
+# deep nightly torture suite land with the benchmark milestone (nightly.yml).
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Sync environment (Python pinned via .python-version)
+        run: uv sync
+
+      - name: Lint (ruff)
+        run: uv run ruff check .
+
+      - name: Type check (pyright — standard mode; strict is the goal at the v0.1.0 tag)
+        run: uvx pyright src tests examples
+
+      - name: Tests (unit, property, integration, fitness gates)
+        run: uv run pytest -q
+
+      - name: Demo survives a rerun (persistence smoke)
+        run: |
+          uv run python examples/minerals/demo.py
+          uv run python examples/minerals/demo.py
+
+      - name: Wheel purity (fitness #17 — pure py3-none-any, no native code)
+        run: |
+          uv build
+          python3 - << 'EOF'
+          import glob, sys, zipfile
+          wheels = glob.glob("dist/*.whl")
+          assert wheels, "no wheel built"
+          [wheel] = wheels
+          assert "py3-none-any" in wheel, f"wheel is not pure: {wheel}"
+          bad = [n for n in zipfile.ZipFile(wheel).namelist()
+                 if n.endswith((".so", ".pyd"))]
+          assert not bad, f"native code in the wheel: {bad}"
+          print(f"wheel OK: {wheel}")
+          EOF
