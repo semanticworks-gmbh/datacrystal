@@ -14,6 +14,10 @@ resources/
 
 # Test/demo artifacts
 .pytest_cache/
+.ruff_cache/
 .hypothesis/
 .benchmarks/
 *.store/
+
+# OS noise
+.DS_Store

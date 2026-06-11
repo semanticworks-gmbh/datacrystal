@@ -18,7 +18,7 @@ def test_entities_are_slots_classes():
     with pytest.raises(AttributeError):
         _ = m.__dict__
     with pytest.raises(AttributeError):
-        m.nonexistent_field = 1  # slots reject unknown attributes
+        m.nonexistent_field = 1  # pyright: ignore[reportAttributeAccessIssue] — slots reject unknown attributes
 
 
 def test_entities_support_weakrefs():

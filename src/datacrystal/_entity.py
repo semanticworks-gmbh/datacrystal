@@ -44,13 +44,15 @@ from typing import (
 )
 
 from datacrystal._conditions import FieldExpr
+from datacrystal._containers import wrap_value
 from datacrystal._errors import FrozenEntityError, NotAnEntityError
 from datacrystal._lazy import Lazy
-
-# Entity lifecycle states (kept as small ints in the __dc_state__ slot).
-STATE_NEW = 0     # constructed in this process, not yet committed
-STATE_CLEAN = 1   # in sync with the store; write hook armed
-STATE_DIRTY = 2   # changed since the last commit; buffered for the next one
+from datacrystal._state import (  # noqa: F401  (STATE_* re-exported)
+    STATE_CLEAN,
+    STATE_DIRTY,
+    STATE_NEW,
+    touch,
+)
 
 
 class _Marker:
@@ -86,7 +88,7 @@ class FieldSpec:
 class TypeInfo:
     """Engine-side metadata for one entity class."""
 
-    __slots__ = ("cls", "typename", "field_names", "frozen", "_specs")
+    __slots__ = ("cls", "typename", "field_names", "frozen", "_specs", "_defaults")
 
     def __init__(self, cls: type, typename: str, field_names: tuple[str, ...],
                  frozen: bool) -> None:
@@ -95,12 +97,31 @@ class TypeInfo:
         self.field_names = field_names
         self.frozen = frozen
         self._specs: tuple[FieldSpec, ...] | None = None
+        self._defaults: dict[str, Any] | None = None
 
     @property
     def specs(self) -> tuple[FieldSpec, ...]:
         if self._specs is None:
             self._specs = _resolve_specs(self.cls, self.field_names)
         return self._specs
+
+    @property
+    def defaults(self) -> dict[str, Any]:
+        """name → zero-arg factory, for the fields that HAVE a default.
+
+        Additive schema evolution fills fields missing from old records from
+        here; a field absent from this map cannot be added to a class that
+        has persisted records (SchemaMismatchError names it).
+        """
+        if self._defaults is None:
+            out: dict[str, Any] = {}
+            for f in dataclasses.fields(self.cls):
+                if f.default is not dataclasses.MISSING:
+                    out[f.name] = lambda v=f.default: v
+                elif f.default_factory is not dataclasses.MISSING:
+                    out[f.name] = f.default_factory
+            self._defaults = out
+        return self._defaults
 
     def indexed_fields(self) -> tuple[FieldSpec, ...]:
         return tuple(s for s in self.specs if s.indexed or s.unique)
@@ -138,15 +159,11 @@ def _entity_new(cls: type, *args: Any, **kwargs: Any) -> Any:
 
 
 def _tracked_setattr(self: Any, name: str, value: Any) -> None:
-    if object.__getattribute__(self, "__dc_state__") == STATE_CLEAN:
-        storeref = object.__getattribute__(self, "__dc_store__")
-        store = storeref()
-        if store is not None:
-            # Checks the owner thread (raising BEFORE the mutation lands),
-            # flips the state to DIRTY and buffers the entity for commit.
-            store._on_first_write(self)
-        else:
-            object.__setattr__(self, "__dc_state__", STATE_DIRTY)
+    # Checks the owner thread (raising BEFORE the mutation lands), flips the
+    # state to DIRTY and buffers the entity for commit.
+    touch(self)
+    if isinstance(value, (list, dict, tuple)):
+        value = wrap_value(value, self)
     object.__setattr__(self, name, value)
 
 

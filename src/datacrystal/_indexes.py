@@ -23,7 +23,7 @@ from pyroaring import BitMap64
 
 from datacrystal._conditions import And, Condition, Or, Pred
 from datacrystal._entity import TypeInfo
-from datacrystal._errors import UniqueViolationError
+from datacrystal._errors import SchemaMismatchError, UniqueViolationError
 from datacrystal._records import decode_payload
 from datacrystal._storage.protocol import StorageBackend
 
@@ -63,9 +63,9 @@ class IndexManager:
     """Lazily builds and incrementally maintains per-class indexes."""
 
     def __init__(self, backend: StorageBackend,
-                 cid_lookup: Callable[[str], int | None]) -> None:
+                 lineage_for: Callable[[TypeInfo], list[tuple[int, list[str]]]]) -> None:
         self._backend = backend
-        self._cid_lookup = cid_lookup
+        self._lineage_for = lineage_for
         self._by_cls: dict[type, ClassIndexes] = {}
 
     def ensure(self, ti: TypeInfo) -> ClassIndexes:
@@ -74,18 +74,45 @@ class IndexManager:
             return ci
         specs = ti.specs
         indexed = [s.name for s in specs if s.indexed or s.unique]
-        unique = [s.name for s in specs if s.unique]
-        ci = ClassIndexes(indexed, unique)
-        cid = self._cid_lookup(ti.typename)
-        if cid is not None and indexed:
-            positions = [ti.field_names.index(name) for name in indexed]
+        unique = frozenset(s.name for s in specs if s.unique)
+        ci = ClassIndexes(indexed, list(unique))
+        # The build scans the type's whole lineage (additive schema
+        # evolution): per cid, indexed fields map to that shape's positions;
+        # fields the old shape lacked are filled from the class defaults.
+        # Each OID appears under exactly one cid (updates rewrite the row).
+        for cid, persisted in self._lineage_for(ti):
+            if not indexed:
+                for rec in self._backend.scan_type(cid):
+                    ci.extent.add(rec.oid)
+                continue
+            position = {n: persisted.index(n) for n in indexed if n in persisted}
+            fill: dict[str, Any] = {}
+            colliding: str | None = None
+            for name in indexed:
+                if name in position:
+                    continue
+                factory = ti.defaults.get(name)
+                if factory is None:
+                    raise SchemaMismatchError(
+                        f"{ti.typename}.{name} does not exist in records "
+                        f"persisted with fields {persisted} and has no default "
+                        "— give the new field a default value to enable "
+                        "additive schema evolution"
+                    )
+                fill[name] = factory()
+                if name in unique and fill[name] is not None:
+                    colliding = name  # only an error if old records exist
             for rec in self._backend.scan_type(cid):
+                if colliding is not None:
+                    raise SchemaMismatchError(
+                        f"{ti.typename}.{colliding}: a Unique field added by "
+                        "schema evolution must default to None — a shared "
+                        "non-None default would make every old record collide"
+                    )
                 values = decode_payload(rec.payload)
-                ci.insert(rec.oid, {name: values[pos]
-                                    for name, pos in zip(indexed, positions)})
-        elif cid is not None:
-            for rec in self._backend.scan_type(cid):
-                ci.extent.add(rec.oid)
+                entry = {name: values[pos] for name, pos in position.items()}
+                entry.update(fill)
+                ci.insert(rec.oid, entry)
         self._by_cls[ti.cls] = ci
         return ci
 

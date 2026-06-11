@@ -8,6 +8,9 @@ Amended 2026-06-10 with the accepted [SDA-LAYERING](SDA-LAYERING.md) deltas (mar
 inline): frozen entities + batch hydration in item 1, unique secondary-key index in item 4,
 `datacrystal[fts]` resequenced into late v0.x (item 10), `datacrystal[ledger]` punted (item 19).
 
+Amended 2026-06-11 (owner request): git-like data branching/time-travel recorded as punted
+item 20; the object-store/datalake positioning clarified under item 16.
+
 ## Core v0.x (ordered)
 
 1. **Object engine**: slots-dataclasses canonical form, msgspec msgpack records, WeakValueDictionary
@@ -63,7 +66,14 @@ inline): frozen entities + batch hydration in item 1, unique secondary-key index
     workloads; SQLite-blob v0.x has no boot problem — boot index *is* the B-tree).
 15. Optional Rust "turbo" wheel for log scan/compaction behind the same 3-method protocol
     (only after #14; PyO3 wheel-matrix tax until PEP 803-class ABI relief lands).
-16. S3 log shipping / SlateDB-style lease-fencing extension (requires #14).
+16. S3 log shipping / SlateDB-style lease-fencing extension (requires #14). **Datalake
+    positioning (2026-06-11)**: the supported object-store stories *before* #14 are
+    (a) Litestream replication of the SQLite file to S3 (item 6 recipe — works with today's
+    backend) and (b) v1 Arrow mirrors exported as parquet-on-S3, queryable by DuckDB/polars/
+    Spark-class readers (rides item 7) — that is the datalake answer. An S3-*primary* blob
+    backend is pluggable behind the 3-method protocol in principle, but stays gated on #14 +
+    lease fencing: per-commit PUT latency and conditional-write fencing make it wrong for the
+    interactive path until the log exists.
 17. `datacrystal-rdf` — term dictionary, triples Arrow sidecar, rdflib Store facade (~500 LOC),
     optional in-memory pyoxigraph as SPARQL accelerator.
 18. CRDT field extension (`Annotated[Text, pyr.Crdt]`, pycrdt doc blobs; 10–100x plaintext memory
@@ -72,6 +82,18 @@ inline): frozen entities + batch hydration in item 1, unique secondary-key index
     Tier-3 watermark consumer (GoBD/audit/agent-provenance; SDA delta). Demand-driven; requires
     only the deterministic replayable commit deltas already promised by item 3 — never Merkle
     computation in the commit path.
+20. **Git-like data branching / time-travel** (à la Omnigraph/lakeFS/Dolt; owner request
+    2026-06-11). Today the SQLite-blob backend *overwrites* rows — no history is retained, so
+    nothing branches "for free". The prerequisites ride already-planned work: item 3's
+    deterministic, replayable commit-delta stream (if *retained*) plus item 13's
+    open-at-watermark readers give **time-travel reads** and **branch-by-replay** (copy store,
+    replay a prefix) at moderate cost; crude-but-real today: branch = file copy of a closed
+    store, and Litestream PITR is linear time travel. Full in-store copy-on-write branching
+    with merges is major new scope — per-branch identity/unique/index invariants and
+    object-graph merge conflicts (adjacent to the CRDT "Never" rationale) — and systems like
+    Omnigraph get branching cheap precisely because their substrate is immutable columnar
+    snapshots (Lance), which for us corresponds to the v1 Arrow mirror tier, not the live
+    object graph. Demand-driven; merge semantics never promised for core.
 
 ## Never (all five round-2 recommendations agree, ratified)
 

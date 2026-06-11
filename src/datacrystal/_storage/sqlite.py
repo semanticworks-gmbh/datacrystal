@@ -33,7 +33,7 @@ CREATE TABLE IF NOT EXISTS meta (
 ) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS types (
     cid    INTEGER PRIMARY KEY,
-    name   TEXT NOT NULL UNIQUE,
+    name   TEXT NOT NULL,
     fields TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS objects (
@@ -68,6 +68,7 @@ class SqliteBackend:
         # executescript() force-commits any open transaction, so the
         # (idempotent) DDL runs in autocommit mode, outside the version check.
         conn.executescript(_SCHEMA)
+        self._drop_types_unique_constraint(conn)
         conn.execute("BEGIN IMMEDIATE")
         try:
             row = conn.execute(
@@ -98,6 +99,30 @@ class SqliteBackend:
             )
         ]
         return BootInfo(meta=meta, types=types)
+
+    @staticmethod
+    def _drop_types_unique_constraint(conn: sqlite3.Connection) -> None:
+        """Stores created before additive schema evolution carry a UNIQUE
+        constraint on types.name; the type lineage needs several rows per
+        name. One-time, idempotent table rebuild."""
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='types'"
+        ).fetchone()
+        if row is None or "UNIQUE" not in row[0]:
+            return
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute("ALTER TABLE types RENAME TO types_legacy")
+            conn.execute(
+                "CREATE TABLE types ("
+                "cid INTEGER PRIMARY KEY, name TEXT NOT NULL, fields TEXT NOT NULL)"
+            )
+            conn.execute("INSERT INTO types SELECT cid, name, fields FROM types_legacy")
+            conn.execute("DROP TABLE types_legacy")
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
 
     def load_many(self, oids: list[int]) -> dict[int, StoredRecord]:
         out: dict[int, StoredRecord] = {}
