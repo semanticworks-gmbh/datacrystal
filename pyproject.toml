@@ -3,7 +3,18 @@ name = "datacrystal"
 version = "0.1.0.dev0"
 description = "Embedded object-graph database for Python — your live objects, crystallized: transparent, pickle-free persistence with built-in queries, full-text/vector search, and zero-copy Arrow analytics"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Sven Hodapp", email = "sven.hodapp@gmail.com" }]
 requires-python = ">=3.14"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Database",
+    "Topic :: Database :: Database Engines/Servers",
+    "Typing :: Typed",
+]
 dependencies = [
     "msgspec>=0.21.1",
     "pyroaring>=1.1.0",
