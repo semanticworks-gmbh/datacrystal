@@ -1,0 +1,19 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Cloned third-party reference repos (see README)
+resources/
+
+# Test/demo artifacts
+.pytest_cache/
+.hypothesis/
+.benchmarks/
+*.store/

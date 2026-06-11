@@ -1,0 +1,78 @@
+# SDA reading: sda-specs-usage
+
+_SDA layering study, 2026-06-10. Sources: /Users/sh/tetrahedron (concept docs, sda_store implementation, specs)._
+
+## Summary
+
+SDA (Semantic Digital Asset) is Sven's semiotic data model from his 2014 thesis / 2018 paper: every fact is an immutable 5-tuple (sigmatic=URI identity, pragmatics=functional layer, semantics=attribute, syntax=format, asset=JSON-list payload) plus ingested_at — essentially a Datomic-style append-only EAV/datom store where the attribute is split into two orthogonal dimensions. The concept doc explicitly positions it against Datomic, RDF, event sourcing, and standoff annotation. The implementation (sda_store, ~2600 LOC, SQLModel/aiosqlite, one SQLite table per tenant) backs "semantic-studio", a FastAPI+NiceGUI app whose primary domain is outline-centric documents: hierarchical outlines (has_children/has_parents URI lists), a "published" datetime SDA as head-document marker, PBI status, business-map boards, SWARM-agent-pushed invoices, SKOS terminology concepts, and entity deduplication via identifiers/uid → owl:sameAs. Reads are dominated by exact-sigmatic latest-version lookups, BFS tree walks, pragmatics/semantics raw-SQL scans, and a denormalized search_index table with external-content FTS5; writes are bursty agent pushes and editor edits, each followed by a FULL search-index rebuild. The reported growth slowness has clear structural causes: every read routes through an sda_union view that recomputes a recursive-CTE connected-components dedup clustering, latest-version resolution self-joins on the full asset text, and O(corpus) index rebuilds per write batch. Roughly 70% of sda_store is generic persistence machinery (versioned facts, identity, traversal, indexing, FTS/vector sidecars, multi-tenancy) that maps almost one-to-one onto datacrystal's planned features; the semiotic vocabulary, outline/SKOS/dedup policies, and render/search-ranking logic are application semantics.
+
+## Key findings
+
+### SDA model = immutable semiotic 5-tuple, consciously Datomic/RDF-adjacent
+
+docs/concepts/SDA/CONCEPT.md defines SDA=(sigmatics, pragmatism, semantics, syntax, asset, fingerprint, editstamp); core principles: flat over nested, immutability, emit/revoke event sourcing, orthogonal querying, recursive decomposition of assets into finer SDAs. Explicit comparison table to Datomic datoms (entity≈sigmatics, attribute≈pragmatics+semantics, transaction≈editstamp). Known limitations listed: no inference, no recursive graph traversal ('topology must be processed'), schema-free = no validation. OUTLOOK.md plans 4+ academic papers (formal model, GoBD ledger, SDA-meets-RDF, semiotic retrieval, CRDT direction) — SDA is a research/publication agenda, not just an implementation detail.
+
+### Implementation: single append-only SQLite table, latest-wins resolved at read time
+
+sda_store/core.py:301-340: table sda_store(id, sigmatic, pragmatics, semantics, syntax, asset TEXT, ingested_at) with 3 indexes (sigmatic; sigmatic+pragmatics+semantics; ingested_at). update_sda just calls create_sda (core.py:776). All assets normalized to JSON lists (normalize_asset, core.py:184) with cardinality enum 0-n/1-1/0-1/1-n. 'Latest version' is computed per read via GROUP BY (sigmatic,pragmatics,semantics,syntax,asset) + MAX(ingested_at) self-join including the full asset column (core.py:467-511) — there is no version chain per attribute, only exact-tuple dedup, so edits accumulate as parallel facts.
+
+### Root cause candidates for 'slow when growing': sda_union recursive CTE on EVERY read
+
+sda_store/plugins/deduplication/views.py: all SDAService reads go through view sda_union = sda_store UNION ALL v_object_toc UNION ALL v_redirects (core.py:455-464 _get_read_table). v_clusters is a RECURSIVE flood-fill connected-components CTE over all identifiers/alsoKnownAs pairs (json_each over assets), re-evaluated per query with no materialization. Combined with the 5-column self-join for latest-only and LIKE prefix scans, read cost grows superlinearly with row count. A 'volatile' column exists 'for future materialization' but is unused.
+
+### Write path: bursty agent pushes with read-back idempotency, then O(corpus) reindex
+
+swarm_integration/business_logic.py push_objects (lines ~640-845): each SWARM object becomes 1 SDA per data field + auto outline title/published + comment/review_reason + blob, after fetching ALL existing SDAs for the sigmatic and comparing (pragmatics,semantics,syntax,normalized_asset) tuples in Python. Hierarchy building creates inbox→sync-batch→object nodes with has_parents/has_children SDAs. post_push_maintenance then runs per-sigmatic dedup AND SearchIndexService.rebuild() — a FULL delete-all+rewalk of every outline tree, board, and SKOS concept (search/index.py:136-198) plus FTS5 rebuild. Same full rebuild after terminology import, admin import, and on startup if empty (main.py:86).
+
+### Read/query shapes are narrow and index-friendly
+
+Dominant patterns: (1) exact-sigmatic fetch of all latest SDAs (get_sdas_by_uri), (2) batch IN-clause variant added to fix N+1 (get_sdas_by_uris_batch, core.py:601), (3) raw SQL scans WHERE pragmatics='X' [AND semantics='Y'] (discover_root_outlines, board/terminology collection, synonym expansion via LOWER(asset) LIKE), (4) BFS tree build: level-by-level batch queries O(depth) (render_processor/outline_tree.py:94-197), (5) published-outline listing ORDER BY asset DESC. The hierarchical dot-suffix URI scheme (parent.1.2) with LIKE-prefix queries exists in core.py but the real hierarchy is has_children/has_parents URI-list assets — the prefix machinery is largely vestigial.
+
+### Search: denormalized search_index table + external-content FTS5 + SKOS synonym expansion
+
+search/index.py: one row per outline node (title, description, topics_flat=whole-subtree text, breadcrumbs_json, is_published, content_type ∈ {'', business-map, board-element, terminology-concept}, updated_at bubbled from descendants). FTS5 external-content table with BM25 rank, prefix tokens (term*), hyphen sanitization, two-pass query (title/description then topics_flat for concepts). Query-time synonym→canonical-label expansion via SQL LIKE on skos/synonym assets, OR-ed label groups (deliberately one-directional after Sprint-32 over-expansion incident). Incremental refresh_for_sigmatic exists but full rebuild() is what's actually called after writes.
+
+### Terminology integration: SKOS concepts ARE SDAs; binding via 4 relation layers
+
+specs/terminology-integration.md (approved design): concepts stored under pragmatics='skos' with semantics ∈ {label, definition, broader, narrower, related, synonym, exactMatch, source_uri} — 'no new tables', deliberately inheriting multi-tenancy/versioning/search/rendering. docs/concepts/SDA/RELATIONS.md formalizes 4 layers: identifiers (uid/primaryId/alsoKnownAs, W3C-DID-inspired identity properties), owl/sameAs (instance equivalence created by DedupService from shared uid, bidirectional+idempotent), skos/exactMatch (concept↔board-element equivalence), dcterms/subject (instance→concept classification by SWARM + retroactive linker). Terminologies: EN16931/ZUGFeRD invoice fields, SWARM-extracted entities, Business-Map-derived concepts; TTL import as bootstrap. Live dev DB: 682 rows — skos 286, object 256, semantic-topic 81, comment 58.
+
+### Planned 3-layer search puts SPARQL/RDF and vectors on the roadmap
+
+terminology-integration.md Waves: 1 FTS5+SKOS (done), 2 synonym expansion/board extraction/dedup (done), 3 reasoning agent with three tools — SPARQL over RDFLib in-memory graph, outline navigator over has_parents/has_children, FTS5 — explicitly arguing 'the SDA model is already a structured retrieval index... richer signal than vectors' (citing PageIndex 98.7% FinanceBench), 4 Ollama+sqlite-vec embeddings. rdflib currently appears only in terminology/business_logic.py (TTL parsing). This is precisely datacrystal's FTS5 sidecar + RDF extension + usearch vector sidecar + traversal API trio.
+
+### Outline is the primary concept; 'published' SDA is the head-document marker
+
+specs/outline-sda-concept.txt: outline = successor of 'semantic topic', the overarching baseline concept; title/description/has_children (syntax=uri for refs, syntax=outline for volatile inline children)/has_parents (informational only — has_children is authoritative); PBI status enum renders as checkboxes; assets always lists with cardinality constraints; (id, outline, published, datetime, ts) marks a head document — presence = visible in overview, value = sort key, deletion = unpublish (the ONLY hard DELETE in the service besides migrations, core.py:1021). UI consumers: document overview newest-first, Vue outline editor (flat rows + level ints, annotation_type/needs_review enrichment with parent roll-up counts), article detail, /concepts read-only page, admin debug panel, table/pivot export.
+
+### Multi-tenancy and blobs are infrastructure already shaped like datacrystal's persona
+
+sda_store/tenant.py: DB-per-tenant SQLite at data/{org_id}/studio.db, lazily created via per-tenant asyncio.Lock, cached SDAService per org; default tenant '_default' for local dev. sda_store/blob.py: co-located blob_store table with sha256 content_hash dedup (#270), blobs referenced from SDAs via syntax='blob_ref'; comment says 'interim — will be replaced with S3-compatible store later'. Everything is asyncio (FastAPI lifespan singletons + module-level service registry) — note datacrystal's owner-thread confinement contract would need an asyncio-facing story (single-event-loop ownership) for this consumer.
+
+### Functional requirements SDA actually serves today (the contract any successor must keep)
+
+(1) schema-free multi-layer facts about a URI-identified entity, appendable by independent producers (SWARM, importer, editor, dedup service) without coordination; (2) latest-wins read with full history retained (audit/GoBD ambitions, gobd-ledger-research.md); (3) outline tree traversal both directions + root discovery; (4) published listing; (5) FTS search with synonym expansion and breadcrumb-renderable results; (6) entity dedup with canonical election (oldest wins) and redirect resolution; (7) idempotent re-import/re-push; (8) per-tenant isolation; (9) blob attachment with hash dedup; (10) tabular export of layer attributes (table_export flattens SDAs to pivot rows); (11) cross-vocabulary concept linking. Write volume is small (hundreds-to-thousands of rows per tenant today); the pain is read amplification and rebuild cost, not write throughput.
+
+## Relevance to datacrystal
+
+GENERIC persistence primitives currently hand-rolled inside sda_store (candidates to be ABSORBED by datacrystal): (1) append-only versioned fact storage with latest-wins reads and retained history → datacrystal records + immutable watermark snapshots (SDA's ingested_at ≈ watermark; 'time-travel by tuple' falls out for free); (2) sigmatic URI identity → OID registry (sigmatic strings as aliases on OIDs); (3) pragmatics/semantics/syntax equality filters (all current raw-SQL scans) → pyroaring bitmap indexes + Condition AST — this directly replaces the worst LIKE/scan queries; (4) has_children/has_parents traversal, root discovery, sibling lookup → v1 reverse-reference index + traversal API (kills the BFS batch-query walker and _find_root_sigmatic loop); (5) search_index + FTS5 full rebuilds → FTS5 sidecar fed by the idempotent commit-delta/watermark pipeline — this is the single biggest fix for the reported slowness, converting O(corpus)-per-write into O(delta); (6) planned Wave-4 sqlite-vec embeddings → usearch vector sidecar; (7) planned Wave-3 SPARQL/RDFLib reasoning tool → the RDF/triples extension package (an SDA row (sig, prag, sem, syn, asset) maps to a quad: subject=sigmatic, predicate=prag/sem, object=asset typed by syntax, graph≈pragmatics layer); (8) table_export pivot flattening → Arrow columnar mirrors with DuckDB/polars zero-copy; (9) DB-per-tenant → one datacrystal store per tenant (embedded model fits exactly); (10) blob_store with content-hash → blob entities or a blob sidecar; (11) dedup redirect/union resolution (sda_union recursive CTE) → should become a maintained index/materialized entity set updated on commit delta, not a per-read view — datacrystal's dirty-tracking + commit pipeline is the right place. DOMAIN/application semantics that should stay ON TOP as an 'sda' or 'semantic-outline' package: the semiotic vocabulary and layer conventions (outline, PBI, skos, owl, dcterms, identifiers, comment, prov, de.semanticworks.invoice), cardinality constraint policy, the published/head-document convention, inline-vs-uri children semantics, render processors (plain text/HTML outlines), SKOS synonym-expansion direction policy, dedup matching rules + canonical election, SWARM push contract/hierarchy building (inbox/sync batches), needs_review roll-ups, search ranking policy (published-first, two-pass terminology), and Business-Map concept extraction. STRUCTURAL TENSION to resolve: SDA is deliberately schema-free EAV (any producer adds any layer without migration) while datacrystal's core is typed slots-dataclasses; the clean synthesis is a generic `Fact`/`Statement` record type (msgspec) in datacrystal — or in the RDF extension — carrying the 5-tuple with bitmap-indexed dimension fields, with typed entities optionally projected per pragmatics layer; plus an asyncio ownership story (semantic-studio is fully async; ADR-001 owner-thread confinement maps to single-event-loop confinement). Verdict the evidence supports: SDA-the-store is ~70% reimplementable as datacrystal features (and would directly cure the measured pathologies: per-read recursive CTE, 5-column self-join latest resolution, full-index rebuilds, read-back idempotency); SDA-the-model (semiotics, outlines, SKOS, dedup policy) is application/domain vocabulary that should be a layer or extension package over datacrystal, not core — with the 5-tuple fact/statement primitive being the one SDA element worth promoting INTO the datacrystal concept (likely as/alongside the RDF extension).
+
+## Sources
+
+- /Users/sh/tetrahedron/projects/semantic-studio/specs/outline-sda-concept.txt
+- /Users/sh/tetrahedron/projects/semantic-studio/specs/terminology-integration.md
+- /Users/sh/tetrahedron/projects/semantic-studio/src/semantic_studio/sda_store/core.py
+- /Users/sh/tetrahedron/projects/semantic-studio/src/semantic_studio/sda_store/db_setup.py
+- /Users/sh/tetrahedron/projects/semantic-studio/src/semantic_studio/sda_store/tenant.py
+- /Users/sh/tetrahedron/projects/semantic-studio/src/semantic_studio/sda_store/blob.py
+- /Users/sh/tetrahedron/projects/semantic-studio/src/semantic_studio/sda_store/plugins/deduplication/views.py
+- /Users/sh/tetrahedron/projects/semantic-studio/src/semantic_studio/search/index.py
+- /Users/sh/tetrahedron/projects/semantic-studio/src/semantic_studio/render_processor/outline_tree.py
+- /Users/sh/tetrahedron/projects/semantic-studio/src/semantic_studio/outline_editor/business_logic.py
+- /Users/sh/tetrahedron/projects/semantic-studio/src/semantic_studio/swarm_integration/business_logic.py
+- /Users/sh/tetrahedron/projects/semantic-studio/src/semantic_studio/terminology/business_logic.py
+- /Users/sh/tetrahedron/projects/semantic-studio/src/semantic_studio/dedup/service.py
+- /Users/sh/tetrahedron/projects/semantic-studio/src/semantic_studio/api.py
+- /Users/sh/tetrahedron/docs/concepts/SDA/CONCEPT.md
+- /Users/sh/tetrahedron/docs/concepts/SDA/RELATIONS.md
+- /Users/sh/tetrahedron/docs/concepts/SDA/OUTLOOK.md
+- /Users/sh/tetrahedron/projects/semantic-studio/src/semantic_studio/semantic_studio.db (682 rows: skos 286, object 256, semantic-topic 81, comment 58)
