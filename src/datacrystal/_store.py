@@ -368,15 +368,22 @@ class Store:
                     (oid, ti, {name: getattr(obj, name) for name in relevant})
                 )
         self._index.check_unique(index_entries)
-        tid = self._alloc.next_tid()
         new_types: list[tuple[int, str, list[str]]] = []
-        records: list[StoredRecord] = []
+        encoded: list[tuple[int, int, bytes]] = []
         for oid, obj in pending.items():
             ti = type_info(obj)
             cid = self._cid_for(ti, new_types)
             values = [getattr(obj, name) for name in ti.field_names]
-            payload = encode_payload(values, self._oid_for_encode)
-            records.append(StoredRecord(oid=oid, cid=cid, tid=tid, payload=payload))
+            # Encoding can reject values (e.g. ints beyond msgpack's 64-bit
+            # range) — it must run BEFORE the TID allocation so a rejected
+            # commit consumes no TID and the buffers stay intact for a
+            # fixed-up retry (gapless sequence, invariant 5).
+            encoded.append((oid, cid, encode_payload(values, self._oid_for_encode)))
+        tid = self._alloc.next_tid()
+        records = [
+            StoredRecord(oid=oid, cid=cid, tid=tid, payload=payload)
+            for oid, cid, payload in encoded
+        ]
         batch = CommitBatch(
             tid=tid,
             records=records,

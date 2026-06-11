@@ -121,6 +121,22 @@ def test_types_row_survives_a_failed_first_commit_of_a_type():
     reopened.close()
 
 
+def test_unencodable_value_rejects_the_commit_without_consuming_a_tid():
+    """Found by the stateful machine: an int beyond msgpack's 64-bit range
+    fails P1 encoding. The rejection must consume no TID (gapless,
+    invariant 5) and leave the buffers intact for a fixed-up retry."""
+    with dc.Store._from_backend(MemoryBackend()) as store:
+        scan = Mineral(qid="Q1", name="quartz", tags=[2**64])  # too big
+        store.store(scan)
+        with pytest.raises(OverflowError):
+            store.commit()
+        scan.tags[0] = 2**64 - 1  # the largest honest msgpack int
+        tid = store.commit()
+        assert tid == TID_BASE  # the very first TID: the rejection burned none
+        found = store.get(Mineral, qid="Q1")
+        assert found is not None and found.tags == [2**64 - 1]
+
+
 def test_commit_remains_atomic_and_correct_across_backends(store_factory):
     """The restructure must not change observable sync semantics."""
     store = store_factory()
