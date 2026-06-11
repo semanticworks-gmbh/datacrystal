@@ -32,14 +32,15 @@ class WrongThreadError(DataCrystalError):
     """A live entity or store was touched from a thread that does not own it.
 
     Per ADR-001, a store and its live object graph are confined to the thread
-    (or asyncio event loop) that opened them. Read from other threads via
-    ``store.snapshot()`` (v0.x), or send work to the owner via
-    ``store.submit(fn)`` (M2).
+    (or asyncio event loop) that opened them. Send work to the owner via
+    ``store.submit(fn)``; cross-thread reads via ``store.snapshot()`` land
+    at M3.
     """
 
 
 class EntityEscapeError(DataCrystalError):
-    """A live entity was returned across the owner-thread boundary (ADR-001)."""
+    """A ``submit()`` result would have carried a live entity across the
+    owner boundary (ADR-001) — return plain data from submitted closures."""
 
 
 class FrozenEntityError(DataCrystalError):
@@ -84,3 +85,12 @@ class CorruptRecordError(DataCrystalError):
 class QueryError(DataCrystalError):
     """A condition is malformed — e.g. it mixes fields of two entity classes
     (cross-entity joins are a v1 feature on Arrow mirrors, not v0.x)."""
+
+
+class UntrackedMutationWarning(UserWarning):
+    """``debug=True`` found a CLEAN entity whose re-encoded record differs
+    from its last committed/hydrated state: something mutated it without
+    going through the dirty-tracking hook (e.g. ``object.__setattr__`` or a
+    mutable non-container object like a ``bytearray``). The safety net
+    commits the entity anyway — fix the write path it names (KICKOFF risk 1:
+    silent lost writes were the #1 DX killer in both ancestor systems)."""

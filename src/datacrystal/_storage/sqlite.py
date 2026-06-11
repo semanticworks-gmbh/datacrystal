@@ -6,12 +6,16 @@ custom on-disk format in v0.x, which is exactly why the crash-consistency
 story is honest from day one (KICKOFF risk 4). The boot index *is* the
 B-tree (ROADMAP punt 14: no boot problem to solve).
 
-Durability:
-* ``durability="full"`` (default) — ``synchronous=FULL`` plus
-  ``fullfsync=ON`` on macOS (the ~4 ms F_FULLFSYNC floor measured in the
-  feasibility study; honesty over speed).
-* ``durability="relaxed"`` — ``synchronous=NORMAL`` under WAL: commits may
-  be lost on OS crash/power loss, never corrupted.
+Durability is the KICKOFF M2 fsync triad (per-commit / interval / never):
+* ``durability="commit"`` — ``synchronous=FULL`` plus ``fullfsync=ON`` on
+  macOS (the ~4 ms F_FULLFSYNC floor measured in the feasibility study;
+  honesty over speed). Every acked commit survives power loss.
+* ``durability="interval"`` (default) — WAL group-commit:
+  ``synchronous=NORMAL`` fsyncs at WAL checkpoints, so commits between
+  checkpoints may be lost on OS crash/power loss but the file is never
+  corrupted. Process crash (kill -9) loses nothing under any policy.
+* ``durability="never"`` — ``synchronous=OFF``; benchmarks and scratch
+  stores only. OS crash/power loss can corrupt the file.
 """
 
 from __future__ import annotations
@@ -50,18 +54,27 @@ _LOAD_CHUNK = 500
 
 
 class SqliteBackend:
-    def __init__(self, path: Path | str, *, durability: str = "full") -> None:
-        if durability not in ("full", "relaxed"):
-            raise ValueError(f"durability must be 'full' or 'relaxed', got {durability!r}")
+    def __init__(self, path: Path | str, *, durability: str = "interval") -> None:
+        if durability not in ("commit", "interval", "never"):
+            raise ValueError(
+                f"durability must be 'commit', 'interval' or 'never', got {durability!r}"
+            )
         self._path = Path(path)
-        self._conn = sqlite3.connect(self._path, isolation_level=None)
+        # check_same_thread=False: commit P2 applies batches from the store's
+        # single IO worker thread while the owner thread keeps reading
+        # (ADR-001 three-phase commit). CPython's sqlite3 is serialized
+        # (threadsafety 3), so interleaved calls are safe; the engine never
+        # issues concurrent *writes* (single IO worker + owner confinement).
+        self._conn = sqlite3.connect(self._path, isolation_level=None, check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
-        if durability == "full":
+        if durability == "commit":
             self._conn.execute("PRAGMA synchronous=FULL")
             if sys.platform == "darwin":
                 self._conn.execute("PRAGMA fullfsync=ON")
-        else:
+        elif durability == "interval":
             self._conn.execute("PRAGMA synchronous=NORMAL")
+        else:
+            self._conn.execute("PRAGMA synchronous=OFF")
 
     def boot(self) -> BootInfo:
         conn = self._conn

@@ -40,7 +40,7 @@ class Item:
     payload: str
 
 N, BATCH = 100_000, 10_000
-store = dc.Store.open(sys.argv[1], durability="relaxed")
+store = dc.Store.open(sys.argv[1], durability="interval")
 baseline = peak_bytes()
 
 for start in range(0, N, BATCH):

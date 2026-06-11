@@ -39,6 +39,11 @@ jobs:
           uv run python examples/minerals/demo.py
           uv run python examples/minerals/demo.py
 
+      - name: Journal survives a rerun (M2 scenes incl. async session)
+        run: |
+          uv run python examples/journal/journal.py
+          uv run python examples/journal/journal.py
+
       - name: Wheel purity (fitness #17 — pure py3-none-any, no native code)
         run: |
           uv build
