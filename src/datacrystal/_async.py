@@ -34,14 +34,16 @@ from datacrystal._store import Store
 
 
 async def aopen(path: str | Path, *, durability: str = "interval",
-                lock_ttl: float = 10.0, debug: bool = False) -> "AsyncStore":
+                lock_ttl: float = 10.0, debug: bool = False,
+                lazy_timeout: float | None = None) -> "AsyncStore":
     """Open a store bound to the running event loop.
 
     The boot scan runs on the loop thread (the store's owner must be the
     loop's thread — ADR-001 binding semantics), so ``aopen()`` blocks the
     loop once at startup; boot is O(checkpoint), never O(history).
     """
-    store = Store.open(path, durability=durability, lock_ttl=lock_ttl, debug=debug)
+    store = Store.open(path, durability=durability, lock_ttl=lock_ttl,
+                       debug=debug, lazy_timeout=lazy_timeout)
     return AsyncStore(store)
 
 
@@ -57,9 +59,20 @@ class AsyncStore:
         # submit() from foreign threads wakes the loop instead of waiting
         # for an owner API call (the async flavor of the sync piggyback).
         store._wake = self._wake
+        # LazyReferenceManager as an owner task (ADR-001 bound decision 3):
+        # the sweep runs ON the loop — the owner's thread by construction.
+        self._sweeper: asyncio.Task[None] | None = None
+        manager = store._lazyman
+        if manager is not None:
+            self._sweeper = self._loop.create_task(self._sweep_forever(manager))
 
     def _wake(self) -> None:
         self._loop.call_soon_threadsafe(self._store._pump)
+
+    async def _sweep_forever(self, manager: Any) -> None:
+        while True:
+            await asyncio.sleep(manager.sweep_interval)
+            manager.sweep()
 
     # -- delegated owner-loop surface (sync: these never block on I/O frames
     # beyond what the sync Store does; hydration faults load on the loop —
@@ -138,6 +151,9 @@ class AsyncStore:
     def close(self) -> None:
         """Close the store (drains the IO worker; uncommitted changes are
         discarded — commit first)."""
+        if self._sweeper is not None:
+            self._sweeper.cancel()
+            self._sweeper = None
         self._store.close()
 
     async def __aenter__(self) -> "AsyncStore":

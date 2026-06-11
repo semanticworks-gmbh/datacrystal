@@ -61,7 +61,7 @@ from datacrystal._errors import (
 )
 from datacrystal._ids import IdAllocator, OID_BASE, TID_BASE
 from datacrystal._indexes import IndexManager, plan
-from datacrystal._lazy import Lazy
+from datacrystal._lazy import Lazy, LazyReferenceManager
 from datacrystal._records import RefToken, crc as _crc, decode_payload, encode_payload
 from datacrystal._registry import ObjectRegistry
 from datacrystal._storage.protocol import CommitBatch, StorageBackend, StoredRecord
@@ -100,7 +100,9 @@ class Store:
     """An open datacrystal store. Create via :meth:`Store.open`."""
 
     def __init__(self, backend: StorageBackend, lock: Any | None, *,
-                 p2_inline: bool = False, debug: bool = False) -> None:
+                 p2_inline: bool = False, debug: bool = False,
+                 lazy_timeout: float | None = None,
+                 lazy_clock: Callable[[], float] | None = None) -> None:
         self._backend = backend
         self._lock = lock
         self._owner = threading.get_ident()
@@ -126,6 +128,17 @@ class Store:
         # work and one int per live entity for detection — development tool.
         self._debug = debug
         self._fingerprints: dict[int, int] = {}
+        # lazy_timeout=None means no demotion (the default): root pinning
+        # plus explicit Lazy cut points already bound memory; the manager
+        # adds *time*-based release on top (timeout-only in v0.1).
+        # lazy_clock is the injectable test clock (never sleep in tests).
+        self._lazyman: LazyReferenceManager | None = None
+        if lazy_timeout is not None:
+            self._lazyman = (
+                LazyReferenceManager(lazy_timeout, lazy_clock)
+                if lazy_clock is not None
+                else LazyReferenceManager(lazy_timeout)
+            )
         # The root holder is PINNED (strong reference): everything reachable
         # from store.root stays live — without this, a CLEAN root graph with
         # no user references would be collected and silently rehydrated,
@@ -171,7 +184,8 @@ class Store:
 
     @classmethod
     def open(cls, path: str | Path, *, durability: str = "interval",
-             lock_ttl: float = 10.0, debug: bool = False) -> "Store":
+             lock_ttl: float = 10.0, debug: bool = False,
+             lazy_timeout: float | None = None) -> "Store":
         """Open (creating if needed) the store directory at ``path``.
 
         The directory holds ``data.sqlite`` and the single-writer lease file
@@ -189,6 +203,12 @@ class Store:
         ``UntrackedMutationWarning`` for (and commits) any that changed
         without the dirty-tracking hook firing. Development tool — it costs
         O(live entities) per commit.
+
+        ``lazy_timeout`` (seconds) enables the LazyReferenceManager: loaded
+        ``Lazy`` handles idle past the timeout demote back to unloaded,
+        releasing the subgraph behind the cut point. Demotion runs only on
+        the owner (sweeps piggyback on your store calls; under ``aopen()``
+        an owner-loop task sweeps). Timeout-only in v0.1.
         """
         import sqlite3  # noqa: PLC0415 — stays lazy (dep-budget fitness #3)
 
@@ -203,15 +223,19 @@ class Store:
             backend = SqliteBackend(directory / "data.sqlite", durability=durability)
             # Off-thread P2 shares the connection with owner-thread reads;
             # that requires a serialized sqlite3 build (CPython's default).
-            return cls(backend, lock, p2_inline=sqlite3.threadsafety < 3, debug=debug)
+            return cls(backend, lock, p2_inline=sqlite3.threadsafety < 3,
+                       debug=debug, lazy_timeout=lazy_timeout)
         except BaseException:
             lock.release()
             raise
 
     @classmethod
-    def _from_backend(cls, backend: StorageBackend, *, debug: bool = False) -> "Store":
+    def _from_backend(cls, backend: StorageBackend, *, debug: bool = False,
+                      lazy_timeout: float | None = None,
+                      lazy_clock: Callable[[], float] | None = None) -> "Store":
         """Open over an explicit backend (tests; no lock file)."""
-        return cls(backend, None, debug=debug)
+        return cls(backend, None, debug=debug, lazy_timeout=lazy_timeout,
+                   lazy_clock=lazy_clock)
 
     def close(self) -> None:
         """Close the store. Uncommitted changes are discarded (commit first)."""
@@ -244,8 +268,7 @@ class Store:
 
     @property
     def root(self) -> Any:
-        self._guard()
-        self._pump()
+        self._enter()
         if self._root_oid is None:
             return None
         if self._root_holder is None:
@@ -258,8 +281,7 @@ class Store:
         from ``store.root`` as tracked persistent containers (mutate them in
         place — ``commit()`` sees it), and new entities in the value are
         registered for the next commit."""
-        self._guard()
-        self._pump()
+        self._enter()
         if self._root_oid is None:
             holder = _Root(value=value)
             self._root_oid = self._register_graph(holder)
@@ -279,8 +301,7 @@ class Store:
     def store(self, obj: Any) -> int:
         """Register ``obj`` (and every new entity reachable from it) for the
         next commit; returns its OID."""
-        self._guard()
-        self._pump()
+        self._enter()
         if not is_entity(obj):
             raise NotAnEntityError(
                 f"{type(obj).__name__} is not an @entity class instance"
@@ -291,8 +312,7 @@ class Store:
         """Explicitly buffer an entity for the next commit. Rarely needed —
         attribute writes and in-place container mutation are tracked
         automatically; this is the escape hatch for anything exotic."""
-        self._guard()
-        self._pump()
+        self._enter()
         if not is_entity(obj):
             raise NotAnEntityError(
                 f"{type(obj).__name__} is not an @entity class instance"
@@ -307,8 +327,7 @@ class Store:
     def commit(self) -> int | None:
         """Atomically persist all buffered changes; returns the new commit
         TID, or ``None`` if there was nothing to commit."""
-        self._guard()
-        self._pump()
+        self._enter()
         capture = self._p1_capture()
         if capture is None:
             return None
@@ -490,7 +509,10 @@ class Store:
         """Execute all queued :meth:`submit` work now (owner thread only);
         returns the number of submissions run."""
         self._guard()
-        return self._pump()
+        count = self._pump()
+        if self._lazyman is not None:  # an explicit boundary sweeps too
+            self._lazyman.maybe_sweep()
+        return count
 
     def _pump(self) -> int:
         """Drain the submit() queue on the owner. Called from the public API
@@ -532,8 +554,7 @@ class Store:
         """Look up one entity by a unique secondary key, e.g.
         ``store.get(Mineral, qid="Q43010")``. Returns ``None`` if absent.
         Reflects committed state."""
-        self._guard()
-        self._pump()
+        self._enter()
         if len(unique_key) != 1:
             raise TypeError("get() takes exactly one unique-field keyword argument")
         ti = type_info(cls)
@@ -550,8 +571,7 @@ class Store:
     def get_many(self, refs: Iterable[Any]) -> list[Any]:
         """Batch-hydrate a sequence of OIDs / Lazy handles / entities in one
         storage round-trip (SDA delta 5: N+1 is never the user's problem)."""
-        self._guard()
-        self._pump()
+        self._enter()
         items = list(refs)
         wanted: list[int] = []
         for item in items:
@@ -585,8 +605,7 @@ class Store:
     def query(self, cond: Condition) -> list[Any]:
         """Evaluate a Condition over the *committed* state of one entity
         class; returns hydrated entities."""
-        self._guard()
-        self._pump()
+        self._enter()
         if not isinstance(cond, Condition):
             raise TypeError(
                 f"query() takes a Condition (e.g. Cls.field == value), "
@@ -611,6 +630,15 @@ class Store:
             raise StoreClosedError("this store has been closed")
         if threading.get_ident() != self._owner:
             raise WrongThreadError(_THREAD_RECIPE)
+
+    def _enter(self) -> None:
+        """Public API boundary: guard, then piggyback the work the owner
+        owes — the submit() queue and the lazy-demotion sweep (ADR-001
+        daemon principle: both only ever run on the owner)."""
+        self._guard()
+        self._pump()
+        if self._lazyman is not None:
+            self._lazyman.maybe_sweep()
 
     def _on_first_write(self, obj: Any) -> None:
         """First write to a CLEAN entity (called by the one-shot hook,
@@ -788,7 +816,10 @@ class Store:
             if lazy:
                 existing = self._registry.get(value.oid)
                 if existing is not None:
-                    return Lazy.of(existing)
+                    handle = Lazy._loaded(existing, value.oid, self)
+                    if self._lazyman is not None:
+                        self._lazyman.track(handle)
+                    return handle
                 return Lazy._unloaded(value.oid, self)
             return self._load_oid(value.oid, cache)
         if isinstance(value, list):
