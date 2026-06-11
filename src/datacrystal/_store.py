@@ -27,6 +27,7 @@ the root graph keeps stable identity.
 from __future__ import annotations
 
 import threading
+import warnings
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
@@ -55,12 +56,13 @@ from datacrystal._errors import (
     SchemaMismatchError,
     StoreClosedError,
     UnregisteredTypeError,
+    UntrackedMutationWarning,
     WrongThreadError,
 )
 from datacrystal._ids import IdAllocator, OID_BASE, TID_BASE
 from datacrystal._indexes import IndexManager, plan
 from datacrystal._lazy import Lazy
-from datacrystal._records import RefToken, decode_payload, encode_payload
+from datacrystal._records import RefToken, crc as _crc, decode_payload, encode_payload
 from datacrystal._registry import ObjectRegistry
 from datacrystal._storage.protocol import CommitBatch, StorageBackend, StoredRecord
 
@@ -98,7 +100,7 @@ class Store:
     """An open datacrystal store. Create via :meth:`Store.open`."""
 
     def __init__(self, backend: StorageBackend, lock: Any | None, *,
-                 p2_inline: bool = False) -> None:
+                 p2_inline: bool = False, debug: bool = False) -> None:
         self._backend = backend
         self._lock = lock
         self._owner = threading.get_ident()
@@ -117,6 +119,13 @@ class Store:
         self._submitted: deque[tuple[Callable[[], Any], Future[Any]]] = deque()
         self._pumping = False
         self._wake: Callable[[], None] | None = None  # set by aopen()
+        # debug=True: the msgspec-fingerprint safety net (KICKOFF M2 risk-1
+        # mitigation). Every hydration/commit records crc(payload) per OID;
+        # every commit re-encodes the live CLEAN entities and warns + commits
+        # any that changed without a hook firing. Trades O(live set) commit
+        # work and one int per live entity for detection — development tool.
+        self._debug = debug
+        self._fingerprints: dict[int, int] = {}
         # The root holder is PINNED (strong reference): everything reachable
         # from store.root stays live — without this, a CLEAN root graph with
         # no user references would be collected and silently rehydrated,
@@ -162,7 +171,7 @@ class Store:
 
     @classmethod
     def open(cls, path: str | Path, *, durability: str = "interval",
-             lock_ttl: float = 10.0) -> "Store":
+             lock_ttl: float = 10.0, debug: bool = False) -> "Store":
         """Open (creating if needed) the store directory at ``path``.
 
         The directory holds ``data.sqlite`` and the single-writer lease file
@@ -174,6 +183,12 @@ class Store:
         commits at WAL checkpoints (process crash loses nothing; OS crash
         may lose the last commits, never corrupts), ``"never"`` is for
         benchmarks and scratch stores only.
+
+        ``debug=True`` arms the fingerprint safety net: every commit
+        re-encodes the live CLEAN entities and raises an
+        ``UntrackedMutationWarning`` for (and commits) any that changed
+        without the dirty-tracking hook firing. Development tool — it costs
+        O(live entities) per commit.
         """
         import sqlite3  # noqa: PLC0415 — stays lazy (dep-budget fitness #3)
 
@@ -188,15 +203,15 @@ class Store:
             backend = SqliteBackend(directory / "data.sqlite", durability=durability)
             # Off-thread P2 shares the connection with owner-thread reads;
             # that requires a serialized sqlite3 build (CPython's default).
-            return cls(backend, lock, p2_inline=sqlite3.threadsafety < 3)
+            return cls(backend, lock, p2_inline=sqlite3.threadsafety < 3, debug=debug)
         except BaseException:
             lock.release()
             raise
 
     @classmethod
-    def _from_backend(cls, backend: StorageBackend) -> "Store":
+    def _from_backend(cls, backend: StorageBackend, *, debug: bool = False) -> "Store":
         """Open over an explicit backend (tests; no lock file)."""
-        return cls(backend, None)
+        return cls(backend, None, debug=debug)
 
     def close(self) -> None:
         """Close the store. Uncommitted changes are discarded (commit first)."""
@@ -317,6 +332,8 @@ class Store:
                 "this process lost the single-writer lease (paused too long?); "
                 "another process may own the store now — refusing to write"
             )
+        if self._debug:
+            self._sweep_untracked()  # before discovery: rescued entities get walked too
         self._discover_new_graphs()
         pending = {**self._new, **self._dirty}
         if not pending:
@@ -395,8 +412,49 @@ class Store:
         """P3 (owner): indexes and watermark reflect the now-durable batch."""
         self._index.apply(capture.index_entries)
         self._durable_cids.update(cid for cid, _, _ in capture.batch.new_types)
+        if self._debug:
+            for rec in capture.batch.records:
+                self._fingerprints[rec.oid] = _crc(rec.payload)
         self._last_tid = capture.tid
         return capture.tid
+
+    def _sweep_untracked(self) -> None:
+        """debug=True: warn about (and rescue) CLEAN entities whose
+        re-encoded record no longer matches their last known fingerprint —
+        a mutation slipped past the hooks (KICKOFF risk 1)."""
+        for oid, obj in self._registry.items():
+            if oid in self._new or oid in self._dirty:
+                continue
+            if state_of(obj) != STATE_CLEAN:
+                continue
+            expected = self._fingerprints.get(oid)
+            if expected is None:
+                continue
+            ti = type_info(obj)
+            try:
+                payload = encode_payload(
+                    [getattr(obj, name) for name in ti.field_names],
+                    self._oid_for_encode,
+                )
+                changed = _crc(payload) != expected
+            except BaseException:
+                # It encoded fine when its fingerprint was taken, so the
+                # failure itself proves an untracked change (e.g. a brand-new
+                # entity attached via a bypass write). Rescue it: the commit
+                # path will register reachable new entities or raise loudly.
+                changed = True
+            if changed:
+                warnings.warn(
+                    UntrackedMutationWarning(
+                        f"{ti.typename} (oid {oid}) changed without the "
+                        "dirty-tracking hook firing; committing it anyway — "
+                        "fix the write path (use plain attribute assignment "
+                        "or the persistent containers)"
+                    ),
+                    stacklevel=4,
+                )
+                set_state(obj, STATE_DIRTY)
+                self._dirty[oid] = obj
 
     def _io_executor(self) -> ThreadPoolExecutor:
         if self._io is None:
@@ -711,6 +769,17 @@ class Store:
         for spec, index, factory in plan:
             raw = values[index] if index is not None else factory()
             set_field(obj, spec.name, self._resolve(raw, spec.lazy_refs, cache, obj))
+        if self._debug:
+            # Fingerprint via the same encode path the sweep uses (NOT the
+            # stored payload: an old-lineage record re-encodes through the
+            # live class shape, which must not read as a mutation).
+            try:
+                self._fingerprints[rec.oid] = _crc(encode_payload(
+                    [getattr(obj, name) for name in ti.field_names],
+                    self._oid_for_encode,
+                ))
+            except BaseException:
+                self._fingerprints.pop(rec.oid, None)
         return obj
 
     def _resolve(self, value: Any, lazy: bool, cache: dict[int, StoredRecord] | None,

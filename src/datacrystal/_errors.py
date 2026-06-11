@@ -85,3 +85,12 @@ class CorruptRecordError(DataCrystalError):
 class QueryError(DataCrystalError):
     """A condition is malformed — e.g. it mixes fields of two entity classes
     (cross-entity joins are a v1 feature on Arrow mirrors, not v0.x)."""
+
+
+class UntrackedMutationWarning(UserWarning):
+    """``debug=True`` found a CLEAN entity whose re-encoded record differs
+    from its last committed/hydrated state: something mutated it without
+    going through the dirty-tracking hook (e.g. ``object.__setattr__`` or a
+    mutable non-container object like a ``bytearray``). The safety net
+    commits the entity anyway — fix the write path it names (KICKOFF risk 1:
+    silent lost writes were the #1 DX killer in both ancestor systems)."""

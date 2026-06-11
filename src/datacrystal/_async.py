@@ -34,14 +34,14 @@ from datacrystal._store import Store
 
 
 async def aopen(path: str | Path, *, durability: str = "interval",
-                lock_ttl: float = 10.0) -> "AsyncStore":
+                lock_ttl: float = 10.0, debug: bool = False) -> "AsyncStore":
     """Open a store bound to the running event loop.
 
     The boot scan runs on the loop thread (the store's owner must be the
     loop's thread — ADR-001 binding semantics), so ``aopen()`` blocks the
     loop once at startup; boot is O(checkpoint), never O(history).
     """
-    store = Store.open(path, durability=durability, lock_ttl=lock_ttl)
+    store = Store.open(path, durability=durability, lock_ttl=lock_ttl, debug=debug)
     return AsyncStore(store)
 
 

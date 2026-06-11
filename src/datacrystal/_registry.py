@@ -25,5 +25,9 @@ class ObjectRegistry:
     def add(self, oid: int, obj: Any) -> None:
         self._by_oid[oid] = obj
 
+    def items(self) -> list[tuple[int, Any]]:
+        """Snapshot of the live (oid, entity) pairs (debug sweep, tests)."""
+        return list(self._by_oid.items())
+
     def __len__(self) -> int:
         return len(self._by_oid)

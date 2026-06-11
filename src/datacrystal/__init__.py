@@ -44,6 +44,7 @@ from datacrystal._errors import (
     StoreLockedError,
     UniqueViolationError,
     UnregisteredTypeError,
+    UntrackedMutationWarning,
     WrongThreadError,
 )
 from datacrystal._lazy import Lazy
@@ -90,5 +91,6 @@ __all__ = [
     "NewerStoreError",
     "CorruptRecordError",
     "QueryError",
+    "UntrackedMutationWarning",
     "__version__",
 ]
