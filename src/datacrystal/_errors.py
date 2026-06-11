@@ -32,14 +32,15 @@ class WrongThreadError(DataCrystalError):
     """A live entity or store was touched from a thread that does not own it.
 
     Per ADR-001, a store and its live object graph are confined to the thread
-    (or asyncio event loop) that opened them. Read from other threads via
-    ``store.snapshot()`` (v0.x), or send work to the owner via
-    ``store.submit(fn)`` (M2).
+    (or asyncio event loop) that opened them. Send work to the owner via
+    ``store.submit(fn)``; cross-thread reads via ``store.snapshot()`` land
+    at M3.
     """
 
 
 class EntityEscapeError(DataCrystalError):
-    """A live entity was returned across the owner-thread boundary (ADR-001)."""
+    """A ``submit()`` result would have carried a live entity across the
+    owner boundary (ADR-001) — return plain data from submitted closures."""
 
 
 class FrozenEntityError(DataCrystalError):

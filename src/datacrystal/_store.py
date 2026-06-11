@@ -28,9 +28,9 @@ from __future__ import annotations
 
 import threading
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from datacrystal._conditions import Condition
 from datacrystal._containers import PersistentDict, PersistentList, wrap_value
@@ -49,6 +49,7 @@ from datacrystal._entity import (
 from datacrystal._state import STATE_CLEAN, STATE_DIRTY, STATE_NEW
 from datacrystal._errors import (
     DataCrystalError,
+    EntityEscapeError,
     LeaseLostError,
     NotAnEntityError,
     SchemaMismatchError,
@@ -65,8 +66,10 @@ from datacrystal._storage.protocol import CommitBatch, StorageBackend, StoredRec
 
 _THREAD_RECIPE = (
     "live entities and their store are confined to the thread that opened the "
-    "store (ADR-001); read across threads via store.snapshot() and send writes "
-    "to the owner via store.submit(fn) (both land in v0.x)"
+    "store (ADR-001); send work to the owner via store.submit(fn) — the owner "
+    "runs it at its next store call or store.run_pending() — and return plain "
+    "data, never live entities; cross-thread reads via store.snapshot() land "
+    "at M3"
 )
 
 
@@ -108,6 +111,12 @@ class Store:
         # serialized (threadsafety < 3) — same phases, owner-thread I/O.
         self._io: ThreadPoolExecutor | None = None
         self._p2_inline = p2_inline
+        # submit() queue: foreign threads append, the owner drains at its
+        # API boundaries (sync piggyback) or when woken (async). deque
+        # append/popleft are atomic — no extra lock needed.
+        self._submitted: deque[tuple[Callable[[], Any], Future[Any]]] = deque()
+        self._pumping = False
+        self._wake: Callable[[], None] | None = None  # set by aopen()
         # The root holder is PINNED (strong reference): everything reachable
         # from store.root stays live — without this, a CLEAN root graph with
         # no user references would be collected and silently rehydrated,
@@ -195,6 +204,15 @@ class Store:
             return
         self._closed = True
         self._root_holder = None  # unpin: let the graph be collected
+        while True:  # pending submissions can never run now — fail them loudly
+            try:
+                _fn, future = self._submitted.popleft()
+            except IndexError:
+                break
+            if future.set_running_or_notify_cancel():
+                future.set_exception(
+                    StoreClosedError("the store closed before this submission ran")
+                )
         if self._io is not None:
             self._io.shutdown(wait=True)
         self._backend.close()
@@ -212,6 +230,7 @@ class Store:
     @property
     def root(self) -> Any:
         self._guard()
+        self._pump()
         if self._root_oid is None:
             return None
         if self._root_holder is None:
@@ -225,6 +244,7 @@ class Store:
         place — ``commit()`` sees it), and new entities in the value are
         registered for the next commit."""
         self._guard()
+        self._pump()
         if self._root_oid is None:
             holder = _Root(value=value)
             self._root_oid = self._register_graph(holder)
@@ -245,6 +265,7 @@ class Store:
         """Register ``obj`` (and every new entity reachable from it) for the
         next commit; returns its OID."""
         self._guard()
+        self._pump()
         if not is_entity(obj):
             raise NotAnEntityError(
                 f"{type(obj).__name__} is not an @entity class instance"
@@ -256,6 +277,7 @@ class Store:
         attribute writes and in-place container mutation are tracked
         automatically; this is the escape hatch for anything exotic."""
         self._guard()
+        self._pump()
         if not is_entity(obj):
             raise NotAnEntityError(
                 f"{type(obj).__name__} is not an @entity class instance"
@@ -271,6 +293,7 @@ class Store:
         """Atomically persist all buffered changes; returns the new commit
         TID, or ``None`` if there was nothing to commit."""
         self._guard()
+        self._pump()
         capture = self._p1_capture()
         if capture is None:
             return None
@@ -382,11 +405,77 @@ class Store:
             )
         return self._io
 
+    def submit(self, fn: Callable[[], Any]) -> Future[Any]:
+        """Run ``fn()`` on the owner thread; returns a Future for its result.
+
+        The sanctioned cross-thread write path (ADR-001): foreign threads
+        must not touch live entities, but they may ship a closure here. The
+        owner executes pending submissions whenever it next calls into the
+        store (piggyback), or explicitly via :meth:`run_pending`; under
+        ``aopen()`` the loop is woken instead. A result that would carry a
+        live entity (directly or inside a container) fails the Future with
+        ``EntityEscapeError`` — return plain data.
+        """
+        if self._closed:
+            raise StoreClosedError("this store has been closed")
+        future: Future[Any] = Future()
+        if threading.get_ident() == self._owner:
+            self._execute_submission(fn, future)  # owner: run inline, same rules
+            return future
+        self._submitted.append((fn, future))
+        wake = self._wake
+        if wake is not None:
+            wake()
+        return future
+
+    def run_pending(self) -> int:
+        """Execute all queued :meth:`submit` work now (owner thread only);
+        returns the number of submissions run."""
+        self._guard()
+        return self._pump()
+
+    def _pump(self) -> int:
+        """Drain the submit() queue on the owner. Called from the public API
+        boundaries; reentrant calls (a submission touching the store) no-op."""
+        if self._pumping or not self._submitted:
+            return 0
+        self._pumping = True
+        count = 0
+        try:
+            while True:
+                try:
+                    fn, future = self._submitted.popleft()
+                except IndexError:
+                    return count
+                self._execute_submission(fn, future)
+                count += 1
+        finally:
+            self._pumping = False
+
+    def _execute_submission(self, fn: Callable[[], Any], future: Future[Any]) -> None:
+        if not future.set_running_or_notify_cancel():
+            return
+        try:
+            result = fn()
+        except BaseException as exc:
+            future.set_exception(exc)
+            return
+        offender = _find_escapee(result)
+        if offender is not None:
+            future.set_exception(EntityEscapeError(
+                f"the submit() result would carry a live entity ({offender}) "
+                f"across the owner boundary — return plain data instead; "
+                + _THREAD_RECIPE
+            ))
+            return
+        future.set_result(result)
+
     def get(self, cls: type, **unique_key: Any) -> Any | None:
         """Look up one entity by a unique secondary key, e.g.
         ``store.get(Mineral, qid="Q43010")``. Returns ``None`` if absent.
         Reflects committed state."""
         self._guard()
+        self._pump()
         if len(unique_key) != 1:
             raise TypeError("get() takes exactly one unique-field keyword argument")
         ti = type_info(cls)
@@ -404,6 +493,7 @@ class Store:
         """Batch-hydrate a sequence of OIDs / Lazy handles / entities in one
         storage round-trip (SDA delta 5: N+1 is never the user's problem)."""
         self._guard()
+        self._pump()
         items = list(refs)
         wanted: list[int] = []
         for item in items:
@@ -438,6 +528,7 @@ class Store:
         """Evaluate a Condition over the *committed* state of one entity
         class; returns hydrated entities."""
         self._guard()
+        self._pump()
         if not isinstance(cond, Condition):
             raise TypeError(
                 f"query() takes a Condition (e.g. Cls.field == value), "
@@ -645,6 +736,27 @@ class Store:
     def __repr__(self) -> str:
         state = "closed" if self._closed else f"tid={self._last_tid}"
         return f"<datacrystal.Store {state}>"
+
+
+def _find_escapee(value: Any) -> str | None:
+    """Name the first live entity (or handle to one) inside a submit()
+    result, or None if the value is plain data (ADR-001: EntityEscapeError)."""
+    if is_entity(value):
+        return type(value).__name__
+    if isinstance(value, Lazy):
+        target = value.peek()
+        return f"Lazy[{type(target).__name__}]" if target is not None else "Lazy"
+    if isinstance(value, (list, tuple, set, frozenset)):
+        for item in value:
+            found = _find_escapee(item)
+            if found is not None:
+                return found
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            found = _find_escapee(key) or _find_escapee(item)
+            if found is not None:
+                return found
+    return None
 
 
 def QueryErrorFor(cls: type, field: str) -> Exception:
