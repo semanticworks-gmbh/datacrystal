@@ -171,6 +171,46 @@ class Not(Condition):
         return f"~{self.part!r}"
 
 
+class FieldProxy:
+    """Typed query-field access for one entity class (see :func:`fields`)."""
+
+    __slots__ = ("_cls",)
+
+    def __init__(self, cls: type) -> None:
+        self._cls = cls
+
+    def __getattr__(self, name: str) -> "FieldExpr":
+        cls = self._cls
+        fieldset = type.__getattribute__(cls, "__dc_fieldset__")
+        if name not in fieldset:
+            raise AttributeError(f"{cls.__name__} has no persisted field {name!r}")
+        return FieldExpr(cls, name)
+
+    def __repr__(self) -> str:
+        return f"<fields of {self._cls.__name__}>"
+
+
+def fields(entity_class: type) -> FieldProxy:
+    """A statically-typed handle for building query conditions.
+
+    ``Mineral.mohs >= 6.0`` works at runtime but type checkers infer the
+    field's *value* type for class-level access and flag the comparison.
+    The proxy route is checker-clean and otherwise identical::
+
+        M = dc.fields(Mineral)
+        store.query((M.crystal_system == "cubic") & (M.mohs >= 6.0))
+    """
+    try:
+        type.__getattribute__(entity_class, "__dc_fieldset__")
+    except AttributeError:
+        from datacrystal._errors import NotAnEntityError
+
+        raise NotAnEntityError(
+            f"{entity_class.__name__} is not an @entity class"
+        ) from None
+    return FieldProxy(entity_class)
+
+
 class FieldExpr:
     """``EntityClass.field`` — the left-hand side of a predicate."""
 

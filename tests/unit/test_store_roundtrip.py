@@ -143,21 +143,20 @@ def test_get_many_hydrates_in_order(store_factory):
 
 
 def test_clean_entities_are_collectable(store_factory):
-    """The registry must not keep clean, unreferenced entities alive."""
+    """The registry must not keep clean entities alive that are not
+    reachable from the pinned root (the root graph itself IS pinned —
+    see test_root.py)."""
     store = store_factory()
     _cabinet(store)
+    orphan = Locality(qid="QORPHAN", name="not reachable from root")
+    store.store(orphan)
     store.commit()
     registry = store._registry
-    store.close()
-
-    reopened = store_factory()
-    _ = reopened.root  # hydrate, then drop every strong reference
-    registry = reopened._registry
-    assert len(registry) > 0
-    del _
+    before = len(registry)
+    del orphan
     gc.collect()
-    assert len(registry) == 0
-    reopened.close()
+    assert len(registry) == before - 1
+    store.close()
 
 
 def test_uncommitted_changes_are_discarded_on_close(store_factory):

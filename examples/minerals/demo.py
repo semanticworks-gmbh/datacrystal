@@ -116,16 +116,19 @@ def main() -> None:
               f"{len(cabinet.minerals)} minerals, {len(cabinet.specimens)} specimens, "
               f"{len(cabinet.log)} log entries (watermark tid={store.last_tid})")
 
-        # Bitmap query (single-class by design; KICKOFF §5)
-        hits = store.query((Specimen.quality == "fine") & (Specimen.mass_g >= 30.0))
+        # Bitmap query (single-class by design; KICKOFF §5). dc.fields() is
+        # the type-checker-clean route; `Specimen.quality == ...` also works.
+        S, M = dc.fields(Specimen), dc.fields(Mineral)
+        hits = store.query((S.quality == "fine") & (S.mass_g >= 30.0))
         print(f"fine specimens >= 30 g: {len(hits)}")
 
         # Condition AST over the mineral facets
-        hard_cubic = store.query((Mineral.crystal_system == "cubic") & (Mineral.mohs >= 6.0))
+        hard_cubic = store.query((M.crystal_system == "cubic") & (M.mohs >= 6.0))
         print("hard cubic minerals:", sorted(m.name for m in hard_cubic))
 
         # Unique secondary key + lazy traversal
         azurite = store.get(Mineral, qid="Q193563")
+        assert azurite is not None and azurite.type_locality is not None
         print(f"azurite type locality (lazy → loaded): "
               f"{azurite.type_locality.get().name}, {azurite.type_locality.get().country}")
 
@@ -135,10 +138,11 @@ def main() -> None:
         assert tsumeb_minerals[0].type_locality.get() is tsumeb_minerals[1].type_locality.get()
         print("identity holds: azurite and malachite share one live Tsumeb object")
 
-        # Frozen provenance log: appending is the only legal mutation
+        # Frozen provenance log: appending is the only legal mutation.
+        # The in-place append is tracked transparently — cabinet.log is a
+        # PersistentList bound to the cabinet, no mark_dirty needed.
         cabinet.log.append(LogEntry(specimen_no="DC-0000", kind="inspected",
                                     note="demo run inspection"))
-        store.mark_dirty(cabinet)  # in-place list append: explicit until M2's PersistentList
         try:
             cabinet.log[0].note = "rewrite history"
         except dc.FrozenEntityError:

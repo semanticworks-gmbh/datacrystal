@@ -56,10 +56,14 @@ class UniqueViolationError(DataCrystalError):
 
 
 class SchemaMismatchError(DataCrystalError):
-    """The persisted field schema of a type differs from the live class.
+    """A persisted record cannot be mapped onto the live class.
 
-    Schema evolution (renames, adds, deletes) is post-v0.1 work; until then
-    datacrystal refuses loudly instead of guessing.
+    Additive schema evolution is automatic — fields added *with a default*
+    are filled on load, removed fields are ignored. This error means
+    something beyond that: a new field without a default, a Unique field
+    added with a non-None default, or a damaged type dictionary. A rename is
+    remove+add (the old values are dropped); explicit data migrations are
+    post-v0.1 work.
     """
 
 

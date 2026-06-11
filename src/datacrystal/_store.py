@@ -13,14 +13,12 @@ KICKOFF.md M2). The M1 scaffold to be deleted at M2 is the *scheduling*,
 not the phases.
 
 Write model (buffer-until-commit): ``store.store(obj)`` registers an object
-graph; mutating a CLEAN entity buffers it via the one-shot hook; nothing
-touches storage until ``commit()``. The storer holds strong references to
-pending objects, so uncommitted work cannot be garbage-collected.
-
-Known v0.1 limitation (documented, M2 fixes it with PersistentList/Dict +
-the fingerprint safety net): in-place mutation of a list/dict *inside* a
-CLEAN entity is invisible to the hook — reassign the field or call
-``store.mark_dirty(entity)``.
+graph; mutating a CLEAN entity buffers it via the one-shot hook; in-place
+mutation of a list/dict field buffers its owner via the owner-bound
+persistent containers (``_containers.py``); nothing touches storage until
+``commit()``. The storer holds strong references to pending objects, so
+uncommitted work cannot be garbage-collected; the root holder is pinned so
+the root graph keeps stable identity.
 """
 
 from __future__ import annotations
@@ -31,9 +29,8 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from datacrystal._conditions import Condition
+from datacrystal._containers import PersistentDict, PersistentList, wrap_value
 from datacrystal._entity import (
-    STATE_CLEAN,
-    STATE_DIRTY,
     TYPES_BY_NAME,
     TypeInfo,
     entity,
@@ -45,6 +42,7 @@ from datacrystal._entity import (
     state_of,
     type_info,
 )
+from datacrystal._state import STATE_CLEAN, STATE_DIRTY
 from datacrystal._errors import (
     DataCrystalError,
     LeaseLostError,
@@ -60,8 +58,6 @@ from datacrystal._lazy import Lazy
 from datacrystal._records import RefToken, decode_payload, encode_payload
 from datacrystal._registry import ObjectRegistry
 from datacrystal._storage.protocol import CommitBatch, StorageBackend, StoredRecord
-
-_UNSET = object()
 
 _THREAD_RECIPE = (
     "live entities and their store are confined to the thread that opened the "
@@ -88,7 +84,12 @@ class Store:
         self._registry = ObjectRegistry()
         self._new: dict[int, Any] = {}
         self._dirty: dict[int, Any] = {}
-        self._root_pending: Any = _UNSET
+        # The root holder is PINNED (strong reference): everything reachable
+        # from store.root stays live — without this, a CLEAN root graph with
+        # no user references would be collected and silently rehydrated,
+        # losing identity and any in-place mutations. Lazy[T] is the explicit
+        # cut point where pinning (and memory) stops.
+        self._root_holder: Any = None
 
         boot = backend.boot()
         meta = boot.meta
@@ -100,15 +101,23 @@ class Store:
         self._last_tid = self._alloc.tid_watermark - 1
         root_meta = meta.get("root_oid", "")
         self._root_oid: int | None = int(root_meta) if root_meta else None
-        self._cid_by_typename: dict[str, int] = {}
+        # Type lineage (additive schema evolution): one typename may own
+        # SEVERAL cids — one per field shape it ever had. New commits use the
+        # latest cid; every old cid stays decodable through its own persisted
+        # field list (records are hydrated by NAME, missing fields filled
+        # from dataclass defaults, removed fields ignored).
+        self._cid_by_typename: dict[str, int] = {}          # typename → latest
+        self._cids_by_typename: dict[str, list[int]] = {}   # full lineage
         self._typename_by_cid: dict[int, str] = {}
         self._persisted_fields: dict[int, list[str]] = {}
-        for cid, typename, fields in boot.types:
+        for cid, typename, fields in boot.types:  # ordered by cid: last wins
             self._cid_by_typename[typename] = cid
+            self._cids_by_typename.setdefault(typename, []).append(cid)
             self._typename_by_cid[cid] = typename
             self._persisted_fields[cid] = fields
         self._ti_by_cid: dict[int, TypeInfo] = {}
-        self._index = IndexManager(backend, self._cid_by_typename.get)
+        self._plan_by_cid: dict[int, list[tuple[Any, int | None, Any]]] = {}
+        self._index = IndexManager(backend, self._lineage_for)
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -145,6 +154,7 @@ class Store:
         if self._closed:
             return
         self._closed = True
+        self._root_holder = None  # unpin: let the graph be collected
         self._backend.close()
         if self._lock is not None:
             self._lock.release()
@@ -160,16 +170,29 @@ class Store:
     @property
     def root(self) -> Any:
         self._guard()
-        if self._root_pending is not _UNSET:
-            return self._root_pending
         if self._root_oid is None:
             return None
-        return self._load_oid(self._root_oid).value
+        if self._root_holder is None:
+            self._root_holder = self._load_oid(self._root_oid)
+        return self._root_holder.value
 
     @root.setter
     def root(self, value: Any) -> None:
+        """Assigning the root captures it immediately: lists/dicts come back
+        from ``store.root`` as tracked persistent containers (mutate them in
+        place — ``commit()`` sees it), and new entities in the value are
+        registered for the next commit."""
         self._guard()
-        self._root_pending = value
+        if self._root_oid is None:
+            holder = _Root(value=value)
+            self._root_oid = self._register_graph(holder)
+        else:
+            holder = self._root_holder
+            if holder is None:
+                holder = self._load_oid(self._root_oid)
+            holder.value = value  # one-shot hook buffers the holder
+            self._register_graph(holder)
+        self._root_holder = holder
 
     @property
     def last_tid(self) -> int:
@@ -187,18 +210,20 @@ class Store:
         return self._register_graph(obj)
 
     def mark_dirty(self, obj: Any) -> None:
-        """Explicitly buffer an entity for the next commit (the escape hatch
-        for in-place container mutation, until M2's PersistentList/Dict)."""
+        """Explicitly buffer an entity for the next commit. Rarely needed —
+        attribute writes and in-place container mutation are tracked
+        automatically; this is the escape hatch for anything exotic."""
         self._guard()
         if not is_entity(obj):
             raise NotAnEntityError(
                 f"{type(obj).__name__} is not an @entity class instance"
             )
-        if oid_of(obj) is None:
+        oid = oid_of(obj)
+        if oid is None:
             self._register_graph(obj)
         elif state_of(obj) == STATE_CLEAN:
             set_state(obj, STATE_DIRTY)
-            self._dirty[oid_of(obj)] = obj
+            self._dirty[oid] = obj
 
     def commit(self) -> int | None:
         """Atomically persist all buffered changes; returns the new commit
@@ -210,8 +235,6 @@ class Store:
                 "another process may own the store now — refusing to write"
             )
         # ---- P1 (owner): capture + encode ---------------------------------
-        if self._root_pending is not _UNSET:
-            self._capture_root()
         self._discover_new_graphs()
         pending = {**self._new, **self._dirty}
         if not pending:
@@ -255,6 +278,15 @@ class Store:
             raise
         # ---- P3 (owner): flip, re-arm, advance the watermark ----------------
         for oid, obj in pending.items():
+            ti = type_info(obj)
+            if ti.frozen:
+                # Frozen __init__ bypasses the tracked __setattr__, so its
+                # containers are still plain — bind them now so post-commit
+                # in-place mutation raises instead of silently doing nothing.
+                for name in ti.field_names:
+                    value = getattr(obj, name)
+                    if isinstance(value, (list, dict, tuple)):
+                        set_field(obj, name, wrap_value(value, obj))
             set_state(obj, STATE_CLEAN)
             self._registry.add(oid, obj)
         self._index.apply(index_entries)
@@ -289,8 +321,9 @@ class Store:
         wanted: list[int] = []
         for item in items:
             if isinstance(item, Lazy):
-                if not item.loaded:
-                    wanted.append(item.oid)  # type: ignore[arg-type]
+                oid = item.oid
+                if not item.loaded and oid is not None:
+                    wanted.append(oid)
             elif isinstance(item, int):
                 wanted.append(item)
             elif not is_entity(item):
@@ -303,7 +336,11 @@ class Store:
         out = []
         for item in items:
             if isinstance(item, Lazy):
-                out.append(item.get() if item.loaded else self._load_oid(item.oid, cache))
+                oid = item.oid
+                if item.loaded or oid is None:
+                    out.append(item.get())
+                else:
+                    out.append(self._load_oid(oid, cache))
             elif isinstance(item, int):
                 out.append(self._load_oid(item, cache))
             else:
@@ -347,19 +384,9 @@ class Store:
         if self._closed:
             raise StoreClosedError("this store has been closed")
         set_state(obj, STATE_DIRTY)
-        self._dirty[oid_of(obj)] = obj
-
-    def _capture_root(self) -> None:
-        if self._root_oid is None:
-            holder = _Root(value=self._root_pending)
-            self._root_oid = self._register_graph(holder)
-        else:
-            holder = self._load_oid(self._root_oid)
-            holder.value = self._root_pending  # one-shot hook buffers it
-            if state_of(holder) != STATE_DIRTY:  # store-less edge: force it
-                set_state(holder, STATE_DIRTY)
-                self._dirty[self._root_oid] = holder
-        self._root_pending = _UNSET
+        oid = oid_of(obj)
+        assert oid is not None  # CLEAN implies stamped
+        self._dirty[oid] = obj
 
     def _register_graph(self, obj: Any, walked: set[int] | None = None) -> int:
         if walked is None:
@@ -409,11 +436,21 @@ class Store:
             )
         return oid
 
+    def _lineage_for(self, ti: TypeInfo) -> list[tuple[int, list[str]]]:
+        """Every (cid, persisted field list) this typename ever committed."""
+        return [
+            (cid, self._persisted_fields[cid])
+            for cid in self._cids_by_typename.get(ti.typename, [])
+        ]
+
     def _cid_for(self, ti: TypeInfo, new_types: list[tuple[int, str, list[str]]]) -> int:
         cid = self._cid_by_typename.get(ti.typename)
+        if cid is not None and self._persisted_fields[cid] != list(ti.field_names):
+            cid = None  # field shape changed: start a new lineage row
         if cid is None:
             cid = self._alloc.next_cid()
             self._cid_by_typename[ti.typename] = cid
+            self._cids_by_typename.setdefault(ti.typename, []).append(cid)
             self._typename_by_cid[cid] = ti.typename
             self._persisted_fields[cid] = list(ti.field_names)
             self._ti_by_cid[cid] = ti
@@ -434,15 +471,34 @@ class Store:
                 "class with that name is defined in this process — import it "
                 "before opening the data"
             )
-        persisted = self._persisted_fields.get(cid, [])
-        if persisted != list(ti.field_names):
-            raise SchemaMismatchError(
-                f"{typename}: persisted fields {persisted} != live class fields "
-                f"{list(ti.field_names)}; schema evolution lands post-v0.1 — "
-                "keep the class shape stable until then"
-            )
         self._ti_by_cid[cid] = ti
         return ti
+
+    def _hydration_plan(self, cid: int, ti: TypeInfo) -> list[tuple[Any, int | None, Any]]:
+        """Per-(cid → live class) decode plan: for every live field, where its
+        value comes from — a position in the persisted record, or a default
+        factory (additive evolution). Removed persisted fields are ignored."""
+        plan = self._plan_by_cid.get(cid)
+        if plan is None:
+            persisted = self._persisted_fields.get(cid, [])
+            position = {name: i for i, name in enumerate(persisted)}
+            plan = []
+            for spec in ti.specs:
+                index = position.get(spec.name)
+                if index is not None:
+                    plan.append((spec, index, None))
+                    continue
+                factory = ti.defaults.get(spec.name)
+                if factory is None:
+                    raise SchemaMismatchError(
+                        f"{ti.typename}.{spec.name} does not exist in records "
+                        f"persisted with fields {persisted} and has no default "
+                        "— give the new field a default value to enable "
+                        "additive schema evolution"
+                    )
+                plan.append((spec, None, factory))
+            self._plan_by_cid[cid] = plan
+        return plan
 
     def _load_oid(self, oid: int, cache: dict[int, StoredRecord] | None = None) -> Any:
         self._guard()
@@ -458,20 +514,24 @@ class Store:
 
     def _materialize(self, rec: StoredRecord, cache: dict[int, StoredRecord] | None) -> Any:
         ti = self._ti_for_cid(rec.cid)
+        plan = self._hydration_plan(rec.cid, ti)
         obj = object.__new__(ti.cls)
         stamp(obj, rec.oid, self, STATE_CLEAN)
         self._registry.add(rec.oid, obj)  # before fills: breaks reference cycles
         values = decode_payload(rec.payload)
-        if len(values) != len(ti.field_names):
+        persisted = self._persisted_fields.get(rec.cid, [])
+        if len(values) != len(persisted):
             raise SchemaMismatchError(
-                f"{ti.typename}: record has {len(values)} fields, class has "
-                f"{len(ti.field_names)}"
+                f"{ti.typename}: record has {len(values)} fields, its type "
+                f"dictionary row has {len(persisted)} — the store is damaged"
             )
-        for spec, value in zip(ti.specs, values):
-            set_field(obj, spec.name, self._resolve(value, spec.lazy_refs, cache))
+        for spec, index, factory in plan:
+            raw = values[index] if index is not None else factory()
+            set_field(obj, spec.name, self._resolve(raw, spec.lazy_refs, cache, obj))
         return obj
 
-    def _resolve(self, value: Any, lazy: bool, cache: dict[int, StoredRecord] | None) -> Any:
+    def _resolve(self, value: Any, lazy: bool, cache: dict[int, StoredRecord] | None,
+                 owner: Any) -> Any:
         if isinstance(value, RefToken):
             if lazy:
                 existing = self._registry.get(value.oid)
@@ -480,9 +540,14 @@ class Store:
                 return Lazy._unloaded(value.oid, self)
             return self._load_oid(value.oid, cache)
         if isinstance(value, list):
-            return [self._resolve(item, lazy, cache) for item in value]
+            return PersistentList(
+                (self._resolve(item, lazy, cache, owner) for item in value), owner=owner
+            )
         if isinstance(value, dict):
-            return {k: self._resolve(v, lazy, cache) for k, v in value.items()}
+            return PersistentDict(
+                ((k, self._resolve(v, lazy, cache, owner)) for k, v in value.items()),
+                owner=owner,
+            )
         return value
 
     def __repr__(self) -> str:

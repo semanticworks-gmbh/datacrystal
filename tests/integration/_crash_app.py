@@ -40,7 +40,7 @@ def write(path: str) -> None:
 
 def verify(path: str, minimum_batch: int) -> None:
     store = dc.Store.open(path, lock_ttl=0.1)
-    rows = store.query(Row.batch >= 0)
+    rows = store.query(dc.fields(Row).batch >= 0)
     counts = Counter(r.batch for r in rows)
     incomplete = {b: n for b, n in counts.items() if n != ROWS_PER_BATCH}
     assert not incomplete, f"torn batches survived the crash: {incomplete}"

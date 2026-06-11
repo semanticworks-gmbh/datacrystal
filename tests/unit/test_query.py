@@ -1,4 +1,12 @@
-"""Condition AST + bitmap planner (ROADMAP item 4)."""
+"""Condition AST + bitmap planner (ROADMAP item 4).
+
+These tests deliberately exercise the magic class-attribute path
+(``Mineral.mohs >= 3.7``), which type checkers cannot model — the pragma
+below silences exactly that. Checker-clean user code uses ``dc.fields()``.
+"""
+# pyright: reportOptionalOperand=false, reportOptionalMemberAccess=false
+# pyright: reportAttributeAccessIssue=false, reportOperatorIssue=false
+# pyright: reportArgumentType=false
 
 from __future__ import annotations
 
@@ -29,6 +37,16 @@ def test_indexed_eq(cabinet):
     assert _names(cabinet.query(Mineral.crystal_system == "monoclinic")) == [
         "azurite", "malachite",
     ]
+
+
+def test_fields_proxy_is_equivalent_and_validated(cabinet):
+    M = dc.fields(Mineral)
+    hits = cabinet.query((M.crystal_system == "monoclinic") & (M.mohs >= 3.7))
+    assert _names(hits) == ["malachite"]
+    with pytest.raises(AttributeError, match="no persisted field"):
+        _ = M.no_such_field
+    with pytest.raises(dc.NotAnEntityError):
+        dc.fields(str)
 
 
 def test_and_of_indexed_and_residual(cabinet):

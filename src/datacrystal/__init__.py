@@ -25,6 +25,8 @@ Quickstart::
 Design docs: docs/design/ in the repository (DESIGN.md, ROADMAP.md, ADR-001).
 """
 
+from datacrystal._conditions import fields
+from datacrystal._containers import PersistentDict, PersistentList
 from datacrystal._entity import FullText, Index, Unique, entity
 from datacrystal._errors import (
     CorruptRecordError,
@@ -50,10 +52,13 @@ __version__ = "0.1.0.dev0"
 __all__ = [
     "Store",
     "entity",
+    "fields",
     "Lazy",
     "Index",
     "Unique",
     "FullText",
+    "PersistentList",
+    "PersistentDict",
     "DataCrystalError",
     "StoreClosedError",
     "StoreLockedError",
