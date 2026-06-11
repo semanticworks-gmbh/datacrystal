@@ -4,13 +4,16 @@ Concurrency contract (ADR-001, accepted): a store and its live graph are
 **owner-confined** — bound at ``open()`` to the opening thread. Foreign
 threads get ``WrongThreadError`` with the escape recipe in the message.
 
-The commit pipeline is structured in the ratified three-phase shape from its
-first version — P1 capture+encode on the owner, P2 backend I/O on bytes
-only, P3 flip+re-arm+watermark on the owner — even though v0.1 runs all
-three synchronously on the owner thread. M2 moves P2 off-thread without
-changing the logic (this sequencing IS the crystallization point; see
-KICKOFF.md M2). The M1 scaffold to be deleted at M2 is the *scheduling*,
-not the phases.
+The commit pipeline is the ratified three-phase machine (ADR-001 bound
+decision 2): P1 captures, encodes, FLIPS the captured set back to CLEAN and
+re-arms the hooks — all await-free on the owner, so a write racing P2
+re-dirties and lands in the next commit; P2 applies the batch (bytes only)
+on the store's single IO worker thread; P3 finalizes indexes and the
+watermark on the owner. A failed P2 compensates: captured entities return
+to their buffers (unless a racing write already re-buffered them) and the
+TID is reused — a rejected commit leaves the sequence gapless. The
+synchronous ``commit()`` blocks until P3; ``aopen()``'s commit awaits P2 so
+the event loop stays free.
 
 Write model (buffer-until-commit): ``store.store(obj)`` registers an object
 graph; mutating a CLEAN entity buffers it via the one-shot hook; in-place
@@ -25,6 +28,7 @@ from __future__ import annotations
 
 import threading
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -42,7 +46,7 @@ from datacrystal._entity import (
     state_of,
     type_info,
 )
-from datacrystal._state import STATE_CLEAN, STATE_DIRTY
+from datacrystal._state import STATE_CLEAN, STATE_DIRTY, STATE_NEW
 from datacrystal._errors import (
     DataCrystalError,
     LeaseLostError,
@@ -73,10 +77,25 @@ class _Root:
     value: Any = None
 
 
+class _Capture:
+    """Everything P1 hands to P2/P3 — and enough to compensate a failed P2."""
+
+    __slots__ = ("tid", "batch", "index_entries", "flipped")
+
+    def __init__(self, tid: int, batch: CommitBatch,
+                 index_entries: list[tuple[int, TypeInfo, dict[str, Any]]],
+                 flipped: list[tuple[int, Any, int]]) -> None:
+        self.tid = tid
+        self.batch = batch
+        self.index_entries = index_entries
+        self.flipped = flipped  # (oid, obj, state before the P1 flip)
+
+
 class Store:
     """An open datacrystal store. Create via :meth:`Store.open`."""
 
-    def __init__(self, backend: StorageBackend, lock: Any | None) -> None:
+    def __init__(self, backend: StorageBackend, lock: Any | None, *,
+                 p2_inline: bool = False) -> None:
         self._backend = backend
         self._lock = lock
         self._owner = threading.get_ident()
@@ -84,6 +103,11 @@ class Store:
         self._registry = ObjectRegistry()
         self._new: dict[int, Any] = {}
         self._dirty: dict[int, Any] = {}
+        # P2 runs on this single-worker executor (created on first commit).
+        # p2_inline is the fallback for sqlite3 builds that are not
+        # serialized (threadsafety < 3) — same phases, owner-thread I/O.
+        self._io: ThreadPoolExecutor | None = None
+        self._p2_inline = p2_inline
         # The root holder is PINNED (strong reference): everything reachable
         # from store.root stays live — without this, a CLEAN root graph with
         # no user references would be collected and silently rehydrated,
@@ -110,11 +134,17 @@ class Store:
         self._cids_by_typename: dict[str, list[int]] = {}   # full lineage
         self._typename_by_cid: dict[int, str] = {}
         self._persisted_fields: dict[int, list[str]] = {}
+        # cids whose types-table row is durably persisted. A commit batch
+        # re-includes every non-durable lineage row, so a commit that failed
+        # in P2 cannot leave later records pointing at a cid the store never
+        # learned about.
+        self._durable_cids: set[int] = set()
         for cid, typename, fields in boot.types:  # ordered by cid: last wins
             self._cid_by_typename[typename] = cid
             self._cids_by_typename.setdefault(typename, []).append(cid)
             self._typename_by_cid[cid] = typename
             self._persisted_fields[cid] = fields
+            self._durable_cids.add(cid)
         self._ti_by_cid: dict[int, TypeInfo] = {}
         self._plan_by_cid: dict[int, list[tuple[Any, int | None, Any]]] = {}
         self._index = IndexManager(backend, self._lineage_for)
@@ -136,6 +166,8 @@ class Store:
         may lose the last commits, never corrupts), ``"never"`` is for
         benchmarks and scratch stores only.
         """
+        import sqlite3  # noqa: PLC0415 — stays lazy (dep-budget fitness #3)
+
         from datacrystal._storage.lock import LeaseLock  # sqlite3/locking stay lazy
         from datacrystal._storage.sqlite import SqliteBackend
 
@@ -145,7 +177,9 @@ class Store:
         lock.acquire()
         try:
             backend = SqliteBackend(directory / "data.sqlite", durability=durability)
-            return cls(backend, lock)
+            # Off-thread P2 shares the connection with owner-thread reads;
+            # that requires a serialized sqlite3 build (CPython's default).
+            return cls(backend, lock, p2_inline=sqlite3.threadsafety < 3)
         except BaseException:
             lock.release()
             raise
@@ -161,6 +195,8 @@ class Store:
             return
         self._closed = True
         self._root_holder = None  # unpin: let the graph be collected
+        if self._io is not None:
+            self._io.shutdown(wait=True)
         self._backend.close()
         if self._lock is not None:
             self._lock.release()
@@ -235,12 +271,29 @@ class Store:
         """Atomically persist all buffered changes; returns the new commit
         TID, or ``None`` if there was nothing to commit."""
         self._guard()
+        capture = self._p1_capture()
+        if capture is None:
+            return None
+        try:
+            self._run_p2(capture.batch)
+        except BaseException:
+            self._p2_rollback(capture)
+            raise
+        return self._p3_finalize(capture)
+
+    # -- the three commit phases (ADR-001 bound decision 2) ------------------
+
+    def _p1_capture(self) -> _Capture | None:
+        """P1 (owner, await-free): discover, validate, encode — then flip the
+        captured set CLEAN and re-arm the hooks. The flip happens BEFORE P2
+        so a write racing P2 re-dirties through the normal hook path and
+        lands in the *next* commit; a failed P2 compensates via
+        :meth:`_p2_rollback`."""
         if self._lock is not None and self._lock.lost:
             raise LeaseLostError(
                 "this process lost the single-writer lease (paused too long?); "
                 "another process may own the store now — refusing to write"
             )
-        # ---- P1 (owner): capture + encode ---------------------------------
         self._discover_new_graphs()
         pending = {**self._new, **self._dirty}
         if not pending:
@@ -276,13 +329,7 @@ class Store:
                 "root_oid": str(self._root_oid) if self._root_oid is not None else "",
             },
         )
-        # ---- P2: backend I/O on bytes only (off-thread at M2) --------------
-        try:
-            self._backend.apply(batch)
-        except BaseException:
-            self._alloc._next_tid = tid  # the TID was never durable; reuse it
-            raise
-        # ---- P3 (owner): flip, re-arm, advance the watermark ----------------
+        flipped: list[tuple[int, Any, int]] = []
         for oid, obj in pending.items():
             ti = type_info(obj)
             if ti.frozen:
@@ -293,13 +340,47 @@ class Store:
                     value = getattr(obj, name)
                     if isinstance(value, (list, dict, tuple)):
                         set_field(obj, name, wrap_value(value, obj))
+            flipped.append((oid, obj, state_of(obj)))
             set_state(obj, STATE_CLEAN)
             self._registry.add(oid, obj)
-        self._index.apply(index_entries)
         self._new.clear()
         self._dirty.clear()
-        self._last_tid = tid
-        return tid
+        return _Capture(tid, batch, index_entries, flipped)
+
+    def _run_p2(self, batch: CommitBatch) -> None:
+        """P2: backend I/O on bytes only, off the owner thread."""
+        if self._p2_inline:
+            self._backend.apply(batch)
+        else:
+            self._io_executor().submit(self._backend.apply, batch).result()
+
+    def _p2_rollback(self, capture: _Capture) -> None:
+        """A failed P2 was never durable: re-buffer the captured set (unless
+        a racing write already re-buffered an entity) and reuse the TID —
+        the sequence stays gapless (invariant 5)."""
+        self._alloc._next_tid = capture.tid
+        for oid, obj, prior in capture.flipped:
+            if prior == STATE_NEW:
+                set_state(obj, STATE_NEW)
+                self._dirty.pop(oid, None)  # racing write during failed P2
+                self._new[oid] = obj
+            else:
+                set_state(obj, STATE_DIRTY)
+                self._dirty[oid] = obj
+
+    def _p3_finalize(self, capture: _Capture) -> int:
+        """P3 (owner): indexes and watermark reflect the now-durable batch."""
+        self._index.apply(capture.index_entries)
+        self._durable_cids.update(cid for cid, _, _ in capture.batch.new_types)
+        self._last_tid = capture.tid
+        return capture.tid
+
+    def _io_executor(self) -> ThreadPoolExecutor:
+        if self._io is None:
+            self._io = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="datacrystal-io"
+            )
+        return self._io
 
     def get(self, cls: type, **unique_key: Any) -> Any | None:
         """Look up one entity by a unique secondary key, e.g.
@@ -460,6 +541,11 @@ class Store:
             self._typename_by_cid[cid] = ti.typename
             self._persisted_fields[cid] = list(ti.field_names)
             self._ti_by_cid[cid] = ti
+        # Batch every lineage row that is not yet durable — NOT just freshly
+        # allocated ones: after a failed P2 the cid stays cached in the maps
+        # above, and the retry's batch must carry its types row again or the
+        # store ends up with records pointing at a cid it never learned.
+        if cid not in self._durable_cids and all(row[0] != cid for row in new_types):
             new_types.append((cid, ti.typename, list(ti.field_names)))
         return cid
 
