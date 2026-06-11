@@ -31,14 +31,17 @@ store = dc.Store.open("cabinet.store")        # a directory; created if needed
 store.close()                                  # or: with dc.Store.open(...) as store:
 ```
 
-`Store.open(path, *, durability="full", lock_ttl=10.0)`:
+`Store.open(path, *, durability="interval", lock_ttl=10.0)`:
 
 - The directory holds `data.sqlite` (records as msgpack blobs, riding SQLite's journal) and
   `used.lock`, the **single-writer lease**: a second process opening the same store gets a loud
   `StoreLockedError` instead of silent corruption.
-- `durability="full"` (default) fsyncs every commit (plus `F_FULLFSYNC` on macOS — honest, so a
-  commit costs ~4 ms there). `durability="relaxed"` may lose the last commits on OS crash or
-  power loss but never corrupts.
+- `durability` is a triad. `"commit"` fsyncs every commit (plus `F_FULLFSYNC` on macOS —
+  honest, so a commit costs ~4 ms there); an acked commit survives even power loss.
+  `"interval"` (default) group-commits: fsync happens at WAL checkpoints, so a **process**
+  crash (kill -9) loses nothing, while an OS crash or power loss may lose the last commits —
+  but never corrupts the file. `"never"` skips fsync entirely: benchmarks and scratch stores
+  only, an OS crash can corrupt it.
 - `close()` **discards uncommitted changes** — commit first. Closing releases the lock and the
   in-memory graph.
 
@@ -320,9 +323,13 @@ store and its live graph belong to the thread that opened the store.
 
 ## Durability and crash safety
 
-- A commit is one SQLite transaction; `durability="full"` makes it fsync-durable per commit.
-- Kill -9 mid-commit, power loss, OS crash: on reopen you get exactly the committed prefix.
-  This is CI-gated (the SIGKILL crash test) and was true from the first walking skeleton.
+- A commit is one SQLite transaction; `durability="commit"` makes it fsync-durable per commit,
+  the default `"interval"` group-commits at WAL checkpoints (see [Open a store](#open-a-store)
+  for the triad's exact loss windows).
+- Kill -9 mid-commit, power loss, OS crash: on reopen you get exactly a committed prefix —
+  never a torn commit. Under `"commit"` that prefix is *every acked commit*; under
+  `"interval"` an OS crash may trim the tail. This is CI-gated (the SIGKILL crash test runs
+  under `"commit"`) and was true from the first walking skeleton.
 - Backup: close the store (or pause writing) and copy the directory.
   `sqlite3.backup`/Litestream PITR recipes are `[planned — docs, v0.x]`.
 - Opening a store written by a **newer** library version raises `NewerStoreError` naming both

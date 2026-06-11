@@ -28,7 +28,10 @@ ROWS_PER_BATCH = 10
 
 
 def write(path: str) -> None:
-    store = dc.Store.open(path, lock_ttl=0.5)
+    # durability="commit" pins the strongest policy: the gate's claim is
+    # "every ACKED commit survives", which per-commit fsync promises even
+    # against power loss (SIGKILL alone would also pass under "interval").
+    store = dc.Store.open(path, lock_ttl=0.5, durability="commit")
     batch = 0
     while True:
         for seq in range(ROWS_PER_BATCH):

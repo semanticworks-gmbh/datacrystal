@@ -122,13 +122,19 @@ class Store:
     # -- lifecycle -----------------------------------------------------------
 
     @classmethod
-    def open(cls, path: str | Path, *, durability: str = "full",
+    def open(cls, path: str | Path, *, durability: str = "interval",
              lock_ttl: float = 10.0) -> "Store":
         """Open (creating if needed) the store directory at ``path``.
 
         The directory holds ``data.sqlite`` and the single-writer lease file
         ``used.lock`` — a second concurrent opener fails with
         ``StoreLockedError``.
+
+        ``durability`` is the fsync triad (KICKOFF M2): ``"commit"`` fsyncs
+        every commit (power-loss durable), ``"interval"`` (default) group-
+        commits at WAL checkpoints (process crash loses nothing; OS crash
+        may lose the last commits, never corrupts), ``"never"`` is for
+        benchmarks and scratch stores only.
         """
         from datacrystal._storage.lock import LeaseLock  # sqlite3/locking stay lazy
         from datacrystal._storage.sqlite import SqliteBackend
