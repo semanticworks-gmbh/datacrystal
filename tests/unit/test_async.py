@@ -48,6 +48,9 @@ class _GatedApply:
         assert self.release.wait(timeout=10), "test forgot to release P2"
         self._inner.apply(batch)
 
+    def read_view(self):
+        return self._inner.read_view()
+
     def close(self):
         self._inner.close()
 

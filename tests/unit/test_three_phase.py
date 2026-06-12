@@ -41,6 +41,9 @@ class _Recording:
         self.apply_threads.append(threading.get_ident())
         self._inner.apply(batch)
 
+    def read_view(self):
+        return self._inner.read_view()
+
     def close(self):
         self._inner.close()
 
