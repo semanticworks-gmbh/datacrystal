@@ -9,12 +9,19 @@ SQLite (Litestream/Turso), EclipseStore (Eclipse Data Grid), and SlateDB all con
 
 ## Tier 0 — one process, many cores
 
-Owner thread/loop owns mutation. Parallelism comes from `store.snapshot()`: immutable watermark
-views (Arrow tables, frozen bitmaps) readable from any thread, crunched by DuckDB/polars/numpy
-kernels that **release the GIL** — real multi-core analytics. Background threads return results
-via `store.submit()`. (Redis precedent: a single-threaded command loop is not "single-core software".)
-Free-threaded 3.14t widens this lane (parallel snapshot analytics); the contract itself never
-leaned on the GIL.
+Owner thread/loop owns mutation. Parallelism comes from `store.snapshot()` (immutable
+`EntityView`s + frozen index bitmaps, readable from any thread) and from the `[arrow]` mirror's
+immutable Arrow tables, crunched by DuckDB/polars/numpy kernels that **release the GIL** — real
+multi-core analytics. Background threads return results via `store.submit()`. (Redis precedent:
+a single-threaded command loop is not "single-core software".) Free-threaded 3.14t widens this
+lane (parallel snapshot analytics); the contract itself never leaned on the GIL.
+
+**Ceilings, honestly (2026-06-12):** the live-object tier is comfortable to ~10⁷–10⁸ objects.
+The binding constraint above that is not storage (SQLite handles TB-class files; commits stay
+O(delta)) but the **in-memory index tier**: unique maps are Python dicts (~GBs at 10⁸ keys) and
+bitmap indexes lazy-build by an O(extent) scan per process start. Multi-GB→TB *querying* is the
+mirror tier's job (partitioned parquet + DuckDB is TB-class). A pipeline-fed persistent-index
+sidecar could raise the live ceiling later — demand-driven, deliberately not a roadmap item.
 
 ## Tier 1 — multiple processes, one machine (`uvicorn --workers N`)
 
@@ -29,11 +36,14 @@ leaned on the GIL.
 
 ## Tier 2 — multiple nodes
 
-Ship data out, funnel writes back. Columnar mirrors export to Parquet/Arrow/Lance in one call
-(hand-off to Ray/Dask et al.); full read replicas via log shipping (today: Litestream over the
-SQLite file, docs recipe; native once the custom append-log lands). Writable multi-node stays
-permanently out of core — Eclipse Data Grid (1 writer + N full-copy readers, event-stream
-replication) took a funded company a decade.
+Ship data out, funnel writes back. Columnar mirrors are **real** (`datacrystal[arrow]`,
+2026-06-12): `mirror.table()` hands Arrow zero-copy to Ray/Dask/DuckDB/polars, and after
+`compact()` the mirror's `data/` directory is plain one-parquet-per-type — `s3 sync` it and any
+parquet reader queries it with no datacrystal on the reading side (the datalake story, ROADMAP
+item 16(b)). Full read replicas via log shipping (today: Litestream over the SQLite file, docs
+recipe; native once the custom append-log lands — ROADMAP item 23's retained delta log is the
+stepping stone). Writable multi-node stays permanently out of core — Eclipse Data Grid (1 writer
++ N full-copy readers, event-stream replication) took a funded company a decade.
 
 ## Tier 3 — external derived-data consumers (the indexer scenario)
 
@@ -42,7 +52,8 @@ precisely so consumers can live out of process. An external indexer tails commit
 its index anywhere, stamps the artifact with the applied watermark; the app attaches it
 read-only. Indexes are rebuildable derived data with idempotent watermark application, so the
 indexer needs **zero write access**, may lag or crash, and can always be rebuilt from the graph.
-This is textbook CDC; the in-process FTS5/usearch sidecars are merely the first two consumers of
+This is textbook CDC; the in-process consumers — `datacrystal[fts]` and `datacrystal[arrow]`,
+both real since 2026-06-12, plus the planned usearch sidecar — are merely the first riders of
 the same contract.
 
 ## Never (ratified)

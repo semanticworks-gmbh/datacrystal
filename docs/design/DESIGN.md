@@ -15,6 +15,16 @@ the per-topic evidence lives in [../research/2026-06-10-feasibility/](../researc
 > startup solved by persisted indexes (SQLite v0.x has no boot problem), never by parallel scans;
 > RDF stays an extension, but a reverse-reference index + traversal API moves into core v1.
 
+> **Update 2026-06-12 (owner ratification — personas):** stress-test amendment 1's framing is
+> broadened. The owner's stated targets are co-primary with the local-first/CLI/agent persona:
+> **FastAPI data services and small UIs; metadata management / systems of record; enterprise
+> search; semantic/knowledge systems ("digital twins of organisations")** — flexible to grow,
+> fast to experiment with, schema-follows-code, multi-GB→TB via the tier split (live object
+> tier vs the `[arrow]` mirror tier; see [SCALING.md](SCALING.md)). The *deployment doctrine*
+> is unchanged (workers=1 + command fan-in; single writer); what changes is emphasis: FastAPI
+> is no longer "demoted from flagship", and the reverse-reference index + a retained delta log
+> moved up ([ROADMAP.md](ROADMAP.md) 2026-06-12 third amendment).
+
 ## Accepted amendments from the stress test
 
 The adversarial review (STRESS-TEST.md) produced these binding changes to the proposal below:
