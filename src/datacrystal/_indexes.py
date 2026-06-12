@@ -3,9 +3,16 @@
 ROADMAP item 4 (bitmap indexes + Condition AST) and the SDA delta (unique
 secondary-key index). v0.1 indexes are **rebuildable derived data**: built
 lazily per class from a backend scan at first use, then maintained
-incrementally from each commit (the in-process forerunner of the public
-commit-delta consumer they become at M3/M4). They are never persisted and
-never participate in the commit transaction.
+incrementally from each commit. They are never persisted and never
+participate in the commit transaction.
+
+The KICKOFF plan sketched these as "the second commit-delta consumer";
+they deliberately are NOT one (decided at M4): a DeltaConsumer would force
+prior-payload reads and delta builds on EVERY commit, while spec §5
+promises an unwatched store pays nothing for the pipeline. The index keeps
+its own ``oid → last-indexed-values`` memory instead and is folded in
+directly at P3. The pipeline's prior-value contract is validated by the
+M3 FTS5 spike; the Arrow mirror becomes the first real second consumer.
 
 Un-indexing on update needs the *prior* values; the index keeps its own
 ``oid → last-indexed-values`` map rather than requiring deltas to carry old

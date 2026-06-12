@@ -18,6 +18,7 @@ freezes at the v0.1.0 tag.
 - [Schema evolution](#schema-evolution)
 - [Frozen entities](#frozen-entities)
 - [Concurrency and deployment](#concurrency-and-deployment)
+- [Snapshots and the commit-delta pipeline](#snapshots-and-the-commit-delta-pipeline)
 - [Durability and crash safety](#durability-and-crash-safety)
 - [Errors](#errors)
 - [Planned features and when they land](#planned-features-and-when-they-land)
@@ -159,6 +160,28 @@ tid = store.commit()                   # atomically persists everything buffered
   in-place list/dict mutation are both tracked.
 - `store.last_tid` is the current commit watermark.
 
+### Upserting by natural key
+
+`store.upsert(obj)` inserts, or merges into the entity that already owns the same unique key —
+the shape of every sync-against-a-source loop:
+
+```python
+for row in feed:                                   # initial import AND refresh
+    store.upsert(Mineral(qid=row["qid"], name=row["name"], mohs=row["mohs"]))
+store.commit()
+```
+
+- On a match the **existing live instance survives** (identity is never broken) and every
+  field is overwritten with the new object's values — but only fields that actually changed
+  are written. Re-importing an unchanged dataset buffers nothing: the refresh commit is
+  O(changed rows), not O(rows).
+- `upsert(obj, key="qid")` picks the natural key explicitly; with exactly one `dc.Unique`
+  field on the class, `key=` is optional. The return value is the canonical instance — use
+  it, not your argument, after the call.
+- One batch may upsert the same key many times (later calls merge into the first). Duplicates
+  created via plain `store()` are *not* matched and keep their loud `UniqueViolationError`
+  at commit.
+
 ## Deleting
 
 `store.delete()` buffers like every other write and executes at `commit()`
@@ -252,11 +275,15 @@ ref.peek()                       # the target if loaded, else None — never loa
 
 Query semantics:
 
-- Operators on class-level fields: `==`, `!=`, `<`, `<=`, `>`, `>=`, `.in_([...])`; combine
-  with `&`, `|`, `~`. **Parenthesize predicates** — `&` binds tighter than `==` (you get a
-  helpful `QueryError` if you forget).
-- `==` and `.in_()` on `dc.Index` fields answer from roaring bitmaps; all other predicates run
-  as a Python residual over the bitmap candidates. Ordering comparisons never match `None`.
+- Operators on class-level fields: `==`, `!=`, `<`, `<=`, `>`, `>=`, `.in_([...])`,
+  `.contains("sub")`, `.startswith("pre")`; combine with `&`, `|`, `~`. **Parenthesize
+  predicates** — `&` binds tighter than `==` (you get a helpful `QueryError` if you forget).
+- `==` and `.in_()` on `dc.Index` fields answer from roaring bitmaps. `.contains()` /
+  `.startswith()` on an indexed field iterate the index's **distinct values** and OR the
+  matching bitmaps — O(distinct values), never a record read; they are exact and
+  case-sensitive (linguistic matching is `datacrystal[fts]`'s job). All other predicates run
+  as a Python residual over the bitmap candidates. Ordering comparisons never match `None`,
+  and string matching never matches a non-string value.
 - A condition uses fields of **one entity class** — cross-entity joins are
   `[planned — v1, on Arrow mirrors]`.
 - `query()` and `get()` reflect **committed** state; uncommitted buffered changes are not
@@ -308,14 +335,15 @@ in order of leverage:
    objects) and reach the bulk through unique keys, queries, or lazy edges.
 
 3. **Index-friendly queries — and the decode-level reads.** `==`/`.in_()` on `dc.Index`
-   fields answer from bitmaps and hydrate only the hits; `count()` on them is pure bitmap
-   cardinality (zero loads). For "how many?" and column reads use `count()`/`pluck()` —
-   they decode records without constructing entities, so even their full-scan residual
-   form costs decode time, not an entity-RAM spike. The expensive shape that remains is a
-   residual predicate in `query()` (`>=`, `!=`, …): that **hydrates the whole extent** —
-   on a million-object class a full table scan with a matching RAM peak. Design hot
-   filters as `dc.Index` equality facets; real columnar speed is the
-   `datacrystal[arrow]` mirror's job `[planned — late v0.x]`.
+   fields answer from bitmaps and hydrate only the hits — and so do `.contains()`/
+   `.startswith()` on them (they walk the index's distinct values, not the records);
+   `count()` on any of these is pure bitmap cardinality (zero loads). For "how many?" and
+   column reads use `count()`/`pluck()` — they decode records without constructing
+   entities, so even their full-scan residual form costs decode time, not an entity-RAM
+   spike. The expensive shape that remains is a residual predicate in `query()`
+   (`>=`, `!=`, …): that **hydrates the whole extent** — on a million-object class a full
+   table scan with a matching RAM peak. Design hot filters as `dc.Index` equality facets;
+   real columnar speed is the `datacrystal[arrow]` mirror's job `[planned — late v0.x]`.
 
 Measured (M2 dev machine, SQLite backend, 300k objects ≈ 29 MB on disk): streaming ingest
 3.4 s peaking at ~750 B/object RSS with **zero** entities left live; warm bitmap query
@@ -432,8 +460,8 @@ sanctioned way for worker threads to read while the owner keeps writing (ADR-001
 ```python
 def report(store: dc.Store) -> int:        # runs on any thread
     with store.snapshot() as snap:         # pins one durable commit boundary
-        fine = [s for s in snap.all(Specimen) if s.quality == "fine"]
-        return len(fine)
+        S = dc.fields(Specimen)
+        return snap.count((S.quality == "fine") & (S.mass_g >= 100.0))
 ```
 
 - `snap.get(oid_or_ref)`, `snap.all(EntityClass)` and `snap.root` return **immutable
@@ -441,6 +469,12 @@ def report(store: dc.Store) -> int:        # runs on any thread
   explicit `dc.Ref` tokens you resolve via `snap.get(ref)`, lists come back as tuples,
   dicts as read-only mappings. Never live entities — nothing a worker thread does with a
   snapshot can violate confinement or dirty tracking.
+- `snap.query(cond)` and `snap.count(target)` answer the full Condition AST at the
+  watermark — bitmap-indexed like the live store, results as `EntityView`s. The indexes
+  behind them are **snapshot-local**, rebuilt from the pinned view on first use (one-time
+  O(extent) per class, cached for the snapshot's lifetime). `snap.index_bitmaps(Cls)`
+  exposes them directly as frozen bitmaps/mappings (`dc.SnapshotIndexes`) — the bootstrap
+  material for index-shaped sidecars.
 - `snap.tid` is the pinned watermark; `snap.types` is the type lineage at that watermark
   (what a delta consumer needs to bootstrap, see below).
 - Close promptly (use the context manager): on the sqlite backend an open snapshot holds a
@@ -531,8 +565,7 @@ Sequencing follows the ratified [roadmap](design/ROADMAP.md) and the
 
 | Feature | Where it lands |
 |---|---|
-| bitmap-index snapshot views (`Snapshot.index_bitmaps()` — the reserved slot raises until then) | M4 — current milestone |
-| v0.1.0 tag: API freeze (incl. the COMMIT-DELTA-v1 lock), PyPI publication | M4 |
+| v0.1.0 tag: API freeze (incl. the COMMIT-DELTA-v1 lock), PyPI publication | M4 — current milestone |
 | **full-text search** — `datacrystal[fts]`, SQLite FTS5 over `dc.FullText` fields, BM25 ranking via `store.search()`, per-field language stemming (Snowball; German + English first-class) | next after M4: the M3 contract spike was already FTS5-shaped (`tests/contract/fts_consumer.py` is the extra's embryo), the pipeline it rides is real |
 | **pandas / polars / DuckDB** — zero-copy via Arrow columnar mirrors (`datacrystal[arrow]`) | **late v0.x** (resequenced 2026-06-12: the pipeline's second consumer, and the real answer to projection/range analytics at millions of rows) |
 | **GraphQL / FastAPI** — `datacrystal[web]` with strawberry integration | extension package, after the v1 core freeze |

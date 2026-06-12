@@ -52,6 +52,9 @@ def verify(path: str, minimum_batch: int) -> None:
     assert max_present >= minimum_batch, (
         f"acked batch {minimum_batch} lost; only {max_present} survived"
     )
+    # KICKOFF M4 exit, literally: indexes are rebuildable after kill -9 —
+    # a bitmap-equality lookup answers from the freshly rebuilt postings.
+    assert store.count(dc.fields(Row).batch == max_present) == ROWS_PER_BATCH
     store.close()
     print(f"VERIFY-OK max_batch={max_present}", flush=True)
 
