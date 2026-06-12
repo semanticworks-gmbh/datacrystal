@@ -41,15 +41,15 @@ stale venv shebangs — `rm -rf .venv && uv sync`.
 
 | Module | Role |
 |---|---|
-| `_store.py` | facade: open/root/store/delete/commit/get/query/count/pluck/get_many/attach/detach/snapshot; P1 capture (+ prior reads + delta build when consumers watch) → P2 backend I/O → P3 flip + delta delivery; type lineage + hydration plans; decode-level reads (count/pluck) construct no entities; deletes are unchecked per ADR-003 (DanglingRefError on follow) |
+| `_store.py` | facade: open/root/store/delete/upsert/commit/get/query/count/pluck/get_many/attach/detach/snapshot; P1 capture (+ prior reads + delta build when consumers watch) → P2 backend I/O → P3 flip + delta delivery; type lineage + hydration plans; decode-level reads (count/pluck) construct no entities; deletes are unchecked per ADR-003 (DanglingRefError on follow); upsert merges into the surviving instance, writing only changed fields |
 | `_pipeline.py` | COMMIT-DELTA-v1 emission: `DeltaConsumer` protocol + `build_delta`; delivery in P3 post-durability; a raising consumer detaches loudly (never holds writes hostage) |
-| `_snapshot.py` | `store.snapshot()` frozen `EntityView`/`Ref` reads at a commit watermark, callable from any thread (ADR-002 read views); `index_bitmaps()` slot reserved for M4 |
+| `_snapshot.py` | `store.snapshot()` frozen `EntityView`/`Ref` reads at a commit watermark, callable from any thread (ADR-002 read views); bitmap `query()`/`count()` + `index_bitmaps()` over snapshot-local indexes rebuilt from the pinned view (never shared with the owner's) |
 | `testing.py` | public conformance kit `check_delta_consumer` + `CountingConsumer` (incl. the snapshot-bootstrap recipe for mid-life attach) |
 | `_entity.py` | `@entity` decorator → slots dataclass + engine slots; one-shot `__setattr__` dirty hook; `TypeInfo` (specs, defaults); metaclass turns class-attr access into query `FieldExpr`s |
 | `_state.py` | leaf module: NEW/CLEAN/DIRTY constants + `touch()` (shared by hook and containers) |
 | `_containers.py` | owner-bound `PersistentList`/`PersistentDict`: in-place mutation marks the owner dirty; assignment copies (by-value semantics) |
-| `_conditions.py` | Condition AST (`Pred`/`And`/`Or`/`Not`), `FieldExpr`, `fields()` typed proxy |
-| `_indexes.py` | rebuildable in-memory pyroaring bitmap indexes + unique maps; planner splits conditions into bitmap + Python residual |
+| `_conditions.py` | Condition AST (`Pred`/`And`/`Or`/`Not` incl. contains/startswith), `FieldExpr`, `fields()` typed proxy |
+| `_indexes.py` | rebuildable in-memory pyroaring bitmap indexes + unique maps (deliberately NOT a delta consumer — spec §5 says unwatched stores pay nothing); planner splits conditions into bitmap + Python residual; contains/startswith iterate distinct index keys; `build_class_indexes` is shared with snapshots |
 | `_records.py` | msgspec msgpack codec; entity refs swizzled to OID extension values in an explicit pre-pass |
 | `_registry.py` | WeakValueDictionary OID → live entity (identity contract) |
 | `_lazy.py` | explicit `Lazy[T]` handles — the only deferred-loading mechanism in v0.x |

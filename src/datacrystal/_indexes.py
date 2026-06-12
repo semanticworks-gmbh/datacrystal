@@ -3,9 +3,16 @@
 ROADMAP item 4 (bitmap indexes + Condition AST) and the SDA delta (unique
 secondary-key index). v0.1 indexes are **rebuildable derived data**: built
 lazily per class from a backend scan at first use, then maintained
-incrementally from each commit (the in-process forerunner of the public
-commit-delta consumer they become at M3/M4). They are never persisted and
-never participate in the commit transaction.
+incrementally from each commit. They are never persisted and never
+participate in the commit transaction.
+
+The KICKOFF plan sketched these as "the second commit-delta consumer";
+they deliberately are NOT one (decided at M4): a DeltaConsumer would force
+prior-payload reads and delta builds on EVERY commit, while spec §5
+promises an unwatched store pays nothing for the pipeline. The index keeps
+its own ``oid → last-indexed-values`` memory instead and is folded in
+directly at P3. The pipeline's prior-value contract is validated by the
+M3 FTS5 spike; the Arrow mirror becomes the first real second consumer.
 
 Un-indexing on update needs the *prior* values; the index keeps its own
 ``oid → last-indexed-values`` map rather than requiring deltas to carry old
@@ -17,7 +24,7 @@ OIDs live above 2**32, hence ``BitMap64``.
 
 from __future__ import annotations
 
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterable, Iterator
 
 from pyroaring import BitMap64
 
@@ -25,7 +32,7 @@ from datacrystal._conditions import And, Condition, Or, Pred
 from datacrystal._entity import TypeInfo
 from datacrystal._errors import SchemaMismatchError, UniqueViolationError
 from datacrystal._records import decode_payload
-from datacrystal._storage.protocol import StorageBackend
+from datacrystal._storage.protocol import StorageBackend, StoredRecord
 
 
 class ClassIndexes:
@@ -73,6 +80,64 @@ class ClassIndexes:
                         del holder[value]
         self.extent.discard(oid)
 
+    def seal(self) -> None:
+        """Drop the incremental-maintenance memory (oid → last-indexed
+        values). For a consumer that will never fold in another commit —
+        the frozen snapshot views — that map is pure O(extent) waste."""
+        self._last_values.clear()
+
+
+def build_class_indexes(
+    ti: TypeInfo,
+    lineage: list[tuple[int, list[str]]],
+    scan_type: Callable[[int], Iterable[StoredRecord]],
+) -> ClassIndexes:
+    """Build one class's indexes by scanning its whole lineage (additive
+    schema evolution): per cid, indexed fields map to that shape's
+    positions; fields the old shape lacked are filled from the class
+    defaults. Each OID appears under exactly one cid (updates rewrite the
+    row). ``scan_type`` is the seam: the live store scans its backend, a
+    snapshot scans its pinned read view (ADR-002) — same rules, one code
+    path."""
+    specs = ti.specs
+    indexed = [s.name for s in specs if s.indexed or s.unique]
+    unique = frozenset(s.name for s in specs if s.unique)
+    ci = ClassIndexes(indexed, list(unique))
+    for cid, persisted in lineage:
+        if not indexed:
+            for rec in scan_type(cid):
+                ci.extent.add(rec.oid)
+            continue
+        position = {n: persisted.index(n) for n in indexed if n in persisted}
+        fill: dict[str, Any] = {}
+        colliding: str | None = None
+        for name in indexed:
+            if name in position:
+                continue
+            factory = ti.defaults.get(name)
+            if factory is None:
+                raise SchemaMismatchError(
+                    f"{ti.typename}.{name} does not exist in records "
+                    f"persisted with fields {persisted} and has no default "
+                    "— give the new field a default value to enable "
+                    "additive schema evolution"
+                )
+            fill[name] = factory()
+            if name in unique and fill[name] is not None:
+                colliding = name  # only an error if old records exist
+        for rec in scan_type(cid):
+            if colliding is not None:
+                raise SchemaMismatchError(
+                    f"{ti.typename}.{colliding}: a Unique field added by "
+                    "schema evolution must default to None — a shared "
+                    "non-None default would make every old record collide"
+                )
+            values = decode_payload(rec.payload)
+            entry = {name: values[pos] for name, pos in position.items()}
+            entry.update(fill)
+            ci.insert(rec.oid, entry)
+    return ci
+
 
 class IndexManager:
     """Lazily builds and incrementally maintains per-class indexes."""
@@ -85,50 +150,10 @@ class IndexManager:
 
     def ensure(self, ti: TypeInfo) -> ClassIndexes:
         ci = self._by_cls.get(ti.cls)
-        if ci is not None:
-            return ci
-        specs = ti.specs
-        indexed = [s.name for s in specs if s.indexed or s.unique]
-        unique = frozenset(s.name for s in specs if s.unique)
-        ci = ClassIndexes(indexed, list(unique))
-        # The build scans the type's whole lineage (additive schema
-        # evolution): per cid, indexed fields map to that shape's positions;
-        # fields the old shape lacked are filled from the class defaults.
-        # Each OID appears under exactly one cid (updates rewrite the row).
-        for cid, persisted in self._lineage_for(ti):
-            if not indexed:
-                for rec in self._backend.scan_type(cid):
-                    ci.extent.add(rec.oid)
-                continue
-            position = {n: persisted.index(n) for n in indexed if n in persisted}
-            fill: dict[str, Any] = {}
-            colliding: str | None = None
-            for name in indexed:
-                if name in position:
-                    continue
-                factory = ti.defaults.get(name)
-                if factory is None:
-                    raise SchemaMismatchError(
-                        f"{ti.typename}.{name} does not exist in records "
-                        f"persisted with fields {persisted} and has no default "
-                        "— give the new field a default value to enable "
-                        "additive schema evolution"
-                    )
-                fill[name] = factory()
-                if name in unique and fill[name] is not None:
-                    colliding = name  # only an error if old records exist
-            for rec in self._backend.scan_type(cid):
-                if colliding is not None:
-                    raise SchemaMismatchError(
-                        f"{ti.typename}.{colliding}: a Unique field added by "
-                        "schema evolution must default to None — a shared "
-                        "non-None default would make every old record collide"
-                    )
-                values = decode_payload(rec.payload)
-                entry = {name: values[pos] for name, pos in position.items()}
-                entry.update(fill)
-                ci.insert(rec.oid, entry)
-        self._by_cls[ti.cls] = ci
+        if ci is None:
+            ci = build_class_indexes(ti, self._lineage_for(ti),
+                                     self._backend.scan_type)
+            self._by_cls[ti.cls] = ci
         return ci
 
     def check_unique(self, entries: list[tuple[int, TypeInfo, dict[str, Any]]],
@@ -202,6 +227,19 @@ def plan(cond: Condition, ci: ClassIndexes) -> tuple[BitMap64 | None, Condition 
                 for value in cond.value:
                     postings = ci.eq[cond.field].get(value)
                     if postings is not None:
+                        acc |= postings
+                return acc, None
+            if cond.op in ("contains", "startswith"):
+                # KICKOFF M4: string matching on an indexed field iterates
+                # the index's DISTINCT keys and ORs the matching postings —
+                # O(distinct values), never a record load.
+                needle = cond.value
+                acc = BitMap64()
+                for key, postings in ci.eq[cond.field].items():
+                    if not isinstance(key, str):
+                        continue
+                    if (needle in key if cond.op == "contains"
+                            else key.startswith(needle)):
                         acc |= postings
                 return acc, None
         return None, cond

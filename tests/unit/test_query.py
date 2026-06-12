@@ -113,3 +113,55 @@ def test_uncommitted_changes_are_invisible_to_query(cabinet):
 def test_forgot_parentheses_gives_a_helpful_error(cabinet):
     with pytest.raises(dc.QueryError, match="parentheses"):
         Mineral.crystal_system == "cubic" & (Mineral.mohs >= 1)  # noqa: B015
+
+
+# -- contains / startswith (KICKOFF M4: distinct-key iteration) -----------------
+
+
+def test_startswith_on_indexed_field_uses_index_keys(cabinet):
+    from datacrystal._entity import type_info
+    from datacrystal._indexes import plan
+
+    cond = Mineral.crystal_system.startswith("mono")
+    assert _names(cabinet.query(cond)) == ["azurite", "malachite"]
+    # The planner must answer this from the index alone (no residual) —
+    # the None key in the cabinet's index is skipped, not a crash.
+    ci = cabinet._index.ensure(type_info(Mineral))
+    bitmap, residual = plan(cond, ci)
+    assert bitmap is not None and residual is None
+    assert len(bitmap) == 2
+
+
+def test_contains_on_indexed_field_uses_index_keys(cabinet):
+    cond = Mineral.crystal_system.contains("clin")
+    assert _names(cabinet.query(cond)) == ["azurite", "malachite"]
+    assert cabinet.count(cond) == 2
+
+
+def test_contains_and_startswith_on_residual_fields(cabinet):
+    assert _names(cabinet.query(Mineral.name.contains("ite"))) == [
+        "azurite", "malachite",
+    ]
+    assert _names(cabinet.query(Mineral.name.startswith("qua"))) == ["quartz"]
+    assert cabinet.pluck(Mineral.name.contains("ite"), "qid") == ["Q2", "Q3"]
+
+
+def test_string_matching_is_case_sensitive_and_exact(cabinet):
+    # Linguistic matching (stemming, folding) is the datacrystal[fts]
+    # extra's job — the core predicate is plain substring semantics.
+    assert cabinet.query(Mineral.name.contains("ITE")) == []
+    assert cabinet.query(Mineral.name.startswith("Qua")) == []
+
+
+def test_string_matching_skips_non_string_values(cabinet):
+    # A None (or any non-str) field value never matches — the SQL-NULL-like
+    # rule ordering comparisons already follow.
+    assert cabinet.count(Mineral.mohs.contains("7")) == 0
+    assert "opal" not in _names(cabinet.query(Mineral.crystal_system.contains("o")))
+
+
+def test_string_matching_validates_the_needle_type(cabinet):
+    with pytest.raises(dc.QueryError, match="takes a str"):
+        Mineral.name.contains(7)
+    with pytest.raises(dc.QueryError, match="takes a str"):
+        Mineral.name.startswith(None)

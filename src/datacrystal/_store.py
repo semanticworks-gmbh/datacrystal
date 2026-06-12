@@ -33,7 +33,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from datacrystal._conditions import And, Condition, Not, Or, Pred
+from datacrystal._conditions import And, Condition, Not, Or, Pred, query_target
 from datacrystal._containers import PersistentDict, PersistentList, wrap_value
 from datacrystal._entity import (
     TYPES_BY_NAME,
@@ -59,6 +59,7 @@ from datacrystal._errors import (
     QueryError,
     SchemaMismatchError,
     StoreClosedError,
+    UniqueViolationError,
     UnregisteredTypeError,
     UnseenTypeWarning,
     UntrackedMutationWarning,
@@ -125,6 +126,11 @@ class Store:
         # The strong reference keeps the doomed instance alive until P3 so a
         # pre-commit read cannot rehydrate a mutable CLEAN twin beside it.
         self._deleted: dict[int, tuple[TypeInfo, Any | None]] = {}
+        # upsert()'s same-batch memory: (cls, key field, value) → the entity
+        # an earlier upsert buffered. Lives across a failed P2 (rollback
+        # re-buffers those entities); P3 clears it — from then on the
+        # committed unique map answers.
+        self._pending_upserts: dict[tuple[type, str, Any], Any] = {}
         # P2 runs on this single-worker executor (created on first commit).
         # p2_inline is the fallback for sqlite3 builds that are not
         # serialized (threadsafety < 3) — same phases, owner-thread I/O.
@@ -447,6 +453,92 @@ class Store:
         self._deleted[oid] = (ti, obj)
         return True
 
+    def upsert(self, obj: Any, /, key: str | None = None) -> Any:
+        """Insert ``obj``, or merge it into the entity that already owns its
+        natural key — the KICKOFF M4 upsert-by-natural-key, ETL-loop shaped::
+
+            for row in feed:
+                store.upsert(Mineral(qid=row["qid"], name=row["name"]))
+            store.commit()
+
+        ``key`` names a ``dc.Unique`` field and may be omitted when the
+        class has exactly one. On a match the existing live instance is the
+        survivor (identity is never broken): every persisted field is
+        overwritten with ``obj``'s value, but only fields that actually
+        *changed* are written — re-importing an unchanged dataset buffers
+        nothing and the commit is O(changed), not O(rows). Returns the
+        canonical instance (the survivor, or ``obj`` itself when its key
+        was unseen).
+
+        Matching covers committed state plus entities buffered by earlier
+        ``upsert`` calls in the same batch (so one batch may see the same
+        key twice). Entities buffered via plain ``store()`` are not matched
+        — a duplicate there stays what it always was: a loud
+        ``UniqueViolationError`` from ``commit()``.
+        """
+        self._enter()
+        if not is_entity(obj):
+            raise NotAnEntityError(
+                f"{type(obj).__name__} is not an @entity class instance"
+            )
+        ti = type_info(obj)
+        unique_fields = [s.name for s in ti.specs if s.unique]
+        if key is None:
+            if len(unique_fields) != 1:
+                raise TypeError(
+                    f"{type(obj).__name__} has {len(unique_fields)} Unique "
+                    "fields — pass key=<field name> to choose the natural key"
+                    if unique_fields else
+                    f"{type(obj).__name__} has no Unique field — upsert needs "
+                    "a natural key (mark one field Annotated[..., dc.Unique])"
+                )
+            key = unique_fields[0]
+        elif key not in unique_fields:
+            raise QueryErrorFor(type(obj), key)
+        value = getattr(obj, key)
+        if value is None:
+            raise QueryError(
+                f"{type(obj).__name__}.{key} is None — a natural key must "
+                "have a value (None never matches, SQL-style)"
+            )
+        existing = self._find_by_key(ti, key, value)
+        if existing is None:
+            self.store(obj)
+            self._pending_upserts[(ti.cls, key, value)] = obj
+            return obj
+        if existing is obj:
+            return obj
+        if oid_of(obj) is not None:
+            raise UniqueViolationError(
+                f"{type(obj).__name__}.{key}={value!r} already belongs to "
+                "another entity, and the given instance is itself registered "
+                "with the store — upsert fresh (untracked) instances or the "
+                "canonical instance"
+            )
+        for name in ti.field_names:
+            new = getattr(obj, name)
+            cur = getattr(existing, name)
+            if not _equivalent(cur, new):
+                setattr(existing, name, new)  # the one-shot hook buffers it
+        return existing
+
+    def _find_by_key(self, ti: TypeInfo, field: str, value: Any) -> Any | None:
+        """The upsert lookup: committed unique map (a key freed by a
+        buffered delete is reusable, ADR-003), then earlier upserts of this
+        batch — self-healing against mid-batch key mutation or deletion."""
+        if self._cid_by_typename.get(ti.typename) is not None:
+            ci = self._index.ensure(ti)
+            oid = ci.unique[field].get(value)
+            if oid is not None and oid not in self._deleted:
+                return self._load_oid(oid)
+        pending = self._pending_upserts.get((ti.cls, field, value))
+        if pending is not None:
+            if (state_of(pending) != STATE_DELETED
+                    and getattr(pending, field) == value):
+                return pending
+            del self._pending_upserts[(ti.cls, field, value)]
+        return None
+
     def commit(self) -> int | None:
         """Atomically persist all buffered changes; returns the new commit
         TID, or ``None`` if there was nothing to commit."""
@@ -620,6 +712,7 @@ class Store:
                 set_state(live, STATE_DELETED)
             self._registry.discard(oid)
             self._fingerprints.pop(oid, None)
+        self._pending_upserts.clear()  # the committed unique map takes over
         self._durable_cids.update(cid for cid, _, _ in capture.batch.new_types)
         if self._debug:
             for rec in capture.batch.records:
@@ -952,7 +1045,7 @@ class Store:
         Reads committed state (like :meth:`snapshot`, unlike :meth:`query`,
         whose hydrated results show uncommitted in-memory changes)."""
         self._enter()
-        cls, cond = _query_target(target, "count")
+        cls, cond = query_target(target, "count")
         ti = type_info(cls)
         if self._cid_by_typename.get(ti.typename) is None:
             self._warn_unseen(ti)
@@ -984,7 +1077,7 @@ class Store:
         self._enter()
         if not fields:
             raise TypeError("pluck() takes at least one field name")
-        cls, cond = _query_target(target, "pluck")
+        cls, cond = query_target(target, "pluck")
         ti = type_info(cls)
         known = set(ti.field_names)
         for name in fields:
@@ -1295,17 +1388,38 @@ class _RawView:
             raise AttributeError(name) from None
 
 
-def _query_target(target: Any, method: str) -> tuple[type, Condition | None]:
-    """count()/pluck() accept an @entity class (whole extent) or a Condition."""
-    if isinstance(target, Condition):
-        return target.entity_class(), target
-    if isinstance(target, type):
-        type_info(target)  # loud for non-entity classes
-        return target, None
-    raise TypeError(
-        f"{method}() takes an @entity class or a Condition, "
-        f"got {type(target).__name__}"
-    )
+def _ref_target_oid(value: Any) -> int | None:
+    """The OID a reference-shaped value points at (entity or Lazy handle),
+    or None for plain values and not-yet-stored targets."""
+    if is_entity(value):
+        return oid_of(value)
+    if isinstance(value, Lazy):
+        if value.oid is not None:
+            return value.oid
+        target = value.peek()
+        return oid_of(target) if target is not None else None
+    return None
+
+
+def _equivalent(cur: Any, new: Any) -> bool:
+    """Would persisting ``new`` over ``cur`` write the same bytes? Decides
+    whether upsert() skips a field. Conservative: references match by
+    target OID (a Lazy handle and a direct reference encode identically);
+    a type change (e.g. ``1`` → ``True``) re-writes even when ``==`` says
+    equal, because msgpack bytes differ; wrapped containers compare to the
+    plain ones they came from."""
+    if cur is new:
+        return True
+    cur_ref, new_ref = _ref_target_oid(cur), _ref_target_oid(new)
+    if cur_ref is not None or new_ref is not None:
+        return cur_ref == new_ref and cur_ref is not None
+    if cur.__class__ is new.__class__:
+        return bool(cur == new)
+    if isinstance(cur, list) and isinstance(new, list):
+        return bool(cur == new)  # PersistentList vs the plain list
+    if isinstance(cur, dict) and isinstance(new, dict):
+        return bool(cur == new)
+    return False
 
 
 def _raw_value(value: Any) -> Any:

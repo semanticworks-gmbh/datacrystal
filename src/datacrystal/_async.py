@@ -103,6 +103,10 @@ class AsyncStore:
         in-memory buffers; ``await commit()`` makes it durable."""
         return self._store.delete(obj_or_cls, **unique_key)
 
+    def upsert(self, obj: Any, /, key: str | None = None) -> Any:
+        """Insert-or-merge by natural key — see :meth:`Store.upsert`."""
+        return self._store.upsert(obj, key=key)
+
     def get(self, cls: type, **unique_key: Any) -> Any | None:
         return self._store.get(cls, **unique_key)
 
