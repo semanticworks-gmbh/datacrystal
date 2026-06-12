@@ -31,12 +31,14 @@ pytestmark = pytest.mark.skipif(
 
 @dc.entity
 class Specimen:
-    """Spike-local cabinet entity with prose fields (KICKOFF §5 shape)."""
+    """Spike-local cabinet entity with prose fields (KICKOFF §5 shape).
+    The language declarations are inert today — the spike's unicode61 path
+    ignores them; datacrystal[fts] will pick the Snowball stemmer per field."""
 
     catalog_no: Annotated[str, dc.Unique]
     label: str
-    notes: Annotated[str, dc.FullText] = ""
-    description: Annotated[str, dc.FullText] = ""
+    notes: Annotated[str, dc.FullText(language="de")] = ""
+    description: Annotated[str, dc.FullText(language="en")] = ""
 
 
 def _fulltext_config() -> dict[str, list[str]]:

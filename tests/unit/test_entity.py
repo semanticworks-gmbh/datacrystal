@@ -58,6 +58,29 @@ def test_marker_harvest():
     assert not by_name["name"].indexed
 
 
+def test_fulltext_marker_bare_and_parameterized():
+    """dc.FullText stays inert in core, but both forms — bare and
+    FullText(language="de") — must round-trip through the FieldSpec: the
+    parameterized form is frozen core API before datacrystal[fts] ships
+    (decided 2026-06-12; the extra reads field + language from the model)."""
+    @dc.entity
+    class FieldNote:
+        label: str
+        befund: Annotated[str, dc.FullText(language="de")] = ""
+        summary: Annotated[str, dc.FullText] = ""
+
+    by_name = {s.name: s for s in type_info(FieldNote).specs}
+    assert by_name["befund"].fulltext
+    assert by_name["befund"].fulltext_language == "de"
+    assert by_name["summary"].fulltext
+    assert by_name["summary"].fulltext_language is None
+    assert not by_name["label"].fulltext
+    assert repr(dc.FullText(language="de")) == "datacrystal.FullText(language='de')"
+
+    with pytest.raises(TypeError, match="language code"):
+        dc.FullText(language="")
+
+
 def test_index_on_non_scalar_field_rejected():
     @dc.entity
     class Bad:

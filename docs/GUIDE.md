@@ -82,9 +82,13 @@ class Mineral:
     optionally `| None`).
   - `dc.Unique` — unique secondary key (e.g. URIs, slugs, external ids). Duplicates are
     rejected at commit (`UniqueViolationError`); `None` never collides (SQL-NULL-style).
-  - `dc.FullText` — **inert in the core engine**: it reserves the field for
-    `datacrystal[fts]` `[planned — after M4, see below]`. External consumers can already
-    read it (the M3 FTS5 contract spike derives its indexing config from these markers).
+  - `dc.FullText` — declares a prose field for full-text search, optionally with its
+    language: `Annotated[str, dc.FullText(language="de")]` (lowercase short codes; bare
+    `dc.FullText` = language unspecified). **Inert in the core engine** — indexing,
+    stemming and `store.search()` are `datacrystal[fts]`'s job `[planned — after M4, see
+    below]`. The declaration is recorded and readable today (the M3 FTS5 contract spike
+    derives its indexing config from these markers); which language codes are supported,
+    and the default when unspecified, is the extra's contract.
 - `@dc.entity(frozen=True)` declares an append-only record — see [Frozen entities](#frozen-entities).
 - Entity classes are identified by `module:qualname` in the store. Keep an entity class
   importable under the same module path, or opening old data raises `UnregisteredTypeError`.
