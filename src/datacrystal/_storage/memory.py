@@ -84,6 +84,8 @@ class MemoryBackend:
             self._types.extend(batch.new_types)
             for rec in batch.records:
                 self._objects[rec.oid] = rec
+            for oid in batch.deletes:
+                self._objects.pop(oid, None)
             self._meta.update(batch.meta)
 
     def read_view(self) -> _MemoryReadView:

@@ -37,11 +37,15 @@ delete shape hostage to a v1 feature.
    the TID (invariant 5, gapless).
 3. **Precedence**: a buffered delete wins over any buffered write to the same OID
    in the same commit (the write is dropped, deterministically).
-4. **Entity lifecycle**: a fourth state, `DELETED`. Mutating, re-`store()`ing or
-   re-deleting a DELETED instance raises `DeletedEntityError` — pre-mutation, like
-   every write barrier. Field *reads* keep working (it is a plain detached object).
-   A pending (uncommitted) graph that references a DELETED instance rejects the
-   commit loudly during P1 discovery, before the TID is allocated.
+4. **Entity lifecycle**: a fourth state, `DELETED`. Mutating or re-`store()`ing a
+   DELETED instance raises `DeletedEntityError` (pre-mutation, like every write
+   barrier); re-deleting returns `False`. Field *reads* keep working (it is a
+   plain detached object). *Referencing* a DELETED instance from another entity
+   is allowed and encodes as a ref to the dead OID — deliberately: rejecting it
+   would be a de-facto checked delete exactly where the user cannot enumerate
+   referrers (no reverse index until v1), making bulk sync commits
+   un-committable. Unchecked means unchecked, uniformly; the dangle is loud at
+   dereference (rule 8), never at creation.
 5. **Physical removal**: `CommitBatch` grows a `deletes: list[int]` field; backends
    remove the rows inside the same atomic transaction as the batch's upserts. This
    is the protocol growth this ADR ratifies (the `apply()` signature is unchanged).
@@ -80,6 +84,14 @@ delete shape hostage to a v1 feature.
   SQLite vacuum semantics — documented in the GUIDE, not engine work).
 - A deleted entity's live instance, if the user still holds one, is a detached
   plain object: readable forever, write-barred, registry-evicted at P3.
+- A deleted entity inside the *root graph* makes `store.root` reads raise
+  `DanglingRefError` after a reopen (the eager hydration follows the dangle).
+  The root setter is the recovery path: assigning `store.root` replaces the
+  holder (the orphaned holder record is deleted in the same commit) — the store
+  is never bricked by a dangling root.
+- A failed hydration (dangling eager ref, schema mismatch) evicts the
+  half-filled instance from the registry before re-raising — the identity
+  contract never serves a corpse.
 - "Real" checked delete (refuse-if-referenced, cascades, orphan sweeps) arrives
   with v1's reverse-reference index and is *additive* API on top of this — nothing
   here forecloses it.

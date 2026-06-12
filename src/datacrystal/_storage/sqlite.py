@@ -245,6 +245,11 @@ class SqliteBackend:
                     for r in batch.records
                 ],
             )
+            if batch.deletes:  # physical removal (ADR-003) — no tombstone rows
+                conn.executemany(
+                    "DELETE FROM objects WHERE oid=?",
+                    [(oid,) for oid in batch.deletes],
+                )
             conn.executemany(
                 "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
                 list(batch.meta.items()),

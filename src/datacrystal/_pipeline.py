@@ -21,7 +21,7 @@ Engine-side guarantees (the consumer side lives in ``datacrystal/contract/``):
 
 from __future__ import annotations
 
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Protocol, Sequence, runtime_checkable
 
 from datacrystal.contract.applier import CONTRACT_VERSION, FORMAT_MARKER
 from datacrystal._storage.protocol import StoredRecord
@@ -46,26 +46,34 @@ class DeltaConsumer(Protocol):
 def build_delta(tid: int, records: list[StoredRecord],
                 new_types: list[tuple[int, str, list[str]]],
                 root_oid: int | None,
-                priors: dict[int, bytes]) -> dict[str, Any]:
+                priors: dict[int, bytes],
+                deletes: Sequence[tuple[int, int, bytes]] = ()) -> dict[str, Any]:
     """Assemble one COMMIT-DELTA-v1 map (spec §2/§3) from P1's capture.
 
-    Ops are in capture order; ``priors`` maps OID → previous payload for the
-    records that existed before this commit (absent key = created here).
+    Upsert ops come first, in capture order (``priors`` maps OID → previous
+    payload; absent key = created in this commit), then delete tombstones in
+    deletion order as ``(oid, cid, last payload)`` triples (spec §3.1) —
+    one OID never appears in both (ADR-003 precedence).
     """
+    ops: list[dict[str, Any]] = [
+        {
+            "op": "upsert",
+            "oid": rec.oid,
+            "cid": rec.cid,
+            "payload": rec.payload,
+            "prior": priors.get(rec.oid),
+        }
+        for rec in records
+    ]
+    ops.extend(
+        {"op": "delete", "oid": oid, "cid": cid, "payload": None, "prior": prior}
+        for oid, cid, prior in deletes
+    )
     return {
         "f": FORMAT_MARKER,
         "v": CONTRACT_VERSION,
         "tid": tid,
-        "ops": [
-            {
-                "op": "upsert",
-                "oid": rec.oid,
-                "cid": rec.cid,
-                "payload": rec.payload,
-                "prior": priors.get(rec.oid),
-            }
-            for rec in records
-        ],
+        "ops": ops,
         "types": [[cid, typename, list(fields)] for cid, typename, fields in new_types],
         "root": root_oid,
     }

@@ -58,6 +58,21 @@ class ClassIndexes:
                 self.unique[field][value] = oid
         self._last_values[oid] = values
 
+    def remove(self, oid: int) -> None:
+        """Un-index a committed delete (ADR-003) from the index's own
+        ``last_values`` memory — never a store read (invariant 11)."""
+        old = self._last_values.pop(oid, None)
+        if old is not None:
+            for field, value in old.items():
+                postings = self.eq[field].get(value)
+                if postings is not None:
+                    postings.discard(oid)
+                if field in self._unique_fields and value is not None:
+                    holder = self.unique[field]
+                    if holder.get(value) == oid:
+                        del holder[value]
+        self.extent.discard(oid)
+
 
 class IndexManager:
     """Lazily builds and incrementally maintains per-class indexes."""
@@ -116,10 +131,13 @@ class IndexManager:
         self._by_cls[ti.cls] = ci
         return ci
 
-    def check_unique(self, entries: list[tuple[int, TypeInfo, dict[str, Any]]]) -> None:
+    def check_unique(self, entries: list[tuple[int, TypeInfo, dict[str, Any]]],
+                     deleted: frozenset[int] | set[int] = frozenset()) -> None:
         """P1 validation: no commit may create a duplicate unique-key value.
 
-        ``None`` values are exempt (SQL-style: NULL never collides).
+        ``None`` values are exempt (SQL-style: NULL never collides). A value
+        currently held by an OID in ``deleted`` (buffered deletions in the
+        same commit) is free to claim — ADR-003 unique-key reuse.
         """
         seen: dict[tuple[type, str, Any], int] = {}
         for oid, ti, values in entries:
@@ -132,6 +150,8 @@ class IndexManager:
                 if value is None:
                     continue
                 existing = ci.unique[field].get(value)
+                if existing is not None and existing in deleted:
+                    existing = None
                 if existing is not None and existing != oid:
                     raise UniqueViolationError(
                         f"{ti.cls.__name__}.{field}={value!r} already belongs to "
@@ -154,6 +174,14 @@ class IndexManager:
                 continue  # not built yet; a later build scans these records
             indexed = {s.name for s in ti.specs if s.indexed or s.unique}
             ci.insert(oid, {f: v for f, v in values.items() if f in indexed})
+
+    def apply_deletes(self, deletes: list[tuple[int, TypeInfo]]) -> None:
+        """P3: drop committed deletions from every already-built index
+        (unbuilt indexes scan the post-delete records and never see them)."""
+        for oid, ti in deletes:
+            ci = self._by_cls.get(ti.cls)
+            if ci is not None:
+                ci.remove(oid)
 
 
 def plan(cond: Condition, ci: ClassIndexes) -> tuple[BitMap64 | None, Condition | None]:

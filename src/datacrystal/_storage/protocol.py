@@ -41,6 +41,9 @@ class CommitBatch:
     records: list[StoredRecord] = field(default_factory=list)
     new_types: list[tuple[int, str, list[str]]] = field(default_factory=list)  # (cid, typename, fields)
     meta: dict[str, str] = field(default_factory=dict)
+    # OIDs whose rows this commit removes (ADR-003) — applied in the same
+    # atomic transaction as the records; never overlaps records' OIDs.
+    deletes: list[int] = field(default_factory=list)
 
 
 @dataclass(slots=True)

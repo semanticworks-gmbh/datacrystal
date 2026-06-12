@@ -47,10 +47,12 @@ from datacrystal._entity import (
     state_of,
     type_info,
 )
-from datacrystal._state import STATE_CLEAN, STATE_DIRTY, STATE_NEW
+from datacrystal._state import STATE_CLEAN, STATE_DELETED, STATE_DIRTY, STATE_NEW
 from datacrystal._errors import (
     ConsumerDetachedWarning,
+    DanglingRefError,
     DataCrystalError,
+    DeletedEntityError,
     EntityEscapeError,
     LeaseLostError,
     NotAnEntityError,
@@ -88,17 +90,19 @@ class _Root:
 class _Capture:
     """Everything P1 hands to P2/P3 — and enough to compensate a failed P2."""
 
-    __slots__ = ("tid", "batch", "index_entries", "flipped", "delta")
+    __slots__ = ("tid", "batch", "index_entries", "flipped", "delta", "deletes")
 
     def __init__(self, tid: int, batch: CommitBatch,
                  index_entries: list[tuple[int, TypeInfo, dict[str, Any]]],
                  flipped: list[tuple[int, Any, int]],
-                 delta: dict[str, Any] | None) -> None:
+                 delta: dict[str, Any] | None,
+                 deletes: list[tuple[int, TypeInfo, Any | None]]) -> None:
         self.tid = tid
         self.batch = batch
         self.index_entries = index_entries
         self.flipped = flipped  # (oid, obj, state before the P1 flip)
         self.delta = delta  # COMMIT-DELTA-v1 map; built only when consumers watch
+        self.deletes = deletes  # (oid, ti, live instance or None) — ADR-003
 
 
 class Store:
@@ -115,6 +119,10 @@ class Store:
         self._registry = ObjectRegistry()
         self._new: dict[int, Any] = {}
         self._dirty: dict[int, Any] = {}
+        # delete() buffer (ADR-003): oid → (TypeInfo, live instance or None).
+        # The strong reference keeps the doomed instance alive until P3 so a
+        # pre-commit read cannot rehydrate a mutable CLEAN twin beside it.
+        self._deleted: dict[int, tuple[TypeInfo, Any | None]] = {}
         # P2 runs on this single-worker executor (created on first commit).
         # p2_inline is the fallback for sqlite3 builds that are not
         # serialized (threadsafety < 3) — same phases, owner-thread I/O.
@@ -281,7 +289,14 @@ class Store:
         if self._root_oid is None:
             return None
         if self._root_holder is None:
-            self._root_holder = self._load_oid(self._root_oid)
+            try:
+                self._root_holder = self._load_oid(self._root_oid)
+            except DanglingRefError as exc:
+                raise DanglingRefError(
+                    f"{exc} — the root graph references a deleted entity "
+                    "(ADR-003 unchecked deletes); assigning store.root "
+                    "replaces the root and recovers the store"
+                ) from None
         return self._root_holder.value
 
     @root.setter
@@ -297,7 +312,17 @@ class Store:
         else:
             holder = self._root_holder
             if holder is None:
-                holder = self._load_oid(self._root_oid)
+                try:
+                    holder = self._load_oid(self._root_oid)
+                except DanglingRefError:
+                    # The old root graph references a deleted entity (ADR-003
+                    # unchecked deletes). Recovery path: replace the holder
+                    # and delete its now-orphaned record in the same commit.
+                    self._deleted[self._root_oid] = (type_info(_Root), None)
+                    holder = _Root(value=value)
+                    self._root_oid = self._register_graph(holder)
+                    self._root_holder = holder
+                    return
             holder.value = value  # one-shot hook buffers the holder
             self._register_graph(holder)
         self._root_holder = holder
@@ -326,12 +351,99 @@ class Store:
             raise NotAnEntityError(
                 f"{type(obj).__name__} is not an @entity class instance"
             )
+        if state_of(obj) == STATE_DELETED:
+            raise DeletedEntityError(
+                f"this {type(obj).__name__} was deleted via store.delete(); "
+                "create a new entity instead — OIDs are never reused"
+            )
         oid = oid_of(obj)
         if oid is None:
             self._register_graph(obj)
         elif state_of(obj) == STATE_CLEAN:
             set_state(obj, STATE_DIRTY)
             self._dirty[oid] = obj
+
+    def delete(self, obj_or_cls: Any, /, **unique_key: Any) -> bool:
+        """Delete an entity's record at the next ``commit()`` (ADR-003).
+
+        Two call shapes::
+
+            store.delete(mineral)                      # by live instance
+            store.delete(Mineral, qid="Q43010")        # by unique key, no hydration
+
+        Returns ``True`` if a deletion was buffered, ``False`` if there was
+        nothing to delete (unknown key, already deleted) — idempotent, never
+        raises for a miss. Deleting a NEW (never-committed) entity cancels
+        its pending insert. A buffered delete **wins** over any buffered
+        write to the same OID in the same commit.
+
+        Deletes are *unchecked* in v0.x: nothing stops you deleting an
+        entity other records still reference — following such a stale
+        reference raises :class:`~datacrystal._errors.DanglingRefError`.
+        Checked deletes (cascade/orphan validation) arrive with the v1
+        reverse-reference index. After the commit, a live instance you still
+        hold is a detached plain object: reads work, writes raise
+        :class:`~datacrystal._errors.DeletedEntityError`.
+        """
+        self._enter()
+        if isinstance(obj_or_cls, type):
+            ti = type_info(obj_or_cls)  # loud for non-entity classes
+            if len(unique_key) != 1:
+                raise TypeError(
+                    "delete(EntityClass, ...) takes exactly one unique-field "
+                    "keyword argument"
+                )
+            (field, value), = unique_key.items()
+            spec = next((s for s in ti.specs if s.name == field), None)
+            if spec is None or not spec.unique:
+                raise QueryErrorFor(obj_or_cls, field)
+            if self._cid_by_typename.get(ti.typename) is None:
+                return False
+            ci = self._index.ensure(ti)
+            oid = ci.unique[field].get(value)
+            if oid is None or oid in self._deleted:
+                return False
+            return self._delete_oid(self._registry.get(oid), oid, ti)
+        if unique_key:
+            raise TypeError(
+                "delete(entity) takes no keyword arguments — use "
+                "delete(EntityClass, field=value) for key-based deletion"
+            )
+        obj = obj_or_cls
+        if not is_entity(obj):
+            raise NotAnEntityError(
+                f"{type(obj).__name__} is not an @entity class instance"
+            )
+        oid = oid_of(obj)
+        if oid is None:
+            return False  # never registered with a store — nothing to delete
+        if state_of(obj) == STATE_DELETED:
+            return False  # idempotent: delete-twice ≡ delete-once
+        owner = object.__getattribute__(obj, "__dc_store__")()
+        if owner is not self:
+            raise DataCrystalError(
+                f"this {type(obj).__name__} belongs to a different (or "
+                "closed) store"
+            )
+        return self._delete_oid(obj, oid, type_info(obj))
+
+    def _delete_oid(self, obj: Any | None, oid: int, ti: TypeInfo) -> bool:
+        if oid == self._root_oid:
+            raise DataCrystalError(
+                "the root holder cannot be deleted — assign store.root instead"
+            )
+        if obj is not None and state_of(obj) == STATE_NEW:
+            # Cancel the pending insert: no record ever existed, so nothing
+            # reaches storage, the indexes, or the delta stream.
+            self._new.pop(oid, None)
+            self._dirty.pop(oid, None)
+            set_state(obj, STATE_DELETED)
+            return True
+        self._dirty.pop(oid, None)  # ADR-003 precedence: the delete wins
+        if obj is not None:
+            set_state(obj, STATE_DELETED)
+        self._deleted[oid] = (ti, obj)
+        return True
 
     def commit(self) -> int | None:
         """Atomically persist all buffered changes; returns the new commit
@@ -364,7 +476,14 @@ class Store:
             self._sweep_untracked()  # before discovery: rescued entities get walked too
         self._discover_new_graphs()
         pending = {**self._new, **self._dirty}
-        if not pending:
+        deletes = [(oid, ti, obj) for oid, (ti, obj) in self._deleted.items()]
+        for oid, _, _ in deletes:
+            # ADR-003 precedence: a buffered delete wins over a buffered
+            # write to the same OID (a twin hydrated and mutated after the
+            # delete was buffered — delete() itself already drops the direct
+            # case).
+            pending.pop(oid, None)
+        if not pending and not deletes:
             return None
         # Validate before allocating the TID: a rejected commit must leave
         # the TID sequence gapless (replay determinism).
@@ -376,7 +495,7 @@ class Store:
                 index_entries.append(
                     (oid, ti, {name: getattr(obj, name) for name in relevant})
                 )
-        self._index.check_unique(index_entries)
+        self._index.check_unique(index_entries, deleted=set(self._deleted))
         new_types: list[tuple[int, str, list[str]]] = []
         encoded: list[tuple[int, int, bytes]] = []
         for oid, obj in pending.items():
@@ -392,11 +511,16 @@ class Store:
         # back the last durable payload of every already-persisted record —
         # O(delta) reads, only while consumers watch, and like encoding
         # strictly before the TID allocation (a failed read rejects the
-        # commit without consuming a TID).
+        # commit without consuming a TID). Deletes always have a persisted
+        # record (NEW entities never enter the delete buffer), and their
+        # tombstones carry it as prior (spec §3.1, strictly verified by the
+        # reference applier).
         priors: dict[int, bytes] = {}
+        delete_ops: list[tuple[int, int, bytes]] = []
         if self._consumers:
             persisted_oids = [oid for oid in pending if oid not in self._new]
-            prior_records = self._backend.load_many(persisted_oids) if persisted_oids else {}
+            want = persisted_oids + [oid for oid, _, _ in deletes]
+            prior_records = self._backend.load_many(want) if want else {}
             for oid in persisted_oids:
                 rec = prior_records.get(oid)
                 if rec is None:
@@ -405,6 +529,14 @@ class Store:
                         "persisted record to take a prior payload from"
                     )
                 priors[oid] = rec.payload
+            for oid, _, _ in deletes:
+                rec = prior_records.get(oid)
+                if rec is None:
+                    raise DataCrystalError(
+                        f"internal error: deleted entity oid {oid} has no "
+                        "persisted record to take a tombstone prior from"
+                    )
+                delete_ops.append((oid, rec.cid, rec.payload))
         tid = self._alloc.next_tid()
         records = [
             StoredRecord(oid=oid, cid=cid, tid=tid, payload=payload)
@@ -420,9 +552,10 @@ class Store:
                 "next_tid": str(self._alloc.tid_watermark),
                 "root_oid": str(self._root_oid) if self._root_oid is not None else "",
             },
+            deletes=[oid for oid, _, _ in deletes],
         )
         delta = (
-            build_delta(tid, records, new_types, self._root_oid, priors)
+            build_delta(tid, records, new_types, self._root_oid, priors, delete_ops)
             if self._consumers
             else None
         )
@@ -442,7 +575,8 @@ class Store:
             self._registry.add(oid, obj)
         self._new.clear()
         self._dirty.clear()
-        return _Capture(tid, batch, index_entries, flipped, delta)
+        self._deleted.clear()
+        return _Capture(tid, batch, index_entries, flipped, delta, deletes)
 
     def _run_p2(self, batch: CommitBatch) -> None:
         """P2: backend I/O on bytes only, off the owner thread."""
@@ -464,10 +598,22 @@ class Store:
             else:
                 set_state(obj, STATE_DIRTY)
                 self._dirty[oid] = obj
+        for oid, ti, obj in capture.deletes:  # the deletions stay buffered too
+            self._deleted[oid] = (ti, obj)
 
     def _p3_finalize(self, capture: _Capture) -> int:
         """P3 (owner): indexes and watermark reflect the now-durable batch."""
         self._index.apply(capture.index_entries)
+        self._index.apply_deletes([(oid, ti) for oid, ti, _ in capture.deletes])
+        for oid, _, obj in capture.deletes:
+            # The identity contract ends with the record: write-bar any live
+            # instance (incl. twins hydrated after the delete was buffered),
+            # then forget the OID — a later load raises DanglingRefError.
+            live = obj if obj is not None else self._registry.get(oid)
+            if live is not None:
+                set_state(live, STATE_DELETED)
+            self._registry.discard(oid)
+            self._fingerprints.pop(oid, None)
         self._durable_cids.update(cid for cid, _, _ in capture.batch.new_types)
         if self._debug:
             for rec in capture.batch.records:
@@ -781,6 +927,12 @@ class Store:
         queue: deque[Any] = deque([obj])
         while queue:
             current = queue.popleft()
+            if state_of(current) == STATE_DELETED:
+                raise DeletedEntityError(
+                    f"this {type(current).__name__} was deleted via "
+                    "store.delete() and cannot be stored again — create a "
+                    "new entity instead (OIDs are never reused)"
+                )
             oid = oid_of(current)
             if oid is None:
                 oid = self._alloc.next_oid()
@@ -901,7 +1053,11 @@ class Store:
         if rec is None:
             rec = self._backend.load_many([oid]).get(oid)
         if rec is None:
-            raise DataCrystalError(f"no record for oid {oid} in the store")
+            raise DanglingRefError(
+                f"no record for oid {oid} in the store — deleted (v0.x "
+                "deletes are unchecked, ADR-003) or never committed; the "
+                "reference you followed is stale"
+            )
         return self._materialize(rec, cache)
 
     def _materialize(self, rec: StoredRecord, cache: dict[int, StoredRecord] | None) -> Any:
@@ -910,16 +1066,22 @@ class Store:
         obj = object.__new__(ti.cls)
         stamp(obj, rec.oid, self, STATE_CLEAN)
         self._registry.add(rec.oid, obj)  # before fills: breaks reference cycles
-        values = decode_payload(rec.payload)
-        persisted = self._persisted_fields.get(rec.cid, [])
-        if len(values) != len(persisted):
-            raise SchemaMismatchError(
-                f"{ti.typename}: record has {len(values)} fields, its type "
-                f"dictionary row has {len(persisted)} — the store is damaged"
-            )
-        for spec, index, factory in plan:
-            raw = values[index] if index is not None else factory()
-            set_field(obj, spec.name, self._resolve(raw, spec.lazy_refs, cache, obj))
+        try:
+            values = decode_payload(rec.payload)
+            persisted = self._persisted_fields.get(rec.cid, [])
+            if len(values) != len(persisted):
+                raise SchemaMismatchError(
+                    f"{ti.typename}: record has {len(values)} fields, its type "
+                    f"dictionary row has {len(persisted)} — the store is damaged"
+                )
+            for spec, index, factory in plan:
+                raw = values[index] if index is not None else factory()
+                set_field(obj, spec.name, self._resolve(raw, spec.lazy_refs, cache, obj))
+        except BaseException:
+            # A failed hydration (dangling eager ref, schema mismatch) must
+            # not leave a half-filled corpse behind the identity contract.
+            self._registry.discard(rec.oid)
+            raise
         if self._debug:
             # Fingerprint via the same encode path the sweep uses (NOT the
             # stored payload: an old-lineage record re-encodes through the

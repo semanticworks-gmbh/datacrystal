@@ -25,6 +25,12 @@ class ObjectRegistry:
     def add(self, oid: int, obj: Any) -> None:
         self._by_oid[oid] = obj
 
+    def discard(self, oid: int) -> None:
+        """Forget an OID (committed delete, ADR-003): the identity contract
+        ends with the record — a later load of this OID must fail loudly,
+        never resurrect the detached instance."""
+        self._by_oid.pop(oid, None)
+
     def items(self) -> list[tuple[int, Any]]:
         """Snapshot of the live (oid, entity) pairs (debug sweep, tests)."""
         return list(self._by_oid.items())
