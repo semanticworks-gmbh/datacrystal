@@ -36,6 +36,9 @@ snapshot (fitness #13) — or null when no class is registered.
 Owner confinement: ``apply()`` runs on the store's owner thread (that is
 where deltas are delivered); call ``table()`` there too and hand the
 returned (immutable) ``pyarrow.Table`` to any thread or engine you like.
+Like the store file, a mirror directory has ONE owner process: opening it
+twice concurrently is unsupported (the open-time orphan sweep would treat
+the other instance's fresh segments as crash debris).
 """
 
 from __future__ import annotations
@@ -262,6 +265,14 @@ def decode_fallback(buf: bytes) -> Any:
 def _safe_dirname(typename: str) -> str:
     stem = re.sub(r"[^A-Za-z0-9_.-]", "_", typename)
     return f"{stem}-{hashlib.sha1(typename.encode()).hexdigest()[:8]}"
+
+
+def _fsync_path(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 class _TableState:
@@ -580,6 +591,11 @@ class ArrowMirror:
         directory.mkdir(parents=True, exist_ok=True)
         name = f"seg-{state.next_segment:06d}.parquet"
         pq.write_table(table, directory / name)
+        # The manifest is the commit point: a segment it names must be ON
+        # DISK first, or a crash leaves the manifest pointing at bytes that
+        # never landed (the watermark would lie — spec §4.3).
+        _fsync_path(directory / name)
+        _fsync_path(directory)
         state.segments.append(name)
         state.next_segment += 1
 
@@ -684,11 +700,7 @@ class ArrowMirror:
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, self._manifest_path())
-        dir_fd = os.open(self._dir, os.O_RDONLY)
-        try:
-            os.fsync(dir_fd)
-        finally:
-            os.close(dir_fd)
+        _fsync_path(self._dir)
 
     def _load_manifest(self) -> None:
         path = self._manifest_path()

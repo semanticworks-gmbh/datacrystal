@@ -235,15 +235,44 @@ def test_temporals_mirror_natively(tmp_path, store_factory) -> None:
     store = store_factory()
     mirror = fresh_mirror(tmp_path)
     store.attach(mirror)
-    aware = dt.datetime(2026, 6, 12, 12, 0, tzinfo=dt.timezone.utc)
-    store.root = [Find(label="t", tags=[], found_on=dt.date(2026, 6, 12))]
+    cet = dt.timezone(dt.timedelta(hours=2))
+    aware = dt.datetime(2026, 6, 12, 14, 30, 5, tzinfo=cet)
+    store.root = [Find(label="t", tags=[aware], found_on=dt.date(2026, 6, 12))]
     store.commit()
     table = mirror.table(Find)
     assert table.schema.field("found_on").type == pa.date32()
-    assert table.to_pylist()[0]["found_on"] == dt.date(2026, 6, 12)
-    assert aware.tzinfo is not None  # (aware datetimes are covered in unit tests)
+    row = table.to_pylist()[0]
+    assert row["found_on"] == dt.date(2026, 6, 12)
+    # aware datetimes mirror as UTC-instant timestamps (format-v2 codec:
+    # the offset's identity is not preserved, the instant is)
+    assert table.schema.field("tags").type == pa.list_(
+        pa.timestamp("us", tz="UTC")
+    )
+    assert row["tags"][0] == aware  # same instant, compared tz-aware
     store.close()
     mirror.close()
+
+
+def test_newer_mirror_format_refused(tmp_path, store_factory) -> None:
+    """Format honesty (invariant 9): a manifest from a newer datacrystal
+    [arrow] must refuse loudly, never half-read."""
+    import json
+
+    store = store_factory()
+    path = tmp_path / "newer.mirror"
+    mirror = ArrowMirror(path)
+    store.attach(mirror)
+    store.root = [Quarry(qid="Q1", name="Tsumeb")]
+    store.commit()
+    store.detach(mirror)
+    mirror.close()
+
+    manifest = json.loads((path / "manifest.json").read_text())
+    manifest["version"] += 1
+    (path / "manifest.json").write_text(json.dumps(manifest))
+    with pytest.raises(MirrorConfigError):
+        ArrowMirror(path)
+    store.close()
 
 
 # -- compaction + fold ---------------------------------------------------------------
