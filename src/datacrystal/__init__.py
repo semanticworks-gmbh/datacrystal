@@ -31,6 +31,7 @@ from datacrystal._conditions import fields
 from datacrystal._containers import PersistentDict, PersistentList
 from datacrystal._entity import FullText, Index, Unique, entity
 from datacrystal._errors import (
+    ConsumerDetachedWarning,
     CorruptRecordError,
     DataCrystalError,
     EntityEscapeError,
@@ -48,6 +49,8 @@ from datacrystal._errors import (
     WrongThreadError,
 )
 from datacrystal._lazy import Lazy
+from datacrystal._pipeline import DeltaConsumer
+from datacrystal._snapshot import EntityView, Ref, Snapshot
 from datacrystal._store import Store
 
 if TYPE_CHECKING:  # the real import stays lazy — see __getattr__ below
@@ -77,6 +80,11 @@ __all__ = [
     "FullText",
     "PersistentList",
     "PersistentDict",
+    "Snapshot",
+    "EntityView",
+    "Ref",
+    "DeltaConsumer",
+    "ConsumerDetachedWarning",
     "DataCrystalError",
     "StoreClosedError",
     "StoreLockedError",

@@ -33,8 +33,7 @@ class WrongThreadError(DataCrystalError):
 
     Per ADR-001, a store and its live object graph are confined to the thread
     (or asyncio event loop) that opened them. Send work to the owner via
-    ``store.submit(fn)``; cross-thread reads via ``store.snapshot()`` land
-    at M3.
+    ``store.submit(fn)``; read from other threads via ``store.snapshot()``.
     """
 
 
@@ -85,6 +84,17 @@ class CorruptRecordError(DataCrystalError):
 class QueryError(DataCrystalError):
     """A condition is malformed — e.g. it mixes fields of two entity classes
     (cross-entity joins are a v1 feature on Arrow mirrors, not v0.x)."""
+
+
+class ConsumerDetachedWarning(UserWarning):
+    """An attached delta consumer raised during delivery and was detached.
+
+    The commit it choked on is durable and the store is healthy — sidecars
+    are rebuildable derived data (invariant 11), so a broken consumer never
+    holds writes hostage. Its watermark now lags the store; ``attach()``
+    refuses it until it rebuilds (e.g. from ``store.snapshot()``). See
+    COMMIT-DELTA-v1 §5: deltas are not retained, missed history cannot be
+    re-fetched from the engine."""
 
 
 class UntrackedMutationWarning(UserWarning):
