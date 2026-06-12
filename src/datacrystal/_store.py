@@ -33,7 +33,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from datacrystal._conditions import Condition
+from datacrystal._conditions import And, Condition, Not, Or, Pred
 from datacrystal._containers import PersistentDict, PersistentList, wrap_value
 from datacrystal._entity import (
     TYPES_BY_NAME,
@@ -56,9 +56,11 @@ from datacrystal._errors import (
     EntityEscapeError,
     LeaseLostError,
     NotAnEntityError,
+    QueryError,
     SchemaMismatchError,
     StoreClosedError,
     UnregisteredTypeError,
+    UnseenTypeWarning,
     UntrackedMutationWarning,
     WrongThreadError,
 )
@@ -68,7 +70,7 @@ from datacrystal._lazy import Lazy, LazyReferenceManager
 from datacrystal._pipeline import DeltaConsumer, build_delta
 from datacrystal._records import RefToken, crc as _crc, decode_payload, encode_payload
 from datacrystal._registry import ObjectRegistry
-from datacrystal._snapshot import Snapshot
+from datacrystal._snapshot import Ref, Snapshot
 from datacrystal._storage.protocol import CommitBatch, StorageBackend, StoredRecord
 from datacrystal.contract.applier import DeltaGapError
 
@@ -841,11 +843,25 @@ class Store:
         oid = ci.unique[field].get(value)
         return None if oid is None else self._load_oid(oid)
 
-    def get_many(self, refs: Iterable[Any]) -> list[Any]:
-        """Batch-hydrate a sequence of OIDs / Lazy handles / entities in one
-        storage round-trip (SDA delta 5: N+1 is never the user's problem)."""
+    def get_many(self, refs: Iterable[Any] | type, /, **unique_key: Any) -> list[Any]:
+        """Batch-hydrate in one storage round-trip (SDA delta 5: N+1 is
+        never the user's problem). Two call shapes::
+
+            store.get_many(mixed)                      # OIDs / Lazy / Ref / entities
+            store.get_many(Mineral, qid=["Q1", "Q2"])  # bulk unique-key lookup
+
+        The unique-key form returns a list aligned with the given values,
+        ``None`` where a key is absent — the bulk twin of :meth:`get`, for
+        ETL upserts that fetch thousands of natural keys at once."""
         self._enter()
-        items = list(refs)
+        if unique_key:
+            if not isinstance(refs, type):
+                raise TypeError(
+                    "get_many(EntityClass, field=values) needs an @entity "
+                    "class as its first argument"
+                )
+            return self._get_many_by_key(refs, unique_key)
+        items = list(refs)  # type: ignore[arg-type]  # a class without kwargs falls through
         wanted: list[int] = []
         for item in items:
             if isinstance(item, Lazy):
@@ -854,10 +870,12 @@ class Store:
                     wanted.append(oid)
             elif isinstance(item, int):
                 wanted.append(item)
+            elif isinstance(item, Ref):
+                wanted.append(item.oid)
             elif not is_entity(item):
                 raise NotAnEntityError(
-                    f"get_many() accepts OIDs, Lazy refs and entities, "
-                    f"got {type(item).__name__}"
+                    f"get_many() accepts OIDs, Lazy refs, snapshot Refs and "
+                    f"entities, got {type(item).__name__}"
                 )
         missing = [oid for oid in wanted if self._registry.get(oid) is None]
         cache = self._backend.load_many(missing) if missing else {}
@@ -871,9 +889,35 @@ class Store:
                     out.append(self._load_oid(oid, cache))
             elif isinstance(item, int):
                 out.append(self._load_oid(item, cache))
+            elif isinstance(item, Ref):
+                out.append(self._load_oid(item.oid, cache))
             else:
                 out.append(item)
         return out
+
+    def _get_many_by_key(self, cls: type, unique_key: dict[str, Any]) -> list[Any]:
+        if len(unique_key) != 1:
+            raise TypeError(
+                "get_many() takes exactly one unique-field keyword argument"
+            )
+        ti = type_info(cls)
+        (field, values), = unique_key.items()
+        spec = next((s for s in ti.specs if s.name == field), None)
+        if spec is None or not spec.unique:
+            raise QueryErrorFor(cls, field)
+        values = list(values)
+        if self._cid_by_typename.get(ti.typename) is None:
+            return [None] * len(values)  # silent like get(): the miss idiom
+        ci = self._index.ensure(ti)
+        oids = [ci.unique[field].get(value) for value in values]
+        missing = [
+            oid for oid in oids
+            if oid is not None and self._registry.get(oid) is None
+        ]
+        cache = self._backend.load_many(missing) if missing else {}
+        return [
+            None if oid is None else self._load_oid(oid, cache) for oid in oids
+        ]
 
     def query(self, cond: Condition) -> list[Any]:
         """Evaluate a Condition over the *committed* state of one entity
@@ -887,7 +931,8 @@ class Store:
         cls = cond.entity_class()
         ti = type_info(cls)
         if self._cid_by_typename.get(ti.typename) is None:
-            return []  # no committed records of this type yet
+            self._warn_unseen(ti)
+            return []
         ci = self._index.ensure(ti)
         bitmap, residual = plan(cond, ci)
         oids = list(bitmap) if bitmap is not None else list(ci.extent)
@@ -896,7 +941,111 @@ class Store:
             objs = [o for o in objs if residual.evaluate(o)]
         return objs
 
+    def count(self, target: type | Condition) -> int:
+        """How many committed entities match — without hydrating any.
+
+        ``count(Mineral)`` is the class extent's cardinality; a fully
+        bitmap-answerable condition (``==``/``.in_()`` on indexed fields) is
+        bitmap cardinality — both O(1)-ish, zero record loads. A residual
+        predicate falls back to a decode-level scan of the candidates:
+        records are read and decoded but **no entity is constructed**.
+        Reads committed state (like :meth:`snapshot`, unlike :meth:`query`,
+        whose hydrated results show uncommitted in-memory changes)."""
+        self._enter()
+        cls, cond = _query_target(target, "count")
+        ti = type_info(cls)
+        if self._cid_by_typename.get(ti.typename) is None:
+            self._warn_unseen(ti)
+            return 0
+        ci = self._index.ensure(ti)
+        if cond is None:
+            return len(ci.extent)
+        bitmap, residual = plan(cond, ci)
+        if residual is None:
+            return len(bitmap) if bitmap is not None else len(ci.extent)
+        oids = list(bitmap) if bitmap is not None else list(ci.extent)
+        raw_cond = _raw_condition(residual)
+        matches = 0
+        for _oid, row in self._iter_raw(ti, oids):
+            if raw_cond.evaluate(_RawView(row)):
+                matches += 1
+        return matches
+
+    def pluck(self, target: type | Condition, *fields: str) -> list[Any]:
+        """Project fields without constructing entities — the decode-level
+        column read (ROADMAP item 4; full columnar speed is the
+        ``datacrystal[arrow]`` mirror's job).
+
+        ``pluck(Mineral, "name")`` returns a list of values;
+        ``pluck(cond, "name", "mohs")`` a list of tuples. Entity references
+        come back as :class:`~datacrystal.Ref` tokens (feed them to
+        :meth:`get_many` to hydrate), containers as plain lists/dicts.
+        Reads committed state, like :meth:`count`."""
+        self._enter()
+        if not fields:
+            raise TypeError("pluck() takes at least one field name")
+        cls, cond = _query_target(target, "pluck")
+        ti = type_info(cls)
+        known = set(ti.field_names)
+        for name in fields:
+            if name not in known:
+                raise QueryError(
+                    f"{cls.__name__}.{name} is not a persisted field "
+                    f"(fields: {', '.join(ti.field_names)})"
+                )
+        if self._cid_by_typename.get(ti.typename) is None:
+            self._warn_unseen(ti)
+            return []
+        ci = self._index.ensure(ti)
+        if cond is not None:
+            bitmap, residual = plan(cond, ci)
+        else:
+            bitmap, residual = None, None
+        oids = list(bitmap) if bitmap is not None else list(ci.extent)
+        raw_cond = _raw_condition(residual) if residual is not None else None
+        single = fields[0] if len(fields) == 1 else None
+        out: list[Any] = []
+        for _oid, row in self._iter_raw(ti, oids):
+            if raw_cond is not None and not raw_cond.evaluate(_RawView(row)):
+                continue
+            if single is not None:
+                out.append(_publish(row[single]))
+            else:
+                out.append(tuple(_publish(row[name]) for name in fields))
+        return out
+
     # -- engine internals ----------------------------------------------------
+
+    def _warn_unseen(self, ti: TypeInfo) -> None:
+        warnings.warn(
+            UnseenTypeWarning(
+                f"the store has no committed records of {ti.cls.__name__} — "
+                "the result is empty (first run? forgot to commit()? opened "
+                "a different store file?)"
+            ),
+            stacklevel=3,
+        )
+
+    def _iter_raw(self, ti: TypeInfo, oids: list[int]):
+        """Decode-level row scan: committed records → field-value dicts via
+        the per-cid hydration plan (additive evolution honored). Loads in
+        chunks to bound peak memory; constructs no entities, touches no
+        registry — the machinery behind count()/pluck() and gate #19."""
+        for start in range(0, len(oids), _RAW_CHUNK):
+            chunk = oids[start:start + _RAW_CHUNK]
+            records = self._backend.load_many(chunk)
+            for oid in chunk:
+                rec = records.get(oid)
+                if rec is None:
+                    raise DataCrystalError(
+                        f"internal error: indexed oid {oid} has no record"
+                    )
+                hydration = self._hydration_plan(rec.cid, ti)
+                values = decode_payload(rec.payload)
+                row: dict[str, Any] = {}
+                for spec, index, factory in hydration:
+                    row[spec.name] = values[index] if index is not None else factory()
+                yield oid, row
 
     def _guard(self) -> None:
         if self._closed:
@@ -1125,6 +1274,85 @@ class Store:
     def __repr__(self) -> str:
         state = "closed" if self._closed else f"tid={self._last_tid}"
         return f"<datacrystal.Store {state}>"
+
+
+_RAW_CHUNK = 8192  # records per load_many in decode-level scans (peak-RAM bound)
+
+
+class _RawView:
+    """A decoded record posing as an entity for ``Condition.evaluate`` —
+    attribute reads come from the row dict, nothing else exists."""
+
+    __slots__ = ("_row",)
+
+    def __init__(self, row: dict[str, Any]) -> None:
+        self._row = row
+
+    def __getattr__(self, name: str) -> Any:
+        try:
+            return self._row[name]
+        except KeyError:
+            raise AttributeError(name) from None
+
+
+def _query_target(target: Any, method: str) -> tuple[type, Condition | None]:
+    """count()/pluck() accept an @entity class (whole extent) or a Condition."""
+    if isinstance(target, Condition):
+        return target.entity_class(), target
+    if isinstance(target, type):
+        type_info(target)  # loud for non-entity classes
+        return target, None
+    raise TypeError(
+        f"{method}() takes an @entity class or a Condition, "
+        f"got {type(target).__name__}"
+    )
+
+
+def _raw_value(value: Any) -> Any:
+    """Map entity/Lazy predicate values onto the decoded representation
+    (RefTokens compare by OID), so residuals evaluate without hydration."""
+    if is_entity(value):
+        oid = oid_of(value)
+        if oid is None:
+            raise QueryError(
+                "cannot match an entity that was never stored — it has no OID"
+            )
+        return RefToken(oid)
+    if isinstance(value, Lazy):
+        target = value.peek()  # mirror swizzle(): a loaded handle knows best
+        if target is not None:
+            return _raw_value(target)
+        if value.oid is None:
+            raise QueryError("cannot match an unloaded Lazy without an OID")
+        return RefToken(value.oid)
+    return value
+
+
+def _raw_condition(cond: Condition) -> Condition:
+    if isinstance(cond, Pred):
+        if cond.op == "in":
+            return Pred(cond.cls, cond.field, "in",
+                        tuple(_raw_value(v) for v in cond.value))
+        return Pred(cond.cls, cond.field, cond.op, _raw_value(cond.value))
+    if isinstance(cond, And):
+        return And(tuple(_raw_condition(p) for p in cond.parts))
+    if isinstance(cond, Or):
+        return Or(tuple(_raw_condition(p) for p in cond.parts))
+    if isinstance(cond, Not):
+        return Not(_raw_condition(cond.part))
+    return cond
+
+
+def _publish(value: Any) -> Any:
+    """Decoded payload value → pluck() output: refs become public Ref
+    tokens (get_many() hydrates them), containers plain lists/dicts."""
+    if isinstance(value, RefToken):
+        return Ref(value.oid)
+    if isinstance(value, list):
+        return [_publish(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _publish(item) for key, item in value.items()}
+    return value
 
 
 def _find_escapee(value: Any) -> str | None:

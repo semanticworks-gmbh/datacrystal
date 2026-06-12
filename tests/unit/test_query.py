@@ -96,8 +96,11 @@ def test_cross_entity_condition_raises(cabinet):
         cabinet.query((Mineral.crystal_system == "cubic") & (Locality.country == "Namibia"))
 
 
-def test_query_before_any_records_returns_empty(store):
-    assert store.query(Locality.country == "Namibia") == []
+def test_query_before_any_records_returns_empty_but_warns(store):
+    # Empty is legitimate on a first run; the warning is the footgun guard
+    # (forgot to commit? opened a different store file?) — 2026-06-12.
+    with pytest.warns(dc.UnseenTypeWarning, match="no committed records"):
+        assert store.query(Locality.country == "Namibia") == []
 
 
 def test_uncommitted_changes_are_invisible_to_query(cabinet):

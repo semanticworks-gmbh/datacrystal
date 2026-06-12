@@ -47,12 +47,22 @@ _SCALARS = (type(None), bool, int, float, str, bytes)
 
 
 class RefToken:
-    """A decoded-but-unresolved entity reference (an OID placeholder)."""
+    """A decoded-but-unresolved entity reference (an OID placeholder).
+
+    Equality is by OID so decode-level reads (``count``/``pluck`` residuals)
+    can match entity-valued predicates without hydrating anything.
+    """
 
     __slots__ = ("oid",)
 
     def __init__(self, oid: int) -> None:
         self.oid = oid
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, RefToken) and other.oid == self.oid
+
+    def __hash__(self) -> int:
+        return hash((RefToken, self.oid))
 
     def __repr__(self) -> str:
         return f"RefToken({self.oid})"
