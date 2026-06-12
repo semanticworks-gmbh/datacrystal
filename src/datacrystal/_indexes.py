@@ -204,6 +204,19 @@ def plan(cond: Condition, ci: ClassIndexes) -> tuple[BitMap64 | None, Condition 
                     if postings is not None:
                         acc |= postings
                 return acc, None
+            if cond.op in ("contains", "startswith"):
+                # KICKOFF M4: string matching on an indexed field iterates
+                # the index's DISTINCT keys and ORs the matching postings —
+                # O(distinct values), never a record load.
+                needle = cond.value
+                acc = BitMap64()
+                for key, postings in ci.eq[cond.field].items():
+                    if not isinstance(key, str):
+                        continue
+                    if (needle in key if cond.op == "contains"
+                            else key.startswith(needle)):
+                        acc |= postings
+                return acc, None
         return None, cond
     if isinstance(cond, And):
         bitmap: BitMap64 | None = None

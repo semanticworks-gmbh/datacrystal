@@ -130,6 +130,21 @@ def test_indexed_reads_scale_with_hits_not_extent():
         del got
         gc.collect()
 
+        # contains/startswith on an indexed field iterate DISTINCT index
+        # keys (8 here), never records: count() stays at zero loads and
+        # query() at exactly |hits| — at both extents.
+        backend.reset()
+        assert store.count(S.crystal_system.startswith("cub")) == HITS
+        assert backend.records_loaded == 0, (
+            f"indexed startswith count loaded {backend.records_loaded} "
+            f"records at extent {extent} — it must OR index-key postings"
+        )
+        hits = store.query(S.crystal_system.contains("ubi"))
+        assert len(hits) == HITS
+        assert backend.records_loaded == HITS
+        del hits
+        gc.collect()
+
         # The residual cliff, pinned at its documented cost: a non-indexed
         # predicate scans the extent (never MORE than the extent, and with
         # zero entity constructions).

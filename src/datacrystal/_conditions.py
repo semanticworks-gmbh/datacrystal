@@ -10,8 +10,10 @@ compose with ``&``, ``|`` and ``~``::
 Conditions are **single-class by design** — mixing fields of two entity
 classes raises :class:`QueryError` (cross-entity joins are v1, on Arrow
 mirrors). Evaluation is split by the store's planner: ``==`` / ``in_`` on
-indexed fields resolve to roaring bitmaps; everything else runs as a residual
-Python predicate over the candidate set.
+indexed fields resolve to roaring bitmaps; ``contains()`` / ``startswith()``
+on indexed string fields iterate the index's *distinct keys* and OR the
+matching postings (KICKOFF M4 — O(distinct values), never entities);
+everything else runs as a residual Python predicate over the candidate set.
 """
 
 from __future__ import annotations
@@ -66,6 +68,14 @@ class Condition:
         raise NotImplementedError
 
 
+def _require_str(cls: type, field: str, op: str, value: object) -> None:
+    if not isinstance(value, str):
+        raise QueryError(
+            f"{cls.__name__}.{field}.{op}() takes a str, "
+            f"got {type(value).__name__}"
+        )
+
+
 def _require_condition(other: object) -> None:
     if not isinstance(other, Condition):
         raise QueryError(
@@ -85,7 +95,8 @@ class Pred(Condition):
 
     __slots__ = ("cls", "field", "op", "value")
 
-    _OPS = frozenset({"==", "!=", "<", "<=", ">", ">=", "in"})
+    _OPS = frozenset({"==", "!=", "<", "<=", ">", ">=", "in",
+                      "contains", "startswith"})
 
     def __init__(self, cls: type, field: str, op: str, value: Any) -> None:
         assert op in self._OPS
@@ -106,6 +117,13 @@ class Pred(Condition):
             return actual != self.value
         if op == "in":
             return actual in self.value
+        # String matching: exact and case-sensitive (linguistic matching is
+        # the datacrystal[fts] extra's job); a non-str value never matches,
+        # mirroring the SQL-NULL-like ordering semantics below.
+        if op == "contains":
+            return isinstance(actual, str) and self.value in actual
+        if op == "startswith":
+            return isinstance(actual, str) and actual.startswith(self.value)
         # Ordering comparisons: None never matches (SQL-NULL-like semantics).
         if actual is None or self.value is None:
             return False
@@ -240,6 +258,18 @@ class FieldExpr:
 
     def in_(self, values: Any) -> Pred:
         return Pred(self.cls, self.name, "in", tuple(values))
+
+    def contains(self, substring: str) -> Pred:
+        """Substring match (exact, case-sensitive). On an indexed field the
+        planner iterates the index's distinct keys — never entities."""
+        _require_str(self.cls, self.name, "contains", substring)
+        return Pred(self.cls, self.name, "contains", substring)
+
+    def startswith(self, prefix: str) -> Pred:
+        """Prefix match (exact, case-sensitive). On an indexed field the
+        planner iterates the index's distinct keys — never entities."""
+        _require_str(self.cls, self.name, "startswith", prefix)
+        return Pred(self.cls, self.name, "startswith", prefix)
 
     __hash__ = None  # type: ignore[assignment]
 
