@@ -98,14 +98,25 @@ class AsyncStore:
     def mark_dirty(self, obj: Any) -> None:
         self._store.mark_dirty(obj)
 
+    def delete(self, obj_or_cls: Any, /, **unique_key: Any) -> bool:
+        """Buffer a deletion (ADR-003) — like ``store()``, this only touches
+        in-memory buffers; ``await commit()`` makes it durable."""
+        return self._store.delete(obj_or_cls, **unique_key)
+
     def get(self, cls: type, **unique_key: Any) -> Any | None:
         return self._store.get(cls, **unique_key)
 
-    def get_many(self, refs: Iterable[Any]) -> list[Any]:
-        return self._store.get_many(refs)
+    def get_many(self, refs: Iterable[Any] | type, /, **unique_key: Any) -> list[Any]:
+        return self._store.get_many(refs, **unique_key)
 
     def query(self, cond: Condition) -> list[Any]:
         return self._store.query(cond)
+
+    def count(self, target: type | Condition) -> int:
+        return self._store.count(target)
+
+    def pluck(self, target: type | Condition, *fields: str) -> list[Any]:
+        return self._store.pluck(target, *fields)
 
     def submit(self, fn: Callable[[], Any]) -> Future[Any]:
         return self._store.submit(fn)

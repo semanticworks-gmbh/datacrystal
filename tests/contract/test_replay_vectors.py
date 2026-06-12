@@ -38,7 +38,8 @@ def test_replay_reaches_every_pinned_digest():
         assert applier.apply(raw) is True
         assert applier.state_digest() == digests[str(applier.watermark)]
     assert applier.root_oid == 4096
-    assert len(applier.objects) == 3
+    assert len(applier.objects) == 2  # 004 deleted azurite
+    assert 4098 not in applier.objects
     assert len(applier.types) == 4  # incl. the evolved Mineral lineage row
 
 
@@ -88,19 +89,32 @@ def test_inconsistent_prior_is_refused():
         applier.apply(encode_delta(tampered))
 
 
-def test_reserved_delete_op_is_total():
-    """v0.x emits no deletes, but consumers are total over the vocabulary
-    from day one (spec §3.1)."""
+def test_the_pinned_tombstone_leaves_the_root_dangling_by_design():
+    """004-delete removes azurite while the pinned root payload still
+    references its OID — the unchecked-delete contract (ADR-003) in bytes.
+    A consumer applies it without complaint; only *following* the dangle
+    errors, outside the stream."""
     raws, _ = _load()
     applier = ReferenceApplier()
     for raw in raws:
         applier.apply(raw)
-    azurite_payload = applier.objects[4098]
-    tombstone = {
-        "f": "datacrystal-delta", "v": 1, "tid": 4, "types": [],
-        "ops": [{"op": "delete", "oid": 4098, "cid": 4,
-                 "payload": None, "prior": azurite_payload}],
+    tombstone = decode_delta(raws[3])
+    (op,) = tombstone["ops"]
+    assert op["op"] == "delete" and op["payload"] is None
+    assert op["prior"] is not None  # the last payload rides the tombstone
+    assert 4098 not in applier.objects
+    assert applier.root_oid == 4096  # the root record still refs 4098
+
+
+def test_delete_of_an_unknown_oid_is_refused():
+    raws, _ = _load()
+    applier = ReferenceApplier()
+    applier.apply(raws[0])
+    ghost = {
+        "f": "datacrystal-delta", "v": 1, "tid": 2, "types": [],
+        "ops": [{"op": "delete", "oid": 99999, "cid": 2,
+                 "payload": None, "prior": None}],
         "root": 4096,
     }
-    assert applier.apply(encode_delta(tombstone)) is True
-    assert 4098 not in applier.objects
+    with pytest.raises(DeltaFormatError, match="does not exist"):
+        applier.apply(encode_delta(ghost))

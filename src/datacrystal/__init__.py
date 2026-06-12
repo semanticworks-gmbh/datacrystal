@@ -33,7 +33,9 @@ from datacrystal._entity import FullText, Index, Unique, entity
 from datacrystal._errors import (
     ConsumerDetachedWarning,
     CorruptRecordError,
+    DanglingRefError,
     DataCrystalError,
+    DeletedEntityError,
     EntityEscapeError,
     FrozenEntityError,
     LeaseLostError,
@@ -45,6 +47,7 @@ from datacrystal._errors import (
     StoreLockedError,
     UniqueViolationError,
     UnregisteredTypeError,
+    UnseenTypeWarning,
     UntrackedMutationWarning,
     WrongThreadError,
 )
@@ -99,6 +102,9 @@ __all__ = [
     "NewerStoreError",
     "CorruptRecordError",
     "QueryError",
+    "DeletedEntityError",
+    "DanglingRefError",
+    "UnseenTypeWarning",
     "UntrackedMutationWarning",
     "__version__",
 ]

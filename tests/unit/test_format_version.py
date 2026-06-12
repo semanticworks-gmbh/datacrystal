@@ -8,6 +8,7 @@ import sqlite3
 import pytest
 
 import datacrystal as dc
+from datacrystal._ids import FORMAT_VERSION
 from datacrystal._storage.memory import MemoryBackend
 
 
@@ -19,7 +20,7 @@ def test_sqlite_newer_store_is_refused(tmp_path):
     conn.commit()
     conn.close()
 
-    with pytest.raises(dc.NewerStoreError, match="v99.*v1"):
+    with pytest.raises(dc.NewerStoreError, match=f"v99.*v{FORMAT_VERSION}"):
         dc.Store.open(tmp_path / "s")
     # The failed open must not leave the lease behind.
     assert not (tmp_path / "s" / "used.lock").exists()

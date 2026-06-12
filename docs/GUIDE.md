@@ -9,6 +9,7 @@ freezes at the v0.1.0 tag.
 - [Define entities](#define-entities)
 - [The root](#the-root)
 - [Writing: mutate, then commit](#writing-mutate-then-commit)
+- [Deleting](#deleting)
 - [Lists and dicts inside entities](#lists-and-dicts-inside-entities)
 - [What can be persisted](#what-can-be-persisted)
 - [Reading: get, query, lazy references](#reading-get-query-lazy-references)
@@ -158,6 +159,35 @@ tid = store.commit()                   # atomically persists everything buffered
   in-place list/dict mutation are both tracked.
 - `store.last_tid` is the current commit watermark.
 
+## Deleting
+
+`store.delete()` buffers like every other write and executes at `commit()`
+([ADR-003](design/ADR-003-delete-semantics.md)). The record's row is physically removed,
+the indexes and the unique map forget it, and attached delta consumers receive a tombstone:
+
+```python
+store.delete(quartz)                       # by live instance
+store.delete(Mineral, qid="Q43010")        # by unique key — no hydration needed
+store.commit()
+```
+
+- **Idempotent**: deleting an unknown key or an already-deleted entity returns `False`,
+  never raises. Deleting a NEW (never-committed) entity just cancels its pending insert.
+- A live instance you still hold becomes a **detached plain object**: reads keep working,
+  writes (and `store()`/`mark_dirty()`) raise `DeletedEntityError`. Create a new entity
+  instead — OIDs are never reused.
+- A buffered delete **wins** over a buffered write to the same object in the same commit.
+- A unique-key value freed by a delete is reusable in the same commit (the
+  sync-against-a-changing-source pattern: delete the withdrawn record, insert its successor).
+- **Deletes are unchecked in v0.x.** Nothing stops you deleting an entity other records
+  still reference; *following* such a stale reference (eager hydration, `Lazy.get()`,
+  `get_many`, snapshot `get`) raises `DanglingRefError` — loudly, never a silent `None`.
+  Checked deletes (refuse-if-referenced, cascades) arrive with the v1 reverse-reference
+  index. If the *root graph* ends up referencing a deleted entity, reading `store.root`
+  raises after a reopen — assigning `store.root` replaces the root and recovers the store.
+- Disk space: the SQLite pages are freed for reuse immediately; the file itself shrinks
+  only on `VACUUM` (run it offline if you need the bytes back).
+
 ## Lists and dicts inside entities
 
 Every `list`/`dict` that enters an entity field (or the root) is wrapped in an owner-bound
@@ -177,8 +207,9 @@ lists after reopen.)
 | Value | Persisted as |
 |---|---|
 | `None`, `bool`, `int`, `float`, `str`, `bytes` | itself (msgpack) |
-| timezone-aware `datetime` | itself (msgpack timestamp) |
-| naive `datetime`, `date`, `time`, `timedelta` | **as ISO strings** — they come back as `str` in v0.1; store aware datetimes, or convert at the edge |
+| timezone-aware `datetime` | itself (msgpack timestamp; the instant is preserved, a non-UTC offset comes back as UTC) |
+| naive `datetime`, `date`, `time` | itself (datacrystal extension codes, format v2) |
+| `timedelta` | **as an ISO-8601 duration string** — it comes back as `str`; store seconds, or convert at the edge |
 | `list`, `dict` | by value; nested fine; dict keys must be scalars |
 | `tuple` | **as a list** — it comes back as a list (msgpack has no tuple type) |
 | `@dc.entity` instance | by reference (8-byte OID), eagerly loaded on access |
@@ -202,6 +233,15 @@ hits = store.query(
 
 # batch hydration — N+1 is never your problem
 minerals = store.get_many(oids_or_lazies_or_entities)   # one storage round-trip
+found = store.get_many(Mineral, qid=["Q43010", "Q193563"])  # bulk unique-key lookup,
+                                                            # aligned, None per miss
+
+# counting and column reads — no entities constructed (decode-level)
+n = store.count(Mineral)                                  # extent cardinality
+n = store.count(Mineral.crystal_system == "monoclinic")   # bitmap cardinality
+names = store.pluck(Mineral, "name")                      # one column, whole class
+rows = store.pluck(Mineral.mohs >= 7.0, "name", "mohs")   # tuples; refs come back
+                                                          # as dc.Ref for get_many()
 
 # lazy references
 ref = azurite.type_locality      # dc.Lazy[Locality]
@@ -220,7 +260,13 @@ Query semantics:
 - A condition uses fields of **one entity class** — cross-entity joins are
   `[planned — v1, on Arrow mirrors]`.
 - `query()` and `get()` reflect **committed** state; uncommitted buffered changes are not
-  visible to them.
+  visible to them. `count()` and `pluck()` read committed state even more strictly: they
+  decode records instead of hydrating entities, so they never see in-memory mutations at
+  all (and never pay entity-construction RAM — that is the point).
+- Querying, counting or plucking a class the store has **no committed records of** returns
+  empty and emits an `UnseenTypeWarning` — legitimate on a first run, a lifesaver when you
+  forgot to `commit()` or opened the wrong store file. `get()` stays silent (`None` is the
+  expected miss in get-or-create code).
 - Type checkers cannot model the magic class-attribute access (they see `Mineral.mohs` as
   `float | None` and flag the comparison). Runtime is fine either way; for checker-clean code
   use the equivalent typed proxy:
@@ -261,12 +307,15 @@ in order of leverage:
    edge stops both the pinning and the loading. Keep the root small (ids, settings, hot
    objects) and reach the bulk through unique keys, queries, or lazy edges.
 
-3. **Index-friendly queries.** `==`/`.in_()` on `dc.Index` fields answer from bitmaps and
-   hydrate only the hits. Any other predicate (`>=`, `!=`, …) runs as a Python residual that
-   **hydrates the whole extent** of the class — on a million-object class that is a full
-   table scan with a matching RAM spike (the objects are collectable again afterwards, but
-   the peak is real). Until Arrow mirrors land `[planned — v1]`, design hot filters as
-   `dc.Index` equality facets.
+3. **Index-friendly queries — and the decode-level reads.** `==`/`.in_()` on `dc.Index`
+   fields answer from bitmaps and hydrate only the hits; `count()` on them is pure bitmap
+   cardinality (zero loads). For "how many?" and column reads use `count()`/`pluck()` —
+   they decode records without constructing entities, so even their full-scan residual
+   form costs decode time, not an entity-RAM spike. The expensive shape that remains is a
+   residual predicate in `query()` (`>=`, `!=`, …): that **hydrates the whole extent** —
+   on a million-object class a full table scan with a matching RAM peak. Design hot
+   filters as `dc.Index` equality facets; real columnar speed is the
+   `datacrystal[arrow]` mirror's job `[planned — late v0.x]`.
 
 Measured (M2 dev machine, SQLite backend, 300k objects ≈ 29 MB on disk): streaming ingest
 3.4 s peaking at ~750 B/object RSS with **zero** entities left live; warm bitmap query
@@ -415,8 +464,9 @@ store.attach(consumer)                          # 2. ride the stream from there
 - `attach()` requires `consumer.watermark == store.last_tid`: deltas are **not retained**,
   a consumer that is behind (or ahead — a store restored from backup) must rebuild from a
   snapshot. This is by design: sidecars are rebuildable derived data, always.
-- Update/delete ops carry the record's **prior payload**, so index-shaped consumers
-  un-index old values without ever reading the store.
+- Update ops carry the record's **prior payload**, so index-shaped consumers un-index old
+  values without ever reading the store; `store.delete()` emits **delete tombstones**
+  (`payload` nil, `prior` = the last payload) through the same channel.
 - A consumer that raises is **detached** with a `ConsumerDetachedWarning` — the commit
   stays durable, the store stays healthy, the sidecar rebuilds and re-attaches.
 - Writing a consumer? `datacrystal.testing.check_delta_consumer(factory, content=...)`
@@ -457,16 +507,21 @@ Everything derives from `dc.DataCrystalError`:
 | `NewerStoreError` | store written by a newer format version |
 | `CorruptRecordError` | a record failed its checksum — the file is damaged |
 | `QueryError` | malformed condition (two classes mixed, missing parentheses, …) |
+| `DeletedEntityError` | write/`store()` on a `store.delete()`d instance — it is detached; create a new entity |
+| `DanglingRefError` | a reference to a deleted (or never-existing) record was followed (see [Deleting](#deleting)) |
 
 Pipeline consumers can additionally raise the contract errors (`datacrystal.contract`):
 `DeltaGapError` (history missing — resync/rebuild; also raised by `attach()` on a
 watermark mismatch) and `DeltaFormatError` (malformed/newer-versioned delta).
 
-Two warnings live outside the exception family (both `UserWarning`s):
+Three warnings live outside the exception family (all `UserWarning`s):
 `UntrackedMutationWarning`, emitted by the `debug=True` safety net when a mutation slipped
-past the dirty tracking — the entity is committed anyway; fix the write path it names —
-and `ConsumerDetachedWarning`, emitted when an attached delta consumer raised during
-delivery and was detached (the commit is durable; rebuild the sidecar and re-attach).
+past the dirty tracking — the entity is committed anyway; fix the write path it names;
+`ConsumerDetachedWarning`, emitted when an attached delta consumer raised during
+delivery and was detached (the commit is durable; rebuild the sidecar and re-attach);
+and `UnseenTypeWarning`, emitted when `query()`/`count()`/`pluck()` run against a class
+the store has no committed records of (the result is empty — first run, or a forgotten
+`commit()`).
 
 ## Planned features and when they land
 
@@ -479,17 +534,17 @@ Sequencing follows the ratified [roadmap](design/ROADMAP.md) and the
 | bitmap-index snapshot views (`Snapshot.index_bitmaps()` — the reserved slot raises until then) | M4 — current milestone |
 | v0.1.0 tag: API freeze (incl. the COMMIT-DELTA-v1 lock), PyPI publication | M4 |
 | **full-text search** — `datacrystal[fts]`, SQLite FTS5 over `dc.FullText` fields, BM25 ranking via `store.search()`, per-field language stemming (Snowball; German + English first-class) | next after M4: the M3 contract spike was already FTS5-shaped (`tests/contract/fts_consumer.py` is the extra's embryo), the pipeline it rides is real |
-| **pandas / polars / DuckDB** — zero-copy via Arrow columnar mirrors | v1 (after v0.x hardening) |
+| **pandas / polars / DuckDB** — zero-copy via Arrow columnar mirrors (`datacrystal[arrow]`) | **late v0.x** (resequenced 2026-06-12: the pipeline's second consumer, and the real answer to projection/range analytics at millions of rows) |
 | **GraphQL / FastAPI** — `datacrystal[web]` with strawberry integration | extension package, after the v1 core freeze |
 | vector search — `datacrystal[vector]`, usearch, ≥2 vector fields per entity | extension package, after v1 |
 | reverse-reference index (`incoming()`), property-graph recipes | v1 |
 | sets, guided migrations, custom scalar types | demand-driven |
 
-Until the Arrow mirrors exist, getting data into pandas is a three-liner (copies, not
-zero-copy, fine for thousands of rows):
+Until the Arrow mirrors exist, getting data into pandas is a two-liner via the
+decode-level projection (copies, not zero-copy — but no entities are built either):
 
 ```python
 import pandas as pd
-rows = store.query(Mineral.crystal_system != None)   # or any entity list
-df = pd.DataFrame([{"qid": m.qid, "name": m.name, "system": m.crystal_system} for m in rows])
+df = pd.DataFrame(store.pluck(Mineral, "qid", "name", "crystal_system"),
+                  columns=["qid", "name", "system"])
 ```

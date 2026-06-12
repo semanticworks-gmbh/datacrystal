@@ -15,6 +15,14 @@ sufficiency**: its contentless FTS5 table physically cannot un-index without
 the old column values, and it runs on nothing but `op["prior"]`. The shape
 freezes as drafted.
 
+M4 status (2026-06-12): `store.delete()` landed
+([ADR-003](ADR-003-delete-semantics.md)) and the engine now **emits** the
+§3.1 `delete` op. This is *activation of a reserved shape, not a revision* —
+the op was fully specified in rev 1, consumers have been required to be
+total over the vocabulary from day one, and the conformance kit has asserted
+delete totality since M3 — so rev 1 stands, no bump. Vector `004-delete.bin`
+pins the tombstone bytes (authored additively; 001–003 byte-identical).
+
 ## 1. What this is
 
 Every commit the engine acknowledges is describable as one **delta** — a
@@ -56,7 +64,7 @@ Each op is a msgpack map:
 
 | key | type | meaning |
 |---|---|---|
-| `op` | str | `"upsert"` — or `"delete"`, reserved (§3.1) |
+| `op` | str | `"upsert"` or `"delete"` (§3.1) |
 | `oid` | int | the record's OID |
 | `cid` | int | the type-lineage row the payload was encoded under |
 | `payload` | bin | the record payload exactly as persisted (msgpack, entity refs as ext-type-1 8-byte OIDs) |
@@ -67,13 +75,17 @@ without reading the store (the M3 FTS5 spike **validated** this is
 sufficient — un-indexing consumed exactly the prior payload, never a store
 read).
 
-### 3.1 `delete` (reserved)
+### 3.1 `delete`
 
-v0.x has no delete API, so the engine emits no `delete` ops yet. The shape is
-reserved now — `{"op": "delete", "oid", "cid", "payload": nil, "prior": <bin>}`
-(a tombstone carrying the last payload) — so consumers can be written
-total over the op vocabulary from day one. Consumers MUST reject unknown
-`op` strings loudly.
+`{"op": "delete", "oid", "cid", "payload": nil, "prior": <bin>}` — a tombstone
+carrying the record's last payload as `prior` (same un-indexing rationale as
+upsert priors; the reference applier verifies it strictly). The shape was
+reserved in rev 1 so consumers could be written total over the op vocabulary
+from day one; since M4 (`store.delete()`, ADR-003) the engine emits it. Within
+one delta, ops are upserts in capture order followed by deletes in deletion
+order; one OID never appears in both (engine precedence: a buffered delete
+wins over a buffered write; OIDs are never reallocated). Consumers MUST
+reject unknown `op` strings loudly.
 
 ## 4. Consumer obligations (the conformance core)
 
@@ -114,4 +126,9 @@ evil twins per section proving each violation class is detectable
 digests at intermediate watermarks). `tests/contract/` replays them through
 the reference applier and asserts: final digest, apply-twice ≡ apply-once,
 gap refusal, version refusal. The vectors were authored against this rev;
-regenerating them is a draft-rev bump, never a quiet edit.
+regenerating an existing vector is a draft-rev bump, never a quiet edit.
+*Adding* a vector that exercises behavior the rev already specifies (e.g.
+`004-delete.bin` at M4) is authoring, not regeneration — existing vector
+bytes and their pinned digests must remain identical, and the diff proves it.
+`004-delete.bin` deliberately leaves the root referencing the deleted OID:
+the unchecked-delete contract (ADR-003), documented in bytes.

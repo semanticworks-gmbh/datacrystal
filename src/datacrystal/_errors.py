@@ -86,6 +86,26 @@ class QueryError(DataCrystalError):
     (cross-entity joins are a v1 feature on Arrow mirrors, not v0.x)."""
 
 
+class DeletedEntityError(DataCrystalError):
+    """A ``store.delete()``d entity was written to, re-``store()``d, or is
+    still referenced by an uncommitted graph (ADR-003).
+
+    A deleted entity is a detached plain object: field reads keep working,
+    everything that would persist it again raises. Create a new entity
+    instead — OIDs are never reused.
+    """
+
+
+class DanglingRefError(DataCrystalError):
+    """A reference to a deleted (or never-existing) record was followed.
+
+    v0.x deletes are *unchecked* (ADR-003): nothing stops you deleting an
+    entity other records still point at — following such a stale reference
+    raises this, loudly, instead of returning None. Checked deletes
+    (cascade/orphan validation) arrive with the v1 reverse-reference index.
+    """
+
+
 class ConsumerDetachedWarning(UserWarning):
     """An attached delta consumer raised during delivery and was detached.
 
@@ -95,6 +115,16 @@ class ConsumerDetachedWarning(UserWarning):
     refuses it until it rebuilds (e.g. from ``store.snapshot()``). See
     COMMIT-DELTA-v1 §5: deltas are not retained, missed history cannot be
     re-fetched from the engine."""
+
+
+class UnseenTypeWarning(UserWarning):
+    """``query()``/``count()``/``pluck()`` ran against an entity class the
+    store has no committed records of — the result is trivially empty.
+
+    Legitimate on a first run (nothing committed yet); a footgun when you
+    meant to open a different store file or forgot to ``commit()`` before
+    reading back. ``get()`` deliberately stays silent — ``None`` is the
+    expected miss in the get-or-create idiom."""
 
 
 class UntrackedMutationWarning(UserWarning):

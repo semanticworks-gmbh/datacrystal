@@ -14,6 +14,17 @@ item 20; the object-store/datalake positioning clarified under item 16.
 Amended 2026-06-11, second (owner request): networked replication recorded as punted item 21
 (transport-agnostic, rides item 3's contract); Zyre/pyre evaluated and declined inside it.
 
+Amended 2026-06-12 (owner decision, after the MaStR big-dataset import feedback): **unchecked
+delete promoted into core v0.x** ([ADR-003](ADR-003-delete-semantics.md)) — must land before the
+tag so the delta op vocabulary locks exercised, not reserved (noted under items 1 and 3).
+**Arrow columnar mirrors (item 7) resequenced into late v0.x** as `datacrystal[arrow]`, the
+watermark pipeline's *second* real consumer — same rationale that resequenced FTS (item 10): the
+contract must hold under a consumer shape it wasn't designed around, and projection/range
+analytics is the measured pain (63 s one-column read over 5.4M rows). Decode-level `count()` /
+`pluck()` and bulk unique-key `get_many()` recorded under item 4 as the core-only interim.
+Composite/multi-field unique keys recorded as punted item 22. Scale-shape fitness gates added
+(op-count + growth-ratio; see KICKOFF gate table).
+
 ## Core v0.x (ordered)
 
 1. **Object engine**: slots-dataclasses canonical form, msgspec msgpack records, WeakValueDictionary
@@ -23,7 +34,10 @@ Amended 2026-06-11, second (owner request): networked replication recorded as pu
    (capture on-owner → I/O off-loop → flip+re-arm on-owner), LazyReferenceManager as owner task,
    `store.submit()` for foreign threads. Includes `@entity(frozen=True)` append-only entity mode
    (dirty tracking never arms; event logs/provenance) and a batch hydration API
-   (load-many-by-OID — N+1 must never be the user's problem) — SDA deltas.
+   (load-many-by-OID — N+1 must never be the user's problem) — SDA deltas. Includes **unchecked
+   `store.delete()`** per [ADR-003](ADR-003-delete-semantics.md) (2026-06-12): buffered through
+   the same commit path, physical row removal, `DanglingRefError` on following a stale ref;
+   *checked* delete (cascade/orphan validation) waits for item 8's reverse-reference index.
 2. **SQLite-as-blob-store** behind the 3-method storage protocol, plus a **single-writer
    lease-refreshed lock file with a loud error** (~1–2 days; port of EclipseStore
    `StorageLockFileManager.java`). `uvicorn --workers 4` silently corrupting is the #1 foreseeable
@@ -38,6 +52,10 @@ Amended 2026-06-11, second (owner request): networked replication recorded as pu
 4. **pyroaring bitmap indexes + Condition AST** — the differentiating query story, in the first release.
    Includes a **unique secondary-key index** (string alias → entity; lookup + upsert-by-natural-key,
    e.g. URIs/slugs/external ids) as an explicit v0.x commitment, not an implied detail — SDA delta.
+   Includes (2026-06-12, MaStR feedback) the **decode-level read path**: `count()` (bitmap
+   cardinality, zero hydration on indexed predicates), `pluck()` (field projection without entity
+   construction) and bulk unique-key `get_many()` — the core-only interim until item 7's mirrors;
+   full columnar speed is item 7's job, range/presence indexes are NOT duplicated in core.
 5. **Format hygiene**: versioned (not frozen) custom-log record header with reserved
    sealed-flag / footer-offset / tid-watermark fields (~zero cost, preserves the whole option).
 6. **Docs**: workers=1 + asyncio deployment guide incl. the asyncio doctrine ("a critical section
@@ -46,7 +64,11 @@ Amended 2026-06-11, second (owner request): networked replication recorded as pu
 
 ## Core v1
 
-7. **Arrow columnar mirrors** + DuckDB/polars zero-copy queries.
+7. **Arrow columnar mirrors** + DuckDB/polars zero-copy queries. **Resequenced into late v0.x
+   (2026-06-12)** as the `datacrystal[arrow]` extra riding the watermark pipeline — the
+   contract's second real consumer (validation rationale of item 10's resequencing) and the
+   real answer to projection/count/range analytics at millions-of-rows scale; pyarrow never
+   enters core deps (invariant 2). The v1 line keeps the DuckDB/polars recipe polish.
 8. **Reverse-reference index** as rebuildable Arrow sidecar on the watermark pipeline + minimal
    traversal API (`incoming()` first). Buys backlinks, orphan detection, cascade checks, impact
    analysis (~+5–15% on the 600 B/object envelope).
@@ -121,6 +143,10 @@ Amended 2026-06-11, second (owner request): networked replication recorded as pu
     request/reply transport. Analytics fan-out (Dask/HPC) is explicitly NOT this item:
     compute workers want the columnar tier (items 7/16, parquet-on-S3), not replicated live
     object graphs.
+22. **Composite/multi-field unique keys and composite indexes** (2026-06-12, MaStR feedback
+    item 8). Single-field unique + bitmap AND-combination covers the known workloads; composite
+    *uniqueness* constraints are real new index machinery. Demand-driven; an app-level
+    concatenated-key field is the documented workaround until then.
 
 ## Never (all five round-2 recommendations agree, ratified)
 

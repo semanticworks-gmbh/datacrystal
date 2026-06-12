@@ -19,7 +19,12 @@ from types import MappingProxyType
 from typing import Any, Mapping
 
 from datacrystal._entity import TYPES_BY_NAME, type_info
-from datacrystal._errors import DataCrystalError, SchemaMismatchError, StoreClosedError
+from datacrystal._errors import (
+    DanglingRefError,
+    DataCrystalError,
+    SchemaMismatchError,
+    StoreClosedError,
+)
 from datacrystal._records import RefToken, decode_payload
 from datacrystal._storage.protocol import StorageReadView
 
@@ -179,8 +184,10 @@ class Snapshot:
             if view is None:
                 rec = self._view.load_many([oid]).get(oid)
                 if rec is None:
-                    raise DataCrystalError(
-                        f"no record for oid {oid} at watermark {self._tid}"
+                    raise DanglingRefError(
+                        f"no record for oid {oid} at watermark {self._tid} — "
+                        "deleted (v0.x deletes are unchecked, ADR-003) or "
+                        "never committed"
                     )
                 view = self._materialize(rec.oid, rec.cid, rec.payload)
             return view

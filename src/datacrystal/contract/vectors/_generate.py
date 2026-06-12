@@ -82,6 +82,22 @@ DELTAS = [
         ],
         "root": ROOT,
     }),
+    # 004 (authored at M4, when store.delete() activated the shape §3.1
+    # reserved in rev 1 — additive authoring, NOT a regeneration: 001–003
+    # stay byte-identical). The tombstone carries the last payload as prior.
+    # Deliberately, the root keeps referencing the deleted AZURITE: that is
+    # the unchecked-delete contract (ADR-003), documented in bytes — a
+    # consumer must apply this without complaint; only *following* the
+    # dangle is an error, and that happens outside the stream.
+    ("004-delete", {
+        "f": "datacrystal-delta", "v": 1, "tid": 4,
+        "types": [],
+        "ops": [
+            {"op": "delete", "oid": AZURITE, "cid": MINERAL_V2_CID,
+             "payload": None, "prior": azurite_v3},
+        ],
+        "root": ROOT,
+    }),
 ]
 
 

@@ -28,6 +28,9 @@ stale venv shebangs — `rm -rf .venv && uv sync`.
 - `docs/design/ADR-001-concurrency-contract.md` — accepted owner-confinement contract.
 - `docs/design/ADR-002-storage-read-views.md` — accepted `read_view()` protocol addition
   (snapshot isolation for `store.snapshot()`); storage-protocol growth always needs an ADR.
+- `docs/design/ADR-003-delete-semantics.md` — accepted unchecked-delete contract
+  (`store.delete()`, tombstone deltas, `CommitBatch.deletes`, `DanglingRefError`);
+  checked delete waits for the v1 reverse-reference index.
 - `docs/design/COMMIT-DELTA-v1.md` — the delta/watermark contract (DRAFT; locks at the tag).
   The applier + replay vectors are normative and byte-pinned; revisions need a draft-rev bump.
 - `docs/GUIDE.md` — user-facing semantics. Documentation honesty rule: features that do not
@@ -38,7 +41,7 @@ stale venv shebangs — `rm -rf .venv && uv sync`.
 
 | Module | Role |
 |---|---|
-| `_store.py` | facade: open/root/store/commit/get/query/get_many/attach/detach/snapshot; P1 capture (+ prior reads + delta build when consumers watch) → P2 backend I/O → P3 flip + delta delivery; type lineage + hydration plans |
+| `_store.py` | facade: open/root/store/delete/commit/get/query/count/pluck/get_many/attach/detach/snapshot; P1 capture (+ prior reads + delta build when consumers watch) → P2 backend I/O → P3 flip + delta delivery; type lineage + hydration plans; decode-level reads (count/pluck) construct no entities; deletes are unchecked per ADR-003 (DanglingRefError on follow) |
 | `_pipeline.py` | COMMIT-DELTA-v1 emission: `DeltaConsumer` protocol + `build_delta`; delivery in P3 post-durability; a raising consumer detaches loudly (never holds writes hostage) |
 | `_snapshot.py` | `store.snapshot()` frozen `EntityView`/`Ref` reads at a commit watermark, callable from any thread (ADR-002 read views); `index_bitmaps()` slot reserved for M4 |
 | `testing.py` | public conformance kit `check_delta_consumer` + `CountingConsumer` (incl. the snapshot-bootstrap recipe for mid-life attach) |
