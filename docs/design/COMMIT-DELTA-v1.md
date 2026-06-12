@@ -5,8 +5,15 @@ Ratified scope: [ROADMAP.md](ROADMAP.md) item 3 — "the single most load-bearin
 undelivered component". The draft may change with explicit draft-rev bumps
 until it is **locked at the v0.1.0 tag**, after both in-tree consumers
 (snapshot views, bitmap indexes) have run against it and strictly before any
-released consumer. The M3 index-shaped consumer spike must prove prior-value
-sufficiency before the shape freezes (KICKOFF §3, M3).
+released consumer.
+
+M3 status (2026-06-12): the engine **emits** this stream (`store.attach()`),
+the conformance kit (`datacrystal.testing`) and the golden engine-output
+fixtures exist, and the index-shaped consumer spike — deliberately
+FTS5-shaped, `tests/contract/fts_consumer.py` — **validated prior-value
+sufficiency**: its contentless FTS5 table physically cannot un-index without
+the old column values, and it runs on nothing but `op["prior"]`. The shape
+freezes as drafted.
 
 ## 1. What this is
 
@@ -56,8 +63,9 @@ Each op is a msgpack map:
 | `prior` | bin / nil | the full previous payload of this OID, nil if this commit created it |
 
 `prior` exists so index-shaped consumers can un-index old values on update
-without reading the store (the M3 spike validates this is sufficient — if it
-is not, the draft rev bumps rather than the lock freezing wrong).
+without reading the store (the M3 FTS5 spike **validated** this is
+sufficient — un-indexing consumed exactly the prior payload, never a store
+read).
 
 ### 3.1 `delete` (reserved)
 
@@ -83,8 +91,10 @@ total over the op vocabulary from day one. Consumers MUST reject unknown
 5. **Version refusal.** A delta whose `v` exceeds the consumer's supported
    version MUST raise (fitness #18, both format directions).
 
-These are exactly the obligations the conformance kit (`datacrystal.testing`,
-M3) will assert with evil twins per section.
+These are exactly the obligations the conformance kit
+(`datacrystal.testing.check_delta_consumer`, shipped at M3) asserts — with
+evil twins per section proving each violation class is detectable
+(`tests/contract/test_conformance_kit.py`).
 
 ## 5. What the stream is NOT (v1)
 

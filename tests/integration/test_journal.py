@@ -1,7 +1,8 @@
 """The journal example is an executable contract (KICKOFF §2): it must run
 twice from a clean directory, with run 2 finding run 1's data, exercising
 the M2 scenes (unique keys + recovery, frozen events, Lazy attachments,
-get_many backlinks, indexed queries, the async session)."""
+get_many backlinks, indexed queries, the async session) and the M3 scenes
+(worker-thread snapshot reads, a commit-delta consumer on the pipeline)."""
 
 from __future__ import annotations
 
@@ -35,4 +36,7 @@ def test_journal_runs_twice_and_run_two_finds_run_one(tmp_path):
     assert "collision refused" in second
     assert "frozen event: mutation refused" in second
     assert "lazy-loaded, identity preserved" in second
-    assert "[planned — M3]" in second  # honesty marker stays until it lands
+    # the M3 scenes are real now: no [planned — M3] honesty marker left
+    assert "[planned — M3]" not in second
+    assert "worker-thread snapshot at tid=" in second
+    assert "delta consumer saw commit tid=" in second

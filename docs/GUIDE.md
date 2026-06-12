@@ -82,8 +82,9 @@ class Mineral:
     optionally `| None`).
   - `dc.Unique` — unique secondary key (e.g. URIs, slugs, external ids). Duplicates are
     rejected at commit (`UniqueViolationError`); `None` never collides (SQL-NULL-style).
-  - `dc.FullText` — accepted but **inert**: it reserves the field for `datacrystal[fts]`
-    `[planned — late v0.x, see below]`.
+  - `dc.FullText` — **inert in the core engine**: it reserves the field for
+    `datacrystal[fts]` `[planned — after M4, see below]`. External consumers can already
+    read it (the M3 FTS5 contract spike derives its indexing config from these markers).
 - `@dc.entity(frozen=True)` declares an append-only record — see [Frozen entities](#frozen-entities).
 - Entity classes are identified by `module:qualname` in the store. Keep an entity class
   importable under the same module path, or opening old data raises `UnregisteredTypeError`.
@@ -338,8 +339,8 @@ store and its live graph belong to the thread that opened the store.
   bytes to a dedicated IO worker thread, and finalizes on the owner. For sync stores that is
   an internal detail (commit blocks as before); for async stores it is what keeps the loop
   free.
-- `store.snapshot()` (read-only views any thread can use while the owner commits) is
-  `[planned — M3]`.
+- `store.snapshot()` gives ANY thread a frozen, read-only view of committed state — see
+  [Snapshots and the commit-delta pipeline](#snapshots-and-the-commit-delta-pipeline).
 
 ### asyncio
 
@@ -367,6 +368,57 @@ store.close()
   fix and commit, or close to discard.
 - Hydration faults (`Lazy.get()`, queries) load synchronously on the loop — the explicit
   `Lazy[T]` cut points make where that can happen visible in your model.
+
+## Snapshots and the commit-delta pipeline
+
+### `store.snapshot()` — reading from any thread
+
+A snapshot is a frozen view of the committed state at one commit watermark, and the
+sanctioned way for worker threads to read while the owner keeps writing (ADR-001 rider 2):
+
+```python
+def report(store: dc.Store) -> int:        # runs on any thread
+    with store.snapshot() as snap:         # pins one durable commit boundary
+        fine = [s for s in snap.all(Specimen) if s.quality == "fine"]
+        return len(fine)
+```
+
+- `snap.get(oid_or_ref)`, `snap.all(EntityClass)` and `snap.root` return **immutable
+  views** (`dc.EntityView`): field access mirrors the live class, entity references are
+  explicit `dc.Ref` tokens you resolve via `snap.get(ref)`, lists come back as tuples,
+  dicts as read-only mappings. Never live entities — nothing a worker thread does with a
+  snapshot can violate confinement or dirty tracking.
+- `snap.tid` is the pinned watermark; `snap.types` is the type lineage at that watermark
+  (what a delta consumer needs to bootstrap, see below).
+- Close promptly (use the context manager): on the sqlite backend an open snapshot holds a
+  WAL read transaction, which blocks checkpoint truncation.
+- A snapshot taken while a commit is mid-flight may be one commit **ahead** of
+  `store.last_tid` — the commit it sees is already durable; views are never torn.
+
+### The commit-delta pipeline — what sidecars ride on
+
+Every commit is describable as one versioned, msgpack-encodable **delta** — the public
+[COMMIT-DELTA-v1](design/COMMIT-DELTA-v1.md) contract (DRAFT until the v0.1.0 tag). Attach
+a consumer and every commit hands it exactly one delta, in TID order, on the owner thread,
+strictly after the commit is durable:
+
+```python
+with store.snapshot() as snap:                  # 1. bootstrap at a watermark
+    consumer = MySidecar.bootstrap(snap)        #    (lineage + state + watermark)
+store.attach(consumer)                          # 2. ride the stream from there
+```
+
+- `attach()` requires `consumer.watermark == store.last_tid`: deltas are **not retained**,
+  a consumer that is behind (or ahead — a store restored from backup) must rebuild from a
+  snapshot. This is by design: sidecars are rebuildable derived data, always.
+- Update/delete ops carry the record's **prior payload**, so index-shaped consumers
+  un-index old values without ever reading the store.
+- A consumer that raises is **detached** with a `ConsumerDetachedWarning` — the commit
+  stays durable, the store stays healthy, the sidecar rebuilds and re-attaches.
+- Writing a consumer? `datacrystal.testing.check_delta_consumer(factory, content=...)`
+  certifies it against every contract obligation (idempotency, ordering, gap/version
+  refusal, prior-based un-indexing); `datacrystal.testing.CountingConsumer` is the
+  minimal reference implementation, `datacrystal/contract/applier.py` the normative one.
 
 ## Durability and crash safety
 
@@ -402,9 +454,15 @@ Everything derives from `dc.DataCrystalError`:
 | `CorruptRecordError` | a record failed its checksum — the file is damaged |
 | `QueryError` | malformed condition (two classes mixed, missing parentheses, …) |
 
-One warning lives outside the exception family: `UntrackedMutationWarning` (a
-`UserWarning`), emitted by the `debug=True` safety net when a mutation slipped past the
-dirty tracking — the entity is committed anyway; fix the write path it names.
+Pipeline consumers can additionally raise the contract errors (`datacrystal.contract`):
+`DeltaGapError` (history missing — resync/rebuild; also raised by `attach()` on a
+watermark mismatch) and `DeltaFormatError` (malformed/newer-versioned delta).
+
+Two warnings live outside the exception family (both `UserWarning`s):
+`UntrackedMutationWarning`, emitted by the `debug=True` safety net when a mutation slipped
+past the dirty tracking — the entity is committed anyway; fix the write path it names —
+and `ConsumerDetachedWarning`, emitted when an attached delta consumer raised during
+delivery and was detached (the commit is durable; rebuild the sidecar and re-attach).
 
 ## Planned features and when they land
 
@@ -414,9 +472,9 @@ Sequencing follows the ratified [roadmap](design/ROADMAP.md) and the
 
 | Feature | Where it lands |
 |---|---|
-| `store.snapshot()` immutable views for threads; the commit-delta/watermark **pipeline** (the contract itself is drafted — [COMMIT-DELTA-v1](design/COMMIT-DELTA-v1.md)) | M3 — current milestone |
-| v0.1.0 tag: API freeze, PyPI publication | M4 |
-| **full-text search** — `datacrystal[fts]`, SQLite FTS5 over `dc.FullText` fields | late v0.x: it is deliberately the *first consumer* of the M3 watermark pipeline, so it follows directly after M3 |
+| bitmap-index snapshot views (`Snapshot.index_bitmaps()` — the reserved slot raises until then) | M4 — current milestone |
+| v0.1.0 tag: API freeze (incl. the COMMIT-DELTA-v1 lock), PyPI publication | M4 |
+| **full-text search** — `datacrystal[fts]`, SQLite FTS5 over `dc.FullText` fields, BM25 ranking via `store.search()`, per-field language stemming (Snowball; German + English first-class) | next after M4: the M3 contract spike was already FTS5-shaped (`tests/contract/fts_consumer.py` is the extra's embryo), the pipeline it rides is real |
 | **pandas / polars / DuckDB** — zero-copy via Arrow columnar mirrors | v1 (after v0.x hardening) |
 | **GraphQL / FastAPI** — `datacrystal[web]` with strawberry integration | extension package, after the v1 core freeze |
 | vector search — `datacrystal[vector]`, usearch, ≥2 vector fields per entity | extension package, after v1 |
