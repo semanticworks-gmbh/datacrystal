@@ -75,6 +75,10 @@ from datacrystal._snapshot import Ref, Snapshot
 from datacrystal._storage.protocol import CommitBatch, StorageBackend, StoredRecord
 from datacrystal.contract.applier import DeltaGapError
 
+# Exact-type membership for the hydration fast path (decode produces exact
+# builtin types, never subclasses — subclass-shaped values still take _resolve).
+_SCALAR_TYPES = frozenset((str, int, float, bool, bytes))
+
 _THREAD_RECIPE = (
     "live entities and their store are confined to the thread that opened the "
     "store (ADR-001); send work to the owner via store.submit(fn) — the owner "
@@ -402,7 +406,7 @@ class Store:
                     "keyword argument"
                 )
             (field, value), = unique_key.items()
-            spec = next((s for s in ti.specs if s.name == field), None)
+            spec = ti.spec(field)
             if spec is None or not spec.unique:
                 raise QueryErrorFor(obj_or_cls, field)
             if self._cid_by_typename.get(ti.typename) is None:
@@ -927,7 +931,7 @@ class Store:
             raise TypeError("get() takes exactly one unique-field keyword argument")
         ti = type_info(cls)
         (field, value), = unique_key.items()
-        spec = next((s for s in ti.specs if s.name == field), None)
+        spec = ti.spec(field)
         if spec is None or not spec.unique:
             raise QueryErrorFor(cls, field)
         if self._cid_by_typename.get(ti.typename) is None:
@@ -995,7 +999,7 @@ class Store:
             )
         ti = type_info(cls)
         (field, values), = unique_key.items()
-        spec = next((s for s in ti.specs if s.name == field), None)
+        spec = ti.spec(field)
         if spec is None or not spec.unique:
             raise QueryErrorFor(cls, field)
         values = list(values)
@@ -1199,8 +1203,11 @@ class Store:
             self._register_graph(obj, walked)
 
     def _walk_value(self, value: Any, queue: deque[Any]) -> None:
+        if value is None or isinstance(value, (str, float, int, bytes)):
+            return  # overwhelmingly the common case: scalars reference nothing
         if is_entity(value):
-            if oid_of(value) is None or oid_of(value) in self._new or oid_of(value) in self._dirty:
+            oid = oid_of(value)
+            if oid is None or oid in self._new or oid in self._dirty:
                 queue.append(value)
         elif isinstance(value, Lazy):
             target = value.peek()
@@ -1320,9 +1327,14 @@ class Store:
                     f"{ti.typename}: record has {len(values)} fields, its type "
                     f"dictionary row has {len(persisted)} — the store is damaged"
                 )
+            fill = object.__setattr__  # bound once: this loop is the hot path
             for spec, index, factory in plan:
                 raw = values[index] if index is not None else factory()
-                set_field(obj, spec.name, self._resolve(raw, spec.lazy_refs, cache, obj))
+                if raw is None or type(raw) in _SCALAR_TYPES:
+                    fill(obj, spec.name, raw)  # scalars skip the resolve call
+                else:
+                    fill(obj, spec.name,
+                         self._resolve(raw, spec.lazy_refs, cache, obj))
         except BaseException:
             # A failed hydration (dangling eager ref, schema mismatch) must
             # not leave a half-filled corpse behind the identity contract.
@@ -1343,6 +1355,8 @@ class Store:
 
     def _resolve(self, value: Any, lazy: bool, cache: dict[int, StoredRecord] | None,
                  owner: Any) -> Any:
+        if value is None or isinstance(value, (str, float, int, bytes)):
+            return value  # scalar fast path: nothing to swizzle back
         if isinstance(value, RefToken):
             if lazy:
                 existing = self._registry.get(value.oid)

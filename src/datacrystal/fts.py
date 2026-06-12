@@ -3,9 +3,9 @@
 The first *real* COMMIT-DELTA-v1 consumer: it rides the watermark pipeline
 exactly like the M3 contract spike (``tests/contract/fts_consumer.py``, its
 embryo) and delivers what the spike's honesty notes deferred — index-time
-Snowball stemming per ``dc.FullText(language=...)``, original + stemmed
-columns per field (snippets vs. ranking), BM25-ranked search with snippets,
-and the snapshot-bootstrap recipe for attaching to a lived-in store.
+Snowball stemming per ``dc.FullText(language=...)``, per-field exact and
+stemmed columns, BM25-ranked search (exact outranks stem-only), and
+fold+stem-consistent highlighting.
 
 Sidecar doctrine (COMMIT-DELTA-v1 §5, invariant 11): the index is derived
 data in its own SQLite file — rebuildable from ``store.snapshot()`` at any
@@ -16,18 +16,31 @@ the persisted watermark.
 
 Design notes (decided 2026-06-12, with the extra's resequencing pre-tag):
 
-* **Two columns per prose field.** ``f_<field>`` holds the original text —
-  snippets and exact-term ranking come from here; ``s_<field>`` holds the
-  Snowball-stemmed tokens — recall ("Kristalle" finds "Kristall") comes
-  from here. Queries match both, BM25 weights prefer exact (2.0 vs 1.0).
+* **Three columns per prose field.** ``f_<field>`` holds the fold-normalized
+  exact tokens, ``s_<field>`` the fold-normalized Snowball stems — *both*
+  written and queried through the same Python normalization, so consistency
+  is by construction on both columns (an asymmetric raw/folded split is
+  exactly what breaks Cyrillic/Greek/kana recall). ``r_<field>`` keeps the
+  raw text UNINDEXED, purely as the snippet source. Queries match f_ and s_,
+  BM25 weights prefer exact (2.0 vs 1.0).
+* **Stem first, fold after.** Snowball stemmers need the diacritics the
+  fold removes (Russian ``й``/``ё`` steer suffix tables), so tokens are
+  stemmed in lowercase NFC form and the *stems* are folded — identically at
+  index and query time.
 * **Stemming is index-time, in Python.** sqlite3 cannot load custom FTS5
-  tokenizers, so both sides of the match — column content and query terms —
-  run through the same fold-lowercase-stem transform; consistency is by
-  construction. Bare ``dc.FullText`` (no language) means fold-only exact
+  tokenizers; bare ``dc.FullText`` (no language) means fold-only exact
   matching, exactly what the spike shipped.
 * **Documents are rows, rowid = OID.** OIDs are globally unique across
   types (partitioned 64-bit space), so one table indexes every configured
   type; ``typename`` is a filterable stored column.
+
+Honest limitations (documentation-honesty rule): unsegmented CJK text forms
+one token per run under unicode61 — ``水晶です`` is only findable as that
+whole run; proper CJK support needs a segmenting tokenizer [planned —
+demand-driven]. Abugida-script languages (Hindi, Nepali, Tamil) are refused
+loudly: both tokenizers split at vowel signs, which would feed the stemmers
+shredded consonants. Like the store itself, an index is owner-confined: use
+it from the thread that opened it (sqlite3 enforces this loudly).
 """
 
 from __future__ import annotations
@@ -68,12 +81,18 @@ _ISO_TO_SNOWBALL = {
     "ar": "arabic", "da": "danish", "de": "german", "el": "greek",
     "en": "english", "es": "spanish", "et": "estonian", "eu": "basque",
     "fa": "persian", "fi": "finnish", "fr": "french", "ga": "irish",
-    "hi": "hindi", "hu": "hungarian", "hy": "armenian", "id": "indonesian",
-    "it": "italian", "lt": "lithuanian", "ne": "nepali", "nl": "dutch",
+    "hu": "hungarian", "hy": "armenian", "id": "indonesian",
+    "it": "italian", "lt": "lithuanian", "nl": "dutch",
     "no": "norwegian", "pl": "polish", "pt": "portuguese", "ro": "romanian",
-    "ru": "russian", "sr": "serbian", "sv": "swedish", "ta": "tamil",
+    "ru": "russian", "sr": "serbian", "sv": "swedish",
     "tr": "turkish", "yi": "yiddish",
 }
+
+# Abugida scripts: unicode61 and the Python tokenizer both split at the
+# combining vowel signs, so the stemmers would only ever see isolated
+# consonants — broken recall sold as a feature. Refused until a
+# cluster-preserving tokenizer exists (documentation-honesty rule).
+_UNSUPPORTED_SNOWBALL = {"hindi", "nepali", "tamil"}
 
 _TOKEN = re.compile(r"[^\W_]+")  # letters + digits, the unicode61 shape
 _PHRASE = re.compile(r'"([^"]*)"')
@@ -88,10 +107,11 @@ class FtsConfigError(DataCrystalError):
 class SearchHit:
     """One ranked match: ``score`` is ``-bm25`` (higher = more relevant);
     ``snippets`` maps field name → excerpt of the original text with the
-    matched surface forms marked ``[`` … ``]`` — highlighting is computed
-    by the same fold+stem transform that indexed the text, so a stemmed
-    match ("Kristall" finding "Kristalle") highlights correctly, which
-    FTS5's own ``snippet()`` cannot do over a stem column."""
+    matched surface forms marked ``[`` … ``]``. Highlighting runs the same
+    normalize-stem-fold transform that indexed the text, so a stemmed match
+    ("Kristall" finding "Kristalle") highlights correctly — which FTS5's
+    own ``snippet()`` cannot do over a stem column. Phrase needles only
+    mark adjacent runs."""
 
     oid: int
     typename: str
@@ -100,38 +120,42 @@ class SearchHit:
 
     @property
     def snippet(self) -> str | None:
-        """The first excerpt, or None when the match has no surface form to
-        excerpt (only fields without stored text matched)."""
+        """The first excerpt, or None when no indexed field of this hit has
+        text to excerpt."""
         for text in self.snippets.values():
             return text
         return None
 
 
+def _tokens(text: str) -> list[str]:
+    """Lowercase NFC tokens, diacritics preserved — the stemmers' input
+    shape (NFC first, so decomposed combining marks never split a token;
+    lowercase because Snowball is case-sensitive: "BERGE" does not stem)."""
+    return _TOKEN.findall(unicodedata.normalize("NFC", text).lower())
+
+
 def _fold_token(token: str) -> str:
-    """NFKD-fold diacritics + lowercase one token — the unicode61 shape.
-    Snowball stemmers are case-sensitive ("BERGE" does not stem, "berge"
-    does), so lowercasing first is correctness, not cosmetics."""
+    """NFKD-fold one token: strip diacritics, normalize compatibility forms
+    (``m²`` → ``m2``, ``ﬁ`` → ``fi``), lowercase — applied identically to
+    column content and query terms, so matching is fold-consistent by
+    construction."""
     return "".join(
         ch for ch in unicodedata.normalize("NFKD", token)
         if not unicodedata.combining(ch)
     ).lower()
 
 
-def _fold(text: str) -> list[str]:
-    """Tokenize the way unicode61 will: fold the whole text first (so
-    decomposed combining marks never split a token), then split on
-    non-alphanumerics."""
-    folded = "".join(
-        ch for ch in unicodedata.normalize("NFKD", text)
-        if not unicodedata.combining(ch)
-    ).lower()
-    return _TOKEN.findall(folded)
-
-
 def _resolve_language(language: str | None) -> str | None:
     if language is None:
         return None
     name = _ISO_TO_SNOWBALL.get(language.lower(), language.lower())
+    if name in _UNSUPPORTED_SNOWBALL:
+        raise FtsConfigError(
+            f"FullText language {language!r} is not supported: unicode61 and "
+            "the index tokenizer split abugida scripts at vowel signs, which "
+            "would silently destroy recall — a cluster-preserving tokenizer "
+            "is a planned, demand-driven extension"
+        )
     if name not in snowballstemmer.algorithms():
         raise FtsConfigError(
             f"unknown FullText language {language!r} — use an ISO code "
@@ -153,6 +177,12 @@ def _registry_fulltext() -> dict[str, dict[str, str | None]]:
         if fields:
             out[typename] = fields
     return out
+
+
+# Needles: per highlight "kind" — "exact" plus one entry per language — the
+# token sequences to mark. A bare term is a length-1 sequence; a quoted
+# phrase a longer one, marked only on adjacent runs.
+_Needles = dict[str, list[list[str]]]
 
 
 class FullTextIndex:
@@ -192,6 +222,13 @@ class FullTextIndex:
                 "nothing to index: no @entity class declares dc.FullText fields "
                 "and no explicit fulltext= map was given"
             )
+        for fields in self._fulltext.values():
+            for field in fields:
+                if not field.isidentifier():
+                    raise FtsConfigError(
+                        f"field name {field!r} is not an identifier — explicit "
+                        "fulltext= maps must name dataclass fields"
+                    )
         self._fields: tuple[str, ...] = tuple(sorted({
             field for fields in self._fulltext.values() for field in fields
         }))
@@ -206,17 +243,21 @@ class FullTextIndex:
         if _wipe and not str(path).startswith(":memory:"):
             Path(path).unlink(missing_ok=True)
         self._conn = sqlite3.connect(str(path), isolation_level=None)
-        self._create_or_check_schema()
-        row = self._conn.execute(
-            "SELECT value FROM sidecar_meta WHERE key='watermark'"
-        ).fetchone()
-        self._watermark = int(row[0]) if row else 0
-        self._types: dict[int, tuple[str, list[str]]] = {
-            cid: (name, fields.split("\x1f") if fields else [])
-            for cid, name, fields in self._conn.execute(
-                "SELECT cid, name, fields FROM sidecar_types"
-            )
-        }
+        try:
+            self._create_or_check_schema()
+            row = self._conn.execute(
+                "SELECT value FROM sidecar_meta WHERE key='watermark'"
+            ).fetchone()
+            self._watermark = int(row[0]) if row else 0
+            self._types: dict[int, tuple[str, list[str]]] = {
+                cid: (name, fields.split("\x1f") if fields else [])
+                for cid, name, fields in self._conn.execute(
+                    "SELECT cid, name, fields FROM sidecar_types"
+                )
+            }
+        except BaseException:
+            self._conn.close()  # a refused config must not leak the handle
+            raise
         self.statements = 0  # per-apply statement count (O(delta) evidence)
 
     # -- consumer surface (COMMIT-DELTA-v1 §4) --------------------------------
@@ -320,21 +361,22 @@ class FullTextIndex:
                limit: int = 20) -> list[SearchHit]:
         """BM25-ranked full-text matches for ``query``.
 
-        Terms match the original text exactly (case/diacritic-folded) AND
-        their Snowball stems against the stemmed columns, per the languages
-        declared for each field — exact matches outrank stem-only matches
-        (column weights 2.0 vs 1.0). Quoted phrases stay phrases. ``cls``
-        narrows to one entity type (class or typename string).
+        Terms match the fold-normalized exact tokens AND their Snowball
+        stems, per the languages declared for each field — exact matches
+        outrank stem-only matches (column weights 2.0 vs 1.0). Quoted
+        phrases stay phrases. ``cls`` narrows to one entity type (class or
+        typename string). Every term is quoted into the FTS5 expression, so
+        user input cannot inject MATCH operators.
         """
         typename = self._typename_of(cls) if cls is not None else None
         expression = self._match_expression(query, typename)
         if expression is None:
             return []
         needles = self._needles(query)
-        weights = "0.0, " + ", ".join("2.0, 1.0" for _ in self._fields)
-        originals = ", ".join(f"f_{f}" for f in self._fields)
+        weights = "0.0, " + ", ".join("2.0, 1.0, 0.0" for _ in self._fields)
+        raws = ", ".join(f"r_{f}" for f in self._fields)
         sql = (
-            f"SELECT rowid, typename, bm25(docs, {weights}) AS r, {originals} "
+            f"SELECT rowid, typename, bm25(docs, {weights}) AS r, {raws} "
             f"FROM docs WHERE docs MATCH ?"
         )
         params: list[Any] = [expression]
@@ -377,7 +419,7 @@ class FullTextIndex:
     # -- internals ----------------------------------------------------------------
 
     def _create_or_check_schema(self) -> None:
-        columns = ", ".join(f"f_{f}, s_{f}" for f in self._fields)
+        columns = ", ".join(f"f_{f}, s_{f}, r_{f} UNINDEXED" for f in self._fields)
         self._conn.executescript(f"""
             CREATE VIRTUAL TABLE IF NOT EXISTS docs USING fts5(
                 typename, {columns}, tokenize='unicode61'
@@ -431,6 +473,12 @@ class FullTextIndex:
             stemmer = self._stemmers[language] = snowballstemmer.stemmer(language)
         return stemmer.stemWords(tokens)
 
+    def _stem_folded(self, tokens: list[str], language: str) -> list[str]:
+        """Stem-first-fold-after: the stemmer sees lowercase NFC tokens with
+        their diacritics (Russian й/ё steer its suffix tables), the index
+        and the query see the folded stems — identical on both sides."""
+        return [_fold_token(stem) for stem in self._stem(tokens, language)]
+
     def _prose_values(self, cid: int, payload: bytes) -> tuple[str, dict[str, str]] | None:
         """Decode one record payload to its indexable ``{field: text}`` —
         by NAME through its persisted shape, missing fields filled from the
@@ -466,16 +514,23 @@ class FullTextIndex:
         for field in self._fields:
             text = values.get(field)
             if text is None or field not in self._fulltext[typename]:
-                row.extend((None, None))
+                row.extend((None, None, None))
                 continue
+            tokens = _tokens(text)
             language = self._fulltext[typename][field]
             stemmed = (
-                " ".join(self._stem(_fold(text), language))
+                " ".join(self._stem_folded(tokens, language))
                 if language is not None else None
             )
-            row.extend((text, stemmed))
-        placeholders = ", ".join("?" for _ in range(1 + 2 * len(self._fields)))
-        columns = "typename, " + ", ".join(f"f_{f}, s_{f}" for f in self._fields)
+            row.extend((
+                " ".join(_fold_token(token) for token in tokens),
+                stemmed,
+                text,
+            ))
+        placeholders = ", ".join("?" for _ in range(1 + 3 * len(self._fields)))
+        columns = "typename, " + ", ".join(
+            f"f_{f}, s_{f}, r_{f}" for f in self._fields
+        )
         self._exec(
             f"INSERT INTO docs (rowid, {columns}) VALUES (?, {placeholders})",
             (oid, *row),
@@ -495,47 +550,68 @@ class FullTextIndex:
         else:
             raise DeltaFormatError(f"unknown op {kind!r} — refusing to guess")
 
-    def _needles(self, query: str) -> tuple[set[str], dict[str, set[str]]]:
-        """What to highlight: the folded query tokens, plus their stems per
-        language in use — the exact transform the index applied."""
-        tokens = _fold(query.replace('"', " "))
-        exact = set(tokens)
-        stems = {
-            language: set(self._stem(tokens, language))
-            for languages in self._languages_by_field.values()
-            for language in languages
+    def _query_units(self, query: str) -> list[list[str]]:
+        """Quoted phrases as multi-token units, the rest as single tokens —
+        all in the stemmer's lowercase-NFC shape."""
+        units = [_tokens(phrase) for phrase in _PHRASE.findall(query)]
+        units += [[token] for token in _tokens(_PHRASE.sub(" ", query))]
+        return [tokens for tokens in units if tokens]
+
+    def _needles(self, query: str) -> _Needles:
+        """What to highlight, per kind: the folded token sequences ("exact")
+        plus the folded stem sequences per language in use — exactly the
+        transforms the index applied."""
+        units = self._query_units(query)
+        needles: _Needles = {"exact": [
+            [_fold_token(token) for token in unit] for unit in units
+        ]}
+        languages = {
+            language for langs in self._languages_by_field.values()
+            for language in langs
         }
-        return exact, stems
+        for language in languages:
+            needles[language] = [self._stem_folded(unit, language) for unit in units]
+        return needles
 
     def _highlight(self, text: str, language: str | None,
-                   needles: tuple[set[str], dict[str, set[str]]]) -> str | None:
-        """A ±~6-token excerpt of ``text`` around the first matched surface
-        form, every matched token marked ``[`` … ``]`` — or None when no
-        token of this text matches the query (the row matched via another
-        field)."""
-        exact, stems_by_language = needles
-        stems = stems_by_language.get(language or "", set())
-        spans: list[tuple[int, int, bool]] = []
-        for m in _TOKEN.finditer(text):
-            folded = _fold_token(m.group())
-            matched = folded in exact or (
-                language is not None
-                and bool(stems)
-                and self._stem([folded], language)[0] in stems
-            )
-            spans.append((m.start(), m.end(), matched))
-        first = next((i for i, span in enumerate(spans) if span[2]), None)
+                   needles: _Needles) -> str | None:
+        """A ±~6-token excerpt of ``text`` around the first matched token,
+        matches marked ``[`` … ``]`` — or None when nothing in this text
+        matches (the row matched via another field). Phrase needles mark
+        only adjacent runs. The text is rendered in NFC so decomposed input
+        highlights exactly like the composed form it was indexed as."""
+        display = unicodedata.normalize("NFC", text)
+        spans = [(m.start(), m.end()) for m in _TOKEN.finditer(display)]
+        if not spans:
+            return None
+        words = [display[start:end].lower() for start, end in spans]
+        folded = [_fold_token(word) for word in words]
+        sources: dict[str, list[str]] = {"exact": folded}
+        if language is not None:
+            sources[language] = self._stem_folded(words, language)
+        matched = [False] * len(spans)
+        for kind, sequences in needles.items():
+            source = sources.get(kind)
+            if source is None:
+                continue
+            for sequence in sequences:
+                width = len(sequence)
+                for i in range(len(source) - width + 1):
+                    if source[i:i + width] == sequence:
+                        for j in range(i, i + width):
+                            matched[j] = True
+        first = next((i for i, hit in enumerate(matched) if hit), None)
         if first is None:
             return None
         lo, hi = max(0, first - 5), min(len(spans), first + 7)
         out: list[str] = ["…" if lo > 0 else ""]
         cursor = spans[lo][0]
-        for start, end, matched in spans[lo:hi]:
-            out.append(text[cursor:start])
-            token = text[start:end]
-            out.append(f"[{token}]" if matched else token)
+        for (start, end), hit in zip(spans[lo:hi], matched[lo:hi]):
+            out.append(display[cursor:start])
+            token = display[start:end]
+            out.append(f"[{token}]" if hit else token)
             cursor = end
-        out.append("…" if hi < len(spans) else text[spans[hi - 1][1]:])
+        out.append("…" if hi < len(spans) else display[spans[hi - 1][1]:])
         return "".join(out)
 
     def _match_expression(self, query: str, typename: str | None) -> str | None:
@@ -546,16 +622,12 @@ class FullTextIndex:
             self._fulltext if typename is None
             else {typename: self._fulltext.get(typename, {})}
         )
-        # a quoted phrase is one multi-token term; everything else single tokens
-        terms: list[list[str]] = [
-            _fold(phrase) for phrase in _PHRASE.findall(query)
-        ]
-        terms += [[token] for token in _fold(_PHRASE.sub(" ", query))]
-        terms = [tokens for tokens in terms if tokens]
-        if not terms:
+        units = self._query_units(query)
+        if not units:
             return None
         clauses: list[str] = []
-        for tokens in terms:
+        for tokens in units:
+            exact = " ".join(_fold_token(token) for token in tokens)
             alternatives: list[str] = []
             for field in self._fields:
                 declaring = [
@@ -563,15 +635,15 @@ class FullTextIndex:
                 ]
                 if not declaring:
                     continue
-                alternatives.append(f'f_{field} : "{" ".join(tokens)}"')
+                alternatives.append(f'f_{field} : "{exact}"')
                 for language in self._languages_by_field[field]:
                     if language not in declaring:
                         continue
-                    stemmed = self._stem(tokens, language)
-                    alternatives.append(f's_{field} : "{" ".join(stemmed)}"')
+                    stemmed = " ".join(self._stem_folded(tokens, language))
+                    alternatives.append(f's_{field} : "{stemmed}"')
             if not alternatives:
                 return None
-            # dedupe (stem may equal the surface form), keep order stable
+            # dedupe (a stem may equal the surface form), keep order stable
             unique = list(dict.fromkeys(alternatives))
             clauses.append("(" + " OR ".join(unique) + ")")
         return " AND ".join(clauses)

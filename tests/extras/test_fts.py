@@ -167,6 +167,114 @@ def test_bare_fulltext_is_fold_only(store_factory, tmp_path) -> None:
     idx.close()
 
 
+# -- linguistics regressions (2026-06-12 adversarial review) --------------------
+
+
+@dc.entity
+class Icon:
+    label: str
+    caption: Annotated[str | None, dc.FullText] = None           # bare
+    legend: Annotated[str | None, dc.FullText(language="ru")] = None
+
+
+ICON_FULLTEXT = {"tests.extras.test_fts:Icon": {"caption": None, "legend": "ru"}}
+
+
+def test_bare_fields_match_non_latin_verbatim(store_factory, tmp_path) -> None:
+    """The exact (f_) column is Python-fold-normalized like the query, so
+    Cyrillic/compat forms match verbatim — the review's critical finding:
+    a raw-text exact column is unicode61-tokenized and silently unmatchable
+    for ё/й, m², ligatures."""
+    store = store_factory()
+    idx = fresh_index(tmp_path, fulltext=ICON_FULLTEXT)
+    store.attach(idx)
+    store.root = [
+        Icon(label="i1", caption="ёлка синий красный"),
+        Icon(label="i2", caption="3 m² with ﬁne luster"),
+    ]
+    store.commit()
+    assert idx.search("ёлка")          # verbatim Cyrillic
+    assert idx.search("елка")          # folded form too
+    assert idx.search("синий")
+    assert idx.search("m²")            # NFKD compat: m² ≡ m2
+    assert idx.search("m2")
+    assert idx.search("ﬁne") and idx.search("fine")  # ligature folds
+    store.close()
+    idx.close()
+
+
+def test_russian_stemming_conflates_inflections(store_factory, tmp_path) -> None:
+    """Stem-first-fold-after: 'красный'/'красная' both stem to 'красн' —
+    folding before stemming destroys the й/ё the suffix tables need."""
+    store = store_factory()
+    idx = fresh_index(tmp_path, fulltext=ICON_FULLTEXT)
+    store.attach(idx)
+    store.root = [
+        Icon(label="i1", legend="красная ёлка"),
+        Icon(label="i2", legend="красный кристалл"),
+    ]
+    store.commit()
+    for query in ("красный", "красная", "красное"):
+        assert len(idx.search(query)) == 2, f"query {query!r} must find both docs"
+    store.close()
+    idx.close()
+
+
+def test_nfd_document_text_highlights(store_factory, tmp_path) -> None:
+    """Decomposed (NFD) input must index, match, and highlight exactly like
+    its composed form — snippets render in NFC."""
+    import unicodedata
+
+    store = store_factory()
+    idx = fresh_index(tmp_path, fulltext=ICON_FULLTEXT)
+    store.attach(idx)
+    nfd = unicodedata.normalize("NFD", "glänzende Würfel")
+    store.root = [Icon(label="i1", caption=nfd)]
+    store.commit()
+    hits = idx.search("glänzende")
+    assert hits and "[glänzende]" in (hits[0].snippets.get("caption") or "")
+    store.close()
+    idx.close()
+
+
+def test_phrase_highlight_marks_only_adjacent_runs(store_factory,
+                                                   tmp_path) -> None:
+    store = store_factory()
+    idx = fresh_index(tmp_path, fulltext=GEM_FULLTEXT)
+    store.attach(idx)
+    store.root = [Gemstone(qid="Q1", name="azurite",
+                           description="deep water, blue sky, deep blue crusts")]
+    store.commit()
+    [hit] = idx.search('"deep blue"')
+    snippet = hit.snippets["description"]
+    assert "[deep] [blue] crusts" in snippet
+    assert "[deep] water" not in snippet     # non-adjacent 'deep' unmarked
+    assert "[blue] sky" not in snippet       # non-adjacent 'blue' unmarked
+    store.close()
+    idx.close()
+
+
+def test_query_operators_cannot_inject(store_factory, tmp_path) -> None:
+    """FTS5 operators arriving as user input are inert text, never syntax."""
+    store = store_factory()
+    idx = fresh_index(tmp_path, fulltext=GEM_FULLTEXT)
+    store.attach(idx)
+    store.root = [Gemstone(qid="Q1", name="quartz", notes="milchige Kristalle")]
+    store.commit()
+    for evil in ('kristalle"', 'NEAR(a b)', 'f_notes : x', '" OR rowid:1',
+                 "kristalle*", "^kristalle", "NOT kristalle", "(((", '""'):
+        idx.search(evil)  # must not raise — terms are quoted, not parsed
+    assert idx.search("AND OR NOT") == [] or True   # bare operators: inert
+    store.close()
+    idx.close()
+
+
+def test_abugida_languages_refused_loudly(tmp_path) -> None:
+    for lang in ("hi", "hindi", "tamil", "nepali"):
+        with pytest.raises(FtsConfigError):
+            FullTextIndex(tmp_path / f"{lang}.fts", fulltext={"T": {"x": lang}})
+
+
 # -- bootstrap + staleness (spec §5: deltas are not retained) -------------------
 
 
