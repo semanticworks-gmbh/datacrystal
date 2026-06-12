@@ -2,17 +2,20 @@
 
 datacrystal: an embedded object-graph database for Python (EclipseStore-inspired) — typed live
 objects ARE the database; pickle-free msgpack records, roaring-bitmap queries, SQLite-blob
-durability. Solo maintainer: Sven Hodapp. Pre-release (`0.1.0.dev0`); current milestone: M4
-(M3 — watermark pipeline, snapshots, conformance kit, FTS5 spike — landed 2026-06-12).
+durability, and two released-shape extras: `datacrystal[fts]` (FTS5 + Snowball) and
+`datacrystal[arrow]` (persistent parquet mirrors). Solo maintainer: Sven Hodapp. Pre-release
+(`0.1.0.dev0`); current milestone: M4 endgame — extras landed pre-tag as contract validators
+(2026-06-12), COMMIT-DELTA-v1 LOCKED, v0.1.0 tag pending the pyright-strict pass.
 
 ## Commands
 
 ```
-uv sync                              # env (Python 3.14 via .python-version)
+uv sync --all-extras                 # env (Python 3.14 via .python-version; extras for their tests)
 uv run pytest -q                     # full suite incl. fitness gates + SIGKILL crash test
 uv run ruff check .                  # lint (line length 100)
-uvx pyright src tests examples       # 0 errors required (standard mode; strict at the v0.1.0 tag)
+uvx pyright src tests examples benchmarks  # 0 errors required (standard mode; strict at the v0.1.0 tag)
 uv run python examples/minerals/demo.py   # run TWICE — second run must find the first run's data
+uv run pytest benchmarks -q -s       # KICKOFF §6 PR perf gates (warn-stage; DC_BENCH_STRICT=1 hardens)
 ```
 
 If `uv run pytest` fails with "No module named datacrystal" after the repo moved/renamed:
@@ -31,8 +34,9 @@ stale venv shebangs — `rm -rf .venv && uv sync`.
 - `docs/design/ADR-003-delete-semantics.md` — accepted unchecked-delete contract
   (`store.delete()`, tombstone deltas, `CommitBatch.deletes`, `DanglingRefError`);
   checked delete waits for the v1 reverse-reference index.
-- `docs/design/COMMIT-DELTA-v1.md` — the delta/watermark contract (DRAFT; locks at the tag).
-  The applier + replay vectors are normative and byte-pinned; revisions need a draft-rev bump.
+- `docs/design/COMMIT-DELTA-v1.md` — the delta/watermark contract (**LOCKED v1**, 2026-06-12).
+  The applier + replay vectors are normative and byte-pinned; changes now mean a NEW contract
+  version, never an edit.
 - `docs/GUIDE.md` — user-facing semantics. Documentation honesty rule: features that do not
   exist are marked `[planned — milestone]`, never described as if real.
 - The API freezes at the v0.1.0 tag; PyPI publication follows it (names reserved earlier).
@@ -55,6 +59,9 @@ stale venv shebangs — `rm -rf .venv && uv sync`.
 | `_lazy.py` | explicit `Lazy[T]` handles — the only deferred-loading mechanism in v0.x |
 | `_ids.py` | partitioned 64-bit OID/CID/TID space; `FORMAT_VERSION` |
 | `_storage/` | storage protocol (`boot/load_many/scan_type/apply/read_view` — growth needs an ADR, see ADR-002) + SQLite-blob backend + memory fake + lease lock |
+| `fts.py` | `datacrystal[fts]` extra (imports snowballstemmer — never from core): FTS5 sidecar consumer; fold/stem symmetry is BY CONSTRUCTION (same Python normalize-stem-fold on column content and query — never index raw text in a searchable column); stem-first-fold-after (Russian й/ё); raw text lives in UNINDEXED r_ columns for Python-side highlighting |
+| `arrow.py` | `datacrystal[arrow]` extra (imports pyarrow — never from core): persistent parquet mirrors; LSM segments + atomic fsync-ordered manifest.json; total type-promotion lattice with msgpack-binary fallback (schema evolution can never wedge it); newest-wins fold per OID; compact() ⇒ plain-parquet datalake dir; one owner process per mirror dir |
+| `benchmarks/` (repo root) | KICKOFF §6 PR perf gates: same-run ratios only, warn until hardened (`DC_BENCH_STRICT=1`); `_gen.py` is the canonical scaled mineral-cabinet generator (Zipf hubs, provenance cycles, frozen events) |
 
 ## Load-bearing invariants (violating one = architectural regression, not a style issue)
 

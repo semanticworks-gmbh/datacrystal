@@ -1,6 +1,6 @@
 # PR gate (KICKOFF §7 "Runs"): lint → types → tests (incl. fitness gates +
-# SIGKILL crash test) → demo-run-twice → wheel purity. Perf trends and the
-# deep nightly torture suite land with the benchmark milestone (nightly.yml).
+# SIGKILL crash test) → perf-gate warnings (KICKOFF §6 PR subset) →
+# demo-run-twice → wheel purity. Nightly trends + deep torture: nightly.yml (later).
 name: ci
 
 on:
@@ -22,17 +22,21 @@ jobs:
         with:
           enable-cache: true
 
-      - name: Sync environment (Python pinned via .python-version)
-        run: uv sync
+      - name: Sync environment (Python pinned via .python-version; extras for their tests)
+        run: uv sync --all-extras
 
       - name: Lint (ruff)
         run: uv run ruff check .
 
       - name: Type check (pyright — standard mode; strict is the goal at the v0.1.0 tag)
-        run: uvx pyright src tests examples
+        run: uvx pyright src tests examples benchmarks
 
-      - name: Tests (unit, property, integration, fitness gates)
+      - name: Tests (unit, property, integration, extras, fitness gates)
         run: uv run pytest -q
+
+      - name: Perf gates (KICKOFF §6 PR subset — same-run ratios, warn-stage)
+        if: matrix.os == 'ubuntu-latest'
+        run: DC_BENCH_SPECIMENS=30000 uv run pytest benchmarks -q -s
 
       - name: Demo survives a rerun (persistence smoke)
         run: |

@@ -48,19 +48,23 @@ records (decoding is structurally incapable of executing code),
 [pyroaring](https://github.com/Ezibenroc/PyRoaringBitMap) bitmap indexes for queries, SQLite's
 journal for crash safety, and one live instance per object — `a.friend is b` survives a restart.
 
-**Works today** (163 tests, Python 3.14): entities, commit/reopen with identity, transparent
+**Works today** (500+ tests, Python 3.14): entities, commit/reopen with identity, transparent
 dirty tracking incl. in-place list/dict mutation, lazy references, bitmap queries with a
-condition AST, unique keys, frozen (append-only) entities, additive schema evolution
-(add fields with defaults / remove fields — handled on load), single-writer lease lock,
-SIGKILL crash safety.
-**Not yet** (see the [roadmap](docs/design/ROADMAP.md)): async three-phase commit,
-`store.snapshot()` / `store.submit()` for threads, the public commit-delta contract,
-full-text & vector search, Arrow/pandas/DuckDB mirrors, GraphQL.
+condition AST (+ decode-level `count()`/`pluck()` that build no entities), unique keys +
+upsert-by-natural-key, unchecked `delete()`, frozen (append-only) entities, additive schema
+evolution, single-writer lease lock, SIGKILL crash safety, async stores (`aopen`), thread-safe
+`store.snapshot()` (bitmap queries included) / `store.submit()`, the **COMMIT-DELTA-v1**
+watermark pipeline (locked contract + public conformance kit), and two extras riding it:
+**`datacrystal[fts]`** — FTS5 full-text search with per-language Snowball stemming and BM25
+ranking over `dc.FullText` fields — and **`datacrystal[arrow]`** — persistent parquet mirrors
+handing DuckDB/polars/pandas zero-copy Arrow tables.
+**Not yet** (see the [roadmap](docs/design/ROADMAP.md)): vector search, reverse-reference
+index (`incoming()`), GraphQL, cross-mirror join recipes.
 
 ## Try it
 
 ```
-uv sync
+uv sync --all-extras
 uv run python examples/minerals/demo.py   # run it twice — the data is still there
 uv run pytest
 ```
@@ -79,6 +83,6 @@ uv run pytest
   art, CPython mechanics with benchmarks, engine surveys). Snapshots predating the 2026-06-10
   rename still say `pyrsistance`.
 
-Status: **pre-release** (`0.1.0.dev0`, M1 walking skeleton complete + M2 in progress,
-started 2026-06-11). The API freezes at the v0.1.0 tag; PyPI publication follows it.
+Status: **pre-release** (`0.1.0.dev0`, M4 endgame: milestones M0–M4 landed 2026-06-11/12,
+COMMIT-DELTA-v1 locked; v0.1.0 tag = API freeze, PyPI publication follows it).
 License: [MIT](LICENSE).

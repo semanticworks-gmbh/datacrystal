@@ -126,7 +126,8 @@ class FieldSpec:
 class TypeInfo:
     """Engine-side metadata for one entity class."""
 
-    __slots__ = ("cls", "typename", "field_names", "frozen", "_specs", "_defaults")
+    __slots__ = ("cls", "typename", "field_names", "frozen", "_specs", "_defaults",
+                 "_spec_by_name")
 
     def __init__(self, cls: type, typename: str, field_names: tuple[str, ...],
                  frozen: bool) -> None:
@@ -136,12 +137,21 @@ class TypeInfo:
         self.frozen = frozen
         self._specs: tuple[FieldSpec, ...] | None = None
         self._defaults: dict[str, Any] | None = None
+        self._spec_by_name: dict[str, FieldSpec] | None = None
 
     @property
     def specs(self) -> tuple[FieldSpec, ...]:
         if self._specs is None:
             self._specs = _resolve_specs(self.cls, self.field_names)
         return self._specs
+
+    def spec(self, name: str) -> FieldSpec | None:
+        """O(1) FieldSpec lookup — ``get()``/``get_many()`` hit this on
+        every natural-key call (perf gate ``unique_key_lookup``)."""
+        by_name = self._spec_by_name
+        if by_name is None:
+            by_name = self._spec_by_name = {s.name: s for s in self.specs}
+        return by_name.get(name)
 
     @property
     def defaults(self) -> dict[str, Any]:

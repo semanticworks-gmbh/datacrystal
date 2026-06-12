@@ -14,6 +14,16 @@ item 20; the object-store/datalake positioning clarified under item 16.
 Amended 2026-06-11, second (owner request): networked replication recorded as punted item 21
 (transport-agnostic, rides item 3's contract); Zyre/pyre evaluated and declined inside it.
 
+Amended 2026-06-12, second (owner decision, M4): **items 7 and 10 land pre-tag.** The
+`datacrystal[fts]` and `datacrystal[arrow]` extras were built in-tree *before* the
+COMMIT-DELTA-v1 lock as its first two real-consumer validators — the strengthened reading of
+item 3's lock condition ("after both in-tree consumers" became "after both in-tree consumers
+and both real extras"; nothing is *released* before the lock since PyPI publication follows the
+tag). Their APIs freeze at the tag with the rest. FTS shipped full (Snowball stemming per
+`dc.FullText(language=...)`, BM25, fold/stem-symmetric highlighting); Arrow shipped as
+persistent parquet mirrors (LSM segments + atomic manifest; the item 16(b) datalake positioning
+is real after `compact()`). The v1 line keeps DuckDB/polars recipe polish (item 7 note stands).
+
 Amended 2026-06-12 (owner decision, after the MaStR big-dataset import feedback): **unchecked
 delete promoted into core v0.x** ([ADR-003](ADR-003-delete-semantics.md)) — must land before the
 tag so the delta op vocabulary locks exercised, not reserved (noted under items 1 and 3).
