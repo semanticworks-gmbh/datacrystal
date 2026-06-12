@@ -19,6 +19,8 @@ freezes at the v0.1.0 tag.
 - [Frozen entities](#frozen-entities)
 - [Concurrency and deployment](#concurrency-and-deployment)
 - [Snapshots and the commit-delta pipeline](#snapshots-and-the-commit-delta-pipeline)
+- [Full-text search: datacrystal[fts]](#full-text-search-datacrystalfts)
+- [Arrow mirrors: datacrystal[arrow]](#arrow-mirrors-datacrystalarrow)
 - [Durability and crash safety](#durability-and-crash-safety)
 - [Errors](#errors)
 - [Planned features and when they land](#planned-features-and-when-they-land)
@@ -86,11 +88,9 @@ class Mineral:
     rejected at commit (`UniqueViolationError`); `None` never collides (SQL-NULL-style).
   - `dc.FullText` — declares a prose field for full-text search, optionally with its
     language: `Annotated[str, dc.FullText(language="de")]` (lowercase short codes; bare
-    `dc.FullText` = language unspecified). **Inert in the core engine** — indexing,
-    stemming and `store.search()` are `datacrystal[fts]`'s job `[planned — after M4, see
-    below]`. The declaration is recorded and readable today (the M3 FTS5 contract spike
-    derives its indexing config from these markers); which language codes are supported,
-    and the default when unspecified, is the extra's contract.
+    `dc.FullText` = fold-only exact matching, no stemming). **Inert in the core engine** —
+    indexing, stemming and ranked search are `datacrystal[fts]`'s job; see
+    [Full-text search](#full-text-search-datacrystalfts).
 - `@dc.entity(frozen=True)` declares an append-only record — see [Frozen entities](#frozen-entities).
 - Entity classes are identified by `module:qualname` in the store. Keep an entity class
   importable under the same module path, or opening old data raises `UnregisteredTypeError`.
@@ -281,7 +281,8 @@ Query semantics:
 - `==` and `.in_()` on `dc.Index` fields answer from roaring bitmaps. `.contains()` /
   `.startswith()` on an indexed field iterate the index's **distinct values** and OR the
   matching bitmaps — O(distinct values), never a record read; they are exact and
-  case-sensitive (linguistic matching is `datacrystal[fts]`'s job). All other predicates run
+  case-sensitive (linguistic matching is `datacrystal[fts]`'s job — see
+  [Full-text search](#full-text-search-datacrystalfts)). All other predicates run
   as a Python residual over the bitmap candidates. Ordering comparisons never match `None`,
   and string matching never matches a non-string value.
 - A condition uses fields of **one entity class** — cross-entity joins are
@@ -343,7 +344,8 @@ in order of leverage:
    spike. The expensive shape that remains is a residual predicate in `query()`
    (`>=`, `!=`, …): that **hydrates the whole extent** — on a million-object class a full
    table scan with a matching RAM peak. Design hot filters as `dc.Index` equality facets;
-   real columnar speed is the `datacrystal[arrow]` mirror's job `[planned — late v0.x]`.
+   real columnar speed is the `datacrystal[arrow]` mirror's job — see
+   [Arrow mirrors](#arrow-mirrors-datacrystalarrow).
 
 Measured (M2 dev machine, SQLite backend, 300k objects ≈ 29 MB on disk): streaming ingest
 3.4 s peaking at ~750 B/object RSS with **zero** entities left live; warm bitmap query
@@ -357,8 +359,8 @@ timeout back to unloaded, releasing the subgraph behind the cut point (the next 
 transparently reloads, identity preserved). Demotion only ever runs on the owner — as a
 piggyback on your own store calls (sync), or as an owner-loop task (`aopen`). Timeout-only in
 v0.1; an RSS-quota variant is deferred (psutil stays out of core), and a hard per-store memory
-cap does not exist. For analytics-style scans, the honest answer is the Arrow/DuckDB tier
-`[planned — v1]`, not the object graph.
+cap does not exist. For analytics-style scans, the honest answer is the
+[Arrow mirror tier](#arrow-mirrors-datacrystalarrow), not the object graph.
 
 ## Schema evolution
 
@@ -508,6 +510,83 @@ store.attach(consumer)                          # 2. ride the stream from there
   refusal, prior-based un-indexing); `datacrystal.testing.CountingConsumer` is the
   minimal reference implementation, `datacrystal/contract/applier.py` the normative one.
 
+## Full-text search: datacrystal[fts]
+
+`pip install 'datacrystal[fts]'` (adds `snowballstemmer`). The extra is a commit-delta
+consumer: an SQLite FTS5 index in its own sidecar file, kept current by the pipeline,
+rebuildable from a snapshot at any time.
+
+```python
+from datacrystal.fts import FullTextIndex
+
+@dc.entity
+class Mineral:
+    qid: Annotated[str, dc.Unique]
+    name: str
+    notes: Annotated[str | None, dc.FullText(language="de")] = None
+
+idx = FullTextIndex("cabinet.fts")     # config read from the dc.FullText markers
+store.attach(idx)
+... store.commit() ...
+
+for hit in idx.search("Kristall"):     # stemming: finds "Kristalle", ranked by BM25
+    print(hit.score, hit.typename, hit.snippet)   # snippet marks matches [like] this
+minerals = store.get_many([hit.oid for hit in idx.search("Tsumeb", cls=Mineral)])
+```
+
+- **Stemming is per-field**: `dc.FullText(language="de")` gets index-time Snowball
+  stemming (27 languages by ISO code or Snowball name); bare `dc.FullText` is fold-only
+  exact matching (case + diacritics + Unicode-compat forms fold: `m²` matches `m2`,
+  `Glänzend` matches `glanzend`). Exact matches outrank stem-only matches.
+- Quoted phrases stay phrases; everything else is AND-of-terms. User input is quoted
+  into the FTS5 expression — it can never inject MATCH operators. `cls=` narrows to one
+  entity type.
+- Attaching to a lived-in store: `FullTextIndex.bootstrap(path, snapshot)` (deltas are
+  not retained — the snapshot recipe above). Reopening with a different field/language
+  configuration raises `FtsConfigError`: rebuild, a half-matching index is stale.
+- Honest limits: unsegmented CJK runs are single tokens under unicode61 (`水晶です` is
+  findable only as that whole run) `[planned — segmenting tokenizer, demand-driven]`;
+  abugida-script languages (hi/ne/ta) are refused loudly rather than silently broken.
+  Like the store, an index is used from the thread that opened it.
+
+## Arrow mirrors: datacrystal[arrow]
+
+`pip install 'datacrystal[arrow]'` (adds `pyarrow`). The mirror is the pipeline's second
+consumer and the columnar answer to projection/range analytics (a one-column read over
+millions of records stops costing minutes): per-type Arrow tables, persisted as parquet
+in a mirror directory, kept current from commit deltas.
+
+```python
+from datacrystal.arrow import ArrowMirror
+
+mirror = ArrowMirror("cabinet.mirror")
+store.attach(mirror)
+... store.commit() ...
+
+table = mirror.table(Specimen)          # pyarrow.Table at the mirror's watermark
+import duckdb, polars as pl
+duckdb.from_arrow(table)                # zero-copy
+pl.from_arrow(table)                    # zero-copy
+table.to_pandas()
+```
+
+- Rows carry `__oid__` (int64) plus every persisted field, types inferred and promoted
+  through a total lattice (`bool < int < float`; lists element-wise; anything mixed
+  becomes msgpack-binary — `datacrystal.arrow.decode_fallback()` restores the value), so
+  additive schema evolution can never wedge the mirror. Entity references are int64 OID
+  columns — join them, or feed them to `store.get_many()`.
+- Persistence is an LSM of parquet segments with `manifest.json` as the atomic,
+  fsync-ordered commit point: reopening resumes at the durable watermark, a crash
+  mid-flush is swept on open. `mirror.compact()` collapses each type to one plain
+  parquet file — after it, the `data/` directory is directly readable by DuckDB/Spark
+  (the parquet-datalake story).
+- `only=[Specimen, ...]` mirrors a subset; `flush_every=N` batches flushes (durable
+  watermark trails by up to N−1 commits; a crash in that window costs a rebuild).
+  Mid-life attach: `ArrowMirror.bootstrap(path, snapshot)`. A mirror directory has one
+  owner process, like the store file.
+- DuckDB/polars recipe polish (joins across mirrors, parquet-on-S3) stays on the
+  roadmap `[planned — v1, items 7/16]`.
+
 ## Durability and crash safety
 
 - A commit is one SQLite transaction; `durability="commit"` makes it fsync-durable per commit,
@@ -546,7 +625,10 @@ Everything derives from `dc.DataCrystalError`:
 
 Pipeline consumers can additionally raise the contract errors (`datacrystal.contract`):
 `DeltaGapError` (history missing — resync/rebuild; also raised by `attach()` on a
-watermark mismatch) and `DeltaFormatError` (malformed/newer-versioned delta).
+watermark mismatch) and `DeltaFormatError` (malformed/newer-versioned delta). The extras
+add `datacrystal.fts.FtsConfigError` and `datacrystal.arrow.MirrorConfigError` (both
+`DataCrystalError`s): the sidecar file/directory contradicts the requested configuration
+or is newer than the installed extra — rebuild rather than guess.
 
 Three warnings live outside the exception family (all `UserWarning`s):
 `UntrackedMutationWarning`, emitted by the `debug=True` safety net when a mutation slipped
@@ -565,16 +647,14 @@ Sequencing follows the ratified [roadmap](design/ROADMAP.md) and the
 
 | Feature | Where it lands |
 |---|---|
-| v0.1.0 tag: API freeze (incl. the COMMIT-DELTA-v1 lock), PyPI publication | M4 — current milestone |
-| **full-text search** — `datacrystal[fts]`, SQLite FTS5 over `dc.FullText` fields, BM25 ranking via `store.search()`, per-field language stemming (Snowball; German + English first-class) | next after M4: the M3 contract spike was already FTS5-shaped (`tests/contract/fts_consumer.py` is the extra's embryo), the pipeline it rides is real |
-| **pandas / polars / DuckDB** — zero-copy via Arrow columnar mirrors (`datacrystal[arrow]`) | **late v0.x** (resequenced 2026-06-12: the pipeline's second consumer, and the real answer to projection/range analytics at millions of rows) |
+| v0.1.0 tag: API freeze (incl. the COMMIT-DELTA-v1 lock); PyPI publication follows | M4 — current milestone (the `[fts]`/`[arrow]` extras landed pre-tag, 2026-06-12, as the contract's real-consumer validators) |
 | **GraphQL / FastAPI** — `datacrystal[web]` with strawberry integration | extension package, after the v1 core freeze |
 | vector search — `datacrystal[vector]`, usearch, ≥2 vector fields per entity | extension package, after v1 |
-| reverse-reference index (`incoming()`), property-graph recipes | v1 |
-| sets, guided migrations, custom scalar types | demand-driven |
+| reverse-reference index (`incoming()`), property-graph recipes, cross-mirror DuckDB recipes | v1 |
+| sets, guided migrations, custom scalar types, CJK-segmenting FTS tokenizer | demand-driven |
 
-Until the Arrow mirrors exist, getting data into pandas is a two-liner via the
-decode-level projection (copies, not zero-copy — but no entities are built either):
+Without the `[arrow]` extra installed, getting data into pandas is still a two-liner via
+the decode-level projection (copies, not zero-copy — but no entities are built either):
 
 ```python
 import pandas as pd

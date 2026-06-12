@@ -1,11 +1,22 @@
 # COMMIT-DELTA-v1 — the commit-delta / watermark contract
 
-Status: **DRAFT rev 1** (M2 deliverable per [KICKOFF.md](KICKOFF.md)).
+Status: **v1 — LOCKED** (2026-06-12, binding at the v0.1.0 tag). Revisions
+from here are a new contract version, never an edit.
 Ratified scope: [ROADMAP.md](ROADMAP.md) item 3 — "the single most load-bearing
-undelivered component". The draft may change with explicit draft-rev bumps
-until it is **locked at the v0.1.0 tag**, after both in-tree consumers
-(snapshot views, bitmap indexes) have run against it and strictly before any
+undelivered component". The draft could change with explicit draft-rev bumps
+until the lock; it was locked after both in-tree consumers (snapshot views,
+bitmap indexes) AND both real extras ran against it, strictly before any
 released consumer.
+
+Lock status (2026-06-12): the KICKOFF condition — "locked at the tag, after
+the in-tree consumers, before any released consumer" — was strengthened by
+an owner decision (2026-06-12): `datacrystal[fts]` (FTS5 sidecar, Snowball
+stemming) and `datacrystal[arrow]` (persistent parquet mirrors) were built
+in-tree *before* the lock as the contract's first two real-consumer
+validators. Both are certified by `datacrystal.testing.check_delta_consumer`
+and exercise every obligation incl. delete tombstones and prior payloads;
+no shape change was needed — rev 1 locks exactly as drafted at M2 and
+activated at M4.
 
 M3 status (2026-06-12): the engine **emits** this stream (`store.attach()`),
 the conformance kit (`datacrystal.testing`) and the golden engine-output
