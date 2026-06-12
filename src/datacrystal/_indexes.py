@@ -24,6 +24,7 @@ OIDs live above 2**32, hence ``BitMap64``.
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Any, Callable, Iterable, Iterator
 
 from pyroaring import BitMap64
@@ -33,6 +34,57 @@ from datacrystal._entity import TypeInfo
 from datacrystal._errors import SchemaMismatchError, UniqueViolationError
 from datacrystal._records import decode_payload
 from datacrystal._storage.protocol import StorageBackend, StoredRecord
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class QueryPlan:
+    """The deterministic execution plan ``store.explain()`` reports.
+
+    There is no optimizer behind this — exactly two rules, always
+    (``==``/``.in_()`` on Index/Unique fields answer from bitmaps,
+    everything else evaluates as a Python residual; the analytics-tier
+    planner is DuckDB over the ``[arrow]`` mirror, never core). ``explain``
+    exists so the cost of a condition is inspectable, not guessed
+    (decided 2026-06-12 with query()'s class-form symmetry).
+    """
+
+    typename: str
+    condition: str | None   # the queried condition; None = bare class (full extent)
+    indexed: bool           # True if any predicate answers from bitmaps
+    residual: str | None    # the part evaluated in Python; None = fully indexed
+    candidates: int         # rows considered: query() hydrates at most this many
+    extent: int             # committed extent of the class
+
+    def __str__(self) -> str:
+        if self.condition is None:
+            return (
+                f"{self.typename}: full extent — query() hydrates all "
+                f"{self.extent} entities (count()/pluck() decode instead)"
+            )
+        via = "bitmaps" if self.indexed else "NO index — full extent"
+        out = (
+            f"{self.typename}: {self.condition}\n"
+            f"  candidates via {via}: {self.candidates} of {self.extent}"
+        )
+        if self.residual is not None:
+            out += f"\n  Python residual over candidates: {self.residual}"
+        return out
+
+
+def explain_plan(typename: str, ci: "ClassIndexes",
+                 cond: Condition | None) -> QueryPlan:
+    """Build the :class:`QueryPlan` for one (class extent, condition) pair —
+    shared by the live store and snapshots (same two rules on both)."""
+    extent = len(ci.extent)
+    if cond is None:
+        return QueryPlan(typename, None, False, None, extent, extent)
+    bitmap, residual = plan(cond, ci)
+    candidates = len(bitmap) if bitmap is not None else extent
+    return QueryPlan(
+        typename, repr(cond), bitmap is not None,
+        repr(residual) if residual is not None else None,
+        candidates, extent,
+    )
 
 
 class ClassIndexes:

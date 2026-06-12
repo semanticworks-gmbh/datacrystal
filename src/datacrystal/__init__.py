@@ -51,6 +51,7 @@ from datacrystal._errors import (
     UntrackedMutationWarning,
     WrongThreadError,
 )
+from datacrystal._indexes import QueryPlan
 from datacrystal._lazy import Lazy
 from datacrystal._pipeline import DeltaConsumer
 from datacrystal._snapshot import EntityView, Ref, Snapshot, SnapshotIndexes
@@ -87,6 +88,7 @@ __all__ = [
     "SnapshotIndexes",
     "EntityView",
     "Ref",
+    "QueryPlan",
     "DeltaConsumer",
     "ConsumerDetachedWarning",
     "DataCrystalError",

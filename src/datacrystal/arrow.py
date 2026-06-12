@@ -312,6 +312,10 @@ class ArrowMirror:
     re-attach; bootstrap again). The default of 1 keeps the mirror exactly
     as durable as the store. All settings are persisted; reopening with
     different ones raises :class:`MirrorConfigError`.
+
+    ``rows_flushed`` is a public diagnostic counter: rows written by the
+    most recent flush — pin your own O(delta) gates on it (fitness #9
+    shape), exactly like this package's tests do.
     """
 
     def __init__(self, path: str | Path, *,

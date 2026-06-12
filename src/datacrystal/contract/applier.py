@@ -25,6 +25,16 @@ else:
     except ImportError:  # pragma: no cover — only when this file is copied out
         _Base = Exception
 
+__all__ = [
+    "FORMAT_MARKER",
+    "CONTRACT_VERSION",
+    "DeltaFormatError",
+    "DeltaGapError",
+    "encode_delta",
+    "decode_delta",
+    "ReferenceApplier",
+]
+
 FORMAT_MARKER = "datacrystal-delta"
 CONTRACT_VERSION = 1
 
