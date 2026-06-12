@@ -33,7 +33,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from datacrystal._conditions import And, Condition, Not, Or, Pred
+from datacrystal._conditions import And, Condition, Not, Or, Pred, query_target
 from datacrystal._containers import PersistentDict, PersistentList, wrap_value
 from datacrystal._entity import (
     TYPES_BY_NAME,
@@ -952,7 +952,7 @@ class Store:
         Reads committed state (like :meth:`snapshot`, unlike :meth:`query`,
         whose hydrated results show uncommitted in-memory changes)."""
         self._enter()
-        cls, cond = _query_target(target, "count")
+        cls, cond = query_target(target, "count")
         ti = type_info(cls)
         if self._cid_by_typename.get(ti.typename) is None:
             self._warn_unseen(ti)
@@ -984,7 +984,7 @@ class Store:
         self._enter()
         if not fields:
             raise TypeError("pluck() takes at least one field name")
-        cls, cond = _query_target(target, "pluck")
+        cls, cond = query_target(target, "pluck")
         ti = type_info(cls)
         known = set(ti.field_names)
         for name in fields:
@@ -1293,19 +1293,6 @@ class _RawView:
             return self._row[name]
         except KeyError:
             raise AttributeError(name) from None
-
-
-def _query_target(target: Any, method: str) -> tuple[type, Condition | None]:
-    """count()/pluck() accept an @entity class (whole extent) or a Condition."""
-    if isinstance(target, Condition):
-        return target.entity_class(), target
-    if isinstance(target, type):
-        type_info(target)  # loud for non-entity classes
-        return target, None
-    raise TypeError(
-        f"{method}() takes an @entity class or a Condition, "
-        f"got {type(target).__name__}"
-    )
 
 
 def _raw_value(value: Any) -> Any:

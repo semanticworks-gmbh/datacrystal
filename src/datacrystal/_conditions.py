@@ -189,6 +189,22 @@ class Not(Condition):
         return f"~{self.part!r}"
 
 
+def query_target(target: Any, method: str) -> tuple[type, Condition | None]:
+    """``count()``/``pluck()``/snapshot reads accept an @entity class (the
+    whole extent) or a Condition — shared validation for both surfaces."""
+    if isinstance(target, Condition):
+        return target.entity_class(), target
+    if isinstance(target, type):
+        from datacrystal._entity import type_info  # lazy: _entity imports us
+
+        type_info(target)  # loud for non-entity classes
+        return target, None
+    raise TypeError(
+        f"{method}() takes an @entity class or a Condition, "
+        f"got {type(target).__name__}"
+    )
+
+
 class FieldProxy:
     """Typed query-field access for one entity class (see :func:`fields`)."""
 

@@ -7,26 +7,39 @@ exactly one durable commit boundary — and exposes records as immutable
 :class:`EntityView` DTOs: plain decoded data, never live entities, so
 nothing here can violate owner confinement or dirty tracking by design.
 
-Scope honesty (KICKOFF M3): views are *DTO reads* — ``get``/``all``/``root``
-at one watermark. The frozen index-bitmap views slot is reserved
-(:meth:`Snapshot.index_bitmaps`) and lands with the bitmap indexes at M4.
+Since M4 a snapshot also answers **bitmap queries**: :meth:`Snapshot.query`
+and :meth:`Snapshot.count` plan over snapshot-local indexes (rebuilt from
+this read view — invariant 11, rebuildable derived data — never shared with
+the owner's live indexes), and :meth:`Snapshot.index_bitmaps` exposes them
+as frozen views, completing the slot reserved at M3 (ADR-001 bound
+decision 4).
 """
 
 from __future__ import annotations
 
 import threading
+import warnings
 from types import MappingProxyType
 from typing import Any, Mapping
 
-from datacrystal._entity import TYPES_BY_NAME, type_info
+from pyroaring import FrozenBitMap64
+
+from datacrystal._conditions import And, Condition, Not, Or, Pred, query_target
+from datacrystal._entity import TYPES_BY_NAME, is_entity, oid_of, type_info
 from datacrystal._errors import (
     DanglingRefError,
     DataCrystalError,
+    QueryError,
     SchemaMismatchError,
     StoreClosedError,
+    UnseenTypeWarning,
 )
+from datacrystal._indexes import ClassIndexes, build_class_indexes, plan
+from datacrystal._lazy import Lazy
 from datacrystal._records import RefToken, decode_payload
 from datacrystal._storage.protocol import StorageReadView
+
+_VIEW_CHUNK = 8192  # records per load_many in snapshot scans (peak-RAM bound)
 
 
 class Ref:
@@ -119,6 +132,83 @@ def _freeze(value: Any) -> Any:
     return value
 
 
+def _view_value(value: Any) -> Any:
+    """Map a predicate value onto the snapshot representation: entities and
+    Lazy handles become :class:`Ref` tokens, lists the tuples ``_freeze``
+    makes of them — so conditions written against live objects evaluate
+    against frozen views (the snapshot twin of the store's raw-read
+    transform)."""
+    if is_entity(value):
+        oid = oid_of(value)
+        if oid is None:
+            raise QueryError(
+                "cannot match an entity that was never stored — it has no OID"
+            )
+        return Ref(oid)
+    if isinstance(value, Lazy):
+        target = value.peek()  # mirror swizzle(): a loaded handle knows best
+        if target is not None:
+            return _view_value(target)
+        if value.oid is None:
+            raise QueryError("cannot match an unloaded Lazy without an OID")
+        return Ref(value.oid)
+    if isinstance(value, list):
+        return tuple(_view_value(item) for item in value)
+    if isinstance(value, dict):
+        return {k: _view_value(v) for k, v in value.items()}
+    return value
+
+
+def _view_condition(cond: Condition) -> Condition:
+    if isinstance(cond, Pred):
+        if cond.op == "in":
+            return Pred(cond.cls, cond.field, "in",
+                        tuple(_view_value(v) for v in cond.value))
+        return Pred(cond.cls, cond.field, cond.op, _view_value(cond.value))
+    if isinstance(cond, And):
+        return And(tuple(_view_condition(p) for p in cond.parts))
+    if isinstance(cond, Or):
+        return Or(tuple(_view_condition(p) for p in cond.parts))
+    if isinstance(cond, Not):
+        return Not(_view_condition(cond.part))
+    return cond
+
+
+class SnapshotIndexes:
+    """One class's index bitmaps, frozen at a snapshot's watermark (the M4
+    completion of ADR-001 bound decision 4).
+
+    ``extent`` holds every committed OID of the class across its full type
+    lineage; ``eq[field][value]`` the OIDs whose indexed ``field`` equals
+    ``value``; ``unique[field][value]`` the single OID owning a unique key.
+    Everything is immutable (``FrozenBitMap64`` / read-only mappings) and
+    snapshot-local — derived data rebuilt from the pinned read view, never
+    shared with the owner's live indexes — so any thread may keep using it
+    while the owner commits.
+    """
+
+    __slots__ = ("extent", "eq", "unique")
+
+    def __init__(self, ci: ClassIndexes) -> None:
+        self.extent: FrozenBitMap64 = FrozenBitMap64(ci.extent)
+        self.eq: Mapping[str, Mapping[Any, FrozenBitMap64]] = MappingProxyType({
+            field: MappingProxyType(
+                {value: FrozenBitMap64(bm) for value, bm in postings.items()}
+            )
+            for field, postings in ci.eq.items()
+        })
+        self.unique: Mapping[str, Mapping[Any, int]] = MappingProxyType({
+            field: MappingProxyType(dict(holders))
+            for field, holders in ci.unique.items()
+        })
+
+    def __repr__(self) -> str:
+        return (
+            f"<SnapshotIndexes extent={len(self.extent)} "
+            f"eq={sorted(self.eq)} unique={sorted(self.unique)}>"
+        )
+
+
 class Snapshot:
     """A frozen, thread-safe view of the store at one commit watermark.
 
@@ -151,6 +241,8 @@ class Snapshot:
             self._cids_by_typename.setdefault(typename, []).append(cid)
         self._lock = threading.Lock()
         self._cache: dict[int, EntityView] = {}
+        self._indexes: dict[type, ClassIndexes] = {}
+        self._frozen: dict[type, SnapshotIndexes] = {}
         self._closed = False
 
     # -- surface ---------------------------------------------------------
@@ -215,12 +307,75 @@ class Snapshot:
                     out.append(view)
         return out
 
-    def index_bitmaps(self) -> Any:
-        """Reserved API slot (KICKOFF M3): frozen index-bitmap views."""
-        raise NotImplementedError(
-            "[planned — M4] frozen index-bitmap views land together with the "
-            "pyroaring bitmap indexes (ADR-001 bound decision 4)"
-        )
+    def index_bitmaps(self, cls: type) -> SnapshotIndexes:
+        """Frozen index-bitmap views for ``cls`` at this watermark — the M4
+        delivery of the slot reserved at M3 (ADR-001 bound decision 4).
+
+        Built on first use by scanning this snapshot's read view (one-time
+        O(extent), the same documented cost as the live store's lazy index
+        build), then cached for the snapshot's lifetime. Needs the live
+        ``@entity`` class: which fields are indexed/unique is declared in
+        code (``dc.Index``/``dc.Unique``), not persisted."""
+        ti = type_info(cls)  # loud for non-entity classes
+        if ti.typename not in self._cids_by_typename:
+            self._warn_unseen(ti)
+        with self._lock:
+            self._guard()
+            frozen = self._frozen.get(cls)
+            if frozen is None:
+                frozen = SnapshotIndexes(self._class_indexes(ti))
+                self._frozen[cls] = frozen
+            return frozen
+
+    def count(self, target: type | Condition) -> int:
+        """How many entities match at this watermark — ``count`` semantics
+        of the live store, answered from the snapshot-local bitmaps (a
+        residual predicate evaluates over cached :class:`EntityView` DTOs,
+        still never live entities)."""
+        cls, cond = query_target(target, "count")
+        ti = type_info(cls)
+        if ti.typename not in self._cids_by_typename:
+            self._warn_unseen(ti)
+            return 0
+        with self._lock:
+            self._guard()
+            ci = self._class_indexes(ti)
+            if cond is None:
+                return len(ci.extent)
+            bitmap, residual = plan(cond, ci)
+            if residual is None:
+                return len(bitmap) if bitmap is not None else len(ci.extent)
+            oids = list(bitmap) if bitmap is not None else list(ci.extent)
+            view_cond = _view_condition(residual)
+            return sum(
+                1 for view in self._views_for(oids) if view_cond.evaluate(view)
+            )
+
+    def query(self, cond: Condition) -> list[EntityView]:
+        """Evaluate a Condition at this watermark; returns
+        :class:`EntityView` DTOs (never live entities — ADR-001). This is
+        the sanctioned way for ANY thread to run a bitmap query while the
+        owner keeps writing (KICKOFF M4 exit)."""
+        if not isinstance(cond, Condition):
+            raise TypeError(
+                f"query() takes a Condition (e.g. Cls.field == value), "
+                f"got {type(cond).__name__}"
+            )
+        cls = cond.entity_class()
+        ti = type_info(cls)
+        if ti.typename not in self._cids_by_typename:
+            self._warn_unseen(ti)
+            return []
+        with self._lock:
+            self._guard()
+            ci = self._class_indexes(ti)
+            bitmap, residual = plan(cond, ci)
+            oids = list(bitmap) if bitmap is not None else list(ci.extent)
+            views = self._views_for(oids)
+        if residual is None:
+            return views
+        view_cond = _view_condition(residual)
+        return [view for view in views if view_cond.evaluate(view)]
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -245,6 +400,47 @@ class Snapshot:
     def _guard(self) -> None:
         if self._closed:
             raise StoreClosedError("this snapshot has been closed")
+
+    def _class_indexes(self, ti: Any) -> ClassIndexes:
+        """The snapshot-local mutable indexes for one class (caller holds
+        the lock); the planner's working form behind the frozen views."""
+        ci = self._indexes.get(ti.cls)
+        if ci is None:
+            lineage = [
+                (cid, list(self._fields_by_cid[cid]))
+                for cid in self._cids_by_typename.get(ti.typename, [])
+            ]
+            ci = build_class_indexes(ti, lineage, self._view.scan_type)
+            ci.seal()  # frozen consumer: drop the incremental-update memory
+            self._indexes[ti.cls] = ci
+        return ci
+
+    def _views_for(self, oids: list[int]) -> list[EntityView]:
+        """Batch-materialize EntityViews (caller holds the lock), loading
+        cache misses in chunks to bound peak memory."""
+        missing = [oid for oid in oids if oid not in self._cache]
+        for start in range(0, len(missing), _VIEW_CHUNK):
+            chunk = missing[start:start + _VIEW_CHUNK]
+            records = self._view.load_many(chunk)
+            for oid in chunk:
+                rec = records.get(oid)
+                if rec is None:
+                    raise DataCrystalError(
+                        f"internal error: indexed oid {oid} has no record "
+                        f"at watermark {self._tid}"
+                    )
+                self._materialize(rec.oid, rec.cid, rec.payload)
+        return [self._cache[oid] for oid in oids]
+
+    def _warn_unseen(self, ti: Any) -> None:
+        warnings.warn(
+            UnseenTypeWarning(
+                f"this snapshot has no committed records of {ti.cls.__name__} "
+                f"at watermark {self._tid} — the result is empty (first run? "
+                "forgot to commit()? opened a different store file?)"
+            ),
+            stacklevel=3,
+        )
 
     def _materialize(self, oid: int, cid: int, payload: bytes) -> EntityView:
         """Decode one record into a cached view — by NAME through its own

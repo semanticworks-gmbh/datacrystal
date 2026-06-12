@@ -53,7 +53,7 @@ from datacrystal._errors import (
 )
 from datacrystal._lazy import Lazy
 from datacrystal._pipeline import DeltaConsumer
-from datacrystal._snapshot import EntityView, Ref, Snapshot
+from datacrystal._snapshot import EntityView, Ref, Snapshot, SnapshotIndexes
 from datacrystal._store import Store
 
 if TYPE_CHECKING:  # the real import stays lazy — see __getattr__ below
@@ -84,6 +84,7 @@ __all__ = [
     "PersistentList",
     "PersistentDict",
     "Snapshot",
+    "SnapshotIndexes",
     "EntityView",
     "Ref",
     "DeltaConsumer",
