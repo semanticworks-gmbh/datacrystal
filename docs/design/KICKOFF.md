@@ -1,6 +1,11 @@
 # datacrystal v0.1 kickoff plan
 
-Date: 2026-06-10. Status: **ACTIVE — go given 2026-06-11, implementation started the same day.**
+Date: 2026-06-10. Status: **M0–M4 COMPLETE (2026-06-11/12); v0.1.0 tag pending the
+pyright-strict pass.** COMMIT-DELTA-v1 locked; the `[fts]`/`[arrow]` extras landed pre-tag as
+contract validators (ROADMAP 2026-06-12 amendments — beyond this plan's scope, owner-ratified);
+the §6 perf-gate PR subset is live in CI (warning-stage), the nightly lane is still future work.
+Post-tag sequencing per ROADMAP third amendment: item 23 (retained delta log) → item 8
+(reverse-reference index).
 Scope authority remains [ROADMAP.md](ROADMAP.md); this document sequences its v0.x items into an
 execution plan. Provenance: 3-angle plan panel + dataset/perf/fitness designers, judged and
 adversarially critiqued — all ten reports in

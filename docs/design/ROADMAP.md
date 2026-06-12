@@ -14,6 +14,15 @@ item 20; the object-store/datalake positioning clarified under item 16.
 Amended 2026-06-11, second (owner request): networked replication recorded as punted item 21
 (transport-agnostic, rides item 3's contract); Zyre/pyre evaluated and declined inside it.
 
+Amended 2026-06-12, third (owner ratification — personas): co-primary personas recorded
+alongside local-first ([DESIGN.md](DESIGN.md) update note): FastAPI data services/small UIs,
+metadata management / **systems of record**, enterprise search, organisational digital twins;
+scale target multi-GB→TB via the tier split (SCALING.md). Consequences: new **item 23
+(retained delta log)** = first post-tag PR; **item 8 (reverse-reference index) promoted** into
+early post-tag v0.x. Discussed and deliberately NOT promoted: field-rename/migration tooling
+(stays the DESIGN amendment-7 v0.2 sketch) and a persistent-index sidecar for >10⁸-object live
+stores (stays demand-driven, unlisted — the mirror tier is the TB answer today).
+
 Amended 2026-06-12, second (owner decision, M4): **items 7 and 10 land pre-tag.** The
 `datacrystal[fts]` and `datacrystal[arrow]` extras were built in-tree *before* the
 COMMIT-DELTA-v1 lock as its first two real-consumer validators — the strengthened reading of
@@ -81,7 +90,9 @@ Composite/multi-field unique keys recorded as punted item 22. Scale-shape fitnes
    enters core deps (invariant 2). The v1 line keeps the DuckDB/polars recipe polish.
 8. **Reverse-reference index** as rebuildable Arrow sidecar on the watermark pipeline + minimal
    traversal API (`incoming()` first). Buys backlinks, orphan detection, cascade checks, impact
-   analysis (~+5–15% on the 600 B/object envelope).
+   analysis (~+5–15% on the 600 B/object envelope). **Promoted into early post-tag v0.x**
+   (2026-06-12 third amendment): digital-twin/metadata-SOR workloads live on backlinks —
+   sequenced right after item 23.
 9. **DuckPGQ property-graph recipe** over the Arrow mirrors (docs-only, days).
 
 ## Extension packages (separate extras, after v1 core freeze)
@@ -94,6 +105,13 @@ Composite/multi-field unique keys recorded as punted item 22. Scale-shape fitnes
     (SDA "Triple Sigmatics" dual embeddings — one `.usearch` file per field, as designed).
 12. `datacrystal[web]` — FastAPI + strawberry GraphQL integration.
 13. v1.x: **read-only snapshot readers**, scoped to open-at-watermark, no live invalidation.
+23. **Retained delta log** — a stdlib-only certified consumer (segmented msgpack append files +
+    watermark manifest). **First post-tag PR** (2026-06-12 third amendment): a system of record
+    needs commit-granular audit history; retention also yields time-travel-by-replay (punt 20's
+    read side), follower catch-up (punt 21's transport precondition), and replayable catch-up for
+    `attach()` refusals (today: rebuild-from-snapshot is the only recovery). Retention/compaction
+    policy is the log's own contract — the engine itself still never retains (COMMIT-DELTA-v1 §5
+    stands unchanged).
 
 ## Punted — demand-driven, zero roadmap commitment
 

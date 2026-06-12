@@ -648,10 +648,12 @@ Sequencing follows the ratified [roadmap](design/ROADMAP.md) and the
 | Feature | Where it lands |
 |---|---|
 | v0.1.0 tag: API freeze (incl. the COMMIT-DELTA-v1 lock); PyPI publication follows | M4 — current milestone (the `[fts]`/`[arrow]` extras landed pre-tag, 2026-06-12, as the contract's real-consumer validators) |
+| **retained delta log** — commit-granular audit history, time-travel-by-replay foundation, replayable catch-up for `attach()` | first post-tag PR (ROADMAP item 23, 2026-06-12) |
+| **reverse-reference index** (`incoming()`) — backlinks, impact analysis | early post-tag v0.x (promoted 2026-06-12 — digital-twin/SOR personas) |
 | **GraphQL / FastAPI** — `datacrystal[web]` with strawberry integration | extension package, after the v1 core freeze |
 | vector search — `datacrystal[vector]`, usearch, ≥2 vector fields per entity | extension package, after v1 |
-| reverse-reference index (`incoming()`), property-graph recipes, cross-mirror DuckDB recipes | v1 |
-| sets, guided migrations, custom scalar types, CJK-segmenting FTS tokenizer | demand-driven |
+| property-graph recipes, cross-mirror DuckDB recipes | v1 |
+| sets, field renames / guided migrations, custom scalar types, CJK-segmenting FTS tokenizer | demand-driven |
 
 Without the `[arrow]` extra installed, getting data into pandas is still a two-liner via
 the decode-level projection (copies, not zero-copy — but no entities are built either):
