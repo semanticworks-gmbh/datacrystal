@@ -69,7 +69,44 @@ class _Marker:
 
 Index = _Marker("Index")      # secondary bitmap index (pyroaring)
 Unique = _Marker("Unique")    # unique secondary key (SDA delta 1)
-FullText = _Marker("FullText")  # reserved for datacrystal[fts] (late v0.x)
+
+
+class _FullText(_Marker):
+    """The ``dc.FullText`` marker — bare, or parameterized by calling it:
+    ``Annotated[str, dc.FullText]`` / ``Annotated[str, dc.FullText(language="de")]``.
+
+    Deliberately **inert in the core engine** (ROADMAP item 10: indexing
+    and stemming are ``datacrystal[fts]``'s job). The engine only records
+    the declaration in the FieldSpec so consumers can read field + language
+    straight from the model — the M3 FTS5 contract spike does today, the
+    extra will. The parameterized form exists in core because the API
+    freezes at the v0.1.0 tag, before the extra ships (decided 2026-06-12).
+
+    ``language`` is a lowercase short code ("de", "en", …); which codes are
+    supported (and the default for ``None``) is the extra's contract.
+    """
+
+    __slots__ = ("language",)
+
+    def __init__(self, language: str | None = None) -> None:
+        super().__init__("FullText")
+        self.language = language
+
+    def __call__(self, *, language: str) -> "_FullText":
+        if not isinstance(language, str) or not language:
+            raise TypeError(
+                "FullText(language=...) takes a non-empty language code, e.g. "
+                'FullText(language="de")'
+            )
+        return _FullText(language=language)
+
+    def __repr__(self) -> str:
+        if self.language is None:
+            return "datacrystal.FullText"
+        return f"datacrystal.FullText(language={self.language!r})"
+
+
+FullText = _FullText()  # the bare marker; call it to declare a language
 
 _INDEXABLE_TYPES = (str, int, float, bool)
 
@@ -83,6 +120,7 @@ class FieldSpec:
     indexed: bool
     unique: bool
     fulltext: bool
+    fulltext_language: str | None = None  # from FullText(language=...), None if bare
 
 
 class TypeInfo:
@@ -270,14 +308,16 @@ def _resolve_specs(cls: type, field_names: tuple[str, ...]) -> tuple[FieldSpec, 
         core = _strip_annotated(hint, markers)
         indexed = any(m is Index for m in markers)
         unique = any(m is Unique for m in markers)
-        fulltext = any(m is FullText for m in markers)
+        fulltext = next((m for m in markers if isinstance(m, _FullText)), None)
         lazy_refs = _contains_lazy(core)
         if (indexed or unique) and not _is_indexable(core):
             raise TypeError(
                 f"{cls.__name__}.{name}: Index/Unique fields must be scalar "
                 f"(str, int, float or bool, optionally | None), got {hint!r}"
             )
-        specs.append(FieldSpec(name, lazy_refs, indexed, unique, fulltext))
+        specs.append(FieldSpec(name, lazy_refs, indexed, unique,
+                               fulltext is not None,
+                               fulltext.language if fulltext is not None else None))
     return tuple(specs)
 
 

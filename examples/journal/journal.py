@@ -9,23 +9,26 @@ Where the demo shows the cabinet, the journal shows the *workflows* around
 it, one scene per engine contract (KICKOFF §2): unique keys with
 upsert-by-natural-key, frozen append-only events (mutation raises), Lazy[T]
 attachments, `get_many` over app-maintained backlink OID lists, bitmap
-queries, and an asyncio session (`aopen` + `async with transaction()`).
+queries, `store.snapshot()` read from a worker thread, a commit-delta
+consumer riding the watermark pipeline, and an asyncio session
+(`aopen` + `async with transaction()`).
 
-Honesty notes: `store.snapshot()` from a worker thread is `[planned — M3]`
-and its scene says so instead of running; engine-derived `incoming()`
-backlinks are `[planned — v1]` (ROADMAP item 8) — until then the journal
-maintains its own backlink OID lists, which is the supported pattern.
+Honesty note: engine-derived `incoming()` backlinks are `[planned — v1]`
+(ROADMAP item 8) — until then the journal maintains its own backlink OID
+lists, which is the supported pattern.
 """
 
 from __future__ import annotations
 
 import asyncio
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import field
 from pathlib import Path
 from typing import Annotated
 
 import datacrystal as dc
+from datacrystal.testing import CountingConsumer
 
 # --- the model ---------------------------------------------------------------
 
@@ -136,9 +139,36 @@ def scene_indexed_query(store: dc.Store) -> None:
     print(f"fine specimens via bitmap index: {sorted(s.catalog_no for s in fine)}")
 
 
-def scene_snapshot() -> None:
-    print("snapshot from a worker thread: [planned — M3] "
-          "(store.snapshot() lands with the watermark pipeline)")
+def scene_snapshot(store: dc.Store) -> None:
+    """Worker threads never touch live entities (ADR-001) — they read a
+    frozen snapshot pinned at the commit watermark instead: plain immutable
+    views, taken and used entirely off the owner thread."""
+    def count_fine_off_thread() -> tuple[int, int]:
+        with store.snapshot() as snap:  # taken ON the worker thread
+            fine = [v for v in snap.all(Specimen) if v.quality == "fine"]
+            return snap.tid, len(fine)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        tid, fine_count = pool.submit(count_fine_off_thread).result()
+    print(f"worker-thread snapshot at tid={tid}: {fine_count} fine specimen(s), "
+          "read while the owner stayed free")
+
+
+def scene_pipeline(store: dc.Store, azurite: Specimen) -> None:
+    """Sidecars (FTS, mirrors, replicas) ride the commit-delta stream
+    (COMMIT-DELTA-v1): bootstrap lineage + state + watermark from one
+    snapshot, attach, and every commit hands you exactly one delta, after
+    durability."""
+    with store.snapshot() as snap:
+        counter = CountingConsumer.bootstrap(snap)
+    store.attach(counter)
+    event = CatalogEvent(catalog_no=azurite.catalog_no, kind="appraised",
+                         note="worth its own insurance rider")
+    azurite.event_oids.append(store.store(event))
+    store.commit()
+    store.detach(counter)
+    seen = {name.rsplit(":", 1)[-1]: n for name, n in counter.content().items()}
+    print(f"delta consumer saw commit tid={counter.watermark}: {seen}")
 
 
 async def scene_async_session(store_dir: Path) -> None:
@@ -163,7 +193,8 @@ def main() -> None:
         scene_backlinks(store, azurite)
         scene_attachments(store, journal)
         scene_indexed_query(store)
-        scene_snapshot()
+        scene_snapshot(store)
+        scene_pipeline(store, azurite)
     asyncio.run(scene_async_session(store_dir))
     print("journal closed — run me again, everything above survives")
 

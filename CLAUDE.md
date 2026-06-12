@@ -2,7 +2,8 @@
 
 datacrystal: an embedded object-graph database for Python (EclipseStore-inspired) — typed live
 objects ARE the database; pickle-free msgpack records, roaring-bitmap queries, SQLite-blob
-durability. Solo maintainer: Sven Hodapp. Pre-release (`0.1.0.dev0`); current milestone: M2.
+durability. Solo maintainer: Sven Hodapp. Pre-release (`0.1.0.dev0`); current milestone: M4
+(M3 — watermark pipeline, snapshots, conformance kit, FTS5 spike — landed 2026-06-12).
 
 ## Commands
 
@@ -25,6 +26,10 @@ stale venv shebangs — `rm -rf .venv && uv sync`.
 - `docs/design/KICKOFF.md` — execution plan: milestones M0–M4, the 18 fitness functions,
   perf-gate principles, the canonical mineral-cabinet example domain (one domain everywhere).
 - `docs/design/ADR-001-concurrency-contract.md` — accepted owner-confinement contract.
+- `docs/design/ADR-002-storage-read-views.md` — accepted `read_view()` protocol addition
+  (snapshot isolation for `store.snapshot()`); storage-protocol growth always needs an ADR.
+- `docs/design/COMMIT-DELTA-v1.md` — the delta/watermark contract (DRAFT; locks at the tag).
+  The applier + replay vectors are normative and byte-pinned; revisions need a draft-rev bump.
 - `docs/GUIDE.md` — user-facing semantics. Documentation honesty rule: features that do not
   exist are marked `[planned — milestone]`, never described as if real.
 - The API freezes at the v0.1.0 tag; PyPI publication follows it (names reserved earlier).
@@ -33,7 +38,10 @@ stale venv shebangs — `rm -rf .venv && uv sync`.
 
 | Module | Role |
 |---|---|
-| `_store.py` | facade: open/root/store/commit/get/query/get_many; P1 capture → P2 backend I/O → P3 flip (three-phase shape, still synchronous pre-M2-async); type lineage + hydration plans |
+| `_store.py` | facade: open/root/store/commit/get/query/get_many/attach/detach/snapshot; P1 capture (+ prior reads + delta build when consumers watch) → P2 backend I/O → P3 flip + delta delivery; type lineage + hydration plans |
+| `_pipeline.py` | COMMIT-DELTA-v1 emission: `DeltaConsumer` protocol + `build_delta`; delivery in P3 post-durability; a raising consumer detaches loudly (never holds writes hostage) |
+| `_snapshot.py` | `store.snapshot()` frozen `EntityView`/`Ref` reads at a commit watermark, callable from any thread (ADR-002 read views); `index_bitmaps()` slot reserved for M4 |
+| `testing.py` | public conformance kit `check_delta_consumer` + `CountingConsumer` (incl. the snapshot-bootstrap recipe for mid-life attach) |
 | `_entity.py` | `@entity` decorator → slots dataclass + engine slots; one-shot `__setattr__` dirty hook; `TypeInfo` (specs, defaults); metaclass turns class-attr access into query `FieldExpr`s |
 | `_state.py` | leaf module: NEW/CLEAN/DIRTY constants + `touch()` (shared by hook and containers) |
 | `_containers.py` | owner-bound `PersistentList`/`PersistentDict`: in-place mutation marks the owner dirty; assignment copies (by-value semantics) |
@@ -43,7 +51,7 @@ stale venv shebangs — `rm -rf .venv && uv sync`.
 | `_registry.py` | WeakValueDictionary OID → live entity (identity contract) |
 | `_lazy.py` | explicit `Lazy[T]` handles — the only deferred-loading mechanism in v0.x |
 | `_ids.py` | partitioned 64-bit OID/CID/TID space; `FORMAT_VERSION` |
-| `_storage/` | 3-method protocol (`boot/load_many/scan_type/apply`) + SQLite-blob backend + memory fake + lease lock |
+| `_storage/` | storage protocol (`boot/load_many/scan_type/apply/read_view` — growth needs an ADR, see ADR-002) + SQLite-blob backend + memory fake + lease lock |
 
 ## Load-bearing invariants (violating one = architectural regression, not a style issue)
 

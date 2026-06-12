@@ -30,6 +30,8 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from datacrystal._conditions import Condition
+from datacrystal._pipeline import DeltaConsumer
+from datacrystal._snapshot import Snapshot
 from datacrystal._store import Store
 
 
@@ -107,6 +109,20 @@ class AsyncStore:
 
     def submit(self, fn: Callable[[], Any]) -> Future[Any]:
         return self._store.submit(fn)
+
+    def attach(self, consumer: DeltaConsumer) -> None:
+        """Attach a COMMIT-DELTA-v1 consumer (delivered on the owner loop's
+        thread during P3 — after ``await commit()`` resumes)."""
+        self._store.attach(consumer)
+
+    def detach(self, consumer: DeltaConsumer) -> None:
+        self._store.detach(consumer)
+
+    def snapshot(self) -> Snapshot:
+        """A frozen read view at the durable watermark — like the sync
+        store's, callable from any thread (e.g. inside
+        ``run_in_executor`` work that must not touch live entities)."""
+        return self._store.snapshot()
 
     # -- the awaitable commit ------------------------------------------------
 

@@ -53,6 +53,85 @@ CREATE INDEX IF NOT EXISTS objects_by_cid ON objects (cid);
 _LOAD_CHUNK = 500
 
 
+def _check_crc(oid: int, payload: bytes, stored_crc: int) -> None:
+    if _crc(payload) != stored_crc:
+        raise CorruptRecordError(
+            f"record oid={oid} failed its checksum — the store file is damaged"
+        )
+
+
+def _load_many(conn: sqlite3.Connection, oids: list[int]) -> dict[int, StoredRecord]:
+    out: dict[int, StoredRecord] = {}
+    for start in range(0, len(oids), _LOAD_CHUNK):
+        chunk = oids[start:start + _LOAD_CHUNK]
+        marks = ",".join("?" * len(chunk))
+        for oid, cid, tid, payload, stored_crc in conn.execute(
+            f"SELECT oid, cid, tid, payload, crc FROM objects WHERE oid IN ({marks})",
+            chunk,
+        ):
+            _check_crc(oid, payload, stored_crc)
+            out[oid] = StoredRecord(oid=oid, cid=cid, tid=tid, payload=payload)
+    return out
+
+
+def _scan_type(conn: sqlite3.Connection, cid: int) -> Iterator[StoredRecord]:
+    for oid, tid, payload, stored_crc in conn.execute(
+        "SELECT oid, tid, payload, crc FROM objects WHERE cid=? ORDER BY oid",
+        (cid,),
+    ):
+        _check_crc(oid, payload, stored_crc)
+        yield StoredRecord(oid=oid, cid=cid, tid=tid, payload=payload)
+
+
+def _read_meta_and_types(conn: sqlite3.Connection) -> BootInfo:
+    meta = dict(conn.execute("SELECT key, value FROM meta"))
+    types = [
+        (cid, name, fields.split("\x1f") if fields else [])
+        for cid, name, fields in conn.execute(
+            "SELECT cid, name, fields FROM types ORDER BY cid"
+        )
+    ]
+    return BootInfo(meta=meta, types=types)
+
+
+class SqliteReadView:
+    """A pinned WAL read transaction over its own connection (ADR-002).
+
+    WAL gives every connection snapshot isolation for the lifetime of a read
+    transaction, so this view sees exactly one durable commit boundary no
+    matter what commit P2 writes concurrently on the backend's connection.
+    Close promptly: an open read transaction blocks WAL checkpoint truncation.
+    """
+
+    def __init__(self, path: Path) -> None:
+        # check_same_thread=False: a snapshot may be handed to a thread pool;
+        # CPython's sqlite3 is serialized, and this connection never writes
+        # (query_only is enforced below, belt and braces over discipline).
+        self._conn = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
+        self._conn.execute("PRAGMA query_only=ON")
+        self._conn.execute("BEGIN")
+        # The read transaction (and with it the snapshot boundary) starts at
+        # the first read, not at BEGIN — pin it now.
+        self._conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
+        self._closed = False
+
+    def boot(self) -> BootInfo:
+        return _read_meta_and_types(self._conn)
+
+    def load_many(self, oids: list[int]) -> dict[int, StoredRecord]:
+        return _load_many(self._conn, oids)
+
+    def scan_type(self, cid: int) -> Iterator[StoredRecord]:
+        return _scan_type(self._conn, cid)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._conn.execute("COMMIT")  # end the read transaction
+        self._conn.close()
+
+
 class SqliteBackend:
     def __init__(self, path: Path | str, *, durability: str = "interval") -> None:
         if durability not in ("commit", "interval", "never"):
@@ -138,33 +217,16 @@ class SqliteBackend:
             raise
 
     def load_many(self, oids: list[int]) -> dict[int, StoredRecord]:
-        out: dict[int, StoredRecord] = {}
-        conn = self._conn
-        for start in range(0, len(oids), _LOAD_CHUNK):
-            chunk = oids[start:start + _LOAD_CHUNK]
-            marks = ",".join("?" * len(chunk))
-            for oid, cid, tid, payload, stored_crc in conn.execute(
-                f"SELECT oid, cid, tid, payload, crc FROM objects WHERE oid IN ({marks})",
-                chunk,
-            ):
-                self._check_crc(oid, payload, stored_crc)
-                out[oid] = StoredRecord(oid=oid, cid=cid, tid=tid, payload=payload)
-        return out
+        return _load_many(self._conn, oids)
 
     def scan_type(self, cid: int) -> Iterator[StoredRecord]:
-        for oid, tid, payload, stored_crc in self._conn.execute(
-            "SELECT oid, tid, payload, crc FROM objects WHERE cid=? ORDER BY oid",
-            (cid,),
-        ):
-            self._check_crc(oid, payload, stored_crc)
-            yield StoredRecord(oid=oid, cid=cid, tid=tid, payload=payload)
+        return _scan_type(self._conn, cid)
 
-    @staticmethod
-    def _check_crc(oid: int, payload: bytes, stored_crc: int) -> None:
-        if _crc(payload) != stored_crc:
-            raise CorruptRecordError(
-                f"record oid={oid} failed its checksum — the store file is damaged"
-            )
+    def read_view(self) -> SqliteReadView:
+        """A snapshot-isolated read view (own connection, pinned WAL read
+        transaction). Safe to call from any thread — it never touches the
+        backend's shared connection (ADR-002)."""
+        return SqliteReadView(self._path)
 
     def apply(self, batch: CommitBatch) -> None:
         conn = self._conn

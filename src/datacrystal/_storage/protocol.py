@@ -9,6 +9,9 @@ protocol — that is the whole point of keeping it this small:
 * ``load_many()``  — batch-read records by OID
 * ``scan_type()``  — stream all records of one type (index builds)
 * ``apply()``      — atomically persist one commit batch
+* ``read_view()``  — a stable read view at the latest durable commit
+  (M3 addition, ratified by ADR-002: ``store.snapshot()`` needs reads that
+  are isolated from a concurrently running commit P2)
 """
 
 from __future__ import annotations
@@ -46,6 +49,25 @@ class BootInfo:
     types: list[tuple[int, str, list[str]]]  # (cid, typename, field names)
 
 
+class StorageReadView(Protocol):
+    """A stable, read-only view of the store at one durable commit boundary.
+
+    Created by :meth:`StorageBackend.read_view` — safe to create from ANY
+    thread while the owner commits (ADR-001 rider 2: this is what
+    ``store.snapshot()`` stands on). ``boot()`` here only *reads* meta and
+    type rows (no DDL, no version repair); a view holds resources (e.g. a
+    pinned WAL read transaction) until ``close()``.
+    """
+
+    def boot(self) -> BootInfo: ...
+
+    def load_many(self, oids: list[int]) -> dict[int, StoredRecord]: ...
+
+    def scan_type(self, cid: int) -> Iterator[StoredRecord]: ...
+
+    def close(self) -> None: ...
+
+
 class StorageBackend(Protocol):
     def boot(self) -> BootInfo: ...
 
@@ -54,5 +76,7 @@ class StorageBackend(Protocol):
     def scan_type(self, cid: int) -> Iterator[StoredRecord]: ...
 
     def apply(self, batch: CommitBatch) -> None: ...
+
+    def read_view(self) -> StorageReadView: ...
 
     def close(self) -> None: ...

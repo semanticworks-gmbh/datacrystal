@@ -49,6 +49,7 @@ from datacrystal._entity import (
 )
 from datacrystal._state import STATE_CLEAN, STATE_DIRTY, STATE_NEW
 from datacrystal._errors import (
+    ConsumerDetachedWarning,
     DataCrystalError,
     EntityEscapeError,
     LeaseLostError,
@@ -62,16 +63,18 @@ from datacrystal._errors import (
 from datacrystal._ids import IdAllocator, OID_BASE, TID_BASE
 from datacrystal._indexes import IndexManager, plan
 from datacrystal._lazy import Lazy, LazyReferenceManager
+from datacrystal._pipeline import DeltaConsumer, build_delta
 from datacrystal._records import RefToken, crc as _crc, decode_payload, encode_payload
 from datacrystal._registry import ObjectRegistry
+from datacrystal._snapshot import Snapshot
 from datacrystal._storage.protocol import CommitBatch, StorageBackend, StoredRecord
+from datacrystal.contract.applier import DeltaGapError
 
 _THREAD_RECIPE = (
     "live entities and their store are confined to the thread that opened the "
     "store (ADR-001); send work to the owner via store.submit(fn) — the owner "
     "runs it at its next store call or store.run_pending() — and return plain "
-    "data, never live entities; cross-thread reads via store.snapshot() land "
-    "at M3"
+    "data, never live entities; for cross-thread reads take a store.snapshot()"
 )
 
 
@@ -85,15 +88,17 @@ class _Root:
 class _Capture:
     """Everything P1 hands to P2/P3 — and enough to compensate a failed P2."""
 
-    __slots__ = ("tid", "batch", "index_entries", "flipped")
+    __slots__ = ("tid", "batch", "index_entries", "flipped", "delta")
 
     def __init__(self, tid: int, batch: CommitBatch,
                  index_entries: list[tuple[int, TypeInfo, dict[str, Any]]],
-                 flipped: list[tuple[int, Any, int]]) -> None:
+                 flipped: list[tuple[int, Any, int]],
+                 delta: dict[str, Any] | None) -> None:
         self.tid = tid
         self.batch = batch
         self.index_entries = index_entries
         self.flipped = flipped  # (oid, obj, state before the P1 flip)
+        self.delta = delta  # COMMIT-DELTA-v1 map; built only when consumers watch
 
 
 class Store:
@@ -145,6 +150,10 @@ class Store:
         # losing identity and any in-place mutations. Lazy[T] is the explicit
         # cut point where pinning (and memory) stops.
         self._root_holder: Any = None
+        # COMMIT-DELTA-v1 consumers (ROADMAP item 3). Commits build and
+        # deliver deltas only while this list is non-empty — an unwatched
+        # store pays nothing for the pipeline (spec §5).
+        self._consumers: list[DeltaConsumer] = []
 
         boot = backend.boot()
         meta = boot.meta
@@ -379,6 +388,23 @@ class Store:
             # commit consumes no TID and the buffers stay intact for a
             # fixed-up retry (gapless sequence, invariant 5).
             encoded.append((oid, cid, encode_payload(values, self._oid_for_encode)))
+        # Prior payloads for the delta stream (COMMIT-DELTA-v1 §3): read
+        # back the last durable payload of every already-persisted record —
+        # O(delta) reads, only while consumers watch, and like encoding
+        # strictly before the TID allocation (a failed read rejects the
+        # commit without consuming a TID).
+        priors: dict[int, bytes] = {}
+        if self._consumers:
+            persisted_oids = [oid for oid in pending if oid not in self._new]
+            prior_records = self._backend.load_many(persisted_oids) if persisted_oids else {}
+            for oid in persisted_oids:
+                rec = prior_records.get(oid)
+                if rec is None:
+                    raise DataCrystalError(
+                        f"internal error: dirty entity oid {oid} has no "
+                        "persisted record to take a prior payload from"
+                    )
+                priors[oid] = rec.payload
         tid = self._alloc.next_tid()
         records = [
             StoredRecord(oid=oid, cid=cid, tid=tid, payload=payload)
@@ -394,6 +420,11 @@ class Store:
                 "next_tid": str(self._alloc.tid_watermark),
                 "root_oid": str(self._root_oid) if self._root_oid is not None else "",
             },
+        )
+        delta = (
+            build_delta(tid, records, new_types, self._root_oid, priors)
+            if self._consumers
+            else None
         )
         flipped: list[tuple[int, Any, int]] = []
         for oid, obj in pending.items():
@@ -411,7 +442,7 @@ class Store:
             self._registry.add(oid, obj)
         self._new.clear()
         self._dirty.clear()
-        return _Capture(tid, batch, index_entries, flipped)
+        return _Capture(tid, batch, index_entries, flipped, delta)
 
     def _run_p2(self, batch: CommitBatch) -> None:
         """P2: backend I/O on bytes only, off the owner thread."""
@@ -442,7 +473,36 @@ class Store:
             for rec in capture.batch.records:
                 self._fingerprints[rec.oid] = _crc(rec.payload)
         self._last_tid = capture.tid
+        if capture.delta is not None:
+            self._deliver(capture.delta)
         return capture.tid
+
+    def _deliver(self, delta: dict[str, Any]) -> None:
+        """Hand the now-durable commit's delta to every attached consumer,
+        in TID order, on the owner thread. A consumer that raises (or that
+        fails to advance its watermark) is detached with a loud warning —
+        sidecars are rebuildable derived data (invariant 11); the store
+        never holds writes hostage to one."""
+        tid = delta["tid"]
+        for consumer in list(self._consumers):
+            try:
+                consumer.apply(delta)
+                if consumer.watermark != tid:
+                    raise DataCrystalError(
+                        f"consumer applied tid {tid} but reports watermark "
+                        f"{consumer.watermark} — it violates COMMIT-DELTA-v1 §4.3"
+                    )
+            except Exception as exc:
+                self._consumers.remove(consumer)
+                warnings.warn(
+                    ConsumerDetachedWarning(
+                        f"delta consumer {consumer!r} failed on tid {tid} and "
+                        f"was detached ({exc!r}); the commit is durable and the "
+                        "store is healthy — rebuild the sidecar (e.g. from "
+                        "store.snapshot()) and attach() it again"
+                    ),
+                    stacklevel=4,
+                )
 
     def _sweep_untracked(self) -> None:
         """debug=True: warn about (and rescue) CLEAN entities whose
@@ -556,6 +616,62 @@ class Store:
             ))
             return
         future.set_result(result)
+
+    def attach(self, consumer: DeltaConsumer) -> None:
+        """Attach a COMMIT-DELTA-v1 consumer: from the next commit on it
+        receives every delta, in TID order, on the owner thread, strictly
+        after the commit is durable (ROADMAP item 3; spec §4 obligations).
+
+        The consumer's watermark must equal ``store.last_tid``. Deltas are
+        not retained (spec §5), so a consumer that is *behind* cannot be
+        caught up — rebuild it from ``store.snapshot()`` (the snapshot's
+        ``tid`` and ``types`` are exactly the bootstrap it needs). A
+        consumer *ahead* of the store means the store was restored to an
+        older point — the sidecar is stale and must be rebuilt (fitness #13).
+        """
+        self._enter()
+        watermark = consumer.watermark
+        if watermark < self._last_tid:
+            raise DeltaGapError(
+                f"consumer watermark {watermark} is behind the store "
+                f"({self._last_tid}) and deltas are not retained "
+                "(COMMIT-DELTA-v1 §5) — rebuild from store.snapshot(), then "
+                "attach at the snapshot's tid"
+            )
+        if watermark > self._last_tid:
+            raise DeltaGapError(
+                f"consumer watermark {watermark} is ahead of the store "
+                f"({self._last_tid}) — the store was restored to an older "
+                "point? The sidecar is stale: rebuild it from scratch"
+            )
+        if any(existing is consumer for existing in self._consumers):
+            raise DataCrystalError("this consumer is already attached")
+        self._consumers.append(consumer)
+
+    def detach(self, consumer: DeltaConsumer) -> None:
+        """Detach a previously attached delta consumer."""
+        self._enter()
+        for i, existing in enumerate(self._consumers):
+            if existing is consumer:
+                del self._consumers[i]
+                return
+        raise DataCrystalError("this consumer is not attached")
+
+    def snapshot(self) -> Snapshot:
+        """A frozen, read-only view of the committed state at the current
+        durable commit watermark — **callable from any thread**, even while
+        the owner commits (ADR-001 rider 2; ADR-002 read views).
+
+        Use it as a context manager and close it promptly: on the sqlite
+        backend an open snapshot pins a WAL read transaction. Views are
+        plain immutable data (:class:`EntityView`); references come back as
+        :class:`Ref` tokens for ``snapshot.get()`` — never live entities.
+        """
+        # Deliberately NOT _enter(): no owner guard, no piggyback work.
+        # The read view isolates itself from the live engine entirely.
+        if self._closed:
+            raise StoreClosedError("this store has been closed")
+        return Snapshot(self._backend.read_view())
 
     def get(self, cls: type, **unique_key: Any) -> Any | None:
         """Look up one entity by a unique secondary key, e.g.
