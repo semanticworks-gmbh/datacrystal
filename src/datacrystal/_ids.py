@@ -17,9 +17,15 @@ persisted in the store's meta table at every commit and restored at boot.
 
 from __future__ import annotations
 
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 """Store format version. Bumped on any incompatible layout change; opening a
 store with a higher version raises ``NewerStoreError`` (fitness function #18).
+
+v2 (2026-06-12): temporal extension codes 2–4 in record payloads (naive
+datetime / date / time as ISO-text exts — they round-tripped as bare strings
+before). A v1-era store stays stamped v1 until its first commit under this
+library: every commit batch re-stamps ``format_version`` (a v1 reader must
+refuse only once v2 payload bytes may actually exist).
 """
 
 CID_BASE = 1

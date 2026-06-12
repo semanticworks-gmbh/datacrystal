@@ -62,7 +62,7 @@ from datacrystal._errors import (
     UntrackedMutationWarning,
     WrongThreadError,
 )
-from datacrystal._ids import IdAllocator, OID_BASE, TID_BASE
+from datacrystal._ids import FORMAT_VERSION, IdAllocator, OID_BASE, TID_BASE
 from datacrystal._indexes import IndexManager, plan
 from datacrystal._lazy import Lazy, LazyReferenceManager
 from datacrystal._pipeline import DeltaConsumer, build_delta
@@ -551,6 +551,10 @@ class Store:
                 "next_cid": str(self._alloc.cid_watermark),
                 "next_tid": str(self._alloc.tid_watermark),
                 "root_oid": str(self._root_oid) if self._root_oid is not None else "",
+                # Re-stamped per commit (invariant 9, format honesty): an
+                # older store upgrades its stamp exactly when this library
+                # first writes payload bytes the old reader could misread.
+                "format_version": str(FORMAT_VERSION),
             },
             deletes=[oid for oid, _, _ in deletes],
         )
