@@ -207,6 +207,10 @@ class FullTextIndex:
     configuration is persisted; reopening the same file with a different
     one raises :class:`FtsConfigError` — a half-matching index is stale
     derived data, rebuild it (invariant 11).
+
+    ``statements`` is a public diagnostic counter: SQL statements executed
+    by the most recent ``apply()`` — pin your own O(delta) gates on it,
+    exactly like this package's tests do (fitness #9 shape).
     """
 
     def __init__(self, path: str | Path, *,

@@ -165,3 +165,69 @@ def test_string_matching_validates_the_needle_type(cabinet):
         Mineral.name.contains(7)
     with pytest.raises(dc.QueryError, match="takes a str"):
         Mineral.name.startswith(None)
+
+
+# -- query(type) symmetry + explain() (decided 2026-06-12, pre-freeze) ----------
+
+
+def test_query_bare_class_hydrates_full_extent(cabinet):
+    """query(Mineral) is the honest spelling of the expensive shape —
+    symmetric with count()/pluck()/Snapshot.all()."""
+    hits = cabinet.query(Mineral)
+    assert _names(hits) == ["azurite", "diamond", "malachite", "opal", "quartz"]
+    assert len(hits) == cabinet.count(Mineral)
+
+
+def test_query_bare_class_unseen_type_is_empty_and_warns(store):
+    with pytest.warns(dc.UnseenTypeWarning):
+        assert store.query(Locality) == []
+
+
+def test_query_rejects_non_entity_targets(cabinet):
+    with pytest.raises(TypeError, match="takes an @entity class or a Condition"):
+        cabinet.query(42)
+    with pytest.raises(dc.NotAnEntityError):
+        cabinet.query(str)
+
+
+def test_explain_reports_the_two_rules(cabinet):
+    fully_indexed = cabinet.explain(Mineral.crystal_system == "monoclinic")
+    assert fully_indexed.indexed and fully_indexed.residual is None
+    assert fully_indexed.candidates == 2 and fully_indexed.extent == 5
+
+    mixed = cabinet.explain(
+        (Mineral.crystal_system == "monoclinic") & (Mineral.mohs >= 3.7)
+    )
+    assert mixed.indexed and mixed.residual is not None
+    assert "mohs" in mixed.residual
+    assert mixed.candidates == 2  # residual evaluates over the bitmap hits
+
+    cliff = cabinet.explain(Mineral.mohs >= 3.7)
+    assert not cliff.indexed and cliff.candidates == cliff.extent == 5
+    assert "NO index" in str(cliff)
+
+    bare = cabinet.explain(Mineral)
+    assert bare.condition is None and bare.candidates == bare.extent == 5
+    assert "full extent" in str(bare)
+
+
+def test_explain_matches_query_hydration_bound(cabinet):
+    cond = (Mineral.crystal_system == "monoclinic") & (Mineral.mohs >= 3.7)
+    plan = cabinet.explain(cond)
+    assert len(cabinet.query(cond)) <= plan.candidates
+
+
+def test_snapshot_query_and_explain_are_symmetric(cabinet):
+    with cabinet.snapshot() as snap:
+        views = snap.query(Mineral)
+        assert sorted(v.name for v in views) == [
+            "azurite", "diamond", "malachite", "opal", "quartz",
+        ]
+        plan = snap.explain(Mineral.crystal_system == "monoclinic")
+        assert plan.indexed and plan.candidates == 2
+
+
+def test_explain_unseen_type_is_empty_plan(store):
+    with pytest.warns(dc.UnseenTypeWarning):
+        plan = store.explain(Locality)
+    assert plan.extent == 0 and plan.candidates == 0

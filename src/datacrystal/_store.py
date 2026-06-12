@@ -66,7 +66,7 @@ from datacrystal._errors import (
     WrongThreadError,
 )
 from datacrystal._ids import FORMAT_VERSION, IdAllocator, OID_BASE, TID_BASE
-from datacrystal._indexes import IndexManager, plan
+from datacrystal._indexes import IndexManager, QueryPlan, explain_plan, plan
 from datacrystal._lazy import Lazy, LazyReferenceManager
 from datacrystal._pipeline import DeltaConsumer, build_delta
 from datacrystal._records import RefToken, crc as _crc, decode_payload, encode_payload
@@ -1016,27 +1016,54 @@ class Store:
             None if oid is None else self._load_oid(oid, cache) for oid in oids
         ]
 
-    def query(self, cond: Condition) -> list[Any]:
-        """Evaluate a Condition over the *committed* state of one entity
-        class; returns hydrated entities."""
+    def query(self, target: type | Condition) -> list[Any]:
+        """Hydrated committed entities matching ``target`` — a Condition,
+        or an entity class for the **full extent**.
+
+        ``query(Mineral)`` is the honest spelling of the expensive shape
+        (every committed Mineral is hydrated — the same cost any
+        non-indexed predicate already pays); symmetric with ``count()``/
+        ``pluck()``/``Snapshot.all()`` (decided 2026-06-12). The plan is
+        deterministic and inspectable: :meth:`explain`."""
         self._enter()
-        if not isinstance(cond, Condition):
-            raise TypeError(
-                f"query() takes a Condition (e.g. Cls.field == value), "
-                f"got {type(cond).__name__}"
-            )
-        cls = cond.entity_class()
+        cls, cond = query_target(target, "query")
         ti = type_info(cls)
         if self._cid_by_typename.get(ti.typename) is None:
             self._warn_unseen(ti)
             return []
         ci = self._index.ensure(ti)
-        bitmap, residual = plan(cond, ci)
+        if cond is None:
+            bitmap, residual = None, None
+        else:
+            bitmap, residual = plan(cond, ci)
         oids = list(bitmap) if bitmap is not None else list(ci.extent)
         objs = self.get_many(oids)
         if residual is not None:
             objs = [o for o in objs if residual.evaluate(o)]
         return objs
+
+    def explain(self, target: type | Condition) -> QueryPlan:
+        """The deterministic plan for ``target``: what answers from
+        bitmaps, what evaluates as a Python residual, and over how many
+        candidates — ``query()`` hydrates at most ``plan.candidates``
+        entities, ``count()``/``pluck()`` decode the same candidates
+        without constructing any.
+
+        Exactly two rules, never an optimizer (the analytics planner is
+        DuckDB over the ``[arrow]`` mirror): ``==``/``.in_()`` on
+        ``dc.Index``/``dc.Unique`` fields → bitmaps; everything else →
+        residual. Read-only; builds the class indexes on first use (the
+        same one-time O(extent) cost as a first query)."""
+        self._enter()
+        cls, cond = query_target(target, "explain")
+        ti = type_info(cls)
+        if self._cid_by_typename.get(ti.typename) is None:
+            self._warn_unseen(ti)
+            return QueryPlan(
+                ti.typename, None if cond is None else repr(cond),
+                False, None, 0, 0,
+            )
+        return explain_plan(ti.typename, self._index.ensure(ti), cond)
 
     def count(self, target: type | Condition) -> int:
         """How many committed entities match — without hydrating any.

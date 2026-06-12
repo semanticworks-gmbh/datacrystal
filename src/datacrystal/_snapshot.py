@@ -34,7 +34,13 @@ from datacrystal._errors import (
     StoreClosedError,
     UnseenTypeWarning,
 )
-from datacrystal._indexes import ClassIndexes, build_class_indexes, plan
+from datacrystal._indexes import (
+    ClassIndexes,
+    QueryPlan,
+    build_class_indexes,
+    explain_plan,
+    plan,
+)
 from datacrystal._lazy import Lazy
 from datacrystal._records import RefToken, decode_payload
 from datacrystal._storage.protocol import StorageReadView
@@ -351,17 +357,13 @@ class Snapshot:
                 1 for view in self._views_for(oids) if view_cond.evaluate(view)
             )
 
-    def query(self, cond: Condition) -> list[EntityView]:
-        """Evaluate a Condition at this watermark; returns
-        :class:`EntityView` DTOs (never live entities — ADR-001). This is
-        the sanctioned way for ANY thread to run a bitmap query while the
-        owner keeps writing (KICKOFF M4 exit)."""
-        if not isinstance(cond, Condition):
-            raise TypeError(
-                f"query() takes a Condition (e.g. Cls.field == value), "
-                f"got {type(cond).__name__}"
-            )
-        cls = cond.entity_class()
+    def query(self, target: type | Condition) -> list[EntityView]:
+        """:class:`EntityView` DTOs matching ``target`` at this watermark —
+        a Condition, or an entity class for the full extent (symmetric
+        with the live store, decided 2026-06-12; never live entities,
+        ADR-001). This is the sanctioned way for ANY thread to run a
+        bitmap query while the owner keeps writing (KICKOFF M4 exit)."""
+        cls, cond = query_target(target, "query")
         ti = type_info(cls)
         if ti.typename not in self._cids_by_typename:
             self._warn_unseen(ti)
@@ -369,13 +371,32 @@ class Snapshot:
         with self._lock:
             self._guard()
             ci = self._class_indexes(ti)
-            bitmap, residual = plan(cond, ci)
+            if cond is None:
+                bitmap, residual = None, None
+            else:
+                bitmap, residual = plan(cond, ci)
             oids = list(bitmap) if bitmap is not None else list(ci.extent)
             views = self._views_for(oids)
         if residual is None:
             return views
         view_cond = _view_condition(residual)
         return [view for view in views if view_cond.evaluate(view)]
+
+    def explain(self, target: type | Condition) -> "QueryPlan":
+        """The deterministic plan for ``target`` over this snapshot's
+        indexes — the same two rules as :meth:`Store.explain`, against the
+        snapshot-local bitmaps."""
+        cls, cond = query_target(target, "explain")
+        ti = type_info(cls)
+        if ti.typename not in self._cids_by_typename:
+            self._warn_unseen(ti)
+            return QueryPlan(
+                ti.typename, None if cond is None else repr(cond),
+                False, None, 0, 0,
+            )
+        with self._lock:
+            self._guard()
+            return explain_plan(ti.typename, self._class_indexes(ti), cond)
 
     # -- lifecycle ---------------------------------------------------------
 

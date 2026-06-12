@@ -278,6 +278,15 @@ Query semantics:
 - Operators on class-level fields: `==`, `!=`, `<`, `<=`, `>`, `>=`, `.in_([...])`,
   `.contains("sub")`, `.startswith("pre")`; combine with `&`, `|`, `~`. **Parenthesize
   predicates** — `&` binds tighter than `==` (you get a helpful `QueryError` if you forget).
+- Every read API takes an entity class **or** a Condition (symmetry, 2026-06-12):
+  `query(Mineral)` hydrates the **full extent** — the expensive shape, same cost as any
+  non-indexed predicate; prefer `count()`/`pluck()` when you don't need live entities.
+- **`store.explain(target)`** (also on snapshots) returns the deterministic `QueryPlan`:
+  which part answers from bitmaps, what evaluates as Python residual, and over how many
+  candidates — `query()` hydrates at most `plan.candidates`. There are exactly **two
+  planning rules and never an optimizer** (`==`/`.in_()` on indexed fields → bitmaps; the
+  rest → residual); when a question needs a real query planner, hand `mirror.table(...)`
+  to DuckDB — that tier owns clever.
 - `==` and `.in_()` on `dc.Index` fields answer from roaring bitmaps. `.contains()` /
   `.startswith()` on an indexed field iterate the index's **distinct values** and OR the
   matching bitmaps — O(distinct values), never a record read; they are exact and

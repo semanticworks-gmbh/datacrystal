@@ -187,8 +187,8 @@ def test_snapshot_query_and_count_match_live_semantics(store_factory):
         assert snap.count(Mineral) == 2
         assert snap.count(M.crystal_system == "trigonal") == 1
         assert snap.count((M.crystal_system == "monoclinic") & (M.mohs >= 3.0)) == 1
-        with pytest.raises(TypeError, match="takes a Condition"):
-            snap.query(Mineral)  # type: ignore[arg-type]
+        # query(type) symmetry (2026-06-12): the bare class is the full extent
+        assert len(snap.query(Mineral)) == snap.count(Mineral)
     store.close()
 
 
