@@ -75,7 +75,8 @@ class Mineral:
     crystal_system: Annotated[str | None, dc.Index] = None   # bitmap-indexed → store.query()
     mohs: float | None = None
     type_locality: dc.Lazy["Locality"] | None = None         # lazy reference
-    tags: list = field(default_factory=list)
+    tags: Annotated[list[str], dc.Index] = field(default_factory=list)  # multi-valued index
+                                                             # → query(Mineral.tags.contains("x"))
 ```
 
 - `@dc.entity` applies `@dataclass(slots=True, weakref_slot=True, eq=False)`. Entity equality
@@ -269,6 +270,18 @@ names = store.pluck(Mineral, "name")                      # one column, whole cl
 rows = store.pluck(Mineral.mohs >= 7.0, "name", "mohs")   # tuples; refs come back
                                                           # as dc.Ref for get_many()
 
+# multi-valued (list) index — exact element membership, answered from a bitmap
+glowing = store.query(Mineral.tags.contains("fluorescent"))   # no record reads
+
+# limit / offset — window a large result set (deterministic, ascending OID)
+top10 = store.query(Mineral.crystal_system == "cubic", limit=10)  # loads 10, not the extent
+page2 = store.query(Mineral, limit=50, offset=50)
+heads = store.pluck(Mineral, "name", limit=100)               # windows the decode-level read too
+
+# stream the whole match set in bounded memory — chunk by chunk, never all at once
+for m in store.iter(Mineral.crystal_system == "cubic"):       # O(chunk) live, not O(extent)
+    process(m)
+
 # lazy references
 ref = azurite.type_locality      # dc.Lazy[Locality]
 ref.loaded                       # False — nothing fetched yet
@@ -369,6 +382,19 @@ in order of leverage:
    table scan with a matching RAM peak. Design hot filters as `dc.Index` equality facets;
    real columnar speed is the `datacrystal[arrow]` mirror's job — see
    [Arrow mirrors](#arrow-mirrors-datacrystalarrow).
+
+4. **Stream or window when you do need the entities.** The expensive shape above —
+   materializing a whole match set as live objects — has two bounded answers.
+   `store.iter(target)` yields the matches **chunk by chunk**, so peak RAM is O(chunk) not
+   O(extent) (CI-gated); it reads committed state at iteration time and stops on a foreign
+   thread or a closed store. For just the first page, `query()`/`pluck()` take
+   `limit=`/`offset=` — a fully-indexed read loads only the slice.
+
+   ```python
+   for specimen in store.iter(Specimen.quality == "museum"):   # millions of matches,
+       export(specimen)                                        # O(chunk) RAM throughout
+   first_page = store.query(Specimen, limit=100)               # hydrates 100, not the extent
+   ```
 
 Measured (M2 dev machine, SQLite backend, 300k objects ≈ 29 MB on disk): streaming ingest
 3.4 s peaking at ~750 B/object RSS with **zero** entities left live; warm bitmap query
@@ -655,11 +681,13 @@ table.to_pandas()
   (the parquet-datalake story).
 - `only=[Specimen, ...]` mirrors a subset; `flush_every=N` batches flushes (durable
   watermark trails by up to N−1 commits; a crash in that window costs a rebuild).
-  Mid-life attach: `ArrowMirror.bootstrap(path, snapshot, flush_every=N)` **streams** the
-  extent in `flush_every`-sized batches, so peak memory is O(batch), not O(extent) — a store
-  larger than RAM can be mirrored. The watermark is stamped only by the final flush, so a
-  crash mid-bootstrap forces a clean re-bootstrap rather than trusting a partial extent. A
-  mirror directory has one owner process, like the store file.
+  Mid-life attach: `ArrowMirror.bootstrap(path, snapshot, batch=N)` **streams** the extent in
+  `batch`-sized chunks (default 50 000), so peak memory is O(batch), not O(extent) — a store
+  larger than RAM can be mirrored; lower `batch` for a tighter footprint. (`batch` is the
+  bootstrap chunk; `flush_every` above is the separate post-bootstrap delta-batch knob.) The
+  watermark is stamped only by the final flush, so a crash mid-bootstrap forces a clean
+  re-bootstrap rather than trusting a partial extent. A mirror directory has one owner
+  process, like the store file.
 - DuckDB/polars recipe polish (joins across mirrors, parquet-on-S3) stays on the
   roadmap `[planned — v1, items 7/16]`.
 
@@ -728,7 +756,7 @@ Sequencing follows the ratified [roadmap](design/ROADMAP.md) and the
 | **GraphQL / FastAPI** — `datacrystal[web]` with strawberry integration | extension package, after the v1 core freeze |
 | vector search — `datacrystal[vector]`, usearch, ≥2 vector fields per entity | extension package, after v1 |
 | property-graph recipes, cross-mirror DuckDB recipes | v1 |
-| sets, field renames / guided migrations, custom scalar types, CJK-segmenting FTS tokenizer | demand-driven |
+| guided migrations (offline `migrate`/`verify`, indexed-field renames), sets, custom scalar types, CJK-segmenting FTS tokenizer | demand-driven (field renames via `dc.RenamedFrom` already ship — see [Schema evolution](#schema-evolution)) |
 
 Without the `[arrow]` extra installed, getting data into pandas is still a two-liner via
 the decode-level projection (copies, not zero-copy — but no entities are built either):
