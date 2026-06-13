@@ -655,8 +655,11 @@ table.to_pandas()
   (the parquet-datalake story).
 - `only=[Specimen, ...]` mirrors a subset; `flush_every=N` batches flushes (durable
   watermark trails by up to N−1 commits; a crash in that window costs a rebuild).
-  Mid-life attach: `ArrowMirror.bootstrap(path, snapshot)`. A mirror directory has one
-  owner process, like the store file.
+  Mid-life attach: `ArrowMirror.bootstrap(path, snapshot, flush_every=N)` **streams** the
+  extent in `flush_every`-sized batches, so peak memory is O(batch), not O(extent) — a store
+  larger than RAM can be mirrored. The watermark is stamped only by the final flush, so a
+  crash mid-bootstrap forces a clean re-bootstrap rather than trusting a partial extent. A
+  mirror directory has one owner process, like the store file.
 - DuckDB/polars recipe polish (joins across mirrors, parquet-on-S3) stays on the
   roadmap `[planned — v1, items 7/16]`.
 

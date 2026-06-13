@@ -20,7 +20,7 @@ from __future__ import annotations
 import threading
 import warnings
 from types import MappingProxyType
-from typing import Any, Mapping, cast
+from typing import Any, Iterator, Mapping, cast
 
 from pyroaring import FrozenBitMap64
 
@@ -499,10 +499,12 @@ class Snapshot:
             stacklevel=3,
         )
 
-    def _materialize(self, oid: int, cid: int, payload: bytes) -> EntityView:
-        """Decode one record into a cached view — by NAME through its own
-        persisted shape, missing live fields filled from dataclass defaults
-        (the same additive-evolution rules as live hydration)."""
+    def _decode_values(self, cid: int, payload: bytes) -> tuple[str, dict[str, Any]]:
+        """Decode one record into ``(typename, frozen-values)`` — by NAME
+        through its own persisted shape, missing live fields filled from
+        dataclass defaults (the same additive-evolution rules as live
+        hydration). Shared by :meth:`_materialize` (which caches a view) and
+        :meth:`_stream` (which constructs nothing)."""
         typename = self._typename_by_cid.get(cid)
         persisted = self._fields_by_cid.get(cid)
         if typename is None or persisted is None:
@@ -534,6 +536,23 @@ class Snapshot:
                         "schema evolution"
                     )
                 values[name] = _freeze(factory())
+        return typename, values
+
+    def _materialize(self, oid: int, cid: int, payload: bytes) -> EntityView:
+        typename, values = self._decode_values(cid, payload)
         view = EntityView(oid, typename, values)
         self._cache[oid] = view
         return view
+
+    def _stream(self, typename: str) -> Iterator[tuple[int, dict[str, Any]]]:
+        """Yield ``(oid, field-values)`` for every committed entity of a type
+        WITHOUT populating ``_cache`` or building a full list — the
+        bounded-memory bootstrap scan (#16, the cache-bypassing sibling of
+        :meth:`all`). ``scan_type`` is a cursor stream on sqlite, so peak
+        residency stays O(1) rows at the source too."""
+        with self._lock:
+            self._guard()
+            for cid in self._cids_by_typename.get(typename, []):
+                for rec in self._view.scan_type(cid):
+                    _, values = self._decode_values(rec.cid, rec.payload)
+                    yield rec.oid, values
