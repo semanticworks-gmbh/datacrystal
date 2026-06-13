@@ -260,6 +260,18 @@ def _make_entity(cls: type, frozen: bool) -> type:
     final = EntityMeta(cls.__name__, (base,), namespace)
 
     info = TypeInfo(final, typename, field_names, frozen)
+    # Resolve the field specs eagerly so a bad Index/Unique type (e.g.
+    # Annotated[datetime, Index]) raises its TypeError at the @entity definition
+    # site, not lazily on first commit() — far from the mistake (#19).
+    # Mutually- or self-referencing Lazy[T] entities can't resolve their hints
+    # here: under `from __future__ import annotations` the referent name isn't
+    # bound yet, so get_type_hints() raises NameError. Fall back to the lazy
+    # path, which re-resolves (and re-validates) once every name exists — the
+    # same TypeError, moved earlier when it can be, never removed.
+    try:
+        _ = info.specs
+    except NameError:
+        pass
     type.__setattr__(final, "__dc_typeinfo__", info)
     TYPES_BY_NAME[typename] = info
     return final
