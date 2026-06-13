@@ -4,9 +4,11 @@ datacrystal: an embedded object-graph database for Python (EclipseStore-inspired
 objects ARE the database; pickle-free msgpack records, roaring-bitmap queries, SQLite-blob
 durability, and two released-shape extras: `datacrystal[fts]` (FTS5 + Snowball) and
 `datacrystal[arrow]` (persistent parquet mirrors). Solo maintainer: Sven Hodapp. Version
-`0.1.0` — **API frozen at the v0.1.0 tag (2026-06-13)**: extras landed pre-tag as contract
-validators (2026-06-12), COMMIT-DELTA-v1 LOCKED, the pyright-strict pass DONE (library `src/`
-strict-clean and CI-gated). PyPI publication is the deferred next step (names reserved).
+`0.2.0` — v0.1.0 was the **API-freeze baseline (2026-06-13)**; **v0.2.0 ships the additive
+surface** (multi-valued list index, `limit`/`offset` + `query_iter` streaming, `RenamedFrom`,
+streaming `ArrowMirror.bootstrap`, iterative graph read-path + `list[Lazy]` adjacency, eager
+Index/Unique validation). Extras are pre-tag contract validators, COMMIT-DELTA-v1 LOCKED,
+pyright-strict CI-gated. PyPI publication deferred (names reserved).
 
 ## Commands
 

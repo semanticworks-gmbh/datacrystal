@@ -1,6 +1,6 @@
 # datacrystal user guide
 
-This guide documents what **exists today** (`0.1.0.dev0`, 2026-06). Everything that does not
+This guide documents what **exists today** (`0.2.0`, 2026-06). Everything that does not
 exist yet is explicitly marked **`[planned — …]`** with its place on the
 [roadmap](design/ROADMAP.md); nothing here describes vapor as if it were real. The public API
 freezes at the v0.1.0 tag.
