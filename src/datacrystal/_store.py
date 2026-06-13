@@ -33,7 +33,16 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable, Iterable, cast
 
-from datacrystal._conditions import And, Condition, Not, Or, Pred, query_target
+from datacrystal._conditions import (
+    And,
+    Condition,
+    Not,
+    Or,
+    Pred,
+    apply_window,
+    query_target,
+    validate_window,
+)
 from datacrystal._containers import PersistentDict, PersistentList, wrap_value
 from datacrystal._entity import (
     TYPES_BY_NAME,
@@ -1018,7 +1027,8 @@ class Store:
             None if oid is None else self._load_oid(oid, cache) for oid in oids
         ]
 
-    def query(self, target: type | Condition) -> list[Any]:
+    def query(self, target: type | Condition, *, limit: int | None = None,
+              offset: int = 0) -> list[Any]:
         """Hydrated committed entities matching ``target`` — a Condition,
         or an entity class for the **full extent**.
 
@@ -1026,8 +1036,16 @@ class Store:
         (every committed Mineral is hydrated — the same cost any
         non-indexed predicate already pays); symmetric with ``count()``/
         ``pluck()``/``Snapshot.all()`` (decided 2026-06-12). The plan is
-        deterministic and inspectable: :meth:`explain`."""
+        deterministic and inspectable: :meth:`explain`.
+
+        ``limit=``/``offset=`` window the result (#14). On a fully-indexed
+        (no-residual) query the slice is applied to the candidate OIDs
+        *before* hydration — ``query(C, limit=10)`` loads 10 records, not the
+        extent. A residual predicate must decode-to-filter first, so the
+        window there only trims the materialized list (it cannot prune the
+        scan). Result order is deterministic (ascending OID)."""
         self._enter()
+        validate_window(limit, offset)
         cls, cond = query_target(target, "query")
         ti = type_info(cls)
         if self._cid_by_typename.get(ti.typename) is None:
@@ -1039,10 +1057,10 @@ class Store:
         else:
             bitmap, residual = plan(cond, ci)
         oids = list(bitmap) if bitmap is not None else list(ci.extent)
-        objs = self.get_many(oids)
-        if residual is not None:
-            objs = [o for o in objs if residual.evaluate(o)]
-        return objs
+        if residual is None:
+            return self.get_many(apply_window(oids, limit, offset))
+        objs = [o for o in self.get_many(oids) if residual.evaluate(o)]
+        return apply_window(objs, limit, offset)
 
     def explain(self, target: type | Condition) -> QueryPlan:
         """The deterministic plan for ``target``: what answers from
@@ -1097,7 +1115,8 @@ class Store:
                 matches += 1
         return matches
 
-    def pluck(self, target: type | Condition, *fields: str) -> list[Any]:
+    def pluck(self, target: type | Condition, *fields: str,
+              limit: int | None = None, offset: int = 0) -> list[Any]:
         """Project fields without constructing entities — the decode-level
         column read (ROADMAP item 4; full columnar speed is the
         ``datacrystal[arrow]`` mirror's job).
@@ -1106,8 +1125,14 @@ class Store:
         ``pluck(cond, "name", "mohs")`` a list of tuples. Entity references
         come back as :class:`~datacrystal.Ref` tokens (feed them to
         :meth:`get_many` to hydrate), containers as plain lists/dicts.
-        Reads committed state, like :meth:`count`."""
+        Reads committed state, like :meth:`count`.
+
+        ``limit=``/``offset=`` window the result (#14) with the same
+        stop-early semantics as :meth:`query`: a fully-indexed read decodes
+        only the windowed OIDs; a residual read decodes-to-filter, then
+        trims."""
         self._enter()
+        validate_window(limit, offset)
         if not fields:
             raise TypeError("pluck() takes at least one field name")
         cls, cond = query_target(target, "pluck")
@@ -1128,6 +1153,9 @@ class Store:
         else:
             bitmap, residual = None, None
         oids = list(bitmap) if bitmap is not None else list(ci.extent)
+        windowed_early = residual is None
+        if windowed_early:
+            oids = apply_window(oids, limit, offset)
         raw_cond = _raw_condition(residual) if residual is not None else None
         single = fields[0] if len(fields) == 1 else None
         out: list[Any] = []
@@ -1138,7 +1166,7 @@ class Store:
                 out.append(_publish(row[single]))
             else:
                 out.append(tuple(_publish(row[name]) for name in fields))
-        return out
+        return out if windowed_early else apply_window(out, limit, offset)
 
     # -- engine internals ----------------------------------------------------
 

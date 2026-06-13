@@ -284,6 +284,11 @@ Query semantics:
 - Every read API takes an entity class **or** a Condition (symmetry, 2026-06-12):
   `query(Mineral)` hydrates the **full extent** — the expensive shape, same cost as any
   non-indexed predicate; prefer `count()`/`pluck()` when you don't need live entities.
+- `query()`/`pluck()` (and `snap.query()`/`snap.all()`) take `limit=`/`offset=` to window the
+  result. On a fully-indexed read the slice hits the candidate OIDs **before** hydration —
+  `query(C, limit=10)` loads 10 records, not the extent. A residual predicate must
+  decode-to-filter first, so there the window only trims the materialized result (it cannot
+  prune the scan). Order is deterministic (ascending OID): `query(C, limit=k) == query(C)[:k]`.
 - **`store.explain(target)`** (also on snapshots) returns the deterministic `QueryPlan`:
   which part answers from bitmaps, what evaluates as Python residual, and over how many
   candidates — `query()` hydrates at most `plan.candidates`. There are exactly **two

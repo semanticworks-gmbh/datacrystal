@@ -231,3 +231,70 @@ def test_explain_unseen_type_is_empty_plan(store):
     with pytest.warns(dc.UnseenTypeWarning):
         plan = store.explain(Locality)
     assert plan.extent == 0 and plan.candidates == 0
+
+
+# --- #14: limit / offset windowing ------------------------------------------
+
+def test_limit_offset_window_matches_full_slice(cabinet):
+    # Determinism oracle: a windowed read equals the full read sliced the same.
+    full = cabinet.query(Mineral)
+    assert cabinet.query(Mineral, limit=2) == full[:2]
+    assert cabinet.query(Mineral, limit=2, offset=1) == full[1:3]
+    assert cabinet.query(Mineral, offset=3) == full[3:]
+
+
+def test_limit_offset_on_indexed_condition(cabinet):
+    full = cabinet.query(Mineral.crystal_system == "monoclinic")
+    assert len(full) == 2
+    assert cabinet.query(Mineral.crystal_system == "monoclinic", limit=1) == full[:1]
+    assert cabinet.query(Mineral.crystal_system == "monoclinic", offset=1) == full[1:]
+
+
+def test_limit_offset_on_residual_condition(cabinet):
+    # mohs > 4.0 is a residual predicate — the window trims after the filter.
+    full = cabinet.query(Mineral.mohs > 4.0)
+    assert cabinet.query(Mineral.mohs > 4.0, limit=1) == full[:1]
+    assert cabinet.query(Mineral.mohs > 4.0, offset=1, limit=1) == full[1:2]
+
+
+def test_limit_offset_edges(cabinet):
+    assert cabinet.query(Mineral, limit=0) == []
+    assert cabinet.query(Mineral, offset=999) == []
+    assert cabinet.query(Mineral, offset=999, limit=5) == []
+    with pytest.raises(ValueError):
+        cabinet.query(Mineral, limit=-1)
+    with pytest.raises(ValueError):
+        cabinet.query(Mineral, offset=-1)
+    with pytest.raises(TypeError):
+        cabinet.query(Mineral, limit="2")
+    with pytest.raises(TypeError):
+        cabinet.query(Mineral, offset=1.5)
+
+
+def test_pluck_limit_offset(cabinet):
+    full = cabinet.pluck(Mineral, "name")
+    assert cabinet.pluck(Mineral, "name", limit=2) == full[:2]
+    assert cabinet.pluck(Mineral, "name", offset=1, limit=2) == full[1:3]
+    assert cabinet.pluck(Mineral, "name", limit=0) == []
+
+
+def test_count_and_explain_take_no_window(cabinet):
+    # count()/explain() are unchanged — the plan never grows a window.
+    assert cabinet.count(Mineral.crystal_system == "monoclinic") == 2
+    plan = cabinet.explain(Mineral.crystal_system == "monoclinic")
+    assert plan.indexed and plan.candidates == 2
+
+
+def test_snapshot_query_and_all_window(cabinet):
+    with cabinet.snapshot() as snap:
+        full = snap.query(Mineral)
+        assert snap.query(Mineral, limit=2) == full[:2]
+        assert snap.query(Mineral, offset=1, limit=2) == full[1:3]
+        full_all = snap.all(Mineral)
+        assert snap.all(Mineral, limit=2) == full_all[:2]
+        assert snap.all(Mineral, offset=3) == full_all[3:]
+        # residual path windows too
+        mono = snap.query(Mineral.crystal_system == "monoclinic")
+        assert snap.query(Mineral.crystal_system == "monoclinic", limit=1) == mono[:1]
+        with pytest.raises(ValueError):
+            snap.all(Mineral, offset=-1)
