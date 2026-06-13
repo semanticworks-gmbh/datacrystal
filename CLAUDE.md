@@ -47,6 +47,10 @@ stale venv shebangs — `rm -rf .venv && uv sync`.
   version, never an edit.
 - `docs/GUIDE.md` — user-facing semantics. Documentation honesty rule: features that do not
   exist are marked `[planned — milestone]`, never described as if real.
+- `docs/design/EVAL-STRATEGY.md` — the **eval feedback loop + the curated real-dataset portfolio**
+  (the frontier sensor: sense → triage → refine → build → ratchet). The proving grounds in `evals/`
+  are run on demand against real data; the loop is what keeps the lib blazing-fast AND correct
+  while developing further — let it guide what to build next.
 - The API freezes at the v0.1.0 tag; PyPI publication follows it (names reserved earlier).
 
 ## Backlog & product ownership
@@ -134,6 +138,13 @@ stale venv shebangs — `rm -rf .venv && uv sync`.
 - Schema-evolution tests fabricate classes dynamically with the same typename to simulate
   code changes between runs; their per-file pyright pragmas exist only for that.
 - The test/demo domain is always the mineral cabinet — do not invent a second domain.
+- **Evals are the deliberate exception, and they are NOT unit tests.** `evals/` holds on-demand
+  **proving grounds** that ingest REAL external datasets (Gene Ontology, GLEIF, deps.dev, …) and
+  report honest absolute numbers — throughput, latency, peak RSS, correctness on real shape. They
+  live OUTSIDE the fast `pytest` suite (they download + ingest tens of MB) — run them in an
+  evaluation phase, never in CI. A real dataset's *shape* (fan-out, depth, cycles) is distilled
+  into `benchmarks/_gen.py` so the fast unit/fitness tests stay mineral-cabinet-only and toy-free.
+  See `docs/design/EVAL-STRATEGY.md`.
 
 ## Style & gotchas
 
