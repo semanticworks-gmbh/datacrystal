@@ -68,8 +68,13 @@ stale venv shebangs — `rm -rf .venv && uv sync`.
   **`needs-owner-decision`** = blocked on a Sven ruling (no code until answered). Plus stock
   `bug` / `documentation` / `good first issue`.
 - **Refinement precedes build-order**: don't pull an issue until it's refined (INVEST + concerns)
-  and any `needs-owner-decision` spike is answered. Item 8 (#20) is the standing Golden Ticket;
-  sequencing is decided in refinement.
+  and any `needs-owner-decision` spike is answered. The resulting sequence IS the Sprint milestones
+  (the live plan, in order); #20 reverse-ref is the standing Golden Ticket. Refined stories +
+  acceptance criteria live as a Gandalf comment on each issue.
+- **Epics span sprints; materialize sub-stories just-in-time.** An `epic` is milestoned to the sprint
+  where its work *starts*; its sub-stories live as a checklist in the epic's refinement comment and
+  are cut into their own issue + sprint only when actually pulled — never bulk-create sub-issues
+  ahead of need.
 
 ## Architecture map (`src/datacrystal/`)
 
