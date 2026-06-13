@@ -84,14 +84,18 @@ The v0.x core landed and the API froze at the v0.1.0 tag (2026-06-13); contracts
 
 Ratified next work, now issues under milestones (decision rationale in each issue body):
 
-| ROADMAP # | Work | Issue | Milestone |
-|-----------|------|-------|-----------|
-| 8 | Reverse-reference index + `incoming()` traversal — the ratified next step (🥇 Golden Ticket) | #20 | v0.2 |
-| 9 | DuckPGQ property-graph recipe (docs-only) | #21 | v1 |
-| 11 | `datacrystal[vector]` — usearch sidecar (≥2 `@Vector` fields) | #22 | extensions |
-| 12 | `datacrystal[web]` — FastAPI + strawberry GraphQL | #23 | extensions |
-| 13 | read-only snapshot readers (open-at-watermark) | #24 | v1 |
-| — | Schema migration — renames + glue reshaping + migrate/verify (DESIGN amendment-7) | #26 | v0.2 |
+| ROADMAP # | Work | Issue | Sprint |
+|-----------|------|-------|--------|
+| 8 | Reverse-reference index + `incoming()` traversal — the ratified next step (🥇 Golden Ticket) | #20 | Sprint 3 |
+| 9 | DuckPGQ property-graph recipe (docs-only) | #21 | backlog |
+| 11 | `datacrystal[vector]` — usearch sidecar (≥2 `@Vector` fields) | #22 | backlog |
+| 12 | `datacrystal[web]` — FastAPI + strawberry GraphQL | #23 | backlog |
+| 13 | read-only snapshot readers (open-at-watermark) | #24 | backlog |
+| — | Schema migration — renames + glue reshaping + migrate/verify (DESIGN amendment-7) | #26 | Sprint 1 |
+
+Milestones are **sprints** (planned waves); product goals are `theme:` labels (cross-cutting);
+unscheduled work has no milestone. The current sprint plan: **Sprint 1** #19/#13/#26 · **Sprint 2**
+#14/#15/#16 · **Sprint 3** #20.
 
 The demand-driven eval backlog from the MaStR / timeseries evaluations (#12–#19, #25) lives in
 GitHub under the same milestones — scored and labelled (`priority:` / `theme:` / `spike`).

@@ -55,12 +55,14 @@ stale venv shebangs — `rm -rf .venv && uv sync`.
   `VISION.md` the product "why". Each roadmap-derived issue cites its ROADMAP item in the body.
 - **Gandalf (the PO skill) owns prioritization, splitting/merging, refinement, hygiene** — invoke
   it for any backlog question. Sizing unit = "concerns"; priority = the Gandalf Score.
-- **Where goals live — three layers, don't mix them:** the *vision & personas* (the big why) →
-  `VISION.md`; **product goals** (scale-out · knowledge-graph · search · analytics · sor ·
-  schema-evolution) → **`theme:` labels on issues, NOT milestones** (a goal spans releases; an issue
-  has only one milestone); *release goals* (what ships when) → the **milestone**.
-- **Label taxonomy** (kept deliberately small — "gandalf-fied"): **milestone** = release horizon
-  (`v0.2 (post-tag)` / `v1` / `extensions` / `demand-driven`); **`priority:`** = Gandalf band
+- **Where things live — three orthogonal axes, one tool each (don't fuse them):** *when it ships* →
+  the **milestone = a sprint** (`Sprint 1`, `Sprint 2`, … = the planned waves; one per issue, it
+  closes; unscheduled backlog has NO milestone); *which product goal it advances* → **`theme:`
+  labels** (many per issue, perpetual, cross-cuts sprints — a goal never "completes"); *the why* →
+  `VISION.md`. Goals are labels, not milestones, precisely because a goal spans many sprints and an
+  issue advances several at once.
+- **Label taxonomy** (kept deliberately small — "gandalf-fied"): **milestone** = sprint
+  (`Sprint N`; backlog items have none); **`priority:`** = Gandalf band
   (golden/high/normal/not-now); **`theme:`** = product goal; **`roadmap`** / **`eval-feedback`** =
   origin; **`epic`** / **`spike`** = Gandalf type; **`frozen-api`** = touches the v0.1.0 freeze → v0.2+;
   **`needs-owner-decision`** = blocked on a Sven ruling (no code until answered). Plus stock
