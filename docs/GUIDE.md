@@ -118,7 +118,11 @@ store.commit()
   before 2026-06-11 had a bug here — the root graph could be garbage-collected and silently
   rehydrated. Fixed; you do not need to hold your own reference anymore.)
 - `dc.Lazy[T]` is the explicit cut point where pinning (and loading, and memory) stops — use it
-  for the parts of the graph that should not live in RAM permanently.
+  for the parts of the graph that should not live in RAM permanently. A **collection** of cut
+  points is `list[dc.Lazy[T]]` / `dict[K, dc.Lazy[T]]` — each element reloads as its own unloaded
+  handle, so a graph node can hold many edges that hydrate **on demand**, one `.get()` at a time
+  (the model for adjacency / edge lists; a plain `list[T]` reloads its elements *eagerly*, so
+  laziness follows the declared element type, not what you put in at write time).
 - Assigning `store.root = value` captures the value immediately: new entities in it are
   registered, and lists/dicts come back from `store.root` as tracked containers.
 

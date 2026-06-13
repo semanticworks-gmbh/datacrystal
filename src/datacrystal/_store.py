@@ -1409,48 +1409,85 @@ class Store:
         obj = self._registry.get(oid)
         if obj is not None:
             return obj
-        rec = cache.get(oid) if cache else None
-        if rec is None:
-            rec = self._backend.load_many([oid]).get(oid)
-        if rec is None:
-            raise DanglingRefError(
-                f"no record for oid {oid} in the store — deleted (v0.x "
-                "deletes are unchecked, ADR-003) or never committed; the "
-                "reference you followed is stale"
-            )
-        return self._materialize(rec, cache)
+        return self._materialize_graph(oid, cache)
 
-    def _materialize(self, rec: StoredRecord, cache: dict[int, StoredRecord] | None) -> Any:
+    def _materialize_graph(self, root_oid: int,
+                           cache: dict[int, StoredRecord] | None) -> Any:
+        """Materialize ``root_oid`` and the transitive closure of its EAGER
+        references with an explicit work-queue — the read-path twin of the
+        iterative write path :meth:`_register_graph`, so load depth is bounded
+        by the heap, not the C stack (#29: a deep or cyclic eager graph that
+        committed fine must also reopen fine). ``Lazy`` refs are NOT followed
+        (they return handles — invariant 6's cut point is untouched).
+
+        Identity + cycles: each shell is registered BEFORE its fields are
+        filled, so a back-edge resolves to the in-progress shell instead of
+        recursing (the registry is the read path's ``walked`` set). Atomicity:
+        if any fill fails (a dangling eager ref, a schema mismatch), every shell
+        THIS call registered is discarded — a partial load never leaves a
+        half-built corpse behind the one-instance-per-OID contract."""
+        registered: list[int] = []
+        fill_queue: deque[tuple[Any, StoredRecord]] = deque()
+
+        def link(child_oid: int) -> Any:
+            # The iterative replacement for the old recursive _load_oid follow:
+            # return the live object for child_oid, allocating + enqueuing its
+            # bare shell if new — WITHOUT filling it here.
+            existing = self._registry.get(child_oid)
+            if existing is not None:
+                return existing
+            rec = cache.get(child_oid) if cache else None
+            if rec is None:
+                rec = self._backend.load_many([child_oid]).get(child_oid)
+            if rec is None:
+                raise DanglingRefError(
+                    f"no record for oid {child_oid} in the store — deleted "
+                    "(v0.x deletes are unchecked, ADR-003) or never committed; "
+                    "the reference you followed is stale"
+                )
+            shell = cast("Any", object.__new__(self._ti_for_cid(rec.cid).cls))
+            stamp(shell, child_oid, self, STATE_CLEAN)
+            self._registry.add(child_oid, shell)  # before fill: breaks cycles
+            registered.append(child_oid)
+            fill_queue.append((shell, rec))
+            return shell
+
+        try:
+            root = link(root_oid)
+            while fill_queue:
+                obj, rec = fill_queue.popleft()
+                self._fill_entity(obj, rec, link)
+        except BaseException:
+            for oid in registered:  # roll back EVERY shell this load registered
+                self._registry.discard(oid)
+                self._fingerprints.pop(oid, None)
+            raise
+        return root
+
+    def _fill_entity(self, obj: Any, rec: StoredRecord,
+                     link: Callable[[int], Any]) -> None:
         ti = self._ti_for_cid(rec.cid)
         plan = self._hydration_plan(rec.cid, ti)
-        obj = cast("Any", object.__new__(ti.cls))
-        stamp(obj, rec.oid, self, STATE_CLEAN)
-        self._registry.add(rec.oid, obj)  # before fills: breaks reference cycles
-        try:
-            values = decode_payload(rec.payload)
-            persisted = self._persisted_fields.get(rec.cid, [])
-            if len(values) != len(persisted):
-                raise SchemaMismatchError(
-                    f"{ti.typename}: record has {len(values)} fields, its type "
-                    f"dictionary row has {len(persisted)} — the store is damaged"
-                )
-            fill = object.__setattr__  # bound once: this loop is the hot path
-            for spec, index, factory in plan:
-                raw = values[index] if index is not None else factory()
-                if raw is None or type(raw) in _SCALAR_TYPES:
-                    fill(obj, spec.name, raw)  # scalars skip the resolve call
-                else:
-                    fill(obj, spec.name,
-                         self._resolve(raw, spec.lazy_refs, cache, obj))
-        except BaseException:
-            # A failed hydration (dangling eager ref, schema mismatch) must
-            # not leave a half-filled corpse behind the identity contract.
-            self._registry.discard(rec.oid)
-            raise
+        values = decode_payload(rec.payload)
+        persisted = self._persisted_fields.get(rec.cid, [])
+        if len(values) != len(persisted):
+            raise SchemaMismatchError(
+                f"{ti.typename}: record has {len(values)} fields, its type "
+                f"dictionary row has {len(persisted)} — the store is damaged"
+            )
+        fill = object.__setattr__  # bound once: this loop is the hot path
+        for spec, index, factory in plan:
+            raw = values[index] if index is not None else factory()
+            if raw is None or type(raw) in _SCALAR_TYPES:
+                fill(obj, spec.name, raw)  # scalars skip the resolve call
+            else:
+                fill(obj, spec.name, self._resolve(raw, spec.lazy_refs, obj, link))
         if self._debug:
             # Fingerprint via the same encode path the sweep uses (NOT the
-            # stored payload: an old-lineage record re-encodes through the
-            # live class shape, which must not read as a mutation).
+            # stored payload: an old-lineage record re-encodes through the live
+            # class shape, which must not read as a mutation). An eager-ref
+            # field may hold a not-yet-filled child shell — fine, the encode
+            # only needs its OID.
             try:
                 self._fingerprints[rec.oid] = _crc(encode_payload(
                     [getattr(obj, name) for name in ti.field_names],
@@ -1458,10 +1495,9 @@ class Store:
                 ))
             except BaseException:
                 self._fingerprints.pop(rec.oid, None)
-        return obj
 
-    def _resolve(self, value: Any, lazy: bool, cache: dict[int, StoredRecord] | None,
-                 owner: Any) -> Any:
+    def _resolve(self, value: Any, lazy: bool, owner: Any,
+                 link: Callable[[int], Any]) -> Any:
         if value is None or isinstance(value, (str, float, int, bytes)):
             return value  # scalar fast path: nothing to swizzle back
         if isinstance(value, RefToken):
@@ -1478,16 +1514,16 @@ class Store:
                 # engine-only Lazy constructors (users use Lazy.of)
                 unloaded: Lazy[Any] = Lazy._unloaded(value.oid, self)  # pyright: ignore[reportPrivateUsage]
                 return unloaded
-            return self._load_oid(value.oid, cache)
+            return link(value.oid)  # eager: hand off to the iterative driver (#29)
         if isinstance(value, list):
             return PersistentList(
-                (self._resolve(item, lazy, cache, owner)
+                (self._resolve(item, lazy, owner, link)
                  for item in cast("list[object]", value)),
                 owner=owner,
             )
         if isinstance(value, dict):
             return PersistentDict(
-                ((k, self._resolve(v, lazy, cache, owner))
+                ((k, self._resolve(v, lazy, owner, link))
                  for k, v in cast("dict[Any, object]", value).items()),
                 owner=owner,
             )
