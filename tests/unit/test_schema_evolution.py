@@ -252,3 +252,41 @@ def test_each_shape_gets_its_own_lineage_row(store_factory):
     names = sorted(m.name for m in reopened.root)
     assert names == ["azurite", "quartz"]
     reopened.close()
+
+
+def test_renamed_from_binds_old_column(store_factory):
+    # V1 persists `hardness`; V2 renames it to `mohs` via RenamedFrom. The old
+    # record decodes with the old value under the new name — additive, no
+    # rewrite (#26 (a)). A rename was "remove+add" (lost data) until this marker.
+    V1 = _evolve(name=(str, REQUIRED), hardness=(float | None, None))
+    store = store_factory()
+    store.root = [V1(name="quartz", hardness=7.0)]
+    store.commit()
+    store.close()
+
+    V2 = _evolve(
+        name=(str, REQUIRED),
+        mohs=(Annotated[float | None, dc.RenamedFrom("hardness")], None),
+    )
+    reopened = store_factory()
+    quartz = reopened.root[0]
+    assert isinstance(quartz, V2)
+    assert quartz.mohs == 7.0  # the old `hardness` value followed the rename
+    reopened.close()
+
+
+def test_renamed_from_prefers_new_name_when_present(store_factory):
+    # Once data is written under the new name, RenamedFrom is a no-op: the new
+    # column wins over the old (correct precedence for an already-migrated store).
+    V2 = _evolve(
+        name=(str, REQUIRED),
+        mohs=(Annotated[float | None, dc.RenamedFrom("hardness")], None),
+    )
+    store = store_factory()
+    store.root = [V2(name="opal", mohs=5.5)]
+    store.commit()
+    store.close()
+
+    reopened = store_factory()
+    assert reopened.root[0].mohs == 5.5
+    reopened.close()

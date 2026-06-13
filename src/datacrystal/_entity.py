@@ -106,6 +106,33 @@ class _FullText(_Marker):
 
 FullText = _FullText()  # the bare marker; call it to declare a language
 
+
+class RenamedFrom(_Marker):
+    """Field marker: this field was persisted under a different name (#26 (a)).
+
+    ``mohs: Annotated[float | None, dc.RenamedFrom("hardness")]`` — on decode, a
+    record that lacks ``mohs`` but has ``hardness`` binds the old column, so the
+    rename follows the code without rewriting old records (additive, invariant
+    8; the rename heuristic stays OFF — you name the old field explicitly).
+
+    Scoped to **non-indexed fields read through live hydration** in v0.2;
+    combining it with ``Index``/``Unique`` raises (the index/snapshot/arrow
+    decode paths don't honor renames yet — that is a follow-on). Rewriting old
+    records to the new name is the ``migrate`` story, not this marker.
+    """
+
+    __slots__ = ("old_name",)
+
+    def __init__(self, old_name: str) -> None:
+        super().__init__("RenamedFrom")
+        if not old_name:
+            raise TypeError("RenamedFrom(old_name) takes a non-empty field name")
+        self.old_name = old_name
+
+    def __repr__(self) -> str:
+        return f"datacrystal.RenamedFrom({self.old_name!r})"
+
+
 _INDEXABLE_TYPES = (str, int, float, bool)
 
 
@@ -120,6 +147,7 @@ class FieldSpec:
     fulltext: bool
     fulltext_language: str | None = None  # from FullText(language=...), None if bare
     multivalued: bool = False  # indexed list field — inverted (element) postings (#13)
+    renamed_from: str | None = None  # old persisted field name (RenamedFrom, #26 (a))
 
 
 class TypeInfo:
@@ -335,6 +363,7 @@ def _resolve_specs(cls: type, field_names: tuple[str, ...]) -> tuple[FieldSpec, 
         indexed = any(m is Index for m in markers)
         unique = any(m is Unique for m in markers)
         fulltext = next((m for m in markers if isinstance(m, _FullText)), None)
+        renamed = next((m for m in markers if isinstance(m, RenamedFrom)), None)
         lazy_refs = _contains_lazy(core)
         is_list = _is_list_of_scalar(core)
         if (indexed or unique) and not (_is_indexable(core) or is_list):
@@ -348,11 +377,19 @@ def _resolve_specs(cls: type, field_names: tuple[str, ...]) -> tuple[FieldSpec, 
                 f"{cls.__name__}.{name}: a Unique field cannot be a list "
                 f"(a multi-valued field has no single key), got {hint!r}"
             )
+        if renamed is not None and (indexed or unique):
+            raise TypeError(
+                f"{cls.__name__}.{name}: RenamedFrom on an Index/Unique field is "
+                "not supported yet — v0.2 scopes renames to non-indexed fields "
+                "read through live hydration; rename an indexed field via a "
+                "migration instead"
+            )
         specs.append(FieldSpec(
             name, lazy_refs, indexed, unique,
             fulltext is not None,
             fulltext.language if fulltext is not None else None,
             multivalued=indexed and is_list,
+            renamed_from=renamed.old_name if renamed is not None else None,
         ))
     return tuple(specs)
 

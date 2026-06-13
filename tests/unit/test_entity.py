@@ -124,6 +124,29 @@ def test_unique_on_list_field_rejected():
         dc.entity(Bad)
 
 
+def test_renamed_from_marker_harvested():
+    # #26 (a): RenamedFrom records the old persisted field name on the spec.
+    @dc.entity
+    class Renamed:
+        mohs: Annotated[float | None, dc.RenamedFrom("hardness")] = None
+
+    spec = {s.name: s for s in type_info(Renamed).specs}["mohs"]
+    assert spec.renamed_from == "hardness"
+    assert repr(dc.RenamedFrom("hardness")) == "datacrystal.RenamedFrom('hardness')"
+    with pytest.raises(TypeError, match="non-empty"):
+        dc.RenamedFrom("")
+
+
+def test_renamed_from_on_indexed_field_rejected():
+    # Scope (a): v0.2 renames are non-indexed-only — Index + RenamedFrom is out
+    # (the index/snapshot decode paths don't honor renames yet).
+    class Bad:
+        crystal_system: Annotated[str | None, dc.Index, dc.RenamedFrom("system")] = None
+
+    with pytest.raises(TypeError, match="RenamedFrom on an Index"):
+        dc.entity(Bad)
+
+
 def test_double_decoration_rejected():
     with pytest.raises(TypeError, match="already an @entity"):
         dc.entity(Mineral)

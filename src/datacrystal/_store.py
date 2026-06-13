@@ -1311,6 +1311,11 @@ class Store:
             plan = cast("list[tuple[Any, int | None, Any]]", [])
             for spec in ti.specs:
                 index = position.get(spec.name)
+                if index is None and spec.renamed_from is not None:
+                    # #26 (a): the new name isn't persisted, but the old one is
+                    # — bind the old column so the rename follows the code
+                    # (additive, never rewrites the record).
+                    index = position.get(spec.renamed_from)
                 if index is not None:
                     plan.append((spec, index, None))
                     continue
