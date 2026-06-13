@@ -30,7 +30,7 @@ import dataclasses
 import datetime as _dt
 import struct
 import zlib
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 import msgspec
 
@@ -83,16 +83,20 @@ def swizzle(value: Any, oid_for: Callable[[Any], int]) -> Any:
     if is_entity(value):
         return _ref_ext(oid_for(value))
     if isinstance(value, Lazy):
-        target = value.peek()
+        lazy = cast("Lazy[Any]", value)
+        target = lazy.peek()
         if target is not None:
             return _ref_ext(oid_for(target))
-        if value.oid is None:
+        if lazy.oid is None:
             raise TypeError("unloaded Lazy reference without an OID cannot be stored")
-        return _ref_ext(value.oid)
+        return _ref_ext(lazy.oid)
     if isinstance(value, (list, tuple)):
-        return [swizzle(item, oid_for) for item in value]
+        return [swizzle(item, oid_for) for item in cast("list[object] | tuple[object, ...]", value)]
     if isinstance(value, dict):
-        return {key: swizzle(item, oid_for) for key, item in value.items()}
+        return {
+            key: swizzle(item, oid_for)
+            for key, item in cast("dict[Any, object]", value).items()
+        }
     if isinstance(value, _dt.datetime):  # before date: datetime IS a date
         if value.tzinfo is None:
             return msgspec.msgpack.Ext(

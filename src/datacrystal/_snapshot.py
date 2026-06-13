@@ -20,7 +20,7 @@ from __future__ import annotations
 import threading
 import warnings
 from types import MappingProxyType
-from typing import Any, Mapping
+from typing import Any, Mapping, cast
 
 from pyroaring import FrozenBitMap64
 
@@ -79,6 +79,10 @@ class EntityView:
 
     __slots__ = ("_oid", "_typename", "_values")
 
+    _oid: int
+    _typename: str
+    _values: dict[str, Any]
+
     def __init__(self, oid: int, typename: str, values: dict[str, Any]) -> None:
         object.__setattr__(self, "_oid", oid)
         object.__setattr__(self, "_typename", typename)
@@ -132,9 +136,11 @@ def _freeze(value: Any) -> Any:
     if isinstance(value, RefToken):
         return Ref(value.oid)
     if isinstance(value, list):
-        return tuple(_freeze(item) for item in value)
+        return tuple(_freeze(item) for item in cast("list[object]", value))
     if isinstance(value, dict):
-        return MappingProxyType({k: _freeze(v) for k, v in value.items()})
+        return MappingProxyType(
+            {k: _freeze(v) for k, v in cast("dict[Any, object]", value).items()}
+        )
     return value
 
 
@@ -152,16 +158,19 @@ def _view_value(value: Any) -> Any:
             )
         return Ref(oid)
     if isinstance(value, Lazy):
-        target = value.peek()  # mirror swizzle(): a loaded handle knows best
+        handle = cast("Lazy[Any]", value)
+        target = handle.peek()  # mirror swizzle(): a loaded handle knows best
         if target is not None:
             return _view_value(target)
-        if value.oid is None:
+        if handle.oid is None:
             raise QueryError("cannot match an unloaded Lazy without an OID")
-        return Ref(value.oid)
+        return Ref(handle.oid)
     if isinstance(value, list):
-        return tuple(_view_value(item) for item in value)
+        return tuple(_view_value(item) for item in cast("list[object]", value))
     if isinstance(value, dict):
-        return {k: _view_value(v) for k, v in value.items()}
+        return {
+            k: _view_value(v) for k, v in cast("dict[Any, object]", value).items()
+        }
     return value
 
 
@@ -295,7 +304,8 @@ class Snapshot:
         (old field shapes decode by name, exactly like the live engine)."""
         if isinstance(cls_or_typename, str):
             typename = cls_or_typename
-        elif isinstance(cls_or_typename, type):
+        # runtime guard: callers may pass non-type/str (test all(42)); annotation advisory
+        elif isinstance(cls_or_typename, type):  # pyright: ignore[reportUnnecessaryIsInstance]
             typename = type_info(cls_or_typename).typename  # loud if not @entity
         else:
             raise TypeError(

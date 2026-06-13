@@ -19,7 +19,7 @@ a container, its owner cannot be collected out from under it.
 
 from __future__ import annotations
 
-from typing import Any, Iterable, Mapping, SupportsIndex
+from typing import Any, Iterable, Mapping, SupportsIndex, cast
 
 from datacrystal._errors import FrozenEntityError
 from datacrystal._state import touch
@@ -30,25 +30,26 @@ def wrap_value(value: Any, owner: Any) -> Any:
     ``owner``. Already-bound containers of the same owner pass through;
     everything else is copied into a fresh bound wrapper."""
     if isinstance(value, (PersistentList, PersistentDict)):
-        if value._dc_owner is owner:
+        # reportPrivateUsage: same-module wrap_value/owner cooperation
+        if value._dc_owner is owner:  # pyright: ignore[reportPrivateUsage]
             return value
         return type(value)(value, owner=owner)
     if isinstance(value, list):
-        return PersistentList(value, owner=owner)
+        return PersistentList(cast("list[Any]", value), owner=owner)
     if isinstance(value, dict):
-        return PersistentDict(value, owner=owner)
+        return PersistentDict(cast("dict[Any, Any]", value), owner=owner)
     if type(value) is tuple:  # exactly tuple: NamedTuples pass through as-is
-        return tuple(wrap_value(item, owner) for item in value)
+        return tuple(wrap_value(item, owner) for item in cast("tuple[Any, ...]", value))
     return value
 
 
 def _is_frozen_owner(owner: Any) -> bool:
     if owner is None:
         return False
-    return type(owner).__dc_typeinfo__.frozen
+    return cast(Any, type(owner)).__dc_typeinfo__.frozen
 
 
-class PersistentList(list):
+class PersistentList(list[Any]):
     """A list that marks its owning entity dirty on every mutation."""
 
     __slots__ = ("_dc_owner", "_dc_frozen")
@@ -106,7 +107,8 @@ class PersistentList(list):
         self._touch()
         if isinstance(index, slice):
             super().__setitem__(
-                index, [wrap_value(item, self._dc_owner) for item in value]
+                cast("slice[Any, Any, Any]", index),
+                [wrap_value(item, self._dc_owner) for item in value],
             )
         else:
             super().__setitem__(index, wrap_value(value, self._dc_owner))
@@ -125,7 +127,7 @@ class PersistentList(list):
         return self
 
 
-class PersistentDict(dict):
+class PersistentDict(dict[Any, Any]):
     """A dict that marks its owning entity dirty on every mutation."""
 
     __slots__ = ("_dc_owner", "_dc_frozen")
@@ -135,7 +137,11 @@ class PersistentDict(dict):
         self._dc_owner = owner
         self._dc_frozen = _is_frozen_owner(owner)
         super().__init__()
-        items = mapping.items() if isinstance(mapping, dict) else mapping
+        items = (
+            cast("dict[Any, Any]", mapping).items()
+            if isinstance(mapping, dict)
+            else mapping
+        )
         for key, value in items:
             super().__setitem__(key, wrap_value(value, owner))
 

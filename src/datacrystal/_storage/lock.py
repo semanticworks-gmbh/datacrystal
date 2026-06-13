@@ -24,7 +24,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Callable
+from typing import Callable, cast
 
 from datacrystal._errors import StoreLockedError
 
@@ -93,13 +93,16 @@ class LeaseLock:
             {"pid": os.getpid(), "token": self._token, "ts": self._clock()}
         )
 
-    def _read(self) -> dict | None:
+    def _read(self) -> dict[str, object] | None:
         try:
-            return json.loads(self._path.read_text())
+            data = json.loads(self._path.read_text())
         except (OSError, ValueError):
             return None
+        if isinstance(data, dict):
+            return cast("dict[str, object]", data)
+        return None
 
-    def _is_stale(self, holder: dict) -> bool:
+    def _is_stale(self, holder: dict[str, object]) -> bool:
         ts = holder.get("ts")
         if not isinstance(ts, (int, float)):
             return True  # unreadable/corrupt lock counts as stale

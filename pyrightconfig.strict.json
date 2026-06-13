@@ -1,0 +1,18 @@
+{
+  // Strict type gate for the LIBRARY only (src/). Invoked explicitly:
+  //   uvx pyright -p pyrightconfig.strict.json
+  // and as a dedicated CI step. The default all-paths check stays in
+  // pyproject.toml's [tool.pyright] (standard mode) because the magic
+  // class-attribute query syntax (Mineral.mohs >= 6.0) is untypeable by
+  // design — tests/examples keep their per-file pragmas, src/ does not.
+  // src/ is strict-clean as of the v0.1.0 pre-tag pass (2026-06-13).
+  //
+  // This filename is deliberately NOT "pyrightconfig.json": only the exact
+  // name is auto-applied, so the standard dev command is left untouched.
+  "venvPath": ".",
+  "venv": ".venv",
+  "typeCheckingMode": "strict",
+  "include": ["src"],
+  "exclude": ["**/__pycache__"],
+  "stubPath": "typings"
+}

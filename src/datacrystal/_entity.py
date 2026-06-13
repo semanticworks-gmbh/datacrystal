@@ -37,6 +37,7 @@ import weakref
 from typing import (
     Annotated,
     Any,
+    cast,
     dataclass_transform,
     get_args,
     get_origin,
@@ -47,12 +48,7 @@ from datacrystal._conditions import FieldExpr
 from datacrystal._containers import wrap_value
 from datacrystal._errors import FrozenEntityError, NotAnEntityError
 from datacrystal._lazy import Lazy
-from datacrystal._state import (  # noqa: F401  (STATE_* re-exported)
-    STATE_CLEAN,
-    STATE_DIRTY,
-    STATE_NEW,
-    touch,
-)
+from datacrystal._state import STATE_NEW, touch
 
 
 class _Marker:
@@ -93,7 +89,7 @@ class _FullText(_Marker):
         self.language = language
 
     def __call__(self, *, language: str) -> "_FullText":
-        if not isinstance(language, str) or not language:
+        if not language:
             raise TypeError(
                 "FullText(language=...) takes a non-empty language code, e.g. "
                 'FullText(language="de")'
@@ -201,7 +197,7 @@ class EntityMeta(type):
 
 
 def _entity_new(cls: type, *args: Any, **kwargs: Any) -> Any:
-    self = object.__new__(cls)
+    self = cast("Any", object.__new__(cls))
     object.__setattr__(self, "__dc_state__", STATE_NEW)
     return self
 
@@ -242,9 +238,12 @@ def entity(cls: type | None = None, /, *, frozen: bool = False):
 def _make_entity(cls: type, frozen: bool) -> type:
     if isinstance(cls, EntityMeta):
         raise TypeError(f"{cls.__name__} is already an @entity class")
-    base = dataclasses.dataclass(  # type: ignore[call-overload]
-        slots=True, weakref_slot=True, eq=False, frozen=frozen
-    )(cls)
+    base = cast(
+        "Any",
+        dataclasses.dataclass(  # type: ignore[call-overload]
+            slots=True, weakref_slot=True, eq=False, frozen=frozen
+        )(cls),
+    )
     field_names = tuple(f.name for f in dataclasses.fields(base))
     typename = f"{cls.__module__}:{cls.__qualname__}"
 
@@ -311,7 +310,7 @@ def set_field(obj: Any, name: str, value: Any) -> None:
 
 def _resolve_specs(cls: type, field_names: tuple[str, ...]) -> tuple[FieldSpec, ...]:
     hints = get_type_hints(cls, include_extras=True)
-    specs = []
+    specs: list[FieldSpec] = []
     for name in field_names:
         hint = hints.get(name, Any)
         markers: list[_Marker] = []

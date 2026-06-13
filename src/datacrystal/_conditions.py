@@ -51,7 +51,7 @@ class Condition:
         raise AssertionError("unreachable")
 
     def entity_class(self) -> type:
-        classes = set()
+        classes: set[type] = set()
         self._collect_classes(classes)
         if len(classes) != 1:
             names = sorted(c.__name__ for c in classes)

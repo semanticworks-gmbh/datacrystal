@@ -31,7 +31,7 @@ import warnings
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, cast
 
 from datacrystal._conditions import And, Condition, Not, Or, Pred, query_target
 from datacrystal._containers import PersistentDict, PersistentList, wrap_value
@@ -498,7 +498,7 @@ class Store:
                 )
             key = unique_fields[0]
         elif key not in unique_fields:
-            raise QueryErrorFor(type(obj), key)
+            raise QueryErrorFor(cast("type[object]", type(obj)), key)
         value = getattr(obj, key)
         if value is None:
             raise QueryError(
@@ -691,7 +691,7 @@ class Store:
         """A failed P2 was never durable: re-buffer the captured set (unless
         a racing write already re-buffered an entity) and reuse the TID —
         the sequence stays gapless (invariant 5)."""
-        self._alloc._next_tid = capture.tid
+        self._alloc._next_tid = capture.tid  # pyright: ignore[reportPrivateUsage]  # gapless TID reuse, invariant 5
         for oid, obj, prior in capture.flipped:
             if prior == STATE_NEW:
                 set_state(obj, STATE_NEW)
@@ -958,12 +958,13 @@ class Store:
                     "class as its first argument"
                 )
             return self._get_many_by_key(refs, unique_key)
-        items = list(refs)  # type: ignore[arg-type]  # a class without kwargs falls through
+        items: list[Any] = list(refs)  # type: ignore[arg-type]  # a class without kwargs falls through
         wanted: list[int] = []
         for item in items:
             if isinstance(item, Lazy):
-                oid = item.oid
-                if not item.loaded and oid is not None:
+                lazy = cast("Lazy[Any]", item)
+                oid = lazy.oid
+                if not lazy.loaded and oid is not None:
                     wanted.append(oid)
             elif isinstance(item, int):
                 wanted.append(item)
@@ -976,12 +977,13 @@ class Store:
                 )
         missing = [oid for oid in wanted if self._registry.get(oid) is None]
         cache = self._backend.load_many(missing) if missing else {}
-        out = []
+        out: list[Any] = []
         for item in items:
             if isinstance(item, Lazy):
-                oid = item.oid
-                if item.loaded or oid is None:
-                    out.append(item.get())
+                lazy = cast("Lazy[Any]", item)
+                oid = lazy.oid
+                if lazy.loaded or oid is None:
+                    out.append(lazy.get())
                 else:
                     out.append(self._load_oid(oid, cache))
             elif isinstance(item, int):
@@ -1237,14 +1239,14 @@ class Store:
             if oid is None or oid in self._new or oid in self._dirty:
                 queue.append(value)
         elif isinstance(value, Lazy):
-            target = value.peek()
+            target = cast("Lazy[Any]", value).peek()
             if target is not None:
                 self._walk_value(target, queue)
         elif isinstance(value, (list, tuple)):
-            for item in value:
+            for item in cast("tuple[Any, ...]", value):
                 self._walk_value(item, queue)
         elif isinstance(value, dict):
-            for item in value.values():
+            for item in cast("dict[Any, object]", value).values():
                 self._walk_value(item, queue)
 
     def _oid_for_encode(self, obj: Any) -> int:
@@ -1306,7 +1308,7 @@ class Store:
         if plan is None:
             persisted = self._persisted_fields.get(cid, [])
             position = {name: i for i, name in enumerate(persisted)}
-            plan = []
+            plan = cast("list[tuple[Any, int | None, Any]]", [])
             for spec in ti.specs:
                 index = position.get(spec.name)
                 if index is not None:
@@ -1343,7 +1345,7 @@ class Store:
     def _materialize(self, rec: StoredRecord, cache: dict[int, StoredRecord] | None) -> Any:
         ti = self._ti_for_cid(rec.cid)
         plan = self._hydration_plan(rec.cid, ti)
-        obj = object.__new__(ti.cls)
+        obj = cast("Any", object.__new__(ti.cls))
         stamp(obj, rec.oid, self, STATE_CLEAN)
         self._registry.add(rec.oid, obj)  # before fills: breaks reference cycles
         try:
@@ -1388,19 +1390,27 @@ class Store:
             if lazy:
                 existing = self._registry.get(value.oid)
                 if existing is not None:
-                    handle = Lazy._loaded(existing, value.oid, self)
+                    # engine-only Lazy constructors (users use Lazy.of)
+                    handle: Lazy[Any] = Lazy[Any]._loaded(  # pyright: ignore[reportPrivateUsage]
+                        existing, value.oid, self
+                    )
                     if self._lazyman is not None:
                         self._lazyman.track(handle)
                     return handle
-                return Lazy._unloaded(value.oid, self)
+                # engine-only Lazy constructors (users use Lazy.of)
+                unloaded: Lazy[Any] = Lazy._unloaded(value.oid, self)  # pyright: ignore[reportPrivateUsage]
+                return unloaded
             return self._load_oid(value.oid, cache)
         if isinstance(value, list):
             return PersistentList(
-                (self._resolve(item, lazy, cache, owner) for item in value), owner=owner
+                (self._resolve(item, lazy, cache, owner)
+                 for item in cast("list[object]", value)),
+                owner=owner,
             )
         if isinstance(value, dict):
             return PersistentDict(
-                ((k, self._resolve(v, lazy, cache, owner)) for k, v in value.items()),
+                ((k, self._resolve(v, lazy, cache, owner))
+                 for k, v in cast("dict[Any, object]", value).items()),
                 owner=owner,
             )
         return value
@@ -1437,7 +1447,7 @@ def _ref_target_oid(value: Any) -> int | None:
     if isinstance(value, Lazy):
         if value.oid is not None:
             return value.oid
-        target = value.peek()
+        target = cast("Lazy[Any]", value).peek()
         return oid_of(target) if target is not None else None
     return None
 
@@ -1474,7 +1484,7 @@ def _raw_value(value: Any) -> Any:
             )
         return RefToken(oid)
     if isinstance(value, Lazy):
-        target = value.peek()  # mirror swizzle(): a loaded handle knows best
+        target = cast("Lazy[Any]", value).peek()  # mirror swizzle(): a loaded handle knows best
         if target is not None:
             return _raw_value(target)
         if value.oid is None:
@@ -1504,9 +1514,10 @@ def _publish(value: Any) -> Any:
     if isinstance(value, RefToken):
         return Ref(value.oid)
     if isinstance(value, list):
-        return [_publish(item) for item in value]
+        return [_publish(item) for item in cast("list[object]", value)]
     if isinstance(value, dict):
-        return {key: _publish(item) for key, item in value.items()}
+        return {key: _publish(item)
+                for key, item in cast("dict[Any, object]", value).items()}
     return value
 
 
@@ -1516,15 +1527,15 @@ def _find_escapee(value: Any) -> str | None:
     if is_entity(value):
         return type(value).__name__
     if isinstance(value, Lazy):
-        target = value.peek()
+        target = cast("Lazy[Any]", value).peek()
         return f"Lazy[{type(target).__name__}]" if target is not None else "Lazy"
     if isinstance(value, (list, tuple, set, frozenset)):
-        for item in value:
+        for item in cast("frozenset[object]", value):
             found = _find_escapee(item)
             if found is not None:
                 return found
     elif isinstance(value, dict):
-        for key, item in value.items():
+        for key, item in cast("dict[Any, object]", value).items():
             found = _find_escapee(key) or _find_escapee(item)
             if found is not None:
                 return found

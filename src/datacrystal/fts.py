@@ -460,7 +460,7 @@ class FullTextIndex:
                 list(stamp.items()),
             )
 
-    def _exec(self, sql: str, params: tuple = ()) -> None:
+    def _exec(self, sql: str, params: tuple[Any, ...] = ()) -> None:
         self.statements += 1
         self._conn.execute(sql, params)
 

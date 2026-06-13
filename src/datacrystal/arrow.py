@@ -50,7 +50,7 @@ import os
 import re
 import shutil
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping, cast
 
 import msgspec
 
@@ -61,8 +61,8 @@ from datacrystal._records import (
     NAIVE_DATETIME_EXT_CODE,
     REF_EXT_CODE,
     TIME_EXT_CODE,
-    _ext_hook,
-    _OID_STRUCT,
+    _ext_hook,  # pyright: ignore[reportPrivateUsage]  # codec primitive, parquet mirror
+    _OID_STRUCT,  # pyright: ignore[reportPrivateUsage]  # codec primitive, parquet mirror
     RefToken,
     decode_payload,
 )
@@ -87,6 +87,14 @@ except ImportError as exc:  # pragma: no cover — core-only installs
 # Compute kernels are registered dynamically; pyarrow's bundled stubs do not
 # know them, so fetch by name (runtime-identical to pc.invert).
 _invert: Any = getattr(_pc, "invert")
+
+# ``pyarrow.parquet`` ships no ``.pyi`` (only untyped ``.py``), so its public
+# functions arrive partially-unknown; fetch by name (like _invert above) and
+# bind typed aliases matching the real runtime signatures (runtime-identical).
+_write_table = cast(
+    "Callable[[pa.Table, str | Path], None]", getattr(pq, "write_table")
+)
+_read_table = cast("Callable[[str | Path], pa.Table]", getattr(pq, "read_table"))
 
 __all__ = ["ArrowMirror", "MirrorConfigError", "decode_fallback"]
 
@@ -140,7 +148,7 @@ def _tag_of(value: Any) -> str:
         return "time" if value.tzinfo is None else "fallback"
     if isinstance(value, (list, tuple)):
         inner = "null"
-        for item in value:
+        for item in cast("tuple[object, ...] | list[object]", value):
             inner = _unify_tags(inner, _tag_of(item))
         return "fallback" if inner == "fallback" else f"list<{inner}>"
     return "fallback"  # dicts/mappings and anything exotic
@@ -246,9 +254,12 @@ def _reswizzle(value: Any) -> Any:
     if isinstance(value, _dt.time):
         return msgspec.msgpack.Ext(TIME_EXT_CODE, value.isoformat().encode())
     if isinstance(value, (list, tuple)):
-        return [_reswizzle(item) for item in value]
+        return [_reswizzle(item) for item in cast("tuple[object, ...] | list[object]", value)]
     if isinstance(value, Mapping):
-        return {key: _reswizzle(item) for key, item in value.items()}
+        return {
+            key: _reswizzle(item)
+            for key, item in cast("Mapping[object, object]", value).items()
+        }
     return value
 
 
@@ -594,7 +605,7 @@ class ArrowMirror:
         directory = self._segment_dir(typename)
         directory.mkdir(parents=True, exist_ok=True)
         name = f"seg-{state.next_segment:06d}.parquet"
-        pq.write_table(table, directory / name)
+        _write_table(table, directory / name)
         # The manifest is the commit point: a segment it names must be ON
         # DISK first, or a crash leaves the manifest pointing at bytes that
         # never landed (the watermark would lie — spec §4.3).
@@ -605,8 +616,9 @@ class ArrowMirror:
 
     def _read_segment(self, typename: str, segment: str,
                       columns: dict[str, str]) -> pa.Table:
-        table = pq.read_table(self._segment_dir(typename) / segment)
-        meta = (table.schema.metadata or {}).get(_TAGS_META, b"{}")
+        table = _read_table(self._segment_dir(typename) / segment)
+        schema_meta = cast("dict[bytes, bytes] | None", table.schema.metadata)
+        meta = (schema_meta or {}).get(_TAGS_META, b"{}")
         written_tags: dict[str, str] = json.loads(meta)
         n = table.num_rows
         arrays = [
@@ -667,7 +679,7 @@ class ArrowMirror:
         )
         directory = self._segment_dir(typename)
         name = f"seg-{state.next_segment:06d}.parquet"
-        pq.write_table(live, directory / name)
+        _write_table(live, directory / name)
         obsolete = [directory / old for old in state.segments]
         state.segments = [name]
         state.next_segment += 1
