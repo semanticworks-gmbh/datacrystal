@@ -46,7 +46,9 @@ def wrap_value(value: Any, owner: Any) -> Any:
 def _is_frozen_owner(owner: Any) -> bool:
     if owner is None:
         return False
-    return cast(Any, type(owner)).__dc_typeinfo__.frozen
+    # owner.__class__ (Any) instead of type(owner) (type[Any]) keeps the
+    # attribute access typed Any — no cast() on this hot (per-wrap) path.
+    return owner.__class__.__dc_typeinfo__.frozen
 
 
 class PersistentList(list[Any]):

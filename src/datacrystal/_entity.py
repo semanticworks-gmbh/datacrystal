@@ -196,8 +196,10 @@ class EntityMeta(type):
         return type.__getattribute__(cls, name)
 
 
-def _entity_new(cls: type, *args: Any, **kwargs: Any) -> Any:
-    self = cast("Any", object.__new__(cls))
+def _entity_new(cls: type[Any], *args: Any, **kwargs: Any) -> Any:
+    # cls: type[Any] (not bare `type`) makes object.__new__ return Any, so no
+    # per-instance cast() is needed on this hot (every-entity) path.
+    self = object.__new__(cls)
     object.__setattr__(self, "__dc_state__", STATE_NEW)
     return self
 
