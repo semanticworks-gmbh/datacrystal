@@ -231,3 +231,121 @@ def test_explain_unseen_type_is_empty_plan(store):
     with pytest.warns(dc.UnseenTypeWarning):
         plan = store.explain(Locality)
     assert plan.extent == 0 and plan.candidates == 0
+
+
+# --- #14: limit / offset windowing ------------------------------------------
+
+def test_limit_offset_window_matches_full_slice(cabinet):
+    # Determinism oracle: a windowed read equals the full read sliced the same.
+    full = cabinet.query(Mineral)
+    assert cabinet.query(Mineral, limit=2) == full[:2]
+    assert cabinet.query(Mineral, limit=2, offset=1) == full[1:3]
+    assert cabinet.query(Mineral, offset=3) == full[3:]
+
+
+def test_limit_offset_on_indexed_condition(cabinet):
+    full = cabinet.query(Mineral.crystal_system == "monoclinic")
+    assert len(full) == 2
+    assert cabinet.query(Mineral.crystal_system == "monoclinic", limit=1) == full[:1]
+    assert cabinet.query(Mineral.crystal_system == "monoclinic", offset=1) == full[1:]
+
+
+def test_limit_offset_on_residual_condition(cabinet):
+    # mohs > 4.0 is a residual predicate — the window trims after the filter.
+    full = cabinet.query(Mineral.mohs > 4.0)
+    assert cabinet.query(Mineral.mohs > 4.0, limit=1) == full[:1]
+    assert cabinet.query(Mineral.mohs > 4.0, offset=1, limit=1) == full[1:2]
+
+
+def test_limit_offset_edges(cabinet):
+    assert cabinet.query(Mineral, limit=0) == []
+    assert cabinet.query(Mineral, offset=999) == []
+    assert cabinet.query(Mineral, offset=999, limit=5) == []
+    with pytest.raises(ValueError):
+        cabinet.query(Mineral, limit=-1)
+    with pytest.raises(ValueError):
+        cabinet.query(Mineral, offset=-1)
+    with pytest.raises(TypeError):
+        cabinet.query(Mineral, limit="2")
+    with pytest.raises(TypeError):
+        cabinet.query(Mineral, offset=1.5)
+
+
+def test_pluck_limit_offset(cabinet):
+    full = cabinet.pluck(Mineral, "name")
+    assert cabinet.pluck(Mineral, "name", limit=2) == full[:2]
+    assert cabinet.pluck(Mineral, "name", offset=1, limit=2) == full[1:3]
+    assert cabinet.pluck(Mineral, "name", limit=0) == []
+
+
+def test_count_and_explain_take_no_window(cabinet):
+    # count()/explain() are unchanged — the plan never grows a window.
+    assert cabinet.count(Mineral.crystal_system == "monoclinic") == 2
+    plan = cabinet.explain(Mineral.crystal_system == "monoclinic")
+    assert plan.indexed and plan.candidates == 2
+
+
+def test_snapshot_query_and_all_window(cabinet):
+    with cabinet.snapshot() as snap:
+        full = snap.query(Mineral)
+        assert snap.query(Mineral, limit=2) == full[:2]
+        assert snap.query(Mineral, offset=1, limit=2) == full[1:3]
+        full_all = snap.all(Mineral)
+        assert snap.all(Mineral, limit=2) == full_all[:2]
+        assert snap.all(Mineral, offset=3) == full_all[3:]
+        # residual path windows too
+        mono = snap.query(Mineral.crystal_system == "monoclinic")
+        assert snap.query(Mineral.crystal_system == "monoclinic", limit=1) == mono[:1]
+        with pytest.raises(ValueError):
+            snap.all(Mineral, offset=-1)
+
+
+# --- #15: store.query_iter() streaming query ---------------------------------------
+
+def test_query_iter_matches_query_as_oid_sets(cabinet):
+    from datacrystal._entity import oid_of
+    streamed = list(cabinet.query_iter(Mineral.crystal_system == "monoclinic"))
+    queried = cabinet.query(Mineral.crystal_system == "monoclinic")
+    assert {oid_of(o) for o in streamed} == {oid_of(o) for o in queried}
+    # full extent: every entity enumerated exactly once
+    all_oids = [oid_of(o) for o in cabinet.query_iter(Mineral)]
+    assert sorted(all_oids) == sorted(oid_of(o) for o in cabinet.query(Mineral))
+    assert len(all_oids) == len(set(all_oids))
+
+
+def test_query_iter_guards_every_next_against_foreign_thread(cabinet):
+    import threading
+    it = cabinet.query_iter(Mineral)
+    next(it)  # owner pulls one — fine
+    errors: list[str] = []
+
+    def foreign():
+        try:
+            next(it)
+        except dc.WrongThreadError as e:
+            errors.append(type(e).__name__)
+
+    t = threading.Thread(target=foreign)
+    t.start()
+    t.join()
+    assert errors == ["WrongThreadError"]
+
+
+def test_query_iter_stops_when_closed_mid_stream(store_factory):
+    s = store_factory()
+    s.root = [Mineral(qid=f"Q{i}", name=f"m{i}") for i in range(3)]
+    s.commit()
+    it = s.query_iter(Mineral)
+    next(it)
+    s.close()
+    with pytest.raises(dc.StoreClosedError):
+        next(it)
+
+
+def test_query_iter_excludes_uncommitted(store_factory):
+    s = store_factory()
+    s.root = [Mineral(qid="Q1", name="quartz")]
+    s.commit()
+    s.store(Mineral(qid="Q2", name="topaz"))  # stored, not committed
+    assert {m.name for m in s.query_iter(Mineral)} == {"quartz"}
+    s.close()

@@ -18,9 +18,11 @@ everything else runs as a residual Python predicate over the candidate set.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, TypeVar
 
 from datacrystal._errors import QueryError
+
+_T = TypeVar("_T")
 
 
 class Condition:
@@ -191,6 +193,31 @@ class Not(Condition):
 
     def __repr__(self) -> str:
         return f"~{self.part!r}"
+
+
+def validate_window(limit: int | None, offset: int) -> None:
+    """Validate the ``limit=``/``offset=`` window for query()/pluck() and the
+    snapshot reads (#14). ``type(...) is not int`` rejects ``bool`` too."""
+    if type(offset) is not int:
+        raise TypeError(f"offset= must be an int, got {type(offset).__name__}")
+    if offset < 0:
+        raise ValueError(f"offset= must be >= 0, got {offset}")
+    if limit is not None:
+        if type(limit) is not int:
+            raise TypeError(f"limit= must be an int, got {type(limit).__name__}")
+        if limit < 0:
+            raise ValueError(f"limit= must be >= 0, got {limit}")
+
+
+def apply_window(seq: list[_T], limit: int | None, offset: int) -> list[_T]:
+    """Slice a result list to its ``(offset, limit)`` window. Result order is
+    deterministic (ascending OID, preserved by ``get_many``), so a windowed read
+    equals the unwindowed read sliced the same way (#14)."""
+    if offset:
+        seq = seq[offset:]
+    if limit is not None:
+        seq = seq[:limit]
+    return seq
 
 
 def query_target(target: Any, method: str) -> tuple[type, Condition | None]:

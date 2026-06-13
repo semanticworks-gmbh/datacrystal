@@ -20,11 +20,20 @@ from __future__ import annotations
 import threading
 import warnings
 from types import MappingProxyType
-from typing import Any, Mapping, cast
+from typing import Any, Iterator, Mapping, cast
 
 from pyroaring import FrozenBitMap64
 
-from datacrystal._conditions import And, Condition, Not, Or, Pred, query_target
+from datacrystal._conditions import (
+    And,
+    Condition,
+    Not,
+    Or,
+    Pred,
+    apply_window,
+    query_target,
+    validate_window,
+)
 from datacrystal._entity import TYPES_BY_NAME, is_entity, oid_of, type_info
 from datacrystal._errors import (
     DanglingRefError,
@@ -299,9 +308,14 @@ class Snapshot:
                 view = self._materialize(rec.oid, rec.cid, rec.payload)
             return view
 
-    def all(self, cls_or_typename: type | str) -> list[EntityView]:
+    def all(self, cls_or_typename: type | str, *, limit: int | None = None,
+            offset: int = 0) -> list[EntityView]:
         """Every committed entity of one type, across its full lineage
-        (old field shapes decode by name, exactly like the live engine)."""
+        (old field shapes decode by name, exactly like the live engine).
+
+        ``limit=``/``offset=`` window the result (#14, symmetric with the live
+        store); materialization stops once the window is filled."""
+        validate_window(limit, offset)
         if isinstance(cls_or_typename, str):
             typename = cls_or_typename
         # runtime guard: callers may pass non-type/str (test all(42)); annotation advisory
@@ -312,6 +326,7 @@ class Snapshot:
                 f"all() takes an @entity class or a typename string, "
                 f"got {cls_or_typename!r}"
             )
+        stop = None if limit is None else offset + limit
         out: list[EntityView] = []
         with self._lock:
             self._guard()
@@ -321,7 +336,9 @@ class Snapshot:
                     if view is None:
                         view = self._materialize(rec.oid, rec.cid, rec.payload)
                     out.append(view)
-        return out
+                    if stop is not None and len(out) >= stop:
+                        return out[offset:]
+        return apply_window(out, limit, offset)
 
     def index_bitmaps(self, cls: type) -> SnapshotIndexes:
         """Frozen index-bitmap views for ``cls`` at this watermark — the M4
@@ -367,12 +384,18 @@ class Snapshot:
                 1 for view in self._views_for(oids) if view_cond.evaluate(view)
             )
 
-    def query(self, target: type | Condition) -> list[EntityView]:
+    def query(self, target: type | Condition, *, limit: int | None = None,
+              offset: int = 0) -> list[EntityView]:
         """:class:`EntityView` DTOs matching ``target`` at this watermark —
         a Condition, or an entity class for the full extent (symmetric
         with the live store, decided 2026-06-12; never live entities,
         ADR-001). This is the sanctioned way for ANY thread to run a
-        bitmap query while the owner keeps writing (KICKOFF M4 exit)."""
+        bitmap query while the owner keeps writing (KICKOFF M4 exit).
+
+        ``limit=``/``offset=`` window the result (#14): a fully-indexed read
+        builds views for only the windowed OIDs; a residual read filters,
+        then trims."""
+        validate_window(limit, offset)
         cls, cond = query_target(target, "query")
         ti = type_info(cls)
         if ti.typename not in self._cids_by_typename:
@@ -386,11 +409,14 @@ class Snapshot:
             else:
                 bitmap, residual = plan(cond, ci)
             oids = list(bitmap) if bitmap is not None else list(ci.extent)
+            if residual is None:
+                oids = apply_window(oids, limit, offset)
             views = self._views_for(oids)
         if residual is None:
             return views
         view_cond = _view_condition(residual)
-        return [view for view in views if view_cond.evaluate(view)]
+        matched = [view for view in views if view_cond.evaluate(view)]
+        return apply_window(matched, limit, offset)
 
     def explain(self, target: type | Condition) -> "QueryPlan":
         """The deterministic plan for ``target`` over this snapshot's
@@ -473,10 +499,12 @@ class Snapshot:
             stacklevel=3,
         )
 
-    def _materialize(self, oid: int, cid: int, payload: bytes) -> EntityView:
-        """Decode one record into a cached view — by NAME through its own
-        persisted shape, missing live fields filled from dataclass defaults
-        (the same additive-evolution rules as live hydration)."""
+    def _decode_values(self, cid: int, payload: bytes) -> tuple[str, dict[str, Any]]:
+        """Decode one record into ``(typename, frozen-values)`` — by NAME
+        through its own persisted shape, missing live fields filled from
+        dataclass defaults (the same additive-evolution rules as live
+        hydration). Shared by :meth:`_materialize` (which caches a view) and
+        :meth:`_stream` (which constructs nothing)."""
         typename = self._typename_by_cid.get(cid)
         persisted = self._fields_by_cid.get(cid)
         if typename is None or persisted is None:
@@ -508,6 +536,23 @@ class Snapshot:
                         "schema evolution"
                     )
                 values[name] = _freeze(factory())
+        return typename, values
+
+    def _materialize(self, oid: int, cid: int, payload: bytes) -> EntityView:
+        typename, values = self._decode_values(cid, payload)
         view = EntityView(oid, typename, values)
         self._cache[oid] = view
         return view
+
+    def _stream(self, typename: str) -> Iterator[tuple[int, dict[str, Any]]]:
+        """Yield ``(oid, field-values)`` for every committed entity of a type
+        WITHOUT populating ``_cache`` or building a full list — the
+        bounded-memory bootstrap scan (#16, the cache-bypassing sibling of
+        :meth:`all`). ``scan_type`` is a cursor stream on sqlite, so peak
+        residency stays O(1) rows at the source too."""
+        with self._lock:
+            self._guard()
+            for cid in self._cids_by_typename.get(typename, []):
+                for rec in self._view.scan_type(cid):
+                    _, values = self._decode_values(rec.cid, rec.payload)
+                    yield rec.oid, values

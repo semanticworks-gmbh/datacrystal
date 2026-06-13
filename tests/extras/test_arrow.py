@@ -421,3 +421,108 @@ def test_decode_fallback_restores_reftokens() -> None:
 
     value = {"ref": RefToken(42), "when": dt.date(2026, 1, 1), "xs": [1, "two"]}
     assert decode_fallback(_encode_fallback(value)) == value
+
+
+# -- #16: streaming bootstrap (larger-than-RAM) -----------------------------------
+
+def _store_with_finds(store_factory, n: int):
+    store = store_factory()
+    store.root = [Find(label=f"f{i}", mass_g=float(i)) for i in range(n)]
+    store.commit()
+    return store
+
+
+def test_bootstrap_streams_without_caching(store_factory, tmp_path) -> None:
+    # AC1: the cache-bypassing _stream materializes nothing, and the streamed
+    # mirror is byte-identical to a single-shot bootstrap.
+    store = _store_with_finds(store_factory, 50)
+    with store.snapshot() as snap:
+        mirror = ArrowMirror.bootstrap(tmp_path / "boot", snap, batch=10)
+        assert len(snap._cache) == 0  # pyright: ignore[reportPrivateUsage]
+    assert mirror.table(Find).num_rows == 50
+    with store.snapshot() as snap2:
+        ref = ArrowMirror.bootstrap(tmp_path / "ref", snap2, batch=10_000)
+    assert rows(mirror, Find) == rows(ref, Find)
+    store.close()
+    mirror.close()
+    ref.close()
+
+
+def test_bootstrap_pending_bounded_by_batch(store_factory, tmp_path,
+                                            monkeypatch) -> None:
+    # AC2: peak resident rows is O(batch), not O(extent) — _pending never holds
+    # the whole extent (this fails on the old single-flush impl). batch is
+    # independent of flush_every (which defaults to 1 — chunking by it would
+    # write one segment per row, the regression this design avoids).
+    store = _store_with_finds(store_factory, 50)
+    peaks: list[int] = []
+    real_flush = ArrowMirror.flush
+
+    def spy(self):
+        peaks.append(sum(len(r) for r in self._pending.values()))
+        return real_flush(self)
+
+    monkeypatch.setattr(ArrowMirror, "flush", spy)
+    with store.snapshot() as snap:
+        ArrowMirror.bootstrap(tmp_path / "boot", snap, batch=10)
+    assert peaks and max(peaks) <= 10, f"peak pending {max(peaks)} > batch"
+    store.close()
+
+
+def test_bootstrap_default_batch_is_few_segments(store_factory, tmp_path) -> None:
+    # Regression guard: the DEFAULT bootstrap (flush_every=1) must NOT flush per
+    # row — chunking the bootstrap by flush_every would write one parquet
+    # segment per row (50 here), catastrophically slow at scale.
+    store = _store_with_finds(store_factory, 50)
+    path = tmp_path / "boot"
+    with store.snapshot() as snap:
+        mirror = ArrowMirror.bootstrap(path, snap)  # all defaults
+    segments = list(path.rglob("*.parquet"))
+    assert len(segments) <= 2, (
+        f"default bootstrap wrote {len(segments)} segments for 50 rows — it "
+        "must batch, not flush per row"
+    )
+    store.close()
+    mirror.close()
+
+
+def test_bootstrap_watermark_deferred_to_final_flush(store_factory, tmp_path,
+                                                     monkeypatch) -> None:
+    # AC3: only the final flush stamps the real watermark — a crash mid-stream
+    # leaves the manifest at 0 (!= snapshot.tid), forcing a clean re-bootstrap.
+    store = _store_with_finds(store_factory, 30)
+    seen: list[int] = []
+    real_flush = ArrowMirror.flush
+
+    def spy(self):
+        seen.append(self._watermark)
+        return real_flush(self)
+
+    monkeypatch.setattr(ArrowMirror, "flush", spy)
+    with store.snapshot() as snap:
+        tid = snap.tid
+        mirror = ArrowMirror.bootstrap(tmp_path / "boot", snap, batch=10)
+    assert len(seen) >= 2
+    assert all(w == 0 for w in seen[:-1]), seen
+    assert seen[-1] == tid and mirror.watermark == tid
+    store.close()
+    mirror.close()
+
+
+def test_bootstrap_suppresses_compaction_thrash(store_factory, tmp_path,
+                                                monkeypatch) -> None:
+    # AC4: many small batches over > max_segments rows would compact repeatedly;
+    # bootstrap suppresses it (<=1 per type — here 0).
+    store = _store_with_finds(store_factory, 40)
+    compactions: list[str] = []
+    real_compact = ArrowMirror._compact_type
+
+    def spy(self, typename, state):
+        compactions.append(typename)
+        return real_compact(self, typename, state)
+
+    monkeypatch.setattr(ArrowMirror, "_compact_type", spy)
+    with store.snapshot() as snap:
+        ArrowMirror.bootstrap(tmp_path / "boot", snap, batch=1, max_segments=4)
+    assert compactions == [], f"bootstrap compacted {compactions} — must suppress"
+    store.close()

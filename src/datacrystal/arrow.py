@@ -354,6 +354,9 @@ class ArrowMirror:
         self._watermark = 0
         self._pending: dict[str, dict[int, Any]] = {}
         self._applies_since_flush = 0
+        # Bootstrap streams many small batches; suppressing per-flush
+        # compaction keeps it to ≤1 compaction per type (#16, no O(M²) thrash).
+        self._suppress_compaction = False
         self.rows_flushed = 0  # rows written by the last flush (O(delta) evidence)
         self._load_manifest()
         self._sweep_orphans()
@@ -428,22 +431,43 @@ class ArrowMirror:
     @classmethod
     def bootstrap(cls, path: str | Path, snapshot: Any, *,
                   only: Iterable[type | str] | None = None,
-                  flush_every: int = 1, max_segments: int = 16) -> "ArrowMirror":
+                  flush_every: int = 1, max_segments: int = 16,
+                  batch: int = 50_000) -> "ArrowMirror":
         """(Re)build the mirror from one ``store.snapshot()`` — the recipe
         for attaching to a store with history, and the rebuild path after a
-        staleness refusal. Any existing directory at ``path`` is replaced."""
+        staleness refusal. Any existing directory at ``path`` is replaced.
+
+        Streams the extent in ``batch``-sized chunks (#16): peak resident rows
+        is O(batch), not O(extent), so a store **larger than RAM** can be
+        mirrored — lower ``batch`` to trade throughput for a smaller footprint.
+        ``batch`` is independent of ``flush_every`` (which configures the
+        mirror's post-bootstrap *delta* batching, and defaults to 1 — chunking
+        the bootstrap by it would write one segment per row). Crash-safe — the
+        watermark is stamped only by the FINAL flush, so a crash mid-bootstrap
+        leaves the manifest watermark at 0 (≠ ``snapshot.tid``) and reopen
+        forces a clean re-bootstrap rather than trusting a partial extent.
+        Compaction is suppressed during the stream (≤1 per type, no O(M²)
+        thrash)."""
+        if batch < 1:
+            raise MirrorConfigError("batch must be >= 1")
         mirror = cls(path, only=only, flush_every=flush_every,
                      max_segments=max_segments, _wipe=True)
         for cid, typename, fields in snapshot.types:
             mirror._types[cid] = (typename, list(fields))
+        mirror._suppress_compaction = True
+        buffered = 0
         for typename in sorted({row[1] for row in snapshot.types}):
             if not mirror._mirrors(typename):
                 continue
-            rows = mirror._pending.setdefault(typename, {})
-            for view in snapshot.all(typename):
-                rows[view.oid] = dict(view.fields())
+            for oid, values in snapshot._stream(typename):
+                mirror._pending.setdefault(typename, {})[oid] = values
+                buffered += 1
+                if buffered >= batch:
+                    mirror.flush()  # watermark stays 0 (deferred); no compaction
+                    buffered = 0
+        mirror._suppress_compaction = False
         mirror._watermark = snapshot.tid
-        mirror.flush()
+        mirror.flush()  # the ONLY flush that stamps the real watermark
         return mirror
 
     # -- reads ---------------------------------------------------------------------
@@ -516,7 +540,8 @@ class ArrowMirror:
                         )
             self._write_segment(typename, state, rows)
             self.rows_flushed += len(rows)
-            if len(state.segments) > self._max_segments:
+            if (not self._suppress_compaction
+                    and len(state.segments) > self._max_segments):
                 doomed += self._compact_type(typename, state)
         self._write_manifest()
         for path in doomed:
