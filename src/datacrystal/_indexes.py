@@ -313,7 +313,7 @@ def plan(cond: Condition, ci: ClassIndexes) -> tuple[BitMap64 | None, Condition 
             residual = And(tuple(residuals))
         return bitmap, residual
     if isinstance(cond, Or):
-        branch_bitmaps = []
+        branch_bitmaps: list[BitMap64] = []
         for part in cond.parts:
             sub_bm, sub_resid = plan(part, ci)
             if sub_bm is None or sub_resid is not None:

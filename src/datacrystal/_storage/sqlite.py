@@ -23,7 +23,7 @@ from __future__ import annotations
 import sqlite3
 import sys
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, cast
 
 from datacrystal._errors import CorruptRecordError, NewerStoreError
 from datacrystal._ids import FORMAT_VERSION
@@ -84,13 +84,11 @@ def _scan_type(conn: sqlite3.Connection, cid: int) -> Iterator[StoredRecord]:
 
 
 def _read_meta_and_types(conn: sqlite3.Connection) -> BootInfo:
-    meta = dict(conn.execute("SELECT key, value FROM meta"))
-    types = [
-        (cid, name, fields.split("\x1f") if fields else [])
-        for cid, name, fields in conn.execute(
-            "SELECT cid, name, fields FROM types ORDER BY cid"
-        )
-    ]
+    meta = cast("dict[str, str]", dict(conn.execute("SELECT key, value FROM meta")))
+    types: list[tuple[int, str, list[str]]] = []
+    for row in conn.execute("SELECT cid, name, fields FROM types ORDER BY cid"):
+        cid, name, fields = cast("tuple[int, str, str | None]", row)
+        types.append((cid, name, fields.split("\x1f") if fields else []))
     return BootInfo(meta=meta, types=types)
 
 
@@ -183,13 +181,11 @@ class SqliteBackend:
                 f"store format v{stored_version} is newer than this library "
                 f"supports (v{FORMAT_VERSION}); upgrade datacrystal to open it"
             )
-        meta = dict(conn.execute("SELECT key, value FROM meta"))
-        types = [
-            (cid, name, fields.split("\x1f") if fields else [])
-            for cid, name, fields in conn.execute(
-                "SELECT cid, name, fields FROM types ORDER BY cid"
-            )
-        ]
+        meta = cast("dict[str, str]", dict(conn.execute("SELECT key, value FROM meta")))
+        types: list[tuple[int, str, list[str]]] = []
+        for row in conn.execute("SELECT cid, name, fields FROM types ORDER BY cid"):
+            cid, name, fields = cast("tuple[int, str, str | None]", row)
+            types.append((cid, name, fields.split("\x1f") if fields else []))
         return BootInfo(meta=meta, types=types)
 
     @staticmethod

@@ -23,7 +23,7 @@ from __future__ import annotations
 import threading
 import time
 import weakref
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 from datacrystal._errors import StoreClosedError
 
@@ -44,6 +44,15 @@ class Lazy[T]:
     """
 
     __slots__ = ("_obj", "_oid", "_storeref", "_atime", "_clock", "__weakref__")
+
+    # Slot attribute types declared at class level (annotation-only, no value —
+    # compatible with __slots__). Pins ``_obj`` to ``T | None`` so an engine
+    # assignment from a loosely-typed store cannot poison it to Unknown.
+    _obj: T | None
+    _oid: int | None
+    _storeref: weakref.ref[Any] | None
+    _atime: float
+    _clock: Callable[[], float] | None
 
     def __init__(self) -> None:
         raise TypeError("use Lazy.of(entity) to create a lazy reference")
@@ -68,7 +77,7 @@ class Lazy[T]:
         return self
 
     @classmethod
-    def _unloaded(cls, oid: int, store: Any) -> "Lazy[T]":
+    def _unloaded(cls, oid: int, store: Any) -> "Lazy[Any]":
         self = object.__new__(cls)
         self._obj = None
         self._oid = oid
@@ -94,7 +103,7 @@ class Lazy[T]:
                 raise StoreClosedError(
                     "lazy reference cannot load: its store is closed or gone"
                 )
-            obj = store._load_oid(self._oid)
+            obj = cast(T, store._load_oid(self._oid))
             self._obj = obj
             manager = store._lazyman
             if manager is not None:

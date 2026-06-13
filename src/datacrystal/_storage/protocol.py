@@ -38,12 +38,14 @@ class CommitBatch:
     """
 
     tid: int
-    records: list[StoredRecord] = field(default_factory=list)
-    new_types: list[tuple[int, str, list[str]]] = field(default_factory=list)  # (cid, typename, fields)
-    meta: dict[str, str] = field(default_factory=dict)
+    records: list[StoredRecord] = field(default_factory=list[StoredRecord])
+    new_types: list[tuple[int, str, list[str]]] = field(
+        default_factory=list[tuple[int, str, list[str]]]
+    )  # (cid, typename, fields)
+    meta: dict[str, str] = field(default_factory=dict[str, str])
     # OIDs whose rows this commit removes (ADR-003) — applied in the same
     # atomic transaction as the records; never overlaps records' OIDs.
-    deletes: list[int] = field(default_factory=list)
+    deletes: list[int] = field(default_factory=list[int])
 
 
 @dataclass(slots=True)
