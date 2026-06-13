@@ -33,10 +33,12 @@ forward references resolve once all classes exist).
 from __future__ import annotations
 
 import dataclasses
+import types
 import weakref
 from typing import (
     Annotated,
     Any,
+    Union,
     cast,
     dataclass_transform,
     get_args,
@@ -117,6 +119,7 @@ class FieldSpec:
     unique: bool
     fulltext: bool
     fulltext_language: str | None = None  # from FullText(language=...), None if bare
+    multivalued: bool = False  # indexed list field — inverted (element) postings (#13)
 
 
 class TypeInfo:
@@ -333,14 +336,24 @@ def _resolve_specs(cls: type, field_names: tuple[str, ...]) -> tuple[FieldSpec, 
         unique = any(m is Unique for m in markers)
         fulltext = next((m for m in markers if isinstance(m, _FullText)), None)
         lazy_refs = _contains_lazy(core)
-        if (indexed or unique) and not _is_indexable(core):
+        is_list = _is_list_of_scalar(core)
+        if (indexed or unique) and not (_is_indexable(core) or is_list):
             raise TypeError(
                 f"{cls.__name__}.{name}: Index/Unique fields must be scalar "
-                f"(str, int, float or bool, optionally | None), got {hint!r}"
+                f"(str, int, float or bool, optionally | None) or a list of "
+                f"scalars, got {hint!r}"
             )
-        specs.append(FieldSpec(name, lazy_refs, indexed, unique,
-                               fulltext is not None,
-                               fulltext.language if fulltext is not None else None))
+        if unique and is_list:
+            raise TypeError(
+                f"{cls.__name__}.{name}: a Unique field cannot be a list "
+                f"(a multi-valued field has no single key), got {hint!r}"
+            )
+        specs.append(FieldSpec(
+            name, lazy_refs, indexed, unique,
+            fulltext is not None,
+            fulltext.language if fulltext is not None else None,
+            multivalued=indexed and is_list,
+        ))
     return tuple(specs)
 
 
@@ -361,11 +374,37 @@ def _contains_lazy(hint: Any) -> bool:
     return any(_contains_lazy(a) for a in get_args(hint))
 
 
+def _is_union(hint: Any) -> bool:
+    return get_origin(hint) in (Union, types.UnionType)
+
+
 def _is_indexable(hint: Any) -> bool:
+    """A scalar (str/int/float/bool) or optional scalar (``| None``).
+
+    Deliberately rejects ``list[scalar]`` — that is a *multi-valued* index
+    (:func:`_is_list_of_scalar`), maintained with element-wise postings, not a
+    single scalar key. This must key off the Union origin, not args alone:
+    ``get_args(list[str])`` is also ``(str,)``, so an args-only check would
+    wrongly accept a list as a scalar (and then crash on the unhashable list
+    key at insert)."""
     if hint in _INDEXABLE_TYPES:
         return True
-    # Allow Optional[scalar] / scalar | None
-    args = [a for a in get_args(hint) if a is not type(None)]
-    if args and all(a in _INDEXABLE_TYPES for a in args):
-        return True
+    if _is_union(hint):
+        args = [a for a in get_args(hint) if a is not type(None)]
+        return bool(args) and all(a in _INDEXABLE_TYPES for a in args)
     return False
+
+
+def _is_list_of_scalar(hint: Any) -> bool:
+    """``list[scalar]`` or ``list[scalar] | None`` — an inverted (multi-valued)
+    index over the list's elements (#13). Rejects bare ``list`` (no element
+    type), ``list[Ref]``, nested ``list[list[...]]``, and ``dict``."""
+    if _is_union(hint):
+        args = [a for a in get_args(hint) if a is not type(None)]
+        if len(args) != 1:
+            return False
+        hint = args[0]
+    if get_origin(hint) is not list:
+        return False
+    elems = get_args(hint)
+    return len(elems) == 1 and elems[0] in _INDEXABLE_TYPES

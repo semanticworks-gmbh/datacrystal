@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import weakref
+from dataclasses import field
 from datetime import datetime
 from typing import Annotated
 
@@ -84,11 +85,42 @@ def test_fulltext_marker_bare_and_parameterized():
 
 def test_index_on_non_scalar_field_rejected():
     # #19: the "must be scalar" TypeError fires at decoration (the hints resolve
-    # there — no forward ref), not lazily at first commit().
+    # there — no forward ref), not lazily at first commit(). A bare `list` (no
+    # element type) stays a reject after #13 added list[scalar] support.
     class Bad:
         refs: Annotated[list, dc.Index]
 
     with pytest.raises(TypeError, match="must be scalar"):
+        dc.entity(Bad)
+
+
+def test_list_of_scalars_index_accepted_and_multivalued():
+    # #13: Annotated[list[str], Index] is a multi-valued (inverted) index.
+    @dc.entity
+    class Tagged:
+        tags: Annotated[list[str], dc.Index] = field(default_factory=list)
+        codes: Annotated[list[int] | None, dc.Index] = None
+
+    by_name = {s.name: s for s in type_info(Tagged).specs}
+    assert by_name["tags"].multivalued and by_name["tags"].indexed
+    assert by_name["codes"].multivalued
+
+
+def test_list_of_refs_index_rejected():
+    # #13: only list[scalar] is indexable — a list of entity refs is not.
+    class Bad:
+        peers: Annotated[list[Mineral], dc.Index]
+
+    with pytest.raises(TypeError, match="must be scalar"):
+        dc.entity(Bad)
+
+
+def test_unique_on_list_field_rejected():
+    # #13: a multi-valued field has no single key, so Unique on a list is out.
+    class Bad:
+        tags: Annotated[list[str], dc.Unique]
+
+    with pytest.raises(TypeError, match="cannot be a list"):
         dc.entity(Bad)
 
 

@@ -121,6 +121,10 @@ class Pred(Condition):
         # the datacrystal[fts] extra's job); a non-str value never matches,
         # mirroring the SQL-NULL-like ordering semantics below.
         if op == "contains":
+            # Multi-valued (list) field: membership of the needle. Scalar string
+            # field: substring match. A non-matching type never matches.
+            if isinstance(actual, (list, tuple)):
+                return self.value in actual
             return isinstance(actual, str) and self.value in actual
         if op == "startswith":
             return isinstance(actual, str) and actual.startswith(self.value)
