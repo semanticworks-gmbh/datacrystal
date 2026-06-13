@@ -526,6 +526,13 @@ no third-party dependency — stdlib + msgspec). It appends every commit's delta
 byte and in TID order, to an append-only file set, so the store gains an **audit history**
 and a foundation for time-travel-by-replay and follower catch-up.
 
+It is **opt-in**: a store with nothing attached pays nothing and is byte-identical to one
+that never had a log, so turn it on only when you want history (it has commit-latency and
+disk costs — see below). And because deltas are never retained, a log records **only from
+the moment you attach it** — attach at the store's birth (`watermark == 0`) for a complete
+history, or later (via `bootstrap()`) to start the trail from that point on; history before
+the attach cannot be recovered.
+
 ```python
 from datacrystal.deltalog import DeltaLog
 
