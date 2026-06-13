@@ -60,7 +60,7 @@ from datacrystal._store import Store
 if TYPE_CHECKING:  # the real import stays lazy — see __getattr__ below
     from datacrystal._async import AsyncStore, aopen
 
-__version__ = "0.1.0.dev0"
+__version__ = "0.1.0"
 
 
 def __getattr__(name: str):  # PEP 562
