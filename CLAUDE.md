@@ -5,7 +5,8 @@ objects ARE the database; pickle-free msgpack records, roaring-bitmap queries, S
 durability, and two released-shape extras: `datacrystal[fts]` (FTS5 + Snowball) and
 `datacrystal[arrow]` (persistent parquet mirrors). Solo maintainer: Sven Hodapp. Pre-release
 (`0.1.0.dev0`); current milestone: M4 endgame — extras landed pre-tag as contract validators
-(2026-06-12), COMMIT-DELTA-v1 LOCKED, v0.1.0 tag pending the pyright-strict pass.
+(2026-06-12), COMMIT-DELTA-v1 LOCKED, the pyright-strict pass DONE (library `src/` is strict-clean
+and CI-gated, 2026-06-13); v0.1.0 tag now unblocked.
 
 ## Commands
 
@@ -13,7 +14,8 @@ durability, and two released-shape extras: `datacrystal[fts]` (FTS5 + Snowball) 
 uv sync --all-extras                 # env (Python 3.14 via .python-version; extras for their tests)
 uv run pytest -q                     # full suite incl. fitness gates + SIGKILL crash test
 uv run ruff check .                  # lint (line length 100)
-uvx pyright src tests examples benchmarks  # 0 errors required (standard mode; strict at the v0.1.0 tag)
+uvx pyright src tests examples benchmarks  # standard mode, 0 errors (tests keep the magic-query pragmas)
+uvx pyright -p pyrightconfig.strict.json   # STRICT, library src/ only — 0 errors, CI-gated (the lib is strict-clean)
 uv run python examples/minerals/demo.py   # run TWICE — second run must find the first run's data
 uv run pytest benchmarks -q -s       # KICKOFF §6 PR perf gates (warn-stage; DC_BENCH_STRICT=1 hardens)
 ```

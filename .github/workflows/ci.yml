@@ -28,8 +28,11 @@ jobs:
       - name: Lint (ruff)
         run: uv run ruff check .
 
-      - name: Type check (pyright — standard mode; strict is the goal at the v0.1.0 tag)
+      - name: Type check (pyright — standard mode, all paths; tests keep the magic-query pragmas)
         run: uvx pyright src tests examples benchmarks
+
+      - name: Type check (pyright — STRICT, library only; src/ is strict-clean at the v0.1.0 tag)
+        run: uvx pyright -p pyrightconfig.strict.json
 
       - name: Tests (unit, property, integration, extras, fitness gates)
         run: uv run pytest -q
