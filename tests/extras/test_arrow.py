@@ -437,21 +437,23 @@ def test_bootstrap_streams_without_caching(store_factory, tmp_path) -> None:
     # mirror is byte-identical to a single-shot bootstrap.
     store = _store_with_finds(store_factory, 50)
     with store.snapshot() as snap:
-        mirror = ArrowMirror.bootstrap(tmp_path / "boot", snap, flush_every=10)
+        mirror = ArrowMirror.bootstrap(tmp_path / "boot", snap, batch=10)
         assert len(snap._cache) == 0  # pyright: ignore[reportPrivateUsage]
     assert mirror.table(Find).num_rows == 50
     with store.snapshot() as snap2:
-        ref = ArrowMirror.bootstrap(tmp_path / "ref", snap2, flush_every=10_000)
+        ref = ArrowMirror.bootstrap(tmp_path / "ref", snap2, batch=10_000)
     assert rows(mirror, Find) == rows(ref, Find)
     store.close()
     mirror.close()
     ref.close()
 
 
-def test_bootstrap_pending_bounded_by_flush_every(store_factory, tmp_path,
-                                                   monkeypatch) -> None:
-    # AC2: peak resident rows is O(flush_every), not O(extent) — _pending never
-    # holds the whole extent (this fails on the old single-flush impl).
+def test_bootstrap_pending_bounded_by_batch(store_factory, tmp_path,
+                                            monkeypatch) -> None:
+    # AC2: peak resident rows is O(batch), not O(extent) — _pending never holds
+    # the whole extent (this fails on the old single-flush impl). batch is
+    # independent of flush_every (which defaults to 1 — chunking by it would
+    # write one segment per row, the regression this design avoids).
     store = _store_with_finds(store_factory, 50)
     peaks: list[int] = []
     real_flush = ArrowMirror.flush
@@ -462,9 +464,26 @@ def test_bootstrap_pending_bounded_by_flush_every(store_factory, tmp_path,
 
     monkeypatch.setattr(ArrowMirror, "flush", spy)
     with store.snapshot() as snap:
-        ArrowMirror.bootstrap(tmp_path / "boot", snap, flush_every=10)
-    assert peaks and max(peaks) <= 10, f"peak pending {max(peaks)} > flush_every"
+        ArrowMirror.bootstrap(tmp_path / "boot", snap, batch=10)
+    assert peaks and max(peaks) <= 10, f"peak pending {max(peaks)} > batch"
     store.close()
+
+
+def test_bootstrap_default_batch_is_few_segments(store_factory, tmp_path) -> None:
+    # Regression guard: the DEFAULT bootstrap (flush_every=1) must NOT flush per
+    # row — chunking the bootstrap by flush_every would write one parquet
+    # segment per row (50 here), catastrophically slow at scale.
+    store = _store_with_finds(store_factory, 50)
+    path = tmp_path / "boot"
+    with store.snapshot() as snap:
+        mirror = ArrowMirror.bootstrap(path, snap)  # all defaults
+    segments = list(path.rglob("*.parquet"))
+    assert len(segments) <= 2, (
+        f"default bootstrap wrote {len(segments)} segments for 50 rows — it "
+        "must batch, not flush per row"
+    )
+    store.close()
+    mirror.close()
 
 
 def test_bootstrap_watermark_deferred_to_final_flush(store_factory, tmp_path,
@@ -482,7 +501,7 @@ def test_bootstrap_watermark_deferred_to_final_flush(store_factory, tmp_path,
     monkeypatch.setattr(ArrowMirror, "flush", spy)
     with store.snapshot() as snap:
         tid = snap.tid
-        mirror = ArrowMirror.bootstrap(tmp_path / "boot", snap, flush_every=10)
+        mirror = ArrowMirror.bootstrap(tmp_path / "boot", snap, batch=10)
     assert len(seen) >= 2
     assert all(w == 0 for w in seen[:-1]), seen
     assert seen[-1] == tid and mirror.watermark == tid
@@ -504,6 +523,6 @@ def test_bootstrap_suppresses_compaction_thrash(store_factory, tmp_path,
 
     monkeypatch.setattr(ArrowMirror, "_compact_type", spy)
     with store.snapshot() as snap:
-        ArrowMirror.bootstrap(tmp_path / "boot", snap, flush_every=1, max_segments=4)
+        ArrowMirror.bootstrap(tmp_path / "boot", snap, batch=1, max_segments=4)
     assert compactions == [], f"bootstrap compacted {compactions} — must suppress"
     store.close()
