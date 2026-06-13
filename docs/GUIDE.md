@@ -83,9 +83,12 @@ class Mineral:
 - Field markers go inside `typing.Annotated`:
   - `dc.Index` — adds the field to the roaring-bitmap indexes; `==` and `.in_()` queries on it
     answer from bitmaps. Index/Unique fields must be scalar (`str | int | float | bool`,
-    optionally `| None`).
+    optionally `| None`) — or a **`list` of scalars** for a multi-valued (inverted) index
+    (`Annotated[list[str], dc.Index]`), queried with `.contains(elem)` for exact element
+    membership. A bad index type is rejected at `@dc.entity` definition, not first `commit()`.
   - `dc.Unique` — unique secondary key (e.g. URIs, slugs, external ids). Duplicates are
-    rejected at commit (`UniqueViolationError`); `None` never collides (SQL-NULL-style).
+    rejected at commit (`UniqueViolationError`); `None` never collides (SQL-NULL-style). A
+    `Unique` field cannot be a list (a multi-valued field has no single key).
   - `dc.FullText` — declares a prose field for full-text search, optionally with its
     language: `Annotated[str, dc.FullText(language="de")]` (lowercase short codes; bare
     `dc.FullText` = fold-only exact matching, no stemming). **Inert in the core engine** —
@@ -291,9 +294,10 @@ Query semantics:
   `.startswith()` on an indexed field iterate the index's **distinct values** and OR the
   matching bitmaps — O(distinct values), never a record read; they are exact and
   case-sensitive (linguistic matching is `datacrystal[fts]`'s job — see
-  [Full-text search](#full-text-search-datacrystalfts)). All other predicates run
-  as a Python residual over the bitmap candidates. Ordering comparisons never match `None`,
-  and string matching never matches a non-string value.
+  [Full-text search](#full-text-search-datacrystalfts)). On a **multi-valued** (`list`) index
+  field, `.contains(elem)` is exact *element membership* — an O(1) posting lookup, no record
+  reads. All other predicates run as a Python residual over the bitmap candidates. Ordering
+  comparisons never match `None`, and string matching never matches a non-string value.
 - A condition uses fields of **one entity class** — cross-entity joins are
   `[planned — v1, on Arrow mirrors]`.
 - `query()` and `get()` reflect **committed** state; uncommitted buffered changes are not
@@ -382,12 +386,16 @@ You can evolve entity classes between runs; old records adapt **on load**:
 | reorder fields | values map by name ✔ |
 | add a field **without a default** | `SchemaMismatchError` naming the field — add a default |
 | add a `dc.Unique` field | must default to `None`, else `SchemaMismatchError` (a shared non-None default would collide) |
-| rename a field | seen as **remove + add**: the old values are dropped — see below |
+| rename a field | mark the new field `Annotated[T, dc.RenamedFrom("old")]` — the old values follow ✔ (see below) |
 | change a field's type | not checked (annotations are not validated on load) — avoid, or migrate |
 
-To "rename" without losing data, migrate explicitly: keep the old field, add the new one with a
-default, copy values over, commit, then remove the old field. Guided migrations are
-`[planned — post-v0.1]`.
+To rename a field without losing data, mark the new field with its old persisted name:
+`mohs: Annotated[float | None, dc.RenamedFrom("hardness")]`. On load, a record that lacks
+`mohs` but still has `hardness` binds the old column, so the rename follows your code —
+additively, never rewriting the record (and the new name wins once data is written under it).
+v0.2 scopes `RenamedFrom` to **non-indexed** fields read through live hydration; renaming an
+indexed field, declarative reshaping glue, and an offline `migrate`/`verify` that rewrites
+records to the newest shape are `[planned — v0.2]`.
 
 How it works (one paragraph, so the behavior is predictable): the store keeps a **type
 lineage** — every field shape a class ever had gets its own row in the type dictionary, and

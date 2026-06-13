@@ -90,46 +90,69 @@ def explain_plan(typename: str, ci: "ClassIndexes",
 class ClassIndexes:
     """All index structures for one entity class in one store."""
 
-    __slots__ = ("extent", "eq", "unique", "_last_values", "_unique_fields")
+    __slots__ = ("extent", "eq", "unique", "list_fields", "_last_values",
+                 "_unique_fields")
 
-    def __init__(self, indexed_fields: list[str], unique_fields: list[str]) -> None:
+    def __init__(self, indexed_fields: list[str], unique_fields: list[str],
+                 list_fields: list[str] | None = None) -> None:
         self.extent = BitMap64()
         self.eq: dict[str, dict[Any, BitMap64]] = {f: {} for f in indexed_fields}
         self.unique: dict[str, dict[Any, int]] = {f: {} for f in unique_fields}
+        # Multi-valued (inverted) index fields (#13): eq[field] keys are the
+        # list's distinct ELEMENTS, not the whole (unhashable) list.
+        self.list_fields: frozenset[str] = frozenset(list_fields or ())
         self._unique_fields = frozenset(unique_fields)
         self._last_values: dict[int, dict[str, Any]] = {}
+
+    def _unindex(self, oid: int, old: dict[str, Any]) -> None:
+        for field, value in old.items():
+            if field in self.list_fields:
+                if value is None:
+                    continue
+                postings_map = self.eq[field]
+                for elem in set(value):
+                    posting = postings_map.get(elem)
+                    if posting is not None:
+                        posting.discard(oid)
+                continue
+            postings = self.eq[field].get(value)
+            if postings is not None:
+                postings.discard(oid)
+            if field in self._unique_fields and value is not None:
+                holder = self.unique[field]
+                if holder.get(value) == oid:
+                    del holder[value]
 
     def insert(self, oid: int, values: dict[str, Any]) -> None:
         old = self._last_values.pop(oid, None)
         if old is not None:
-            for field, value in old.items():
-                postings = self.eq[field].get(value)
-                if postings is not None:
-                    postings.discard(oid)
-                if field in self._unique_fields and value is not None:
-                    holder = self.unique[field]
-                    if holder.get(value) == oid:
-                        del holder[value]
+            self._unindex(oid, old)
         self.extent.add(oid)
+        # Snapshot the indexed values into the last_values memory. A list field
+        # carries a mutable PersistentList shared with the live entity, so we
+        # copy it: an in-place mutation must not corrupt the un-index that the
+        # NEXT update/delete performs against these prior values (invariant 11).
+        snapshot: dict[str, Any] = {}
         for field, value in values.items():
+            if field in self.list_fields:
+                if value is not None:
+                    postings_map = self.eq[field]
+                    for elem in set(value):
+                        postings_map.setdefault(elem, BitMap64()).add(oid)
+                snapshot[field] = None if value is None else list(value)
+                continue
             self.eq[field].setdefault(value, BitMap64()).add(oid)
             if field in self._unique_fields and value is not None:
                 self.unique[field][value] = oid
-        self._last_values[oid] = values
+            snapshot[field] = value
+        self._last_values[oid] = snapshot
 
     def remove(self, oid: int) -> None:
         """Un-index a committed delete (ADR-003) from the index's own
         ``last_values`` memory — never a store read (invariant 11)."""
         old = self._last_values.pop(oid, None)
         if old is not None:
-            for field, value in old.items():
-                postings = self.eq[field].get(value)
-                if postings is not None:
-                    postings.discard(oid)
-                if field in self._unique_fields and value is not None:
-                    holder = self.unique[field]
-                    if holder.get(value) == oid:
-                        del holder[value]
+            self._unindex(oid, old)
         self.extent.discard(oid)
 
     def seal(self) -> None:
@@ -154,7 +177,8 @@ def build_class_indexes(
     specs = ti.specs
     indexed = [s.name for s in specs if s.indexed or s.unique]
     unique = frozenset(s.name for s in specs if s.unique)
-    ci = ClassIndexes(indexed, list(unique))
+    list_fields = [s.name for s in specs if s.multivalued]
+    ci = ClassIndexes(indexed, list(unique), list_fields)
     for cid, persisted in lineage:
         if not indexed:
             for rec in scan_type(cid):
@@ -271,6 +295,17 @@ def plan(cond: Condition, ci: ClassIndexes) -> tuple[BitMap64 | None, Condition 
     """
     if isinstance(cond, Pred):
         if cond.field in ci.eq:
+            if cond.field in ci.list_fields:
+                # Multi-valued (inverted) index (#13): eq[field] keys are the
+                # list's elements, so `.contains(x)` is exact element membership
+                # — an O(1) posting lookup, no record reads, no residual. ==/in/
+                # startswith over a whole list can't be answered from an element
+                # index → residual (evaluate() compares the actual list).
+                if cond.op == "contains":
+                    postings = ci.eq[cond.field].get(cond.value)
+                    return (postings.copy() if postings is not None
+                            else BitMap64()), None
+                return None, cond
             if cond.op == "==":
                 postings = ci.eq[cond.field].get(cond.value)
                 return (postings.copy() if postings is not None else BitMap64()), None

@@ -33,10 +33,12 @@ forward references resolve once all classes exist).
 from __future__ import annotations
 
 import dataclasses
+import types
 import weakref
 from typing import (
     Annotated,
     Any,
+    Union,
     cast,
     dataclass_transform,
     get_args,
@@ -104,6 +106,33 @@ class _FullText(_Marker):
 
 FullText = _FullText()  # the bare marker; call it to declare a language
 
+
+class RenamedFrom(_Marker):
+    """Field marker: this field was persisted under a different name (#26 (a)).
+
+    ``mohs: Annotated[float | None, dc.RenamedFrom("hardness")]`` — on decode, a
+    record that lacks ``mohs`` but has ``hardness`` binds the old column, so the
+    rename follows the code without rewriting old records (additive, invariant
+    8; the rename heuristic stays OFF — you name the old field explicitly).
+
+    Scoped to **non-indexed fields read through live hydration** in v0.2;
+    combining it with ``Index``/``Unique`` raises (the index/snapshot/arrow
+    decode paths don't honor renames yet — that is a follow-on). Rewriting old
+    records to the new name is the ``migrate`` story, not this marker.
+    """
+
+    __slots__ = ("old_name",)
+
+    def __init__(self, old_name: str) -> None:
+        super().__init__("RenamedFrom")
+        if not old_name:
+            raise TypeError("RenamedFrom(old_name) takes a non-empty field name")
+        self.old_name = old_name
+
+    def __repr__(self) -> str:
+        return f"datacrystal.RenamedFrom({self.old_name!r})"
+
+
 _INDEXABLE_TYPES = (str, int, float, bool)
 
 
@@ -117,6 +146,8 @@ class FieldSpec:
     unique: bool
     fulltext: bool
     fulltext_language: str | None = None  # from FullText(language=...), None if bare
+    multivalued: bool = False  # indexed list field — inverted (element) postings (#13)
+    renamed_from: str | None = None  # old persisted field name (RenamedFrom, #26 (a))
 
 
 class TypeInfo:
@@ -260,6 +291,18 @@ def _make_entity(cls: type, frozen: bool) -> type:
     final = EntityMeta(cls.__name__, (base,), namespace)
 
     info = TypeInfo(final, typename, field_names, frozen)
+    # Resolve the field specs eagerly so a bad Index/Unique type (e.g.
+    # Annotated[datetime, Index]) raises its TypeError at the @entity definition
+    # site, not lazily on first commit() — far from the mistake (#19).
+    # Mutually- or self-referencing Lazy[T] entities can't resolve their hints
+    # here: under `from __future__ import annotations` the referent name isn't
+    # bound yet, so get_type_hints() raises NameError. Fall back to the lazy
+    # path, which re-resolves (and re-validates) once every name exists — the
+    # same TypeError, moved earlier when it can be, never removed.
+    try:
+        _ = info.specs
+    except NameError:
+        pass
     type.__setattr__(final, "__dc_typeinfo__", info)
     TYPES_BY_NAME[typename] = info
     return final
@@ -320,15 +363,34 @@ def _resolve_specs(cls: type, field_names: tuple[str, ...]) -> tuple[FieldSpec, 
         indexed = any(m is Index for m in markers)
         unique = any(m is Unique for m in markers)
         fulltext = next((m for m in markers if isinstance(m, _FullText)), None)
+        renamed = next((m for m in markers if isinstance(m, RenamedFrom)), None)
         lazy_refs = _contains_lazy(core)
-        if (indexed or unique) and not _is_indexable(core):
+        is_list = _is_list_of_scalar(core)
+        if (indexed or unique) and not (_is_indexable(core) or is_list):
             raise TypeError(
                 f"{cls.__name__}.{name}: Index/Unique fields must be scalar "
-                f"(str, int, float or bool, optionally | None), got {hint!r}"
+                f"(str, int, float or bool, optionally | None) or a list of "
+                f"scalars, got {hint!r}"
             )
-        specs.append(FieldSpec(name, lazy_refs, indexed, unique,
-                               fulltext is not None,
-                               fulltext.language if fulltext is not None else None))
+        if unique and is_list:
+            raise TypeError(
+                f"{cls.__name__}.{name}: a Unique field cannot be a list "
+                f"(a multi-valued field has no single key), got {hint!r}"
+            )
+        if renamed is not None and (indexed or unique):
+            raise TypeError(
+                f"{cls.__name__}.{name}: RenamedFrom on an Index/Unique field is "
+                "not supported yet — v0.2 scopes renames to non-indexed fields "
+                "read through live hydration; rename an indexed field via a "
+                "migration instead"
+            )
+        specs.append(FieldSpec(
+            name, lazy_refs, indexed, unique,
+            fulltext is not None,
+            fulltext.language if fulltext is not None else None,
+            multivalued=indexed and is_list,
+            renamed_from=renamed.old_name if renamed is not None else None,
+        ))
     return tuple(specs)
 
 
@@ -349,11 +411,37 @@ def _contains_lazy(hint: Any) -> bool:
     return any(_contains_lazy(a) for a in get_args(hint))
 
 
+def _is_union(hint: Any) -> bool:
+    return get_origin(hint) in (Union, types.UnionType)
+
+
 def _is_indexable(hint: Any) -> bool:
+    """A scalar (str/int/float/bool) or optional scalar (``| None``).
+
+    Deliberately rejects ``list[scalar]`` — that is a *multi-valued* index
+    (:func:`_is_list_of_scalar`), maintained with element-wise postings, not a
+    single scalar key. This must key off the Union origin, not args alone:
+    ``get_args(list[str])`` is also ``(str,)``, so an args-only check would
+    wrongly accept a list as a scalar (and then crash on the unhashable list
+    key at insert)."""
     if hint in _INDEXABLE_TYPES:
         return True
-    # Allow Optional[scalar] / scalar | None
-    args = [a for a in get_args(hint) if a is not type(None)]
-    if args and all(a in _INDEXABLE_TYPES for a in args):
-        return True
+    if _is_union(hint):
+        args = [a for a in get_args(hint) if a is not type(None)]
+        return bool(args) and all(a in _INDEXABLE_TYPES for a in args)
     return False
+
+
+def _is_list_of_scalar(hint: Any) -> bool:
+    """``list[scalar]`` or ``list[scalar] | None`` — an inverted (multi-valued)
+    index over the list's elements (#13). Rejects bare ``list`` (no element
+    type), ``list[Ref]``, nested ``list[list[...]]``, and ``dict``."""
+    if _is_union(hint):
+        args = [a for a in get_args(hint) if a is not type(None)]
+        if len(args) != 1:
+            return False
+        hint = args[0]
+    if get_origin(hint) is not list:
+        return False
+    elems = get_args(hint)
+    return len(elems) == 1 and elems[0] in _INDEXABLE_TYPES

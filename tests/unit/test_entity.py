@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import weakref
+from dataclasses import field
+from datetime import datetime
 from typing import Annotated
 
 import pytest
@@ -82,12 +84,67 @@ def test_fulltext_marker_bare_and_parameterized():
 
 
 def test_index_on_non_scalar_field_rejected():
-    @dc.entity
+    # #19: the "must be scalar" TypeError fires at decoration (the hints resolve
+    # there — no forward ref), not lazily at first commit(). A bare `list` (no
+    # element type) stays a reject after #13 added list[scalar] support.
     class Bad:
         refs: Annotated[list, dc.Index]
 
     with pytest.raises(TypeError, match="must be scalar"):
-        _ = type_info(Bad).specs
+        dc.entity(Bad)
+
+
+def test_list_of_scalars_index_accepted_and_multivalued():
+    # #13: Annotated[list[str], Index] is a multi-valued (inverted) index.
+    @dc.entity
+    class Tagged:
+        tags: Annotated[list[str], dc.Index] = field(default_factory=list)
+        codes: Annotated[list[int] | None, dc.Index] = None
+
+    by_name = {s.name: s for s in type_info(Tagged).specs}
+    assert by_name["tags"].multivalued and by_name["tags"].indexed
+    assert by_name["codes"].multivalued
+
+
+def test_list_of_refs_index_rejected():
+    # #13: only list[scalar] is indexable — a list of entity refs is not.
+    class Bad:
+        peers: Annotated[list[Mineral], dc.Index]
+
+    with pytest.raises(TypeError, match="must be scalar"):
+        dc.entity(Bad)
+
+
+def test_unique_on_list_field_rejected():
+    # #13: a multi-valued field has no single key, so Unique on a list is out.
+    class Bad:
+        tags: Annotated[list[str], dc.Unique]
+
+    with pytest.raises(TypeError, match="cannot be a list"):
+        dc.entity(Bad)
+
+
+def test_renamed_from_marker_harvested():
+    # #26 (a): RenamedFrom records the old persisted field name on the spec.
+    @dc.entity
+    class Renamed:
+        mohs: Annotated[float | None, dc.RenamedFrom("hardness")] = None
+
+    spec = {s.name: s for s in type_info(Renamed).specs}["mohs"]
+    assert spec.renamed_from == "hardness"
+    assert repr(dc.RenamedFrom("hardness")) == "datacrystal.RenamedFrom('hardness')"
+    with pytest.raises(TypeError, match="non-empty"):
+        dc.RenamedFrom("")
+
+
+def test_renamed_from_on_indexed_field_rejected():
+    # Scope (a): v0.2 renames are non-indexed-only — Index + RenamedFrom is out
+    # (the index/snapshot decode paths don't honor renames yet).
+    class Bad:
+        crystal_system: Annotated[str | None, dc.Index, dc.RenamedFrom("system")] = None
+
+    with pytest.raises(TypeError, match="RenamedFrom on an Index"):
+        dc.entity(Bad)
 
 
 def test_double_decoration_rejected():
@@ -98,3 +155,46 @@ def test_double_decoration_rejected():
 def test_store_rejects_non_entities(store):
     with pytest.raises(dc.NotAnEntityError):
         store.store({"not": "an entity"})
+
+
+# --- #19: eager Index/Unique validation is forward-ref-safe ------------------
+# Up references Down, which is defined just below it, so at @entity decoration of
+# Up the name Down is not yet bound: an eager get_type_hints() raises NameError
+# under `from __future__ import annotations`. This module importing at all is the
+# load-bearing regression guard — decoration-time validation must fall back to
+# the lazy path on an unresolved ref (mirrors the demo's Lazy[T] graph).
+
+
+@dc.entity
+class Up:
+    label: str
+    down: dc.Lazy[Down] | None = None
+
+
+@dc.entity
+class Down:
+    label: str
+    up: dc.Lazy[Up] | None = None
+
+
+def test_forward_ref_entities_decorate_then_resolve():
+    # Up/Down decorated at import despite the forward ref (eager validation fell
+    # back to the lazy path); their specs resolve now that both names are bound.
+    # AC3 (a deferred class still validates on the unchanged lazy path) is held
+    # jointly by this + the reject tests: _resolve_specs is the same code on
+    # both paths, so a bad type deferred by a forward ref still raises by commit.
+    up_specs = {s.name: s for s in type_info(Up).specs}
+    down_specs = {s.name: s for s in type_info(Down).specs}
+    assert up_specs["down"].lazy_refs
+    assert down_specs["up"].lazy_refs
+
+
+def test_index_on_datetime_rejected_at_decoration():
+    # The original report (timeseries probe): Annotated[datetime, Index] was
+    # accepted at @entity and only failed at first commit(). Now it fails at the
+    # definition site.
+    class Reading:
+        ts: Annotated[datetime, dc.Index]
+
+    with pytest.raises(TypeError, match="must be scalar"):
+        dc.entity(Reading)
