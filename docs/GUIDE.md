@@ -519,6 +519,52 @@ store.attach(consumer)                          # 2. ride the stream from there
   refusal, prior-based un-indexing); `datacrystal.testing.CountingConsumer` is the
   minimal reference implementation, `datacrystal/contract/applier.py` the normative one.
 
+## The delta log: durable audit history
+
+`datacrystal.deltalog` is the pipeline's first consumer that ships with core (no extra,
+no third-party dependency — stdlib + msgspec). It appends every commit's delta, byte for
+byte and in TID order, to an append-only file set, so the store gains an **audit history**
+and a foundation for time-travel-by-replay and follower catch-up.
+
+It is **opt-in**: a store with nothing attached pays nothing and is byte-identical to one
+that never had a log, so turn it on only when you want history (it has commit-latency and
+disk costs — see below). And because deltas are never retained, a log records **only from
+the moment you attach it** — attach at the store's birth (`watermark == 0`) for a complete
+history, or later (via `bootstrap()`) to start the trail from that point on; history before
+the attach cannot be recovered.
+
+```python
+from datacrystal.deltalog import DeltaLog
+
+log = DeltaLog("cabinet.deltalog")     # attach to a FRESH store: records all history
+store.attach(log)
+... store.commit() ...
+
+for delta in log.replay():             # every committed delta, in TID order
+    ...                                # feed a follower, an applier, an audit view
+```
+
+- **Full replayability from a fresh store.** A log attached at `watermark == 0` holds the
+  complete history: `log.replayed_state()` (replaying through the reference applier)
+  reconstructs the exact committed state — the equality check behind time-travel-by-replay.
+- **Crash-safe by construction.** Each flush fsyncs the segment bytes *before* committing
+  the `manifest.json` watermark (temp-file + rename), so the durable watermark never names
+  bytes that did not land. A reopen truncates any partial append and sweeps any orphan
+  segment left by a killed commit — the on-disk log is always an exact, gapless commit
+  prefix (a `kill -9` torture test gates this).
+- **Durability knob.** `flush_every=1` (default) makes the log exactly as durable as the
+  store. `flush_every=N` batches N deltas per fsync — the durable watermark then trails by
+  up to N-1 commits, and a crash in that window means rebuild (the engine refuses a
+  behind-the-watermark re-attach).
+- **Mid-life attach** records changes from the join point on: `DeltaLog.bootstrap(path,
+  snapshot)` pins the watermark to the snapshot so `attach()` accepts it (deltas before the
+  join were never retained — §5). Its replay is the change-feed from the join onward — the
+  honest audit semantics. A full-state checkpoint that would make a mid-life log self-
+  contained for replay is `[planned — demand-driven]`.
+- **Retention is the operator's policy.** The log is append-only and grows with history
+  (segments roll at `max_segment_bytes`); pruning old segments is a deliberate operator
+  choice, never the engine's. Like the store, a log directory has one owner process.
+
 ## Full-text search: datacrystal[fts]
 
 `pip install 'datacrystal[fts]'` (adds `snowballstemmer`). The extra is a commit-delta
@@ -657,7 +703,6 @@ Sequencing follows the ratified [roadmap](design/ROADMAP.md) and the
 | Feature | Where it lands |
 |---|---|
 | v0.1.0 tag: API freeze (incl. the COMMIT-DELTA-v1 lock); PyPI publication follows | M4 — current milestone (the `[fts]`/`[arrow]` extras landed pre-tag, 2026-06-12, as the contract's real-consumer validators) |
-| **retained delta log** — commit-granular audit history, time-travel-by-replay foundation, replayable catch-up for `attach()` | first post-tag PR (ROADMAP item 23, 2026-06-12) |
 | **reverse-reference index** (`incoming()`) — backlinks, impact analysis | early post-tag v0.x (promoted 2026-06-12 — digital-twin/SOR personas) |
 | **GraphQL / FastAPI** — `datacrystal[web]` with strawberry integration | extension package, after the v1 core freeze |
 | vector search — `datacrystal[vector]`, usearch, ≥2 vector fields per entity | extension package, after v1 |
