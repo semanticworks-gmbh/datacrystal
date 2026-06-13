@@ -25,14 +25,14 @@ OIDs live above 2**32, hence ``BitMap64``.
 from __future__ import annotations
 
 import dataclasses
-from typing import Any, Callable, Iterable, Iterator
+from typing import Any, Callable, Iterable, Iterator, cast
 
 from pyroaring import BitMap64
 
 from datacrystal._conditions import And, Condition, Or, Pred
 from datacrystal._entity import TypeInfo
 from datacrystal._errors import SchemaMismatchError, UniqueViolationError
-from datacrystal._records import decode_payload
+from datacrystal._records import RefToken, decode_payload
 from datacrystal._storage.protocol import StorageBackend, StoredRecord
 
 
@@ -215,14 +215,40 @@ def build_class_indexes(
     return ci
 
 
+def harvest_ref_oids(values: list[Any]) -> set[int]:
+    """Every entity-OID a decoded record references — direct refs and Lazy refs
+    alike decode to ``RefToken``, in scalar fields and inside list/dict
+    containers. The reverse-reference index's harvest (#20). Iterative (no
+    recursion) so a deeply-nested within-record structure can't blow the stack."""
+    out: set[int] = set()
+    stack: list[Any] = list(values)
+    while stack:
+        v = stack.pop()
+        if isinstance(v, RefToken):
+            out.add(v.oid)
+        elif isinstance(v, list):
+            stack.extend(cast("list[Any]", v))
+        elif isinstance(v, dict):
+            stack.extend(cast("dict[Any, Any]", v).values())
+    return out
+
+
 class IndexManager:
-    """Lazily builds and incrementally maintains per-class indexes."""
+    """Lazily builds and incrementally maintains per-class indexes (and the
+    global reverse-reference index, #20)."""
 
     def __init__(self, backend: StorageBackend,
-                 lineage_for: Callable[[TypeInfo], list[tuple[int, list[str]]]]) -> None:
+                 lineage_for: Callable[[TypeInfo], list[tuple[int, list[str]]]],
+                 all_cids: Callable[[], Iterable[int]]) -> None:
         self._backend = backend
         self._lineage_for = lineage_for
+        self._all_cids = all_cids
         self._by_cls: dict[type, ClassIndexes] = {}
+        # Reverse-reference index (#20): target OID → referrer OIDs, plus each
+        # referrer's own outgoing set for incremental diffing. Global (cross
+        # class), rebuildable, never persisted (invariant 11). None = not built.
+        self._reverse: dict[int, BitMap64] | None = None
+        self._reverse_refs: dict[int, BitMap64] = {}
 
     def ensure(self, ti: TypeInfo) -> ClassIndexes:
         ci = self._by_cls.get(ti.cls)
@@ -283,6 +309,54 @@ class IndexManager:
             ci = self._by_cls.get(ti.cls)
             if ci is not None:
                 ci.remove(oid)
+
+    @property
+    def reverse_built(self) -> bool:
+        return self._reverse is not None
+
+    def ensure_reverse(self) -> dict[int, BitMap64]:
+        """Lazily build the global reverse-reference postings by scanning every
+        committed record once and harvesting its outgoing refs (#20) — the same
+        rebuildable-derived-data contract as the forward indexes (invariant 11:
+        never persisted, never in the commit txn). Unlike ``build_class_indexes``
+        (per-class, indexed positions only) this is global and decodes every
+        field of every record."""
+        if self._reverse is not None:
+            return self._reverse
+        rev: dict[int, BitMap64] = {}
+        refs: dict[int, BitMap64] = {}
+        for cid in self._all_cids():
+            for rec in self._backend.scan_type(cid):
+                targets = harvest_ref_oids(decode_payload(rec.payload))
+                if targets:
+                    refs[rec.oid] = BitMap64(targets)
+                    for t in targets:
+                        rev.setdefault(t, BitMap64()).add(rec.oid)
+        self._reverse = rev
+        self._reverse_refs = refs
+        return rev
+
+    def apply_reverse(self, ref_entries: list[tuple[int, set[int]]]) -> None:
+        """P3: fold a committed batch's outgoing refs into the reverse postings,
+        diffing old-vs-new per referrer (like the multi-valued index). Skips when
+        the reverse index isn't built — a later ``ensure_reverse`` scans these
+        now-committed records (spec §5: an unwatched store pays nothing)."""
+        rev = self._reverse
+        if rev is None:
+            return
+        for referrer, targets in ref_entries:
+            old = self._reverse_refs.get(referrer)
+            if old is not None:
+                for t in old:
+                    posting = rev.get(t)
+                    if posting is not None:
+                        posting.discard(referrer)
+            if targets:
+                self._reverse_refs[referrer] = BitMap64(targets)
+                for t in targets:
+                    rev.setdefault(t, BitMap64()).add(referrer)
+            else:
+                self._reverse_refs.pop(referrer, None)
 
 
 def plan(cond: Condition, ci: ClassIndexes) -> tuple[BitMap64 | None, Condition | None]:

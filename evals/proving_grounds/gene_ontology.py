@@ -199,6 +199,34 @@ def main() -> None:
     del children  # free the reverse map so the hydration timing below is cold
     gc.collect()
 
+    # --- SAME BACKLINK VIA THE REVERSE INDEX (#20 incoming()) -----------------
+    t0 = time.perf_counter()
+    direct = s.incoming(bp)  # first call builds the global reverse index (one scan)
+    t_build = time.perf_counter() - t0
+    seen2: set[int] = set()
+    frontier_t: list[Term] = [bp]
+    t0 = time.perf_counter()
+    while frontier_t:
+        node = frontier_t.pop()
+        for child in s.incoming(node):  # an index lookup now, not a scan
+            coid = oid_of(child)
+            if coid is not None and coid not in seen2:
+                seen2.add(coid)
+                frontier_t.append(child)
+    t_bfs = time.perf_counter() - t0
+    assert seen2 == seen, "incoming() must answer the SAME set as the full scan"
+    cc = s.get(Term, go_id="GO:0005575")  # cellular_component
+    t0 = time.perf_counter()
+    cc_children = s.incoming(cc) if cc is not None else []
+    t_reuse = (time.perf_counter() - t0) * 1000
+    print("\nsame backlink via incoming() (#20 reverse index):")
+    print(f"  build (first call, one scan): {t_build:5.2f}s   {len(direct):,} direct children")
+    print(f"  transitive descendants via incoming(): {len(seen2):,}  {t_bfs:5.2f}s   "
+          "— matches the full scan exactly ✓")
+    print(f"  a SECOND, unrelated backlink reuses the built index: "
+          f"{len(cc_children):,} direct children in {t_reuse:.2f} ms (no re-scan)")
+    gc.collect()
+
     # --- HYDRATE vs DECODE (the ~24x ratio on real data) ----------------------
     gc.collect()
     t0 = time.perf_counter()

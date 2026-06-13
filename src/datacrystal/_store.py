@@ -106,16 +106,19 @@ class _Root:
 class _Capture:
     """Everything P1 hands to P2/P3 — and enough to compensate a failed P2."""
 
-    __slots__ = ("tid", "batch", "index_entries", "flipped", "delta", "deletes")
+    __slots__ = ("tid", "batch", "index_entries", "ref_entries", "flipped",
+                 "delta", "deletes")
 
     def __init__(self, tid: int, batch: CommitBatch,
                  index_entries: list[tuple[int, TypeInfo, dict[str, Any]]],
+                 ref_entries: list[tuple[int, set[int]]],
                  flipped: list[tuple[int, Any, int]],
                  delta: dict[str, Any] | None,
                  deletes: list[tuple[int, TypeInfo, Any | None]]) -> None:
         self.tid = tid
         self.batch = batch
         self.index_entries = index_entries
+        self.ref_entries = ref_entries  # (referrer oid, {target oids}) — #20
         self.flipped = flipped  # (oid, obj, state before the P1 flip)
         self.delta = delta  # COMMIT-DELTA-v1 map; built only when consumers watch
         self.deletes = deletes  # (oid, ti, live instance or None) — ADR-003
@@ -216,7 +219,8 @@ class Store:
             self._durable_cids.add(cid)
         self._ti_by_cid: dict[int, TypeInfo] = {}
         self._plan_by_cid: dict[int, list[tuple[Any, int | None, Any]]] = {}
-        self._index = IndexManager(backend, self._lineage_for)
+        self._index = IndexManager(backend, self._lineage_for,
+                                   self._persisted_fields.keys)
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -602,6 +606,12 @@ class Store:
                 index_entries.append(
                     (oid, ti, {name: getattr(obj, name) for name in relevant})
                 )
+        # #20: harvest outgoing refs for the reverse index — only when it is
+        # already built (spec §5: an unwatched store pays nothing for it).
+        ref_entries: list[tuple[int, set[int]]] = (
+            [(oid, self._harvest_live_refs(obj)) for oid, obj in pending.items()]
+            if self._index.reverse_built else []
+        )
         self._index.check_unique(index_entries, deleted=set(self._deleted))
         new_types: list[tuple[int, str, list[str]]] = []
         encoded: list[tuple[int, int, bytes]] = []
@@ -687,7 +697,7 @@ class Store:
         self._new.clear()
         self._dirty.clear()
         self._deleted.clear()
-        return _Capture(tid, batch, index_entries, flipped, delta, deletes)
+        return _Capture(tid, batch, index_entries, ref_entries, flipped, delta, deletes)
 
     def _run_p2(self, batch: CommitBatch) -> None:
         """P2: backend I/O on bytes only, off the owner thread."""
@@ -715,6 +725,7 @@ class Store:
     def _p3_finalize(self, capture: _Capture) -> int:
         """P3 (owner): indexes and watermark reflect the now-durable batch."""
         self._index.apply(capture.index_entries)
+        self._index.apply_reverse(capture.ref_entries)  # #20 reverse-ref fold
         self._index.apply_deletes([(oid, ti) for oid, ti, _ in capture.deletes])
         for oid, _, obj in capture.deletes:
             # The identity contract ends with the record: write-bar any live
@@ -1062,6 +1073,30 @@ class Store:
         objs = [o for o in self.get_many(oids) if residual.evaluate(o)]
         return apply_window(objs, limit, offset)
 
+    def incoming(self, entity: Any) -> list[Any]:
+        """Every committed entity that **references** ``entity`` — backlinks for
+        impact analysis, orphan detection, digital-twin traversal (ROADMAP item
+        8). Answered from a rebuildable in-memory reverse-reference index (never
+        persisted, invariant 11): the first call scans the store once to build
+        it, then it is maintained incrementally at each commit.
+
+        Counts both eager and ``Lazy`` referrers, in scalar fields and inside
+        list/dict containers. v0.2 covers live-store reads; deletes are not yet
+        folded into the reverse index, and ``Snapshot.incoming()`` parity is the
+        next sub-story of item 8."""
+        self._enter()
+        if not is_entity(entity):
+            raise NotAnEntityError(
+                f"incoming() takes an @entity instance, got {type(entity).__name__}"
+            )
+        oid = oid_of(entity)
+        if oid is None:
+            return []  # never stored → nothing can reference it yet
+        referrers = self._index.ensure_reverse().get(oid)
+        if referrers is None:
+            return []
+        return self.get_many(list(referrers))
+
     def explain(self, target: type | Condition) -> QueryPlan:
         """The deterministic plan for ``target``: what answers from
         bitmaps, what evaluates as a Python residual, and over how many
@@ -1321,6 +1356,38 @@ class Store:
         elif isinstance(value, dict):
             for item in cast("dict[Any, object]", value).values():
                 self._walk_value(item, queue)
+
+    def _harvest_live_refs(self, obj: Any) -> set[int]:
+        """The OIDs ``obj`` references — direct entity refs and Lazy refs, in
+        scalar fields and inside list/dict containers (#20). The live-object
+        twin of ``_indexes.harvest_ref_oids``; both yield the same OIDs (a ref
+        and a ``Lazy`` to the same entity persist as the same OID)."""
+        out: set[int] = set()
+        stack: list[Any] = [getattr(obj, n) for n in type_info(obj).field_names]
+        while stack:
+            v = stack.pop()
+            if v is None or isinstance(v, (str, float, int, bytes)):
+                continue
+            if is_entity(v):
+                vid = oid_of(v)
+                if vid is not None:
+                    out.add(vid)
+            elif isinstance(v, Lazy):
+                lz = cast("Lazy[Any]", v)
+                # an unloaded handle carries its OID; a fresh Lazy.of(obj) does
+                # not yet, so fall back to the loaded target's OID (mirrors
+                # _walk_value, which follows peek()).
+                vid = lz.oid
+                if vid is None:
+                    target = lz.peek()
+                    vid = oid_of(target) if target is not None else None
+                if vid is not None:
+                    out.add(vid)
+            elif isinstance(v, (list, tuple)):
+                stack.extend(cast("list[Any]", v))
+            elif isinstance(v, dict):
+                stack.extend(cast("dict[Any, object]", v).values())
+        return out
 
     def _oid_for_encode(self, obj: Any) -> int:
         oid = oid_of(obj)
