@@ -28,8 +28,14 @@ stale venv shebangs — `rm -rf .venv && uv sync`.
 - `docs/design/ROADMAP.md` — **scope authority**, incl. the *Punted* and *Never* lists.
   Check both lists before suggesting features (no Rust core, no CRDT core, no multi-writer,
   no homegrown SPARQL/Cypher, …).
-- `docs/design/KICKOFF.md` — execution plan: milestones M0–M4, the 18 fitness functions,
-  perf-gate principles, the canonical mineral-cabinet example domain (one domain everywhere).
+- `docs/design/VISION.md` — the product **"why"** (one page): "your live objects are the database;
+  the data follows your code, no raindances; the only infra is a blob store". Sets direction, never
+  scope. (Ratified 2026-06-13; supersedes the "local-first primary" framing in DESIGN/ROADMAP.)
+- `docs/design/KICKOFF.md` — **(1) the COMPLETED v0.1 execution record** (M0–M4, done) **and (2) the
+  living engineering standards**: the 20 architectural fitness functions, the perf-gate principles +
+  benchmark table, and the canonical mineral-cabinet domain (one domain everywhere) — the **cited
+  source of truth for gate thresholds** (enforced in `tests/fitness/` + `benchmarks/`). NOT a
+  backlog; the one open remainder (the nightly lane) is GitHub #27.
 - `docs/design/ADR-001-concurrency-contract.md` — accepted owner-confinement contract.
 - `docs/design/ADR-002-storage-read-views.md` — accepted `read_view()` protocol addition
   (snapshot isolation for `store.snapshot()`); storage-protocol growth always needs an ADR.
@@ -42,6 +48,26 @@ stale venv shebangs — `rm -rf .venv && uv sync`.
 - `docs/GUIDE.md` — user-facing semantics. Documentation honesty rule: features that do not
   exist are marked `[planned — milestone]`, never described as if real.
 - The API freezes at the v0.1.0 tag; PyPI publication follows it (names reserved earlier).
+
+## Backlog & product ownership
+
+- **GitHub Issues are the operational backlog**; `ROADMAP.md` stays scope authority (in/out) and
+  `VISION.md` the product "why". Each roadmap-derived issue cites its ROADMAP item in the body.
+- **Gandalf (the PO skill) owns prioritization, splitting/merging, refinement, hygiene** — invoke
+  it for any backlog question. Sizing unit = "concerns"; priority = the Gandalf Score.
+- **Where goals live — three layers, don't mix them:** the *vision & personas* (the big why) →
+  `VISION.md`; **product goals** (scale-out · knowledge-graph · search · analytics · sor ·
+  schema-evolution) → **`theme:` labels on issues, NOT milestones** (a goal spans releases; an issue
+  has only one milestone); *release goals* (what ships when) → the **milestone**.
+- **Label taxonomy** (kept deliberately small — "gandalf-fied"): **milestone** = release horizon
+  (`v0.2 (post-tag)` / `v1` / `extensions` / `demand-driven`); **`priority:`** = Gandalf band
+  (golden/high/normal/not-now); **`theme:`** = product goal; **`roadmap`** / **`eval-feedback`** =
+  origin; **`epic`** / **`spike`** = Gandalf type; **`frozen-api`** = touches the v0.1.0 freeze → v0.2+;
+  **`needs-owner-decision`** = blocked on a Sven ruling (no code until answered). Plus stock
+  `bug` / `documentation` / `good first issue`.
+- **Refinement precedes build-order**: don't pull an issue until it's refined (INVEST + concerns)
+  and any `needs-owner-decision` spike is answered. Item 8 (#20) is the standing Golden Ticket;
+  sequencing is decided in refinement.
 
 ## Architecture map (`src/datacrystal/`)
 

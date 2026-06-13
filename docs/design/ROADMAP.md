@@ -44,74 +44,57 @@ analytics is the measured pain (63 s one-column read over 5.4M rows). Decode-lev
 Composite/multi-field unique keys recorded as punted item 22. Scale-shape fitness gates added
 (op-count + growth-ratio; see KICKOFF gate table).
 
-## Core v0.x (ordered)
+Amended 2026-06-13 (owner ratification — vision): the product vision/positioning now lives in
+[VISION.md](VISION.md) (ratified 2026-06-13) — the "why" behind every scope call. It supersedes
+the **"local-first primary"** framing (DESIGN amendment 1): local-first is demoted to the small
+end (CLI/agent-memory); the thesis is "your live objects ARE the database; the data follows your
+code; the only infra is a blob store", with **FastAPI declare-deploy-scale as the flagship arc**.
+Consequence flagged, NOT yet ranked: the vision leans on **S3-primary persistence (item 16)** and
+**replication/read-only followers (item 21)**, both still Punted below — revisit their priority in
+the next refinement session (today's honest answer stays Litestream + parquet-on-S3, single node).
+No item moves on this note alone; it records the lens.
 
-1. **Object engine**: slots-dataclasses canonical form, msgspec msgpack records, WeakValueDictionary
-   OID registry, tri-state dirty tracking, explicit `Lazy[T]` (class-swap ghosts stay deferred as optimization).
-   Concurrency contract = **owner-thread/loop confinement per [ADR-001](ADR-001-concurrency-contract.md)**:
-   owner binding at open, `WrongThreadError`/`EntityEscapeError` taxonomy, three-phase commit
-   (capture on-owner → I/O off-loop → flip+re-arm on-owner), LazyReferenceManager as owner task,
-   `store.submit()` for foreign threads. Includes `@entity(frozen=True)` append-only entity mode
-   (dirty tracking never arms; event logs/provenance) and a batch hydration API
-   (load-many-by-OID — N+1 must never be the user's problem) — SDA deltas. Includes **unchecked
-   `store.delete()`** per [ADR-003](ADR-003-delete-semantics.md) (2026-06-12): buffered through
-   the same commit path, physical row removal, `DanglingRefError` on following a stale ref;
-   *checked* delete (cascade/orphan validation) waits for item 8's reverse-reference index.
-2. **SQLite-as-blob-store** behind the 3-method storage protocol, plus a **single-writer
-   lease-refreshed lock file with a loud error** (~1–2 days; port of EclipseStore
-   `StorageLockFileManager.java`). `uvicorn --workers 4` silently corrupting is the #1 foreseeable
-   user error — docs alone don't prevent it.
-3. **Commit-delta/watermark pipeline specified, versioned, and tested as a PUBLIC contract.**
-   It is the substrate every sidecar (FTS, vector, mirrors, reverse index, future RDF/CRDT) rides on —
-   the single most load-bearing undelivered component. Idempotency + ordering semantics locked
-   before any consumer ships. Includes **`store.snapshot()` minimal immutable views**
-   (frozen-DTO reads + frozen roaring bitmaps at commit watermarks) — promoted into v0.x per
-   ADR-001 rider 2; full Arrow mirrors remain v1. First real consumer: `datacrystal[fts]`
-   (item 10), resequenced into late v0.x as this contract's validation harness — SDA delta.
-4. **pyroaring bitmap indexes + Condition AST** — the differentiating query story, in the first release.
-   Includes a **unique secondary-key index** (string alias → entity; lookup + upsert-by-natural-key,
-   e.g. URIs/slugs/external ids) as an explicit v0.x commitment, not an implied detail — SDA delta.
-   Includes (2026-06-12, MaStR feedback) the **decode-level read path**: `count()` (bitmap
-   cardinality, zero hydration on indexed predicates), `pluck()` (field projection without entity
-   construction) and bulk unique-key `get_many()` — the core-only interim until item 7's mirrors;
-   full columnar speed is item 7's job, range/presence indexes are NOT duplicated in core.
-5. **Format hygiene**: versioned (not frozen) custom-log record header with reserved
-   sealed-flag / footer-offset / tid-watermark fields (~zero cost, preserves the whole option).
-6. **Docs**: workers=1 + asyncio deployment guide incl. the asyncio doctrine ("a critical section
-   is the code between awaits"); DBOS/Celery `concurrency=1` command-queue recipe for multi-process
-   write fan-in; Litestream + `sqlite3.backup` PITR recipe; [SCALING.md](SCALING.md) tiers.
+## How this roadmap works
 
-## Core v1
+**The live backlog lives in [GitHub Issues + Milestones](https://github.com/themerius/datacrystal/issues)**
+— status, ordering, assignment, PR links. This file is the **scope charter**: it records what
+shipped, what we will **not** build (Punted / Never, below) and *why*, and the ratified decision log
+above. Single source of truth: **GitHub owns "what we're building & when"; this file owns "what we
+decided & won't build."** Per-item design rationale lives in each issue body (open work) or in the
+ADRs / [GUIDE.md](GUIDE.md) / CLAUDE.md architecture map (shipped work).
 
-7. **Arrow columnar mirrors** + DuckDB/polars zero-copy queries. **Resequenced into late v0.x
-   (2026-06-12)** as the `datacrystal[arrow]` extra riding the watermark pipeline — the
-   contract's second real consumer (validation rationale of item 10's resequencing) and the
-   real answer to projection/count/range analytics at millions-of-rows scale; pyarrow never
-   enters core deps (invariant 2). The v1 line keeps the DuckDB/polars recipe polish.
-8. **Reverse-reference index** as rebuildable Arrow sidecar on the watermark pipeline + minimal
-   traversal API (`incoming()` first). Buys backlinks, orphan detection, cascade checks, impact
-   analysis (~+5–15% on the 600 B/object envelope). **Promoted into early post-tag v0.x**
-   (2026-06-12 third amendment): digital-twin/metadata-SOR workloads live on backlinks —
-   sequenced right after item 23.
-9. **DuckPGQ property-graph recipe** over the Arrow mirrors (docs-only, days).
+## Shipped in v0.1.0
 
-## Extension packages (separate extras, after v1 core freeze)
+The v0.x core landed and the API froze at the v0.1.0 tag (2026-06-13); contracts live in the ADRs,
+[COMMIT-DELTA-v1](COMMIT-DELTA-v1.md), [GUIDE.md](GUIDE.md), and the CLAUDE.md architecture map.
 
-10. `datacrystal[fts]` — SQLite FTS5 sidecar (cheapest: stdlib). **Resequenced into late v0.x**
-    (SDA delta): the watermark pipeline (item 3) is the most load-bearing undelivered component
-    and must not ship as a public contract with zero consumers; FTS5 is the cheapest real
-    validation harness, and the first customer (SDA) needs it anyway.
-11. `datacrystal[vector]` — usearch sidecar. Must support ≥2 `@Vector` fields per entity
-    (SDA "Triple Sigmatics" dual embeddings — one `.usearch` file per field, as designed).
-12. `datacrystal[web]` — FastAPI + strawberry GraphQL integration.
-13. v1.x: **read-only snapshot readers**, scoped to open-at-watermark, no live invalidation.
-23. **Retained delta log** — a stdlib-only certified consumer (segmented msgpack append files +
-    watermark manifest). **First post-tag PR** (2026-06-12 third amendment): a system of record
-    needs commit-granular audit history; retention also yields time-travel-by-replay (punt 20's
-    read side), follower catch-up (punt 21's transport precondition), and replayable catch-up for
-    `attach()` refusals (today: rebuild-from-snapshot is the only recovery). Retention/compaction
-    policy is the log's own contract — the engine itself still never retains (COMMIT-DELTA-v1 §5
-    stands unchanged).
+| # | Item | Where the detail lives now |
+|---|------|----------------------------|
+| 1 | Object engine — slots-dataclasses, msgspec records, OID registry, tri-state dirty tracking, `Lazy[T]`, `@entity(frozen=True)`, batch hydration, unchecked `store.delete()` | [ADR-001](ADR-001-concurrency-contract.md), [ADR-003](ADR-003-delete-semantics.md) |
+| 2 | SQLite-as-blob-store behind the 3-method protocol + single-writer lease lock | `_storage/`, [ADR-002](ADR-002-storage-read-views.md) |
+| 3 | Commit-delta/watermark pipeline (PUBLIC contract) + `store.snapshot()` views | [COMMIT-DELTA-v1](COMMIT-DELTA-v1.md) (LOCKED) |
+| 4 | pyroaring bitmap indexes + Condition AST + unique secondary-key index + decode-level `count()`/`pluck()`/`get_many()` | `_indexes`, `_conditions`, GUIDE |
+| 5 | Format hygiene — versioned record header, reserved sealed-flag/footer/tid fields | `_ids`, `_records` |
+| 6 | Deployment docs — workers=1 + asyncio doctrine, command-queue fan-in, Litestream PITR | GUIDE, [SCALING.md](SCALING.md) |
+| 7 | `datacrystal[arrow]` — persistent parquet mirrors (resequenced pre-tag) | `arrow.py`, GUIDE |
+| 10 | `datacrystal[fts]` — FTS5 + Snowball sidecar (resequenced pre-tag) | `fts.py`, GUIDE |
+| 23 | Retained delta log — core `datacrystal.deltalog` | PR #11, `deltalog.py`, GUIDE |
+
+## Active & planned — tracked in GitHub
+
+Ratified next work, now issues under milestones (decision rationale in each issue body):
+
+| ROADMAP # | Work | Issue | Milestone |
+|-----------|------|-------|-----------|
+| 8 | Reverse-reference index + `incoming()` traversal — the ratified next step (🥇 Golden Ticket) | #20 | v0.2 |
+| 9 | DuckPGQ property-graph recipe (docs-only) | #21 | v1 |
+| 11 | `datacrystal[vector]` — usearch sidecar (≥2 `@Vector` fields) | #22 | extensions |
+| 12 | `datacrystal[web]` — FastAPI + strawberry GraphQL | #23 | extensions |
+| 13 | read-only snapshot readers (open-at-watermark) | #24 | v1 |
+| — | Schema migration — renames + glue reshaping + migrate/verify (DESIGN amendment-7) | #26 | v0.2 |
+
+The demand-driven eval backlog from the MaStR / timeseries evaluations (#12–#19, #25) lives in
+GitHub under the same milestones — scored and labelled (`priority:` / `theme:` / `spike`).
 
 ## Punted — demand-driven, zero roadmap commitment
 

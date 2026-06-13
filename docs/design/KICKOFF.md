@@ -1,11 +1,16 @@
 # datacrystal v0.1 kickoff plan
 
-Date: 2026-06-10. Status: **M0–M4 COMPLETE (2026-06-11/12); v0.1.0 tag pending the
-pyright-strict pass.** COMMIT-DELTA-v1 locked; the `[fts]`/`[arrow]` extras landed pre-tag as
-contract validators (ROADMAP 2026-06-12 amendments — beyond this plan's scope, owner-ratified);
-the §6 perf-gate PR subset is live in CI (warning-stage), the nightly lane is still future work.
-Post-tag sequencing per ROADMAP third amendment: item 23 (retained delta log) → item 8
-(reverse-reference index).
+Date: 2026-06-10. Status: **v0.1 EXECUTED — M0–M4 complete, v0.1.0 TAGGED 2026-06-13, API frozen.**
+COMMIT-DELTA-v1 locked; the `[fts]`/`[arrow]` extras landed pre-tag as contract validators.
+
+> **What this document is now (2026-06-13):** two things. **(1) A historical record** of the v0.1
+> execution plan (§1–§4, §8–§10) — done, kept for provenance. **(2) The living engineering
+> standards** — §5 the canonical mineral-cabinet domain, §6 the perf-gate principles + benchmark
+> table, §7 the architectural fitness functions — which remain the **cited source of truth for gate
+> thresholds** (enforced in `tests/fitness/` + `benchmarks/`; a threshold change still requires a PR
+> touching both the test and this doc). This is **not a backlog**. The one open remainder — the
+> **nightly perf/fitness lane** — is GitHub #27. Live work → GitHub Issues; scope → [ROADMAP.md](ROADMAP.md);
+> the why → [VISION.md](VISION.md).
 Scope authority remains [ROADMAP.md](ROADMAP.md); this document sequences its v0.x items into an
 execution plan. Provenance: 3-angle plan panel + dataset/perf/fitness designers, judged and
 adversarially critiqued — all ten reports in

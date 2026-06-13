@@ -25,6 +25,14 @@ the per-topic evidence lives in [../research/2026-06-10-feasibility/](../researc
 > is no longer "demoted from flagship", and the reverse-reference index + a retained delta log
 > moved up ([ROADMAP.md](ROADMAP.md) 2026-06-12 third amendment).
 
+> **Update 2026-06-13 (vision ratified):** the canonical positioning/personas now live in
+> [VISION.md](VISION.md) — the "why" behind every scope call. It **supersedes amendment 1's
+> "primary persona = local-first"** below (kept verbatim as historical record): local-first is
+> demoted to the small end (CLI / agent-memory). Thesis: "your live objects ARE the database; the
+> data follows your code, no raindances; the only infra is a blob store." **FastAPI
+> declare-deploy-scale is the flagship arc** — which is why the scale-out items (S3-primary 16,
+> replication/followers 21) are flagged for a priority revisit in [ROADMAP.md](ROADMAP.md).
+
 ## Accepted amendments from the stress test
 
 The adversarial review (STRESS-TEST.md) produced these binding changes to the proposal below:
