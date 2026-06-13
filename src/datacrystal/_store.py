@@ -31,7 +31,7 @@ import warnings
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Callable, Iterable, cast
+from typing import Any, Callable, Iterable, Iterator, cast
 
 from datacrystal._conditions import (
     And,
@@ -1167,6 +1167,48 @@ class Store:
             else:
                 out.append(tuple(_publish(row[name]) for name in fields))
         return out if windowed_early else apply_window(out, limit, offset)
+
+    def iter(self, target: type | Condition) -> Iterator[Any]:
+        """Stream hydrated committed entities matching ``target`` chunk by
+        chunk, with **bounded memory** — the streaming complement to
+        :meth:`query` (whole list) and :meth:`pluck`/:meth:`count`
+        (decode-level). Yields live entities with ``query()``'s semantics
+        (committed result set; live-instance field reads). Like
+        ``count()``/``pluck()`` it reads committed state at **iteration**
+        time, not call time.
+
+        The ADR-001 owner guard is re-asserted on every pull, so a foreign
+        thread or a closed store stops the stream mid-flight
+        (``WrongThreadError`` / ``StoreClosedError``). The peak live set is
+        O(chunk), never O(extent) — walk millions of matches in bounded RAM.
+
+        ``store.iter()`` is the freeze-clean streaming surface (additive;
+        ``query()``'s signature and list return type stay frozen)."""
+        self._enter()
+        cls, cond = query_target(target, "iter")
+        ti = type_info(cls)
+        return self._iter_stream(ti, cond)
+
+    def _iter_stream(self, ti: TypeInfo, cond: Condition | None) -> Iterator[Any]:
+        if self._cid_by_typename.get(ti.typename) is None:
+            self._warn_unseen(ti)
+            return
+        ci = self._index.ensure(ti)
+        if cond is None:
+            bitmap, residual = None, None
+        else:
+            bitmap, residual = plan(cond, ci)
+        oids = list(bitmap) if bitmap is not None else list(ci.extent)
+        for start in range(0, len(oids), _RAW_CHUNK):
+            # get_many hydrates one chunk; reassigning `chunk` each round lets
+            # the previous chunk's non-retained entities be collected (the
+            # O(chunk) bound). get_many() re-enters the owner guard per chunk.
+            chunk = self.get_many(oids[start:start + _RAW_CHUNK])
+            if residual is not None:
+                chunk = [o for o in chunk if residual.evaluate(o)]
+            for obj in chunk:
+                self._guard()  # ADR-001: re-assert on EVERY __next__
+                yield obj
 
     # -- engine internals ----------------------------------------------------
 

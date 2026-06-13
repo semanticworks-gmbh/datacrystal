@@ -298,3 +298,54 @@ def test_snapshot_query_and_all_window(cabinet):
         assert snap.query(Mineral.crystal_system == "monoclinic", limit=1) == mono[:1]
         with pytest.raises(ValueError):
             snap.all(Mineral, offset=-1)
+
+
+# --- #15: store.iter() streaming query ---------------------------------------
+
+def test_iter_matches_query_as_oid_sets(cabinet):
+    from datacrystal._entity import oid_of
+    streamed = list(cabinet.iter(Mineral.crystal_system == "monoclinic"))
+    queried = cabinet.query(Mineral.crystal_system == "monoclinic")
+    assert {oid_of(o) for o in streamed} == {oid_of(o) for o in queried}
+    # full extent: every entity enumerated exactly once
+    all_oids = [oid_of(o) for o in cabinet.iter(Mineral)]
+    assert sorted(all_oids) == sorted(oid_of(o) for o in cabinet.query(Mineral))
+    assert len(all_oids) == len(set(all_oids))
+
+
+def test_iter_guards_every_next_against_foreign_thread(cabinet):
+    import threading
+    it = cabinet.iter(Mineral)
+    next(it)  # owner pulls one — fine
+    errors: list[str] = []
+
+    def foreign():
+        try:
+            next(it)
+        except dc.WrongThreadError as e:
+            errors.append(type(e).__name__)
+
+    t = threading.Thread(target=foreign)
+    t.start()
+    t.join()
+    assert errors == ["WrongThreadError"]
+
+
+def test_iter_stops_when_closed_mid_stream(store_factory):
+    s = store_factory()
+    s.root = [Mineral(qid=f"Q{i}", name=f"m{i}") for i in range(3)]
+    s.commit()
+    it = s.iter(Mineral)
+    next(it)
+    s.close()
+    with pytest.raises(dc.StoreClosedError):
+        next(it)
+
+
+def test_iter_excludes_uncommitted(store_factory):
+    s = store_factory()
+    s.root = [Mineral(qid="Q1", name="quartz")]
+    s.commit()
+    s.store(Mineral(qid="Q2", name="topaz"))  # stored, not committed
+    assert {m.name for m in s.iter(Mineral)} == {"quartz"}
+    s.close()

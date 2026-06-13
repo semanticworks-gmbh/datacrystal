@@ -289,6 +289,11 @@ Query semantics:
   `query(C, limit=10)` loads 10 records, not the extent. A residual predicate must
   decode-to-filter first, so there the window only trims the materialized result (it cannot
   prune the scan). Order is deterministic (ascending OID): `query(C, limit=k) == query(C)[:k]`.
+- **`store.iter(target)`** streams matching entities **chunk by chunk** for bounded memory —
+  walk millions of matches without materializing the whole list (`query()`'s eager
+  complement; `count()`/`pluck()` stay the decode-level options). It reads committed state at
+  iteration time and re-checks the owner thread on every pull, so a foreign thread or a closed
+  store stops it mid-stream.
 - **`store.explain(target)`** (also on snapshots) returns the deterministic `QueryPlan`:
   which part answers from bitmaps, what evaluates as Python residual, and over how many
   candidates — `query()` hydrates at most `plan.candidates`. There are exactly **two

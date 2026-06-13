@@ -184,3 +184,29 @@ def test_limit_stops_early_on_indexed_read():
         f"windowed pluck decoded {backend.records_loaded}, expected 10"
     )
     store.close()
+
+
+def test_iter_streams_with_bounded_live_set():
+    # #15: streaming a full-extent query keeps O(chunk) entities live, never
+    # O(extent) — the registry must not accumulate the whole result set.
+    from datacrystal._store import _RAW_CHUNK
+
+    backend = CountingBackend(MemoryBackend())
+    store = dc.Store._from_backend(backend)
+    _grow(store, 0, SMALL)  # 25_000 > 3 chunks of 8192
+    gc.collect()
+
+    peak = 0
+    seen = 0
+    for obj in store.iter(GateSpecimen):
+        seen += 1
+        if seen % 1000 == 0:
+            gc.collect()
+            peak = max(peak, len(store._registry))
+        del obj
+    assert seen == SMALL
+    assert peak <= 2 * _RAW_CHUNK, (
+        f"iter() held {peak} live entities at extent {SMALL} (chunk "
+        f"{_RAW_CHUNK}) — a streaming read must stay O(chunk), not O(extent)"
+    )
+    store.close()
