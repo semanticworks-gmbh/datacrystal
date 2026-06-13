@@ -1,0 +1,165 @@
+# Manual release routine (KICKOFF §7 "Runs" — the release lane).
+#
+# Hit "Run workflow", pick patch/minor/major. The job: re-runs the full gate
+# (lint → standard & strict pyright → tests → demo/journal rerun → build +
+# wheel purity), then bumps pyproject, commits `release: datacrystal vX.Y.Z`
+# to main, pushes an annotated tag, and cuts a GitHub Release with
+# auto-generated notes. Nothing is committed/pushed unless the gate is green.
+#
+# PyPI publication is DEFERRED (standing decision): the publish job is
+# scaffolded with OIDC trusted publishing but stays OFF unless you tick the
+# `publish_to_pypi` box at run time — and that first needs a PyPI trusted
+# publisher configured for the `datacrystal` project.
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Semver bump from the current version"
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+        required: true
+      publish_to_pypi:
+        description: "Publish to PyPI (OFF by default — publication is deferred; needs a PyPI trusted publisher)"
+        type: boolean
+        default: false
+
+# One release at a time; never cancel a release mid-flight.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write          # push the bump commit + tag, create the GitHub Release
+    outputs:
+      version: ${{ steps.bump.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0        # full history so release notes diff against the last tag
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Sync environment (Python pinned via .python-version; extras for their tests)
+        run: uv sync --all-extras
+
+      - name: Compute next version and write pyproject.toml
+        id: bump
+        env:
+          BUMP: ${{ inputs.bump }}
+        run: |
+          python3 - "$BUMP" <<'PY'
+          import os, re, sys, pathlib
+          bump = sys.argv[1]
+          p = pathlib.Path("pyproject.toml")
+          text = p.read_text()
+          m = re.search(r'^version = "([^"]+)"', text, re.M)
+          if not m:
+              sys.exit("could not find version in pyproject.toml")
+          cur = m.group(1)
+          base = re.match(r"(\d+)\.(\d+)\.(\d+)", cur)  # ignore any .devN / pre suffix
+          if not base:
+              sys.exit(f"version {cur!r} is not X.Y.Z")
+          major, minor, patch = (int(base.group(i)) for i in (1, 2, 3))
+          if bump == "major":
+              major, minor, patch = major + 1, 0, 0
+          elif bump == "minor":
+              minor, patch = minor + 1, 0
+          else:
+              patch += 1
+          new = f"{major}.{minor}.{patch}"
+          p.write_text(text[:m.start(1)] + new + text[m.end(1):])
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"version={new}\n")
+          print(f"{cur} -> {new}  ({bump})")
+          PY
+
+      - name: Guard — tag must not already exist
+        run: |
+          if git rev-parse "v${{ steps.bump.outputs.version }}" >/dev/null 2>&1; then
+            echo "::error::tag v${{ steps.bump.outputs.version }} already exists"
+            exit 1
+          fi
+
+      - name: Gate — lint (ruff)
+        run: uv run ruff check .
+
+      - name: Gate — types (pyright standard, all paths)
+        run: uvx pyright src tests examples benchmarks
+
+      - name: Gate — types (pyright STRICT, library src/)
+        run: uvx pyright -p pyrightconfig.strict.json
+
+      - name: Gate — tests (unit, property, integration, extras, fitness gates + crash test)
+        run: uv run pytest -q
+
+      - name: Gate — demo + journal survive a rerun (persistence smoke)
+        run: |
+          uv run python examples/minerals/demo.py
+          uv run python examples/minerals/demo.py
+          uv run python examples/journal/journal.py
+          uv run python examples/journal/journal.py
+
+      - name: Gate — build + wheel purity (fitness #17 — pure py3-none-any)
+        run: |
+          rm -rf dist
+          uv build
+          python3 - "${{ steps.bump.outputs.version }}" <<'PY'
+          import glob, sys, zipfile
+          version = sys.argv[1]
+          wheels = glob.glob("dist/*.whl")
+          assert wheels, "no wheel built"
+          [wheel] = wheels
+          assert f"datacrystal-{version}-py3-none-any" in wheel, f"unexpected wheel: {wheel}"
+          bad = [n for n in zipfile.ZipFile(wheel).namelist() if n.endswith((".so", ".pyd"))]
+          assert not bad, f"native code in the wheel: {bad}"
+          print(f"wheel OK: {wheel}")
+          PY
+
+      - name: Commit bump, tag, and push to main
+        run: |
+          v="${{ steps.bump.outputs.version }}"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -q pyproject.toml -m "release: datacrystal v$v"
+          git tag -a "v$v" -m "datacrystal v$v"
+          git push origin HEAD:main
+          git push origin "v$v"
+
+      - name: Cut the GitHub Release (auto-generated notes)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          v="${{ steps.bump.outputs.version }}"
+          gh release create "v$v" --title "datacrystal v$v" --generate-notes
+
+  # --- DEFERRED: PyPI publish (scaffold) ----------------------------------
+  # Stays OFF unless `publish_to_pypi` is ticked at run time. Trusted
+  # publishing (OIDC, no stored token) — requires a PyPI "pending publisher"
+  # for `datacrystal` pointed at this workflow + environment before first use.
+  publish-pypi:
+    needs: release
+    if: ${{ inputs.publish_to_pypi }}
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write          # OIDC trusted publishing
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: "v${{ needs.release.outputs.version }}"
+      - uses: astral-sh/setup-uv@v5
+      - name: Build distributions
+        run: |
+          rm -rf dist
+          uv build
+      - name: Publish to PyPI (trusted publishing)
+        uses: pypa/gh-action-pypi-publish@release/v1
