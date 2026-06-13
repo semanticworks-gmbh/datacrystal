@@ -1168,28 +1168,31 @@ class Store:
                 out.append(tuple(_publish(row[name]) for name in fields))
         return out if windowed_early else apply_window(out, limit, offset)
 
-    def iter(self, target: type | Condition) -> Iterator[Any]:
-        """Stream hydrated committed entities matching ``target`` chunk by
-        chunk, with **bounded memory** — the streaming complement to
-        :meth:`query` (whole list) and :meth:`pluck`/:meth:`count`
-        (decode-level). Yields live entities with ``query()``'s semantics
-        (committed result set; live-instance field reads). Like
-        ``count()``/``pluck()`` it reads committed state at **iteration**
-        time, not call time.
+    def query_iter(self, target: type | Condition) -> Iterator[Any]:
+        """The lazy sibling of :meth:`query` — **the same query, iterated**.
+
+        ``query`` materializes the matches as a list (and pages them with
+        ``limit=``/``offset=``); ``query_iter`` yields the *identical* committed
+        result set one chunk at a time, with **bounded memory**. The name is
+        deliberate: this is not a decoupled API with its own rules — it answers
+        the same condition with ``query()``'s hydration (live-instance field
+        reads), so any change to ``query``'s semantics is inherited here by
+        construction. Like ``count()``/``pluck()`` it reads committed state at
+        **iteration** time, not call time.
 
         The ADR-001 owner guard is re-asserted on every pull, so a foreign
         thread or a closed store stops the stream mid-flight
         (``WrongThreadError`` / ``StoreClosedError``). The peak live set is
         O(chunk), never O(extent) — walk millions of matches in bounded RAM.
 
-        ``store.iter()`` is the freeze-clean streaming surface (additive;
-        ``query()``'s signature and list return type stay frozen)."""
+        Additive surface: ``query()``'s signature and list return type stay
+        frozen."""
         self._enter()
-        cls, cond = query_target(target, "iter")
+        cls, cond = query_target(target, "query_iter")
         ti = type_info(cls)
-        return self._iter_stream(ti, cond)
+        return self._query_iter_stream(ti, cond)
 
-    def _iter_stream(self, ti: TypeInfo, cond: Condition | None) -> Iterator[Any]:
+    def _query_iter_stream(self, ti: TypeInfo, cond: Condition | None) -> Iterator[Any]:
         if self._cid_by_typename.get(ti.typename) is None:
             self._warn_unseen(ti)
             return

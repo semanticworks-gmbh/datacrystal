@@ -279,7 +279,7 @@ page2 = store.query(Mineral, limit=50, offset=50)
 heads = store.pluck(Mineral, "name", limit=100)               # windows the decode-level read too
 
 # stream the whole match set in bounded memory — chunk by chunk, never all at once
-for m in store.iter(Mineral.crystal_system == "cubic"):       # O(chunk) live, not O(extent)
+for m in store.query_iter(Mineral.crystal_system == "cubic"):       # O(chunk) live, not O(extent)
     process(m)
 
 # lazy references
@@ -302,7 +302,7 @@ Query semantics:
   `query(C, limit=10)` loads 10 records, not the extent. A residual predicate must
   decode-to-filter first, so there the window only trims the materialized result (it cannot
   prune the scan). Order is deterministic (ascending OID): `query(C, limit=k) == query(C)[:k]`.
-- **`store.iter(target)`** streams matching entities **chunk by chunk** for bounded memory —
+- **`store.query_iter(target)`** streams matching entities **chunk by chunk** for bounded memory —
   walk millions of matches without materializing the whole list (`query()`'s eager
   complement; `count()`/`pluck()` stay the decode-level options). It reads committed state at
   iteration time and re-checks the owner thread on every pull, so a foreign thread or a closed
@@ -385,13 +385,13 @@ in order of leverage:
 
 4. **Stream or window when you do need the entities.** The expensive shape above —
    materializing a whole match set as live objects — has two bounded answers.
-   `store.iter(target)` yields the matches **chunk by chunk**, so peak RAM is O(chunk) not
+   `store.query_iter(target)` yields the matches **chunk by chunk**, so peak RAM is O(chunk) not
    O(extent) (CI-gated); it reads committed state at iteration time and stops on a foreign
    thread or a closed store. For just the first page, `query()`/`pluck()` take
    `limit=`/`offset=` — a fully-indexed read loads only the slice.
 
    ```python
-   for specimen in store.iter(Specimen.quality == "museum"):   # millions of matches,
+   for specimen in store.query_iter(Specimen.quality == "museum"):   # millions of matches,
        export(specimen)                                        # O(chunk) RAM throughout
    first_page = store.query(Specimen, limit=100)               # hydrates 100, not the extent
    ```

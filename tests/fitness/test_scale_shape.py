@@ -186,7 +186,7 @@ def test_limit_stops_early_on_indexed_read():
     store.close()
 
 
-def test_iter_streams_with_bounded_live_set():
+def test_query_iter_streams_with_bounded_live_set():
     # #15: streaming a full-extent query keeps O(chunk) entities live, never
     # O(extent) — the registry must not accumulate the whole result set.
     from datacrystal._store import _RAW_CHUNK
@@ -198,7 +198,7 @@ def test_iter_streams_with_bounded_live_set():
 
     peak = 0
     seen = 0
-    for obj in store.iter(GateSpecimen):
+    for obj in store.query_iter(GateSpecimen):
         seen += 1
         if seen % 1000 == 0:
             gc.collect()
