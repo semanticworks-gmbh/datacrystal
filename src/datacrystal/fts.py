@@ -362,18 +362,28 @@ class FullTextIndex:
     # -- search ----------------------------------------------------------------
 
     def search(self, query: str, *, cls: type | str | None = None,
-               limit: int = 20) -> list[SearchHit]:
+               limit: int = 20, match: str = "any") -> list[SearchHit]:
         """BM25-ranked full-text matches for ``query``.
 
-        Terms match the fold-normalized exact tokens AND their Snowball
-        stems, per the languages declared for each field — exact matches
-        outrank stem-only matches (column weights 2.0 vs 1.0). Quoted
-        phrases stay phrases. ``cls`` narrows to one entity type (class or
-        typename string). Every term is quoted into the FTS5 expression, so
-        user input cannot inject MATCH operators.
+        ``match`` chooses how query terms combine (each term itself always
+        OR-ing its fold-normalized exact column against its per-language
+        Snowball-stemmed column, exact outranking stem-only via the 2.0/1.0
+        column weights):
+
+        * ``"any"`` (default) — **OR over terms**: BM25 ranks the union, and
+          a document missing some terms is naturally down-ranked rather than
+          dropped. This is what ranked retrieval wants — a natural-language
+          query ("Do statin drugs cause cancer?") must not require *every*
+          word in one document or recall collapses (#54).
+        * ``"all"`` — **AND over terms**: every term must appear, the precise
+          filter use case (faceting, "find the doc with exactly these words").
+
+        Quoted phrases stay phrases under either mode. ``cls`` narrows to one
+        entity type (class or typename string). Every term is quoted into the
+        FTS5 expression, so user input cannot inject MATCH operators.
         """
         typename = self._typename_of(cls) if cls is not None else None
-        expression = self._match_expression(query, typename)
+        expression = self._match_expression(query, typename, match)
         if expression is None:
             return []
         needles = self._needles(query)
@@ -618,10 +628,19 @@ class FullTextIndex:
         out.append("…" if hi < len(spans) else display[spans[hi - 1][1]:])
         return "".join(out)
 
-    def _match_expression(self, query: str, typename: str | None) -> str | None:
-        """One FTS5 MATCH expression: AND over query terms, each an OR over
-        (exact column, per-language stemmed column) alternatives. Terms are
-        quoted, so user input can never inject FTS5 operators."""
+    def _match_expression(self, query: str, typename: str | None,
+                          match: str = "any") -> str | None:
+        """One FTS5 MATCH expression. Each query term is an OR over its
+        (exact column, per-language stemmed column) alternatives; ``match``
+        then joins the terms: ``"any"`` with OR (ranked retrieval — BM25
+        scores the union, missing terms down-rank not drop, #54), ``"all"``
+        with AND (the precise-filter use case). Terms are quoted, so user
+        input can never inject FTS5 operators."""
+        if match not in ("any", "all"):
+            raise ValueError(
+                f"match must be 'any' (OR over terms) or 'all' (AND over "
+                f"terms), not {match!r}"
+            )
         scope = (
             self._fulltext if typename is None
             else {typename: self._fulltext.get(typename, {})}
@@ -646,8 +665,15 @@ class FullTextIndex:
                     stemmed = " ".join(self._stem_folded(tokens, language))
                     alternatives.append(f's_{field} : "{stemmed}"')
             if not alternatives:
-                return None
+                # under "all" a term with no searchable column can never
+                # match; under "any" it simply contributes nothing.
+                if match == "all":
+                    return None
+                continue
             # dedupe (a stem may equal the surface form), keep order stable
             unique = list(dict.fromkeys(alternatives))
             clauses.append("(" + " OR ".join(unique) + ")")
-        return " AND ".join(clauses)
+        if not clauses:
+            return None
+        joiner = " AND " if match == "all" else " OR "
+        return joiner.join(clauses)
