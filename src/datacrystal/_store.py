@@ -42,6 +42,7 @@ from datacrystal._conditions import (
     apply_window,
     query_target,
     validate_window,
+    window_iter,
 )
 from datacrystal._containers import PersistentDict, PersistentList, wrap_value
 from datacrystal._entity import (
@@ -1087,9 +1088,12 @@ class Store:
             bitmap, residual = None, None
         else:
             bitmap, residual = plan(cond, ci)
-        oids = list(bitmap) if bitmap is not None else list(ci.extent)
+        candidate = bitmap if bitmap is not None else ci.extent
         if residual is None:
-            return self.get_many(apply_window(oids, limit, offset))
+            # #51: take the window LAZILY — a small limit over a huge extent
+            # stops after offset+limit instead of listing every candidate OID.
+            return self.get_many(window_iter(candidate, limit, offset))
+        oids = list(candidate)  # a residual must consider every candidate, then window
         objs = [o for o in self.get_many(oids) if residual.evaluate(o)]
         return apply_window(objs, limit, offset)
 
@@ -1274,10 +1278,11 @@ class Store:
             bitmap, residual = plan(cond, ci)
         else:
             bitmap, residual = None, None
-        oids = list(bitmap) if bitmap is not None else list(ci.extent)
+        candidate = bitmap if bitmap is not None else ci.extent
         windowed_early = residual is None
-        if windowed_early:
-            oids = apply_window(oids, limit, offset)
+        # #51: no residual → take the window lazily (O(offset+limit)); a residual
+        # must decode every candidate before the window can be applied.
+        oids = window_iter(candidate, limit, offset) if windowed_early else list(candidate)
         raw_cond = _raw_condition(residual) if residual is not None else None
         single = fields[0] if len(fields) == 1 else None
         out: list[Any] = []
