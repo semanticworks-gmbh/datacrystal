@@ -26,6 +26,17 @@ opening one node drags its whole reachable component into RAM and onto the C-sta
 **load-bearing, not corner cases.** Fixing them first unlocks the entire digital-twin persona;
 **#20** (reverse-ref) then turns the backlink queries from O(edges) scans into index lookups.
 
+## Run log — what the proving grounds have actually proven (honest absolute numbers)
+
+Proving grounds run on demand (not in CI); these are real measured numbers, single laptop.
+
+| # | Dataset (`evals/proving_grounds/`) | Scale ingested | Headline result |
+|---|---|---|---|
+| **1** | **Gene Ontology** (`gene_ontology.py`, CC-BY) — knowledge-graph polyhierarchy | 38,263 terms · 57,803 is_a edges · 9.7 MB · 33k terms/s | `incoming()` == full-scan descendant set **exactly (24,135)**; deepest lazy ancestor walk hydrates **64 of 38,263** (the #30 win); backlink **0.31 s scan → 0.04 ms** amortized |
+| **2** | **GLEIF** (`gleif.py`, CC0) — legal-entity ownership, **SOR / org-digital-twin persona** | 180,297 legal entities · 254,089 active consolidation edges · 26.6 MB · **49.7k entities/s** | `incoming()` on a real **Zipf hub** == full scan **exactly (1,008 distinct subsidiaries of the biggest consolidator)**; deepest ownership ladder hydrates **10 of 180,297**; second backlink reuses the index in **~0 ms**; reopen 0.56 s; one-instance-per-OID across paths ✓, **no `RecursionError`** |
+
+**What #2 adds beyond #1:** GLEIF is the org-digital-twin / system-of-record persona (VISION personas 3 & 5) on real data — and the first **Zipf-hub** validation of `incoming()` (a handful of ultimate parents consolidating thousands of subsidiaries is exactly the backlink-heavy shape these workloads live on). It is the RR (Level-2) ownership graph in full; the Level-1 ~3M-entity multi-GB *scale* ingest is wired but optional (`GLEIF_LEI2_CAP`), so the absolute vision-scale throughput number is still a partial (180k-node) reading — the honest next stretch.
+
 ## The three feedback layers
 
 | Layer | Role | Status |
