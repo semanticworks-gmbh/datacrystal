@@ -325,6 +325,15 @@ Query semantics:
   field, `.contains(elem)` is exact *element membership* — an O(1) posting lookup, no record
   reads. All other predicates run as a Python residual over the bitmap candidates. Ordering
   comparisons never match `None`, and string matching never matches a non-string value.
+- **`dc.SortedIndex`** makes a scalar field answer **range** queries — `>=`, `>`, `<=`, `<`,
+  and `between` (write it as `(F.x >= lo) & (F.x <= hi)`) — from a sorted index instead of a
+  full-extent scan. Mark the field `Annotated[float, dc.SortedIndex]` (or `int`/`str`,
+  optionally `| None`); the application chooses which fields need ranges, just like `dc.Index`.
+  A `SortedIndex` field also answers `==`/`.in_()` (it is an index), so it needn't also be
+  `dc.Index`. This is a *third* deterministic planning rule, not an optimizer — `explain()`
+  still shows exactly what answers from the index and what falls to a residual. On real data a
+  range query drops from an O(extent) scan to a sorted slice (measured: a 6.2M-row
+  "capacity ≥ 1 MW" went from ~20 s to ~85 ms).
 - A condition uses fields of **one entity class** — cross-entity joins are
   `[planned — v1, on Arrow mirrors]`.
 - `query()` and `get()` reflect **committed** state; uncommitted buffered changes are not

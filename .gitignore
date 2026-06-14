@@ -21,3 +21,6 @@ resources/
 
 # OS noise
 .DS_Store
+
+# agent worktrees (transient, isolation runs)
+.claude/worktrees/

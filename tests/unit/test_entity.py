@@ -143,7 +143,7 @@ def test_renamed_from_on_indexed_field_rejected():
     class Bad:
         crystal_system: Annotated[str | None, dc.Index, dc.RenamedFrom("system")] = None
 
-    with pytest.raises(TypeError, match="RenamedFrom on an Index"):
+    with pytest.raises(TypeError, match="RenamedFrom on an indexed"):
         dc.entity(Bad)
 
 
@@ -166,7 +166,7 @@ def test_glue_on_indexed_field_rejected():
     class Bad:
         code: Annotated[str, dc.Index, dc.Glue(lambda old: old["x"])] = ""
 
-    with pytest.raises(TypeError, match="Glue on an Index"):
+    with pytest.raises(TypeError, match="Glue on an indexed"):
         dc.entity(Bad)
 
 

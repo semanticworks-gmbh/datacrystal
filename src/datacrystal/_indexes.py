@@ -25,6 +25,7 @@ OIDs live above 2**32, hence ``BitMap64``.
 from __future__ import annotations
 
 import dataclasses
+from bisect import bisect_left, bisect_right, insort
 from typing import Any, Callable, Iterable, Iterator, cast
 
 from pyroaring import BitMap64
@@ -40,12 +41,14 @@ from datacrystal._storage.protocol import StorageBackend, StoredRecord
 class QueryPlan:
     """The deterministic execution plan ``store.explain()`` reports.
 
-    There is no optimizer behind this — exactly two rules, always
-    (``==``/``.in_()`` on Index/Unique fields answer from bitmaps,
-    everything else evaluates as a Python residual; the analytics-tier
-    planner is DuckDB over the ``[arrow]`` mirror, never core). ``explain``
-    exists so the cost of a condition is inspectable, not guessed
-    (decided 2026-06-12 with query()'s class-form symmetry).
+    There is no optimizer behind this — exactly three deterministic rules,
+    always (``==``/``.in_()`` on Index/Unique/SortedIndex fields answer from
+    bitmaps; ``>=``/``>``/``<=``/``<`` on a ``SortedIndex`` field answer from a
+    sorted range slice — ADR-004; everything else evaluates as a Python
+    residual). No cost model, no plan search; the analytics-tier planner is
+    DuckDB over the ``[arrow]`` mirror, never core. ``explain`` exists so the
+    cost of a condition is inspectable, not guessed (decided 2026-06-12 with
+    query()'s class-form symmetry).
     """
 
     typename: str
@@ -90,19 +93,44 @@ def explain_plan(typename: str, ci: "ClassIndexes",
 class ClassIndexes:
     """All index structures for one entity class in one store."""
 
-    __slots__ = ("extent", "eq", "unique", "list_fields", "_last_values",
-                 "_unique_fields")
+    __slots__ = ("extent", "eq", "unique", "list_fields", "sorted_fields",
+                 "sorted_keys", "_building", "_last_values", "_unique_fields")
 
     def __init__(self, indexed_fields: list[str], unique_fields: list[str],
-                 list_fields: list[str] | None = None) -> None:
+                 list_fields: list[str] | None = None,
+                 sorted_fields: list[str] | None = None) -> None:
         self.extent = BitMap64()
         self.eq: dict[str, dict[Any, BitMap64]] = {f: {} for f in indexed_fields}
         self.unique: dict[str, dict[Any, int]] = {f: {} for f in unique_fields}
         # Multi-valued (inverted) index fields (#13): eq[field] keys are the
         # list's distinct ELEMENTS, not the whole (unhashable) list.
         self.list_fields: frozenset[str] = frozenset(list_fields or ())
+        # Sorted index fields (ADR-004 / #18): the same eq[field] postings, plus
+        # a per-field sorted list of its distinct non-None keys — bisected for
+        # range queries (>=/</between). A sorted field is also an eq field, so
+        # point lookups answer from eq[field] unchanged.
+        self.sorted_fields: frozenset[str] = frozenset(sorted_fields or ())
+        self.sorted_keys: dict[str, list[Any]] = {f: [] for f in (sorted_fields or ())}
+        # During the bulk lineage scan, insert() skips the per-key insort (which
+        # would be O(K^2) over K distinct keys) — finalize_build() sorts once.
+        self._building = False
         self._unique_fields = frozenset(unique_fields)
         self._last_values: dict[int, dict[str, Any]] = {}
+
+    def begin_bulk(self) -> None:
+        """Enter bulk-build mode: ``insert()`` defers each sorted field's insort
+        (it would be O(K^2) over the lineage) to a single sort in
+        :meth:`finalize_build`."""
+        self._building = True
+
+    def finalize_build(self) -> None:
+        """After a bulk build, derive each sorted field's sorted run from its eq
+        keys in one O(K log K) sort (incremental updates after this insort)."""
+        for field in self.sorted_fields:
+            self.sorted_keys[field] = sorted(
+                k for k in self.eq[field] if k is not None
+            )
+        self._building = False
 
     def _unindex(self, oid: int, old: dict[str, Any]) -> None:
         for field, value in old.items():
@@ -141,7 +169,18 @@ class ClassIndexes:
                         postings_map.setdefault(elem, BitMap64()).add(oid)
                 snapshot[field] = None if value is None else list(value)
                 continue
-            self.eq[field].setdefault(value, BitMap64()).add(oid)
+            postings = self.eq[field].get(value)
+            if postings is None:
+                postings = BitMap64()
+                self.eq[field][value] = postings
+                # a genuinely new key on a sorted field enters the sorted run
+                # (None never participates in ordering — SQL-NULL-like). During a
+                # bulk build the insort is deferred to finalize_build() (O(K^2)→
+                # one sort); incremental commits insort directly.
+                if (field in self.sorted_fields and value is not None
+                        and not self._building):
+                    insort(self.sorted_keys[field], value)
+            postings.add(oid)
             if field in self._unique_fields and value is not None:
                 self.unique[field][value] = oid
             snapshot[field] = value
@@ -175,10 +214,12 @@ def build_class_indexes(
     snapshot scans its pinned read view (ADR-002) — same rules, one code
     path."""
     specs = ti.specs
-    indexed = [s.name for s in specs if s.indexed or s.unique]
+    indexed = [s.name for s in specs if s.indexed or s.unique or s.sorted]
     unique = frozenset(s.name for s in specs if s.unique)
     list_fields = [s.name for s in specs if s.multivalued]
-    ci = ClassIndexes(indexed, list(unique), list_fields)
+    sorted_fields = [s.name for s in specs if s.sorted]
+    ci = ClassIndexes(indexed, list(unique), list_fields, sorted_fields)
+    ci.begin_bulk()  # defer the sorted-run insort to one sort at the end
     for cid, persisted in lineage:
         if not indexed:
             for rec in scan_type(cid):
@@ -212,6 +253,7 @@ def build_class_indexes(
             entry = {name: values[pos] for name, pos in position.items()}
             entry.update(fill)
             ci.insert(rec.oid, entry)
+    ci.finalize_build()  # one O(K log K) sort of each sorted run
     return ci
 
 
@@ -299,7 +341,7 @@ class IndexManager:
             ci = self._by_cls.get(ti.cls)
             if ci is None:
                 continue  # not built yet; a later build scans these records
-            indexed = {s.name for s in ti.specs if s.indexed or s.unique}
+            indexed = {s.name for s in ti.specs if s.indexed or s.unique or s.sorted}
             ci.insert(oid, {f: v for f, v in values.items() if f in indexed})
 
     def apply_deletes(self, deletes: list[tuple[int, TypeInfo]]) -> None:
@@ -376,6 +418,29 @@ class IndexManager:
                         posting.discard(d)
 
 
+def _range_slice(ci: ClassIndexes, field: str, op: str, value: Any) -> BitMap64:
+    """The OIDs whose SortedIndex ``field`` key satisfies ``op value`` — bisect
+    the sorted run for the matching key interval, union those eq postings
+    (ADR-004 / #18). None is never in the run (SQL-NULL-like ordering), and a
+    None bound matches nothing — mirroring :meth:`Pred.evaluate`."""
+    acc = BitMap64()
+    if value is None:
+        return acc
+    keys = ci.sorted_keys[field]
+    postings = ci.eq[field]
+    if op == ">=":
+        lo, hi = bisect_left(keys, value), len(keys)
+    elif op == ">":
+        lo, hi = bisect_right(keys, value), len(keys)
+    elif op == "<=":
+        lo, hi = 0, bisect_right(keys, value)
+    else:  # "<"
+        lo, hi = 0, bisect_left(keys, value)
+    for key in keys[lo:hi]:
+        acc |= postings[key]
+    return acc
+
+
 def plan(cond: Condition, ci: ClassIndexes) -> tuple[BitMap64 | None, Condition | None]:
     """Split a condition into (bitmap candidates, residual predicate).
 
@@ -386,6 +451,12 @@ def plan(cond: Condition, ci: ClassIndexes) -> tuple[BitMap64 | None, Condition 
     """
     if isinstance(cond, Pred):
         if cond.field in ci.eq:
+            if cond.op in (">=", ">", "<=", "<") and cond.field in ci.sorted_fields:
+                # ADR-004 (#18): the THIRD rule — an ordering comparison on a
+                # SortedIndex field answers from the sorted run as a range slice
+                # (a `between` is an And of two of these, composed below). Still
+                # deterministic and rule-based: no cost model, no plan search.
+                return _range_slice(ci, cond.field, cond.op, cond.value), None
             if cond.field in ci.list_fields:
                 # Multi-valued (inverted) index (#13): eq[field] keys are the
                 # list's elements, so `.contains(x)` is exact element membership
