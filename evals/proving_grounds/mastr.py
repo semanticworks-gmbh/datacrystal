@@ -244,6 +244,38 @@ def main() -> None:
     print("\ncorrectness: unique-key get ✓ · one-instance-per-OID across paths ✓")
     s.close()
 
+    # --- INDEX CACHE (#12 Design A): warm reopen vs cold rebuild -------------
+    # The cold reopen above rebuilt from records (no cache). Opt into the cache,
+    # build+write it once, then a warm reopen serves from it with NO O(corpus)
+    # rebuild (asserted by an operation count, not wall-clock — invariant 12).
+    import datacrystal._indexes as _idx
+
+    s = dc.Store.open(STORE, cache_index=True)
+    s.count(SolarUnit)   # build the index this session
+    s.close()            # writes index.cache stamped at the watermark
+
+    builds: list[int] = []
+    real_build = _idx.build_class_indexes
+
+    def _counting_build(*a, **k):  # noqa: ANN001,ANN002,ANN003
+        builds.append(1)
+        return real_build(*a, **k)
+
+    _idx.build_class_indexes = _counting_build  # type: ignore[assignment]
+    try:
+        t0 = time.perf_counter()
+        s = dc.Store.open(STORE, cache_index=True)
+        warm_total = s.count(SolarUnit)  # served from the cache (read-only → no _last_values walk)
+        t_warm = time.perf_counter() - t0
+    finally:
+        _idx.build_class_indexes = real_build  # type: ignore[assignment]
+    print(f"\nindex cache (#12 Design A): cold rebuild {t_open:7.2f}s → warm reopen "
+          f"{t_warm:7.2f}s  ({t_open / t_warm:.1f}x);  build_class_indexes called: "
+          f"{len(builds)}  (0 = served from cache, no O(corpus) rebuild)")
+    assert warm_total == total and not builds, \
+        "warm reopen must serve from the cache without an O(corpus) rebuild"
+    s.close()
+
     multivalued_biomass()
 
 

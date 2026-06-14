@@ -94,7 +94,8 @@ class ClassIndexes:
     """All index structures for one entity class in one store."""
 
     __slots__ = ("extent", "eq", "unique", "list_fields", "sorted_fields",
-                 "sorted_keys", "_building", "_last_values", "_unique_fields")
+                 "sorted_keys", "_building", "_last_values", "_unique_fields",
+                 "_needs_lv_rebuild")
 
     def __init__(self, indexed_fields: list[str], unique_fields: list[str],
                  list_fields: list[str] | None = None,
@@ -116,6 +117,10 @@ class ClassIndexes:
         self._building = False
         self._unique_fields = frozenset(unique_fields)
         self._last_values: dict[int, dict[str, Any]] = {}
+        # A cache load() defers the O(corpus) _last_values reconstruction to the
+        # first write (#12 Design A): a read-only reopen never pays it. A from-
+        # records build maintains the map incrementally, so this stays False.
+        self._needs_lv_rebuild = False
 
     def begin_bulk(self) -> None:
         """Enter bulk-build mode: ``insert()`` defers each sorted field's insort
@@ -132,6 +137,31 @@ class ClassIndexes:
             )
         self._building = False
 
+    def _rebuild_last_values(self) -> None:
+        """Reconstruct the per-oid un-index memory from the already-loaded postings
+        + unique map — deferred from a cache ``load()`` to the first write (#12), so
+        a read-only reopen pays nothing. Rebuilds from the index (not the records),
+        so additive schema evolution is already baked in and no fill logic is
+        needed. From-records builds maintain the map incrementally and never call
+        this."""
+        last: dict[int, dict[str, Any]] = {}
+        for field, col in self.eq.items():
+            is_list = field in self.list_fields
+            for key, bm in col.items():
+                for oid in bm:
+                    entry = last.setdefault(oid, {})
+                    if is_list:
+                        if key is not None:
+                            entry.setdefault(field, []).append(key)
+                    else:
+                        entry[field] = key
+        for field in self._unique_fields:
+            if field not in self.eq:  # a pure-Unique field: its memory is the map
+                for value, oid in self.unique[field].items():
+                    last.setdefault(oid, {})[field] = value
+        self._last_values = last
+        self._needs_lv_rebuild = False
+
     def _unindex(self, oid: int, old: dict[str, Any]) -> None:
         for field, value in old.items():
             if field in self.list_fields:
@@ -143,15 +173,19 @@ class ClassIndexes:
                     if posting is not None:
                         posting.discard(oid)
                 continue
-            postings = self.eq[field].get(value)
-            if postings is not None:
-                postings.discard(oid)
+            eq_col = self.eq.get(field)  # None for a pure-Unique field (#12: no eq postings)
+            if eq_col is not None:
+                postings = eq_col.get(value)
+                if postings is not None:
+                    postings.discard(oid)
             if field in self._unique_fields and value is not None:
                 holder = self.unique[field]
                 if holder.get(value) == oid:
                     del holder[value]
 
     def insert(self, oid: int, values: dict[str, Any]) -> None:
+        if self._needs_lv_rebuild:  # first write after a cache load (#12)
+            self._rebuild_last_values()
         old = self._last_values.pop(oid, None)
         if old is not None:
             self._unindex(oid, old)
@@ -169,18 +203,24 @@ class ClassIndexes:
                         postings_map.setdefault(elem, BitMap64()).add(oid)
                 snapshot[field] = None if value is None else list(value)
                 continue
-            postings = self.eq[field].get(value)
-            if postings is None:
-                postings = BitMap64()
-                self.eq[field][value] = postings
-                # a genuinely new key on a sorted field enters the sorted run
-                # (None never participates in ordering — SQL-NULL-like). During a
-                # bulk build the insort is deferred to finalize_build() (O(K^2)→
-                # one sort); incremental commits insort directly.
-                if (field in self.sorted_fields and value is not None
-                        and not self._building):
-                    insort(self.sorted_keys[field], value)
-            postings.add(oid)
+            # A pure-Unique field (Unique, not also Index/SortedIndex) carries NO
+            # eq postings (#12): its ==/in_ are answered from the unique map, so
+            # the per-key single-element bitmaps were dead weight. Route it to the
+            # unique map only; Index/SortedIndex (incl. Unique+Index) keep eq.
+            eq_col = self.eq.get(field)
+            if eq_col is not None:
+                postings = eq_col.get(value)
+                if postings is None:
+                    postings = BitMap64()
+                    eq_col[value] = postings
+                    # a genuinely new key on a sorted field enters the sorted run
+                    # (None never participates in ordering — SQL-NULL-like). During
+                    # a bulk build the insort is deferred to finalize_build()
+                    # (O(K^2)→one sort); incremental commits insort directly.
+                    if (field in self.sorted_fields and value is not None
+                            and not self._building):
+                        insort(self.sorted_keys[field], value)
+                postings.add(oid)
             if field in self._unique_fields and value is not None:
                 self.unique[field][value] = oid
             snapshot[field] = value
@@ -189,6 +229,8 @@ class ClassIndexes:
     def remove(self, oid: int) -> None:
         """Un-index a committed delete (ADR-003) from the index's own
         ``last_values`` memory — never a store read (invariant 11)."""
+        if self._needs_lv_rebuild:  # first write after a cache load (#12)
+            self._rebuild_last_values()
         old = self._last_values.pop(oid, None)
         if old is not None:
             self._unindex(oid, old)
@@ -199,13 +241,15 @@ class ClassIndexes:
         values). For a consumer that will never fold in another commit —
         the frozen snapshot views — that map is pure O(extent) waste."""
         self._last_values.clear()
+        self._needs_lv_rebuild = False  # a sealed view never folds a commit
 
     def dump(self) -> dict[str, Any]:
         """Serialize to a msgpack-able structure for the index cache (ADR-005 /
         #12): bitmaps as ``BitMap64`` bytes; keys live in lists (never as map
-        keys) so any scalar key type round-trips. ``sorted_keys`` and the
-        incremental ``_last_values`` memory are NOT stored — they reconstruct
-        from the postings on load."""
+        keys) so any scalar key type round-trips. A pure-Unique field carries NO
+        eq postings (#12) — only the flat ``unique`` value→oid map. ``sorted_keys``
+        reconstruct from the postings on load; the ``_last_values`` memory is not
+        stored and is rebuilt lazily on the first write after a load."""
         return {
             "extent": self.extent.serialize(),
             "eq": [[f, [[k, bm.serialize()] for k, bm in posts.items()]]
@@ -220,40 +264,51 @@ class ClassIndexes:
         """Rebuild from a cached ``dump()`` — but ONLY if the cached index
         surface still matches the live class's markers (else ``None`` → the
         caller rebuilds from records; the cache is never authoritative). The
-        sorted runs and the ``_last_values`` un-index memory are reconstructed
-        from the postings, so a loaded index supports further commits."""
-        indexed = [f for f, _ in blob["eq"]]
+        sorted runs reconstruct from the postings here; the ``_last_values``
+        un-index memory is deferred to the first write (a read-only reopen never
+        pays for it), so a loaded index still supports further commits."""
+        eq_names = [f for f, _ in blob["eq"]]
         unique = [f for f, _ in blob["unique"]]
         list_fields = list(blob["list_fields"])
         sorted_fields = list(blob["sorted_fields"])
-        want = sorted(s.name for s in ti.specs if s.indexed or s.unique or s.sorted)
-        if (sorted(indexed) != want
+        # eq-membership is Index/SortedIndex only (#12); a pure-Unique field is in
+        # `unique`, never `eq` — so the marker-check compares the two separately.
+        if (sorted(eq_names) != sorted(_eq_index_fields(ti))
                 or sorted(unique) != sorted(s.name for s in ti.specs if s.unique)
                 or sorted(list_fields) != sorted(s.name for s in ti.specs if s.multivalued)
                 or sorted(sorted_fields) != sorted(s.name for s in ti.specs if s.sorted)):
             return None  # the code's index markers changed → rebuild
-        ci = cls(indexed, unique, list_fields, sorted_fields)
+        ci = cls(eq_names, unique, list_fields, sorted_fields)
         ci.extent = BitMap64.deserialize(blob["extent"])
-        last: dict[int, dict[str, Any]] = {}
         for field, posts in blob["eq"]:
-            is_list = field in ci.list_fields
             col = ci.eq[field]
             for key, bm_bytes in posts:
-                bm = BitMap64.deserialize(bm_bytes)
-                col[key] = bm
-                for oid in bm:
-                    entry = last.setdefault(oid, {})
-                    if is_list:
-                        if key is not None:
-                            entry.setdefault(field, []).append(key)
-                    else:
-                        entry[field] = key
+                col[key] = BitMap64.deserialize(bm_bytes)
         for field, items in blob["unique"]:
             ci.unique[field] = dict(items)
         for field in ci.sorted_fields:
             ci.sorted_keys[field] = sorted(k for k in ci.eq[field] if k is not None)
-        ci._last_values = last
+        # Defer the O(corpus) _last_values reconstruction to the first write (#12
+        # Design A): a read-only reopen never pays it; the first insert()/remove()
+        # rebuilds it from these postings + the unique map.
+        ci._needs_lv_rebuild = True
         return ci
+
+
+def _eq_index_fields(ti: TypeInfo) -> list[str]:
+    """Fields that carry eq (bitmap) postings: Index and SortedIndex — NOT a
+    pure-Unique field, whose ``==``/``in_`` answer from the value→oid unique map
+    (#12). The SINGLE source of eq-membership; build, the cache marker-check, and
+    plan()'s unique fallback all agree on it so a Unique-only field can't be in
+    ``eq`` on one path and absent on another."""
+    return [s.name for s in ti.specs if s.indexed or s.sorted]
+
+
+def _maintained_fields(ti: TypeInfo) -> list[str]:
+    """Every field the index touches — eq fields ∪ unique fields (#12). A pure-
+    Unique field is maintained (it has a unique map and an un-index memory) but
+    carries no eq postings."""
+    return [s.name for s in ti.specs if s.indexed or s.sorted or s.unique]
 
 
 def build_class_indexes(
@@ -269,21 +324,22 @@ def build_class_indexes(
     snapshot scans its pinned read view (ADR-002) — same rules, one code
     path."""
     specs = ti.specs
-    indexed = [s.name for s in specs if s.indexed or s.unique or s.sorted]
+    eq_fields = _eq_index_fields(ti)
     unique = frozenset(s.name for s in specs if s.unique)
+    maintained = _maintained_fields(ti)  # eq fields + the pure-Unique fields
     list_fields = [s.name for s in specs if s.multivalued]
     sorted_fields = [s.name for s in specs if s.sorted]
-    ci = ClassIndexes(indexed, list(unique), list_fields, sorted_fields)
+    ci = ClassIndexes(eq_fields, list(unique), list_fields, sorted_fields)
     ci.begin_bulk()  # defer the sorted-run insort to one sort at the end
     for cid, persisted in lineage:
-        if not indexed:
+        if not maintained:
             for rec in scan_type(cid):
                 ci.extent.add(rec.oid)
             continue
-        position = {n: persisted.index(n) for n in indexed if n in persisted}
+        position = {n: persisted.index(n) for n in maintained if n in persisted}
         fill: dict[str, Any] = {}
         colliding: str | None = None
-        for name in indexed:
+        for name in maintained:
             if name in position:
                 continue
             factory = ti.defaults.get(name)
@@ -414,8 +470,8 @@ class IndexManager:
             ci = self._by_cls.get(ti.cls)
             if ci is None:
                 continue  # not built yet; a later build scans these records
-            indexed = {s.name for s in ti.specs if s.indexed or s.unique or s.sorted}
-            ci.insert(oid, {f: v for f, v in values.items() if f in indexed})
+            maintained = set(_maintained_fields(ti))  # eq fields + unique fields
+            ci.insert(oid, {f: v for f, v in values.items() if f in maintained})
 
     def apply_deletes(self, deletes: list[tuple[int, TypeInfo]]) -> None:
         """P3: drop committed deletions from every already-built index
@@ -563,6 +619,34 @@ def plan(cond: Condition, ci: ClassIndexes) -> tuple[BitMap64 | None, Condition 
                     if (needle in key if cond.op == "contains"
                             else key.startswith(needle)):
                         acc |= postings
+                return acc, None
+        if cond.field in ci.unique:
+            # A pure-Unique field has no eq postings (#12): answer equality from
+            # the value→oid map. == → 0/1 oid; in_ → the union; contains/startswith
+            # iterate the distinct keys (which ARE the distinct values) — the same
+            # O(distinct) shape as the eq path, never a record load. (A Unique+Index
+            # or Unique+SortedIndex field is in ci.eq and took the branch above, so
+            # this runs only for Unique-only fields.)
+            holder = ci.unique[cond.field]
+            if cond.op == "==":
+                oid = holder.get(cond.value)
+                return (BitMap64([oid]) if oid is not None else BitMap64()), None
+            if cond.op == "in":
+                acc = BitMap64()
+                for value in cond.value:
+                    oid = holder.get(value)
+                    if oid is not None:
+                        acc.add(oid)
+                return acc, None
+            if cond.op in ("contains", "startswith"):
+                needle = cond.value
+                acc = BitMap64()
+                for key, oid in holder.items():
+                    if not isinstance(key, str):
+                        continue
+                    if (needle in key if cond.op == "contains"
+                            else key.startswith(needle)):
+                        acc.add(oid)
                 return acc, None
         return None, cond
     if isinstance(cond, And):
