@@ -1,6 +1,6 @@
 # datacrystal user guide
 
-This guide documents what **exists today** (`0.2.0`, 2026-06). Everything that does not
+This guide documents what **exists today** (`0.3.0`, 2026-06). Everything that does not
 exist yet is explicitly marked **`[planned — …]`** with its place on the
 [roadmap](design/ROADMAP.md); nothing here describes vapor as if it were real. The public API
 freezes at the v0.1.0 tag.
@@ -35,13 +35,25 @@ store = dc.Store.open("cabinet.store")        # a directory; created if needed
 store.close()                                  # or: with dc.Store.open(...) as store:
 ```
 
-`Store.open(path, *, durability="interval", lock_ttl=10.0, debug=False, lazy_timeout=None)`
-(async: `await dc.aopen(...)`, same keywords — see
+`Store.open(path, *, durability="interval", lock_ttl=10.0, debug=False, lazy_timeout=None,
+cache_index=False)` (async: `await dc.aopen(...)`, same keywords — see
 [Concurrency and deployment](#concurrency-and-deployment)):
 
 - The directory holds `data.sqlite` (records as msgpack blobs, riding SQLite's journal) and
   `used.lock`, the **single-writer lease**: a second process opening the same store gets a loud
   `StoreLockedError` instead of silent corruption.
+- **Startup is instant; the *first* query per class isn't (by default).** Secondary indexes are
+  rebuildable derived data, built lazily on first use with a one-time O(extent) scan of that
+  class's records (the same is true of the `incoming()` reverse index). On a multi-million-row
+  store that first query can take tens of seconds.
+- `cache_index=True` (opt-in, [ADR-005](design/ADR-005-index-cache.md)) **persists the built
+  indexes to a watermark-stamped sidecar and loads them at boot instead of rescanning** — a warm
+  reopen skips that O(extent) rebuild (measured **~14× faster** on a 6.2M-row store; the sidecar
+  is ~2.5× smaller than a naïve one because a `Unique` field is stored as a flat key→oid map, not
+  per-key bitmaps). The cache is **never authoritative** (invariant 11): any watermark or
+  index-marker mismatch, or a corrupt/newer sidecar, silently rebuilds from the records — a stale
+  cache can never return a wrong answer. Off by default; turn it on where restarts are frequent
+  and the categorical indexes are worth not rebuilding.
 - `durability` is a triad. `"commit"` fsyncs every commit (plus `F_FULLFSYNC` on macOS —
   honest, so a commit costs ~4 ms there); an acked commit survives even power loss.
   `"interval"` (default) group-commits: fsync happens at WAL checkpoints, so a **process**
@@ -518,7 +530,7 @@ moved = store.migrate()   # re-encode every stale-shape record to the newest sha
 defaults) and re-commits it under the current shape — additive (a new lineage row, never a blob
 rewrite), owner-confined, lease-held, and crash-safe (it rides the normal commit; a partial run
 just resumes). It is **idempotent** (a second run rewrites nothing) and commits in `batch`-sized
-chunks (`store.migrate(batch=50_000)`) so peak memory tracks the batch, not the store.
+chunks (`store.migrate(batch=10_000)`, the default) so peak memory tracks the batch, not the store.
 
 `store.verify()` is the read-only pre-flight: it decodes every record against the current code
 *without* mutating anything and returns the `(typename, oid)` pairs that **don't** decode — a field
@@ -672,7 +684,7 @@ def report(store: dc.Store) -> int:        # runs on any thread
 ### The commit-delta pipeline — what sidecars ride on
 
 Every commit is describable as one versioned, msgpack-encodable **delta** — the public
-[COMMIT-DELTA-v1](design/COMMIT-DELTA-v1.md) contract (DRAFT until the v0.1.0 tag). Attach
+[COMMIT-DELTA-v1](design/COMMIT-DELTA-v1.md) contract (**LOCKED v1**, 2026-06-12). Attach
 a consumer and every commit hands it exactly one delta, in TID order, on the owner thread,
 strictly after the commit is durable:
 
@@ -769,9 +781,12 @@ minerals = store.get_many([hit.oid for hit in idx.search("Tsumeb", cls=Mineral)]
   stemming (27 languages by ISO code or Snowball name); bare `dc.FullText` is fold-only
   exact matching (case + diacritics + Unicode-compat forms fold: `m²` matches `m2`,
   `Glänzend` matches `glanzend`). Exact matches outrank stem-only matches.
-- Quoted phrases stay phrases; everything else is AND-of-terms. User input is quoted
-  into the FTS5 expression — it can never inject MATCH operators. `cls=` narrows to one
-  entity type.
+- Quoted phrases stay phrases; loose terms combine per `match=`: **`"any"` (the default)**
+  ranks the OR-union of the terms (natural-language recall — a question doc needn't contain
+  *every* word), `"all"` requires every term (precise faceting). User input is quoted into the
+  FTS5 expression — it can never inject MATCH operators. `cls=` narrows to one entity type;
+  `hit.snippets` maps each matched field to its highlighted excerpt, and `hit.snippet` is the
+  first non-empty one.
 - Attaching to a lived-in store: `FullTextIndex.bootstrap(path, snapshot)` (deltas are
   not retained — the snapshot recipe above). Reopening with a different field/language
   configuration raises `FtsConfigError`: rebuild, a half-matching index is stale.
@@ -955,18 +970,18 @@ the store has no committed records of (the result is empty — first run, or a f
 
 ## Planned features and when they land
 
-Sequencing follows the ratified [roadmap](design/ROADMAP.md) and the
-[kickoff plan](design/KICKOFF.md); "milestone" refers to the v0.1 execution plan
-(M2 → M3 → M4 ≈ tag v0.1.0 + PyPI release).
+Sequencing follows the ratified [roadmap](design/ROADMAP.md); the live backlog (in/order)
+is on [GitHub Issues](https://github.com/themerius/datacrystal/issues). **v0.1.0 (API freeze)
+and v0.2.0/v0.3.0 (the additive surface) are tagged; PyPI publication is still deferred (names
+reserved).**
 
 | Feature | Where it lands |
 |---|---|
-| v0.1.0 tag: API freeze (incl. the COMMIT-DELTA-v1 lock); PyPI publication follows | M4 — current milestone (the `[fts]`/`[arrow]` extras landed pre-tag, 2026-06-12, as the contract's real-consumer validators) |
-| **object-store (S3) primary backend** — "the only infra is a blob store" | `[planned — v0.2+, item 16]`; feasibility spiked (manifest-LSM + conditional-PUT CAS), gated on the retained log |
+| **object-store (S3) primary backend** — "the only infra is a blob store" | `[planned — item 16]`; feasibility spiked (manifest-LSM + conditional-PUT CAS), gated on the retained log + a scope ruling |
 | **GraphQL / FastAPI** — `datacrystal[web]` with strawberry integration | extension package, after the v1 core freeze |
 | vector search — `datacrystal[vector]`, usearch, ≥2 vector fields per entity | extension package, after v1 |
 | property-graph recipes, cross-mirror DuckDB recipes | v1 |
-| guided migrations (offline `migrate`/`verify`, indexed-field renames), sets, custom scalar types, CJK-segmenting FTS tokenizer | demand-driven (field renames via `dc.RenamedFrom` already ship — see [Schema evolution](#schema-evolution)) |
+| indexed-field renames, sets, custom scalar types, CJK-segmenting FTS tokenizer | demand-driven (offline `migrate`/`verify` and `dc.RenamedFrom`/`dc.Glue` already ship — see [Schema evolution](#schema-evolution)) |
 
 Without the `[arrow]` extra installed, getting data into pandas is still a two-liner via
 the decode-level projection (copies, not zero-copy — but no entities are built either):
