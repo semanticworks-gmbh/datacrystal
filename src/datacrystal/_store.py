@@ -1099,6 +1099,72 @@ class Store:
             return []
         return self.get_many(list(referrers))
 
+    def verify(self) -> list[tuple[str, int]]:
+        """Decode every committed record against the current code, **without
+        mutating anything** — the read-only consistency check of #26 (c). Returns
+        the ``(typename, oid)`` pairs that do *not* decode to their live
+        ``@entity`` class's shape: a field removed-then-re-added with no default
+        or ``Glue``, a type the running code no longer defines, a payload whose
+        ``Glue`` function raises, or a corrupt record. An empty list means the
+        whole store reads cleanly under this code. ``verify()`` itself never
+        raises on a bad record — reporting it is the point — but the owner guard
+        still applies. Run it before :meth:`migrate`."""
+        self._enter()
+        failures: list[tuple[str, int]] = []
+        for typename in list(self._cids_by_typename):
+            ti = TYPES_BY_NAME.get(typename)
+            for cid in list(self._cids_by_typename.get(typename, ())):
+                for rec in self._backend.scan_type(cid):
+                    try:
+                        if ti is None:
+                            raise SchemaMismatchError(
+                                f"no live @entity class named {typename!r} here"
+                            )
+                        self._decode_check(rec, ti)
+                    except (SchemaMismatchError, ValueError, KeyError,
+                            TypeError, IndexError):
+                        failures.append((typename, rec.oid))
+        return failures
+
+    def migrate(self, *, batch: int = 10_000) -> int:
+        """Rewrite every record to the newest shape of its live ``@entity`` class
+        (#26 (c)) — the offline counterpart to read-time ``RenamedFrom``/``Glue``.
+        Each record persisted under an *older* lineage cid is hydrated (through
+        renames, glue and defaults) and re-committed under the current-shape cid,
+        so the migrated values become **real persisted columns** — a glued or
+        renamed field can then be indexed. Additive (a new lineage row, never a
+        blob mutation — invariant 8), owner-confined, lease-held, and crash-safe /
+        TID-gapless (it rides the normal commit machine, so a partial run just
+        resumes). **Idempotent**: a second run finds nothing stale and rewrites
+        nothing. Commits in ``batch``-sized chunks, so peak memory is bounded by
+        the batch, not the store. Returns the number of records rewritten; a type
+        with no live class here is left untouched (``verify()`` names it)."""
+        self._enter()
+        migrated = 0
+        for typename in list(self._cids_by_typename):
+            ti = TYPES_BY_NAME.get(typename)
+            if ti is None:
+                continue  # no live class — can't re-encode; verify() reports it
+            # the current-shape cid is the one whose persisted fields match the
+            # LIVE class — NOT _cid_by_typename (the latest *persisted* cid, which
+            # before any new-shape commit is still the old shape).
+            target = list(ti.field_names)
+            lineage = self._cids_by_typename.get(typename, ())
+            current = next(
+                (c for c in lineage if self._persisted_fields.get(c) == target), None
+            )
+            stale = [c for c in lineage if c != current]
+            if not stale:
+                continue
+            oids = [rec.oid for c in stale for rec in self._backend.scan_type(c)]
+            for start in range(0, len(oids), batch):
+                chunk = self.get_many(oids[start:start + batch])
+                for obj in chunk:
+                    self.mark_dirty(obj)
+                self.commit()
+                migrated += len(chunk)
+        return migrated
+
     def explain(self, target: type | Condition) -> QueryPlan:
         """The deterministic plan for ``target``: what answers from
         bitmaps, what evaluates as a Python residual, and over how many
@@ -1488,6 +1554,27 @@ class Store:
                 plan.append((spec, None, factory))
             self._plan_by_cid[cid] = plan
         return plan
+
+    def _decode_check(self, rec: StoredRecord, ti: TypeInfo) -> None:
+        """Decode one record to ``ti``'s current shape WITHOUT constructing an
+        entity — raises if it cannot (the :meth:`verify` probe). The hydration
+        plan must bind every live field (else ``SchemaMismatchError``), the
+        payload width must match, and every ``Glue`` function must run on this
+        record's old values (a glue that raises is a real, reportable failure)."""
+        hplan = self._hydration_plan(rec.cid, ti)
+        values = decode_payload(rec.payload)
+        persisted = self._persisted_fields.get(rec.cid, [])
+        if len(values) != len(persisted):
+            raise SchemaMismatchError(
+                f"{ti.typename}: record has {len(values)} fields, its type "
+                f"dictionary row has {len(persisted)}"
+            )
+        by_name: dict[str, Any] | None = None
+        for spec, index, _factory in hplan:
+            if index is None and spec.glue is not None:
+                if by_name is None:
+                    by_name = dict(zip(persisted, values))
+                spec.glue(by_name)
 
     def _load_oid(self, oid: int, cache: dict[int, StoredRecord] | None = None) -> Any:
         self._guard()
