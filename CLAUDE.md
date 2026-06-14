@@ -51,7 +51,12 @@ stale venv shebangs — `rm -rf .venv && uv sync`.
   indexes may be cached on disk (watermark-validated, rebuilt-on-mismatch, never authoritative),
   a manifest-LSM sidecar outside the commit txn. ADR-004+005 converge on a persisted sorted index
   (sorted runs + zone-maps + bloom) — the Bigtable/SSTable shape on the existing segment substrate.
-- `docs/design/COMMIT-DELTA-v1.md` — the delta/watermark contract (**LOCKED v1**, 2026-06-12).
+  (ADR-006 reserved for the index-cache lazy key→offset directory, #69 — not yet written.)
+- `docs/design/ADR-007-blob-fields.md` — accepted `dc.Blob` fields (#75): `Annotated[bytes, dc.Blob]`
+  stores bytes **out-of-line raw** in a sibling `blobs` table (record holds a `BLOB_EXT` descriptor),
+  whole-vs-streamed is a **read-time choice** (`.bytes()` / `store.open_blob() -> BinaryIO` via SQLite
+  `blobopen`), no `stream=` flag; v1 single raw cell (size-known, ~954 MiB ceiling), chunked layout =
+  #76 (single-cell→chunked migration, never both). NO engine code shipped yet — this is the gate.
   The applier + replay vectors are normative and byte-pinned; changes now mean a NEW contract
   version, never an edit.
 - `docs/GUIDE.md` — user-facing semantics. Documentation honesty rule: features that do not
