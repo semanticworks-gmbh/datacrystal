@@ -38,6 +38,8 @@ import weakref
 from typing import (
     Annotated,
     Any,
+    Callable,
+    Mapping,
     Union,
     cast,
     dataclass_transform,
@@ -133,6 +135,43 @@ class RenamedFrom(_Marker):
         return f"datacrystal.RenamedFrom({self.old_name!r})"
 
 
+class Glue(_Marker):
+    """Field marker: derive this field from an OLD record when it is absent from
+    a persisted record (#26 (b)) — the declarative reshape hook for schema
+    evolution that needs data *moved*, not just renamed.
+
+    ``Glue(fn)`` calls ``fn(old)`` where ``old`` is the persisted record as a
+    read-only ``{field_name: value}`` mapping, and uses the result as this
+    field's value. It fires **only when the field is absent** from the record's
+    own persisted shape — exactly like a default that can read its siblings — so
+    once data is written in the new shape the glue is a no-op (it never rewrites
+    a record, invariant 8). Split / merge / derive across fields::
+
+        @dc.entity
+        class Locality:
+            lat: Annotated[float, dc.Glue(lambda old: float(old["coords"].split(",")[0]))]
+            lon: Annotated[float, dc.Glue(lambda old: float(old["coords"].split(",")[1]))]
+            # old records persisted `coords="48.1,11.5"`; lat/lon follow the code
+
+    Scoped (v0.2, like :class:`RenamedFrom`) to **non-indexed fields read through
+    live hydration / decode** (``get``/``query``/``pluck``); the index, snapshot
+    and arrow decode paths are a follow-on. Combining it with ``Index``/``Unique``
+    or with ``RenamedFrom`` raises. Rewriting old records to the new shape on disk
+    is the ``migrate`` story (#26 (c)), not this marker.
+    """
+
+    __slots__ = ("fn",)
+
+    def __init__(self, fn: Callable[[Mapping[str, Any]], Any]) -> None:
+        super().__init__("Glue")
+        if not callable(fn):
+            raise TypeError("Glue(fn) takes a callable: old-record mapping -> value")
+        self.fn = fn
+
+    def __repr__(self) -> str:
+        return "datacrystal.Glue(...)"
+
+
 _INDEXABLE_TYPES = (str, int, float, bool)
 
 
@@ -148,6 +187,7 @@ class FieldSpec:
     fulltext_language: str | None = None  # from FullText(language=...), None if bare
     multivalued: bool = False  # indexed list field — inverted (element) postings (#13)
     renamed_from: str | None = None  # old persisted field name (RenamedFrom, #26 (a))
+    glue: Callable[[Mapping[str, Any]], Any] | None = None  # derive-when-absent (Glue, #26 (b))
 
 
 class TypeInfo:
@@ -364,6 +404,7 @@ def _resolve_specs(cls: type, field_names: tuple[str, ...]) -> tuple[FieldSpec, 
         unique = any(m is Unique for m in markers)
         fulltext = next((m for m in markers if isinstance(m, _FullText)), None)
         renamed = next((m for m in markers if isinstance(m, RenamedFrom)), None)
+        glued = next((m for m in markers if isinstance(m, Glue)), None)
         lazy_refs = _contains_lazy(core)
         is_list = _is_list_of_scalar(core)
         if (indexed or unique) and not (_is_indexable(core) or is_list):
@@ -384,12 +425,25 @@ def _resolve_specs(cls: type, field_names: tuple[str, ...]) -> tuple[FieldSpec, 
                 "read through live hydration; rename an indexed field via a "
                 "migration instead"
             )
+        if glued is not None and (indexed or unique):
+            raise TypeError(
+                f"{cls.__name__}.{name}: Glue on an Index/Unique field is not "
+                "supported yet — v0.2 scopes glue to non-indexed fields read "
+                "through live hydration / decode"
+            )
+        if glued is not None and renamed is not None:
+            raise TypeError(
+                f"{cls.__name__}.{name}: a field cannot declare both RenamedFrom "
+                "and Glue — RenamedFrom binds an old column by name, Glue computes "
+                "from the old record; pick one"
+            )
         specs.append(FieldSpec(
             name, lazy_refs, indexed, unique,
             fulltext is not None,
             fulltext.language if fulltext is not None else None,
             multivalued=indexed and is_list,
             renamed_from=renamed.old_name if renamed is not None else None,
+            glue=glued.fn if glued is not None else None,
         ))
     return tuple(specs)
 

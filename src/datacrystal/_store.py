@@ -1278,9 +1278,18 @@ class Store:
                     )
                 hydration = self._hydration_plan(rec.cid, ti)
                 values = decode_payload(rec.payload)
+                by_name: dict[str, Any] | None = None
                 row: dict[str, Any] = {}
                 for spec, index, factory in hydration:
-                    row[spec.name] = values[index] if index is not None else factory()
+                    if index is not None:
+                        row[spec.name] = values[index]
+                    elif spec.glue is not None:  # #26 (b): derive from the old record
+                        if by_name is None:
+                            persisted = self._persisted_fields.get(rec.cid, [])
+                            by_name = dict(zip(persisted, values))
+                        row[spec.name] = spec.glue(by_name)
+                    else:
+                        row[spec.name] = factory()
                 yield oid, row
 
     def _guard(self) -> None:
@@ -1461,6 +1470,13 @@ class Store:
                 if index is not None:
                     plan.append((spec, index, None))
                     continue
+                if spec.glue is not None:
+                    # #26 (b): the field is absent from this record's persisted
+                    # shape — derive it from the old record at fill time (read
+                    # only; never rewrites the record). Distinguished from a
+                    # plain default by ``spec.glue`` in the fill loops.
+                    plan.append((spec, None, None))
+                    continue
                 factory = ti.defaults.get(spec.name)
                 if factory is None:
                     raise SchemaMismatchError(
@@ -1545,8 +1561,16 @@ class Store:
                 f"dictionary row has {len(persisted)} — the store is damaged"
             )
         fill = object.__setattr__  # bound once: this loop is the hot path
+        by_name: dict[str, Any] | None = None  # built once iff a glue field fires
         for spec, index, factory in plan:
-            raw = values[index] if index is not None else factory()
+            if index is not None:
+                raw = values[index]
+            elif spec.glue is not None:  # #26 (b): derive from the old record
+                if by_name is None:
+                    by_name = dict(zip(persisted, values))
+                raw = spec.glue(by_name)
+            else:
+                raw = factory()
             if raw is None or type(raw) in _SCALAR_TYPES:
                 fill(obj, spec.name, raw)  # scalars skip the resolve call
             else:
