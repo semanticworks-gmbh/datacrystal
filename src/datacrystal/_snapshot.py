@@ -22,7 +22,7 @@ import warnings
 from types import MappingProxyType
 from typing import Any, Iterator, Mapping, cast
 
-from pyroaring import FrozenBitMap64
+from pyroaring import BitMap64, FrozenBitMap64
 
 from datacrystal._conditions import (
     And,
@@ -48,6 +48,7 @@ from datacrystal._indexes import (
     QueryPlan,
     build_class_indexes,
     explain_plan,
+    harvest_ref_oids,
     plan,
 )
 from datacrystal._lazy import Lazy
@@ -267,6 +268,10 @@ class Snapshot:
         self._cache: dict[int, EntityView] = {}
         self._indexes: dict[type, ClassIndexes] = {}
         self._frozen: dict[type, SnapshotIndexes] = {}
+        # Snapshot-local reverse-reference postings (target OID → referrer OIDs),
+        # built once from this pinned view on first incoming() — never shared
+        # with the owner's live reverse index (invariant 11). None = not built.
+        self._reverse: dict[int, BitMap64] | None = None
         self._closed = False
 
     # -- surface ---------------------------------------------------------
@@ -434,6 +439,31 @@ class Snapshot:
             self._guard()
             return explain_plan(ti.typename, self._class_indexes(ti), cond)
 
+    def incoming(self, target: "EntityView | Ref | int") -> list[EntityView]:
+        """Every committed entity that **references** ``target`` at this
+        watermark — the snapshot twin of :meth:`Store.incoming` (ROADMAP item 8,
+        sub-story C). Answered from a snapshot-local reverse-reference index
+        rebuilt from the pinned read view (invariant 11; never shared with the
+        owner's live one, the same isolation as every other snapshot index), so
+        it is callable from ANY thread while the owner keeps writing (ADR-002).
+
+        ``target`` is the snapshot's own currency — an :class:`EntityView`, a
+        :class:`Ref`, or a raw OID; snapshots never traffic in live entities
+        (ADR-001). Counts eager and ``Lazy`` referrers, in scalar fields and
+        inside list/dict containers. A referrer committed AFTER this watermark
+        is absent — the snapshot answers as of its pinned commit boundary.
+
+        A ``target`` whose own record is gone at this watermark (deleted, ADR-003
+        — unchecked) still names its now-dangling referrers (OIDs are never
+        reused): ``incoming(dead)`` is the checked-delete enumeration seam."""
+        oid = target.oid if isinstance(target, (EntityView, Ref)) else target
+        with self._lock:
+            self._guard()
+            referrers = self._ensure_reverse().get(oid)
+            if referrers is None:
+                return []
+            return self._views_for(list(referrers))
+
     # -- lifecycle ---------------------------------------------------------
 
     def close(self) -> None:
@@ -471,6 +501,22 @@ class Snapshot:
             ci.seal()  # frozen consumer: drop the incremental-update memory
             self._indexes[ti.cls] = ci
         return ci
+
+    def _ensure_reverse(self) -> dict[int, BitMap64]:
+        """Build the snapshot-local reverse postings once (caller holds the
+        lock): scan every committed record in this pinned view, harvest its
+        outgoing refs, invert to target OID → referrer OIDs. The frozen-view
+        analogue of ``IndexManager.ensure_reverse`` — global (every cid, every
+        field), rebuildable, never persisted (invariant 11)."""
+        if self._reverse is not None:
+            return self._reverse
+        rev: dict[int, BitMap64] = {}
+        for cid in self._fields_by_cid:
+            for rec in self._view.scan_type(cid):
+                for target in harvest_ref_oids(decode_payload(rec.payload)):
+                    rev.setdefault(target, BitMap64()).add(rec.oid)
+        self._reverse = rev
+        return rev
 
     def _views_for(self, oids: list[int]) -> list[EntityView]:
         """Batch-materialize EntityViews (caller holds the lock), loading

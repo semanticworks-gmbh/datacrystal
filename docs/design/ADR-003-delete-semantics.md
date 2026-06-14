@@ -95,3 +95,22 @@ delete shape hostage to a v1 feature.
 - "Real" checked delete (refuse-if-referenced, cascades, orphan sweeps) arrives
   with v1's reverse-reference index and is *additive* API on top of this — nothing
   here forecloses it.
+
+## Closing note — the enumeration seam landed (2026-06-14, ROADMAP item 8 / #20)
+
+The reverse-reference index (`store.incoming()`, and `Snapshot.incoming()` at a
+pinned watermark) now ships. It deliberately stops one step short of *checked*
+delete and instead provides the **enumeration** this ADR said v1 would need:
+
+- A deleted **target** keeps its reverse postings (rule 8's dangle is intentional;
+  OIDs are never reused, rule 4). So `incoming(dead_oid)` returns **exactly the
+  entities still pointing at the dead OID** — the referrers a refuse-if-referenced
+  or cascade policy would act on. `Snapshot.incoming(dead_oid)` answers the same at
+  its watermark even though `snapshot.get(dead_oid)` raises `DanglingRefError`
+  (rule 8): the seam works without the target's record.
+- A deleted **referrer** drops out of the postings (its outgoing edges vanish),
+  so it never appears as a phantom backlink.
+
+Checked delete (the *policy* on top — refuse, cascade, orphan-sweep) remains
+deferred and additive: this ADR's unchecked contract is unchanged, and the
+reverse index is the rebuildable derived data (invariant 11) it consumes.

@@ -9,12 +9,14 @@ sub-stories.) Parametrized over both backends.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import field
 from typing import Annotated
 
 import pytest
 
 import datacrystal as dc
+from datacrystal._entity import oid_of
 from tests.conftest import Locality, Mineral
 
 
@@ -160,3 +162,73 @@ def test_reverse_index_rebuild_equals_incremental(store_factory):
                for q in incremental}
     s2.close()
     assert rebuilt == incremental  # invariant 11: incremental == rebuilt
+
+
+# --- #20-C: Snapshot.incoming() parity (ADR-002 read views) -----------------
+
+def test_snapshot_incoming_matches_store(store):
+    loc = Locality(qid="L", name="loc")
+    mins = [Mineral(qid=f"M{i}", name=f"m{i}", type_locality=dc.Lazy.of(loc))
+            for i in range(5)]
+    for e in (loc, *mins):
+        store.store(e)
+    store.commit()
+    live = sorted(m.qid for m in store.incoming(loc))  # the live-store answer
+    with store.snapshot() as snap:
+        loc_view = next(v for v in snap.query(Locality) if v.qid == "L")
+        # the snapshot accepts its own currency — EntityView, Ref, or raw OID
+        by_view = sorted(v.qid for v in snap.incoming(loc_view))
+        by_ref = sorted(v.qid for v in snap.incoming(dc.Ref(loc_view.oid)))
+        by_oid = sorted(v.qid for v in snap.incoming(loc_view.oid))
+    assert by_view == by_ref == by_oid == live == ["M0", "M1", "M2", "M3", "M4"]
+
+
+def test_snapshot_incoming_excludes_referrers_committed_later(store):
+    loc = Locality(qid="L", name="loc")
+    m1 = Mineral(qid="M1", name="m1", type_locality=dc.Lazy.of(loc))
+    for e in (loc, m1):
+        store.store(e)
+    store.commit()
+    with store.snapshot() as snap:
+        # a referrer committed AFTER the snapshot's watermark
+        m2 = Mineral(qid="M2", name="m2", type_locality=dc.Lazy.of(loc))
+        store.store(m2)
+        store.commit()
+        loc_view = next(v for v in snap.query(Locality) if v.qid == "L")
+        # the pinned view (built lazily, even now) sees only M1
+        assert [v.qid for v in snap.incoming(loc_view)] == ["M1"]
+    assert sorted(m.qid for m in store.incoming(loc)) == ["M1", "M2"]  # live sees both
+
+
+def test_snapshot_incoming_names_dangling_referrer_after_target_delete(store):
+    # ADR-003 seam at a watermark: a deleted TARGET keeps no record, but its
+    # referrers still point at the dead OID — incoming(dead) enumerates them.
+    loc = Locality(qid="L", name="loc")
+    m = Mineral(qid="M", name="m", type_locality=dc.Lazy.of(loc))
+    for e in (loc, m):
+        store.store(e)
+    store.commit()
+    loc_oid = oid_of(loc)
+    assert loc_oid is not None
+    store.delete(loc)
+    store.commit()
+    with store.snapshot() as snap:
+        with pytest.raises(dc.DanglingRefError):
+            snap.get(loc_oid)  # the target's record is gone at this watermark
+        # incoming() still names the dangling referrer (no record needed)
+        assert [v.qid for v in snap.incoming(loc_oid)] == ["M"]
+
+
+def test_snapshot_incoming_callable_from_foreign_thread(store):
+    loc = Locality(qid="L", name="loc")
+    m = Mineral(qid="M", name="m", type_locality=dc.Lazy.of(loc))
+    for e in (loc, m):
+        store.store(e)
+    store.commit()
+    loc_oid = oid_of(loc)
+    with store.snapshot() as snap:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            qids = pool.submit(
+                lambda: [v.qid for v in snap.incoming(loc_oid)]
+            ).result()
+    assert qids == ["M"]
