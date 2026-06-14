@@ -94,7 +94,7 @@ def test_reopen_loads_from_cache_without_rebuilding(tmp_path, monkeypatch):
     import datacrystal._indexes as _idx
 
     path = tmp_path / "cabinet"
-    s = dc.Store.open(path)
+    s = dc.Store.open(path, cache_index=True)
     for i in range(5):
         s.store(Rock(name=f"r{i}", hardness=float(i), color="red" if i % 2 else "blue"))
     s.commit()
@@ -106,7 +106,7 @@ def test_reopen_loads_from_cache_without_rebuilding(tmp_path, monkeypatch):
     real = _idx.build_class_indexes
     monkeypatch.setattr(_idx, "build_class_indexes",
                         lambda *a, **k: built.append(1) or real(*a, **k))
-    s2 = dc.Store.open(path)
+    s2 = dc.Store.open(path, cache_index=True)
     assert s2.count(F.hardness >= 2.0) == 3   # same answer
     assert sorted(r.name for r in s2.query(F.color == "red")) == ["r1", "r3"]
     assert built == []                         # served from the cache — NO O(corpus) rebuild
