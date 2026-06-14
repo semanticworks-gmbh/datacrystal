@@ -10,7 +10,7 @@ from typing import Annotated
 import msgspec.msgpack
 
 import datacrystal as dc
-from datacrystal._entity import type_info
+from datacrystal._entity import oid_of, type_info
 from datacrystal._indexes import ClassIndexes, plan
 
 
@@ -111,3 +111,34 @@ def test_reopen_loads_from_cache_without_rebuilding(tmp_path, monkeypatch):
     assert sorted(r.name for r in s2.query(F.color == "red")) == ["r1", "r3"]
     assert built == []                         # served from the cache — NO O(corpus) rebuild
     s2.close()
+
+
+def test_commit_before_build_invalidates_stale_cache_blob(tmp_path):
+    """#71: a delete (or insert) committed BEFORE a class's index is built in a
+    session must invalidate the boot-loaded cache blob, so ensure() rebuilds from
+    the now-current records instead of loading a pre-commit blob — which would
+    otherwise resurrect a deleted OID (and raise DanglingRefError on hydration)."""
+    path = tmp_path / "cabinet"
+    s = dc.Store.open(path, cache_index=True)
+    a, b = Rock(name="a"), Rock(name="b")
+    s.store(a)
+    s.store(b)
+    s.commit()
+    oid_a = oid_of(a)
+    assert s.count(Rock) == 2     # builds the index this session
+    s.close()                     # writes index.cache (has a, b) at this watermark
+
+    # reopen: the cache blob is loaded at boot; delete `a` by raw OID WITHOUT a
+    # query, so the index is never built and apply_deletes can't fold the delete.
+    s = dc.Store.open(path, cache_index=True)
+    a2 = s.get_many([oid_a])[0]   # hydrate by OID — does not build the secondary index
+    s.delete(a2)
+    s.commit()
+    assert s.count(Rock) == 1                                  # NOT served the stale blob
+    assert sorted(r.name for r in s.query(Rock)) == ["b"]      # 'a' gone, no DanglingRefError
+    s.close()
+
+    s3 = dc.Store.open(path, cache_index=True)                 # next session also correct
+    assert s3.count(Rock) == 1
+    assert sorted(r.name for r in s3.query(Rock)) == ["b"]
+    s3.close()

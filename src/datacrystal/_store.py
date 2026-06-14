@@ -274,14 +274,15 @@ class Store:
         an owner-loop task sweeps). Timeout-only in v0.1.
 
         ``cache_index`` (ADR-005, opt-in) writes the built indexes to a sidecar
-        on close and loads them at boot instead of rebuilding from a scan.
-        **Off by default**: the win is workload-dependent — large for
-        low-cardinality indexes, but only ~1.3x when a high-cardinality
-        ``Unique`` index dominates (deserializing N postings ≈ rebuilding them,
-        measured on a 6.2M store). Turn it on where your indexes are categorical
-        and restarts are frequent. The cache is never authoritative (a
-        watermark/marker mismatch rebuilds from records); a crash test +
-        read-only fast-path are pending (#63).
+        on close and loads them at boot instead of rebuilding from a scan — a
+        warm reopen skips the O(extent) first-query rebuild. **Off by default.**
+        With the cardinality-matched representation (#12 Design A: a ``Unique``
+        field is a flat key→oid map, not per-key bitmaps; ``_last_values`` is
+        rebuilt lazily on the first write), a read-only warm reopen is **~14x
+        faster on a 6.2M store** and the sidecar ~2.5x smaller. Turn it on where
+        restarts are frequent. The cache is never authoritative (a
+        watermark/marker mismatch rebuilds from records); a SIGKILL crash test is
+        pending (#63), so it stays opt-in for now.
         """
         import sqlite3  # noqa: PLC0415 — stays lazy (dep-budget fitness #3)
 
