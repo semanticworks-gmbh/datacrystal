@@ -190,13 +190,17 @@ class FieldSpec:
     renamed_from: str | None = None  # old persisted field name (RenamedFrom, #26 (a))
     glue: Callable[[Mapping[str, Any]], Any] | None = None  # derive-when-absent (Glue, #26 (b))
     sorted: bool = False  # sorted index → range queries (SortedIndex, ADR-004 / #18)
+    # May this field hold an entity reference (direct, Lazy, or in a container)?
+    # Conservatively True unless the resolved type is provably ref-free — drives
+    # the flat-entity ingest fast-path (#52). Default True = always safe.
+    entity_ref: bool = True
 
 
 class TypeInfo:
     """Engine-side metadata for one entity class."""
 
     __slots__ = ("cls", "typename", "field_names", "frozen", "_specs", "_defaults",
-                 "_spec_by_name")
+                 "_spec_by_name", "_has_entity_refs")
 
     def __init__(self, cls: type, typename: str, field_names: tuple[str, ...],
                  frozen: bool) -> None:
@@ -207,6 +211,7 @@ class TypeInfo:
         self._specs: tuple[FieldSpec, ...] | None = None
         self._defaults: dict[str, Any] | None = None
         self._spec_by_name: dict[str, FieldSpec] | None = None
+        self._has_entity_refs: bool | None = None
 
     @property
     def specs(self) -> tuple[FieldSpec, ...]:
@@ -242,6 +247,17 @@ class TypeInfo:
 
     def indexed_fields(self) -> tuple[FieldSpec, ...]:
         return tuple(s for s in self.specs if s.indexed or s.unique or s.sorted)
+
+    @property
+    def has_entity_refs(self) -> bool:
+        """True if any field may hold an entity reference (direct, Lazy, or in a
+        container). A type with none skips P1 graph discovery on commit (#52):
+        :meth:`Store._register_graph` walks no fields for such an entity, since
+        :meth:`Store._walk_value` would only ever hit ref-free leaves."""
+        cached = self._has_entity_refs
+        if cached is None:
+            cached = self._has_entity_refs = any(s.entity_ref for s in self.specs)
+        return cached
 
     def __repr__(self) -> str:
         return f"<TypeInfo {self.typename} fields={self.field_names}>"
@@ -454,6 +470,7 @@ def _resolve_specs(cls: type, field_names: tuple[str, ...]) -> tuple[FieldSpec, 
             renamed_from=renamed.old_name if renamed is not None else None,
             glue=glued.fn if glued is not None else None,
             sorted=srt,
+            entity_ref=_may_hold_entity(core),
         ))
     return tuple(specs)
 
@@ -494,6 +511,36 @@ def _is_indexable(hint: Any) -> bool:
         args = [a for a in get_args(hint) if a is not type(None)]
         return bool(args) and all(a in _INDEXABLE_TYPES for a in args)
     return False
+
+
+# The leaf types _walk_value treats as referencing nothing (None handled via
+# NoneType). The flat-entity fast-path (#52) is the static twin of that runtime
+# check: a field is ref-free iff its type is built solely from these, optionally
+# inside list/tuple/set/dict/union. Everything else — an @entity class, Lazy,
+# Any, object, a bare/unparameterised container, an unknown type — is treated as
+# possibly ref-bearing, so the walk is never wrongly skipped.
+_REF_FREE_LEAVES = (str, int, float, bool, bytes, type(None))
+
+
+def _may_hold_entity(hint: Any) -> bool:
+    """Conservatively True unless ``hint`` is provably ref-free (#52).
+
+    Mirrors :meth:`Store._walk_value`'s leaf set so the static per-type flag and
+    the runtime graph walk agree by construction. Used only to *skip* work, so
+    it must never return False for a type that could carry an entity ref."""
+    if get_origin(hint) is Annotated:
+        return _may_hold_entity(get_args(hint)[0])
+    if hint in _REF_FREE_LEAVES:
+        return False
+    origin = get_origin(hint)
+    if origin in (list, tuple, set, frozenset, dict):
+        args = tuple(a for a in get_args(hint) if a is not Ellipsis)
+        # A bare/unparameterised container (no args) has unknown elements → walk.
+        return (not args) or any(_may_hold_entity(a) for a in args)
+    if _is_union(hint):
+        return any(_may_hold_entity(a) for a in get_args(hint))
+    # entity class, Lazy[...], Any, object, unparameterised generic, unknown.
+    return True
 
 
 def _is_list_of_scalar(hint: Any) -> bool:

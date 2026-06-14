@@ -282,6 +282,11 @@ top10 = store.query(Mineral.crystal_system == "cubic", limit=10)  # loads 10, no
 page2 = store.query(Mineral, limit=50, offset=50)
 heads = store.pluck(Mineral, "name", limit=100)               # windows the decode-level read too
 
+# order_by — sort the whole match set, then window (NULLs last, ascending-OID tiebreak)
+hardest = store.query(Mineral, order_by=(Mineral.mohs, "desc"), limit=10)  # SortedIndex → cheap
+by_name = store.pluck(Mineral, "name", order_by=Mineral.name)  # bare field = ascending
+page = store.query(Mineral, order_by=(Mineral.mohs, "asc"), limit=50, offset=50)  # stable paging
+
 # stream the whole match set in bounded memory — chunk by chunk, never all at once
 for m in store.query_iter(Mineral.crystal_system == "cubic"):       # O(chunk) live, not O(extent)
     process(m)
@@ -306,6 +311,15 @@ Query semantics:
   `query(C, limit=10)` loads 10 records, not the extent. A residual predicate must
   decode-to-filter first, so there the window only trims the materialized result (it cannot
   prune the scan). Order is deterministic (ascending OID): `query(C, limit=k) == query(C)[:k]`.
+- `query()`/`pluck()` (and `snap.query()`/`snap.all()`) take `order_by=(field, "asc"|"desc")`
+  (a bare `field` means ascending; `field` is `EntityClass.f`, `dc.fields(C).f`, or a name str).
+  It sorts the **whole** match set before the window — **NULLs sort last**, and ties break on
+  **ascending OID** so `limit`/`offset` paging is deterministic (`page1 + page2 == query(...)[:n]`).
+  An indexed sort field is ordered **straight from the index** — a `dc.SortedIndex` field
+  (below) is the cheap path; **an un-indexed sort field must decode that field for every match
+  first**, the same O(matches) scan a non-indexed predicate already pays, so it cannot beat the
+  full scan. Mark a field `dc.SortedIndex` if you page by it often. (Multi-valued/list fields
+  can't be a sort key.)
 - **`store.query_iter(target)`** streams matching entities **chunk by chunk** for bounded memory —
   walk millions of matches without materializing the whole list (`query()`'s eager
   complement; `count()`/`pluck()` stay the decode-level options). It reads committed state at
