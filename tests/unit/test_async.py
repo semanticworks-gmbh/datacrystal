@@ -42,6 +42,9 @@ class _GatedApply:
     def scan_type(self, cid):
         return self._inner.scan_type(cid)
 
+    def load_blob(self, oid):
+        return self._inner.load_blob(oid)
+
     def apply(self, batch):
         self.apply_threads.append(threading.get_ident())
         self.entered.set()

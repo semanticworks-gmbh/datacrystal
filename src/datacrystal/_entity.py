@@ -70,6 +70,7 @@ class _Marker:
 Index = _Marker("Index")      # secondary bitmap index (pyroaring)
 Unique = _Marker("Unique")    # unique secondary key (SDA delta 1)
 SortedIndex = _Marker("SortedIndex")  # sorted index → range queries (>=/</between), ADR-004
+Blob = _Marker("Blob")        # out-of-line raw bytes, lazy handle on read (ADR-007 / #81)
 
 
 class _FullText(_Marker):
@@ -190,6 +191,7 @@ class FieldSpec:
     renamed_from: str | None = None  # old persisted field name (RenamedFrom, #26 (a))
     glue: Callable[[Mapping[str, Any]], Any] | None = None  # derive-when-absent (Glue, #26 (b))
     sorted: bool = False  # sorted index → range queries (SortedIndex, ADR-004 / #18)
+    blob: bool = False  # out-of-line raw bytes, hydrates as a Blob handle (ADR-007 / #81)
     # May this field hold an entity reference (direct, Lazy, or in a container)?
     # Conservatively True unless the resolved type is provably ref-free — drives
     # the flat-entity ingest fast-path (#52). Default True = always safe.
@@ -421,11 +423,35 @@ def _resolve_specs(cls: type, field_names: tuple[str, ...]) -> tuple[FieldSpec, 
         indexed = any(m is Index for m in markers)
         unique = any(m is Unique for m in markers)
         srt = any(m is SortedIndex for m in markers)
+        is_blob = any(m is Blob for m in markers)
         fulltext = next((m for m in markers if isinstance(m, _FullText)), None)
         renamed = next((m for m in markers if isinstance(m, RenamedFrom)), None)
         glued = next((m for m in markers if isinstance(m, Glue)), None)
         lazy_refs = _contains_lazy(core)
         is_list = _is_list_of_scalar(core)
+        if is_blob:
+            # A blob is a raw-bytes leaf stored out-of-line (ADR-007): it must be
+            # `bytes` (or `bytes | None`), and cannot also be indexed/renamed/
+            # multivalued — a blob has no key to index, no column to rename, and
+            # the bytes never live in the record the index/rename paths read.
+            if not _is_bytes_or_optional(core):
+                raise TypeError(
+                    f"{cls.__name__}.{name}: a dc.Blob field must be bytes "
+                    f"(optionally | None) — out-of-line raw bytes have no other "
+                    f"shape (ADR-007), got {hint!r}"
+                )
+            if indexed or unique or srt:
+                raise TypeError(
+                    f"{cls.__name__}.{name}: a dc.Blob field cannot also be "
+                    "Index/Unique/SortedIndex — opaque out-of-line bytes are not "
+                    "indexable (ADR-007); index a separate hash/metadata field"
+                )
+            if fulltext is not None or renamed is not None or glued is not None:
+                raise TypeError(
+                    f"{cls.__name__}.{name}: a dc.Blob field cannot also be "
+                    "FullText/RenamedFrom/Glue — the bytes live out-of-line, not "
+                    "in the record those paths read (ADR-007)"
+                )
         if (indexed or unique) and not (_is_indexable(core) or is_list):
             raise TypeError(
                 f"{cls.__name__}.{name}: Index/Unique fields must be scalar "
@@ -470,9 +496,21 @@ def _resolve_specs(cls: type, field_names: tuple[str, ...]) -> tuple[FieldSpec, 
             renamed_from=renamed.old_name if renamed is not None else None,
             glue=glued.fn if glued is not None else None,
             sorted=srt,
+            blob=is_blob,
             entity_ref=_may_hold_entity(core),
         ))
     return tuple(specs)
+
+
+def _is_bytes_or_optional(hint: Any) -> bool:
+    """``bytes`` or ``bytes | None`` — the only shape a ``dc.Blob`` field may
+    take (ADR-007: out-of-line raw bytes have no other representation)."""
+    if hint is bytes:
+        return True
+    if _is_union(hint):
+        args = [a for a in get_args(hint) if a is not type(None)]
+        return args == [bytes]
+    return False
 
 
 def _strip_annotated(hint: Any, markers: list[_Marker]) -> Any:

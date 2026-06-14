@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING
 from datacrystal._conditions import fields
 from datacrystal._containers import PersistentDict, PersistentList
 from datacrystal._entity import (
+    Blob,
     FullText,
     Glue,
     Index,
@@ -60,7 +61,7 @@ from datacrystal._errors import (
     WrongThreadError,
 )
 from datacrystal._indexes import QueryPlan
-from datacrystal._lazy import Lazy
+from datacrystal._lazy import BlobHandle, Lazy
 from datacrystal._pipeline import DeltaConsumer
 from datacrystal._snapshot import EntityView, Ref, Snapshot, SnapshotIndexes
 from datacrystal._store import Store
@@ -93,6 +94,8 @@ __all__ = [
     "RenamedFrom",
     "Glue",
     "SortedIndex",
+    "Blob",
+    "BlobHandle",
     "PersistentList",
     "PersistentDict",
     "Snapshot",

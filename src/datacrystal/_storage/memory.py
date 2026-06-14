@@ -17,7 +17,7 @@ from typing import Iterator
 
 from datacrystal._errors import NewerStoreError
 from datacrystal._ids import FORMAT_VERSION
-from datacrystal._storage.protocol import BootInfo, CommitBatch, StoredRecord
+from datacrystal._storage.protocol import BootInfo, CommitBatch, StoredBlob, StoredRecord
 
 
 class _MemoryReadView:
@@ -29,10 +29,12 @@ class _MemoryReadView:
     """
 
     def __init__(self, meta: dict[str, str], types: list[tuple[int, str, list[str]]],
-                 objects: dict[int, StoredRecord]) -> None:
+                 objects: dict[int, StoredRecord],
+                 blobs: dict[int, StoredBlob]) -> None:
         self._meta = meta
         self._types = types
         self._objects = objects
+        self._blobs = blobs
 
     def boot(self) -> BootInfo:
         return BootInfo(meta=dict(self._meta), types=list(self._types))
@@ -46,6 +48,9 @@ class _MemoryReadView:
             (r for r in self._objects.values() if r.cid == cid), key=lambda r: r.oid
         )
 
+    def load_blob(self, oid: int) -> StoredBlob | None:
+        return self._blobs.get(oid)
+
     def close(self) -> None:
         pass
 
@@ -56,6 +61,7 @@ class MemoryBackend:
         self._meta: dict[str, str] = {"format_version": str(FORMAT_VERSION)}
         self._types: list[tuple[int, str, list[str]]] = []
         self._objects: dict[int, StoredRecord] = {}
+        self._blobs: dict[int, StoredBlob] = {}  # out-of-line bytes (ADR-007)
 
     def boot(self) -> BootInfo:
         with self._lock:
@@ -79,11 +85,17 @@ class MemoryBackend:
             )
         yield from snapshot
 
+    def load_blob(self, oid: int) -> StoredBlob | None:
+        with self._lock:
+            return self._blobs.get(oid)
+
     def apply(self, batch: CommitBatch) -> None:
         with self._lock:
             self._types.extend(batch.new_types)
             for rec in batch.records:
                 self._objects[rec.oid] = rec
+            for blob in batch.blobs:
+                self._blobs[blob.oid] = blob
             for oid in batch.deletes:
                 self._objects.pop(oid, None)
             self._meta.update(batch.meta)
@@ -91,7 +103,7 @@ class MemoryBackend:
     def read_view(self) -> _MemoryReadView:
         with self._lock:
             return _MemoryReadView(dict(self._meta), list(self._types),
-                                   dict(self._objects))
+                                   dict(self._objects), dict(self._blobs))
 
     def close(self) -> None:
         pass

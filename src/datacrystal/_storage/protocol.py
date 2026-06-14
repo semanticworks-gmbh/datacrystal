@@ -28,6 +28,22 @@ class StoredRecord:
     payload: bytes
 
 
+@dataclass(frozen=True, slots=True)
+class StoredBlob:
+    """One out-of-line blob value (ADR-007): raw bytes addressed by their own
+    OID. Blobs are **typeless** — no ``cid`` (a blob has no class or lineage,
+    so the descriptor in the referring record carries everything the engine
+    needs); ``tid`` is the commit that wrote it, ``size``/``hash`` (sha256)
+    mirror the descriptor, ``data`` is the RAW bytes (never msgpack-framed, so
+    a future ``blobopen`` can range-read them)."""
+
+    oid: int
+    tid: int
+    size: int
+    hash: bytes
+    data: bytes
+
+
 @dataclass(slots=True)
 class CommitBatch:
     """Everything one commit persists, applied atomically by the backend.
@@ -46,6 +62,11 @@ class CommitBatch:
     # OIDs whose rows this commit removes (ADR-003) — applied in the same
     # atomic transaction as the records; never overlaps records' OIDs.
     deletes: list[int] = field(default_factory=list[int])
+    # Out-of-line blob values written by this commit (ADR-007), inserted in the
+    # SAME atomic transaction as the records → a blob and its referring record
+    # both survive a crash or neither does. Blobs are immutable: a changed blob
+    # mints a new OID, the old cell is never touched.
+    blobs: list[StoredBlob] = field(default_factory=list[StoredBlob])
 
 
 @dataclass(slots=True)
@@ -70,6 +91,8 @@ class StorageReadView(Protocol):
 
     def scan_type(self, cid: int) -> Iterator[StoredRecord]: ...
 
+    def load_blob(self, oid: int) -> StoredBlob | None: ...
+
     def close(self) -> None: ...
 
 
@@ -79,6 +102,8 @@ class StorageBackend(Protocol):
     def load_many(self, oids: list[int]) -> dict[int, StoredRecord]: ...
 
     def scan_type(self, cid: int) -> Iterator[StoredRecord]: ...
+
+    def load_blob(self, oid: int) -> StoredBlob | None: ...
 
     def apply(self, batch: CommitBatch) -> None: ...
 

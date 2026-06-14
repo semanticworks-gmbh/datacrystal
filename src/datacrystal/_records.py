@@ -41,7 +41,12 @@ REF_EXT_CODE = 1
 NAIVE_DATETIME_EXT_CODE = 2  # ISO text; tz-aware datetimes use msgpack timestamps
 DATE_EXT_CODE = 3            # ISO text
 TIME_EXT_CODE = 4            # ISO text (naive or with offset — ISO carries both)
+BLOB_EXT_CODE = 5           # out-of-line blob descriptor (ADR-007 / #82): oid+size+sha256
 _OID_STRUCT = struct.Struct(">q")
+# Blob descriptor head: blob_oid (int64) + size (uint64); the 32-byte sha256
+# hash is appended raw (so the ext payload is a fixed 48 bytes). The record
+# never carries the bytes themselves — only this descriptor (ADR-007 §2).
+_BLOB_HEAD = struct.Struct(">qQ")
 
 _SCALARS = (type(None), bool, int, float, str, bytes)
 
@@ -70,6 +75,40 @@ class RefToken:
 
 def _ref_ext(oid: int) -> msgspec.msgpack.Ext:
     return msgspec.msgpack.Ext(REF_EXT_CODE, _OID_STRUCT.pack(oid))
+
+
+class BlobToken:
+    """A decoded out-of-line blob descriptor (ADR-007): the blob's own OID,
+    its byte size and its sha256, with the bytes themselves still on disk.
+
+    Inert by construction (the RefToken precedent, invariant 1): it addresses
+    bytes but is structurally incapable of fetching or executing them — the
+    live engine maps it to a :class:`~datacrystal.Blob` handle, and decode-level
+    reads (``count``/``pluck``) match/skip a blob field by descriptor without
+    touching the ``blobs`` table. Equality is by ``blob_oid`` (a blob is
+    immutable: one OID, one content), mirroring ``RefToken``."""
+
+    __slots__ = ("blob_oid", "size", "hash")
+
+    def __init__(self, blob_oid: int, size: int, hash: bytes) -> None:
+        self.blob_oid = blob_oid
+        self.size = size
+        self.hash = hash
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, BlobToken) and other.blob_oid == self.blob_oid
+
+    def __hash__(self) -> int:
+        return hash((BlobToken, self.blob_oid))
+
+    def __repr__(self) -> str:
+        return f"BlobToken(oid={self.blob_oid}, size={self.size})"
+
+
+def _blob_ext(blob_oid: int, size: int, hash: bytes) -> msgspec.msgpack.Ext:
+    return msgspec.msgpack.Ext(
+        BLOB_EXT_CODE, _BLOB_HEAD.pack(blob_oid, size) + hash
+    )
 
 
 def swizzle(value: Any, oid_for: Callable[[Any], int]) -> Any:
@@ -120,9 +159,47 @@ def swizzle(value: Any, oid_for: Callable[[Any], int]) -> Any:
 _ENCODER = msgspec.msgpack.Encoder()
 
 
-def encode_payload(values: list[Any], oid_for: Callable[[Any], int]) -> bytes:
-    """Encode a field-value list (schema order) to a record payload."""
-    return _ENCODER.encode([swizzle(v, oid_for) for v in values])
+def encode_payload(
+    values: list[Any],
+    oid_for: Callable[[Any], int],
+    *,
+    blob_positions: frozenset[int] = frozenset(),
+    blob_sink: Callable[[bytes], tuple[int, int, bytes]] | None = None,
+) -> bytes:
+    """Encode a field-value list (schema order) to a record payload.
+
+    ``dc.Blob`` fields are detected by **position**, not value type (ADR-007 §2):
+    a ``bytes`` value is an ordinary msgpack scalar in ``swizzle``, so the only
+    reliable signal that a field is out-of-line is its FieldSpec — the store
+    passes the blob field indices in ``blob_positions``. For each such position
+    holding a non-None ``bytes`` value, ``blob_sink`` allocates the blob OID and
+    records its bytes for storage, returning ``(blob_oid, size, hash)``; we emit
+    a tiny ``BLOB_EXT`` descriptor in the record instead of the bytes. A None
+    blob value encodes as msgpack None (the field is simply absent)."""
+    out: list[Any] = []
+    for i, v in enumerate(values):
+        if i in blob_positions and v is not None:
+            if blob_sink is None:  # pragma: no cover - the store always supplies one
+                raise TypeError("a blob field needs a blob_sink to encode")
+            blob_oid, size, h = blob_sink(v)
+            out.append(_blob_ext(blob_oid, size, h))
+        else:
+            out.append(swizzle(v, oid_for))
+    return _ENCODER.encode(out)
+
+
+def fingerprint_payload(values: list[Any], oid_for: Callable[[Any], int]) -> bytes:
+    """Encode a value list where any ``BlobToken`` is emitted as its descriptor
+    ext (oid/size/hash) and everything else swizzles normally — the debug
+    fingerprint path (ADR-007). A blob is presented as its already-known
+    descriptor so the net never fetches or re-stores its bytes."""
+    out: list[Any] = []
+    for v in values:
+        if isinstance(v, BlobToken):
+            out.append(_blob_ext(v.blob_oid, v.size, v.hash))
+        else:
+            out.append(swizzle(v, oid_for))
+    return _ENCODER.encode(out)
 
 
 def _ext_hook(code: int, data: memoryview) -> Any:
@@ -134,6 +211,9 @@ def _ext_hook(code: int, data: memoryview) -> Any:
         return _dt.date.fromisoformat(str(data, "ascii"))
     if code == TIME_EXT_CODE:
         return _dt.time.fromisoformat(str(data, "ascii"))
+    if code == BLOB_EXT_CODE:
+        blob_oid, size = _BLOB_HEAD.unpack_from(data)
+        return BlobToken(blob_oid, size, bytes(data[_BLOB_HEAD.size:]))
     return msgspec.msgpack.Ext(code, bytes(data))
 
 
