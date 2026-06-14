@@ -327,7 +327,19 @@ class ArrowMirror:
     ``rows_flushed`` is a public diagnostic counter: rows written by the
     most recent flush — pin your own O(delta) gates on it (fitness #9
     shape), exactly like this package's tests do.
+
+    ``OID_COLUMN`` is the name of the int64 primary-key column every table
+    carries — the join key for the "filter in datacrystal, aggregate in
+    DuckDB" recipe (GUIDE, Arrow mirrors): a bitmap ``store.snapshot()``
+    query yields ``EntityView``/``Ref`` ``.oid`` values that select rows of
+    this column. It is a public constant so the handoff never hard-codes the
+    internal string. ``parquet_dir()`` names the on-disk segment directory
+    for a type (DuckDB ``read_parquet`` over ``compact()``ed mirrors).
     """
+
+    #: Name of the int64 primary-key column in every ``table()`` / parquet
+    #: segment — the OID handoff key (see the GUIDE's analytics recipe).
+    OID_COLUMN = _OID_COL
 
     def __init__(self, path: str | Path, *,
                  only: Iterable[type | str] | None = None,
@@ -518,6 +530,25 @@ class ArrowMirror:
         self._write_manifest()
         for path in doomed:
             path.unlink(missing_ok=True)
+
+    def parquet_dir(self, cls_or_typename: type | str) -> Path:
+        """The on-disk directory holding one type's parquet segment(s) — the
+        path to feed DuckDB's ``read_parquet('.../*.parquet')`` so the engine
+        scans the columnar files directly, off the owner thread and without
+        going through :meth:`table` in RAM.
+
+        After :meth:`compact` this directory is exactly one fold-free parquet
+        file (current state only) — the parquet-datalake story. Without a
+        compaction it may hold several LSM segments that still need newest-
+        wins folding per ``OID_COLUMN`` and tombstone filtering, so a raw
+        multi-segment read can show superseded/deleted rows; ``compact()``
+        first (or read :meth:`table`) when you need the exact live set. The
+        directory exists once the type has been flushed at least once."""
+        typename = (
+            cls_or_typename if isinstance(cls_or_typename, str)
+            else type_info(cls_or_typename).typename
+        )
+        return self._segment_dir(typename)
 
     # -- durability -------------------------------------------------------------------
 
