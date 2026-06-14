@@ -37,7 +37,8 @@ from datacrystal._store import Store
 
 async def aopen(path: str | Path, *, durability: str = "interval",
                 lock_ttl: float = 10.0, debug: bool = False,
-                lazy_timeout: float | None = None) -> "AsyncStore":
+                lazy_timeout: float | None = None,
+                cache_index: bool = True) -> "AsyncStore":
     """Open a store bound to the running event loop.
 
     The boot scan runs on the loop thread (the store's owner must be the
@@ -45,7 +46,8 @@ async def aopen(path: str | Path, *, durability: str = "interval",
     loop once at startup; boot is O(checkpoint), never O(history).
     """
     store = Store.open(path, durability=durability, lock_ttl=lock_ttl,
-                       debug=debug, lazy_timeout=lazy_timeout)
+                       debug=debug, lazy_timeout=lazy_timeout,
+                       cache_index=cache_index)
     return AsyncStore(store)
 
 

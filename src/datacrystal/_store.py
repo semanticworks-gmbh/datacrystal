@@ -248,7 +248,7 @@ class Store:
     @classmethod
     def open(cls, path: str | Path, *, durability: str = "interval",
              lock_ttl: float = 10.0, debug: bool = False,
-             lazy_timeout: float | None = None, cache_index: bool = False) -> "Store":
+             lazy_timeout: float | None = None, cache_index: bool = True) -> "Store":
         """Open (creating if needed) the store directory at ``path``.
 
         The directory holds ``data.sqlite`` and the single-writer lease file
@@ -273,16 +273,17 @@ class Store:
         the owner (sweeps piggyback on your store calls; under ``aopen()``
         an owner-loop task sweeps). Timeout-only in v0.1.
 
-        ``cache_index`` (ADR-005, opt-in) writes the built indexes to a sidecar
-        on close and loads them at boot instead of rebuilding from a scan — a
-        warm reopen skips the O(extent) first-query rebuild. **Off by default.**
-        With the cardinality-matched representation (#12 Design A: a ``Unique``
-        field is a flat key→oid map, not per-key bitmaps; ``_last_values`` is
-        rebuilt lazily on the first write), a read-only warm reopen is **~14x
-        faster on a 6.2M store** and the sidecar ~2.5x smaller. Turn it on where
-        restarts are frequent. The cache is never authoritative (a
-        watermark/marker mismatch rebuilds from records); a SIGKILL crash test is
-        pending (#63), so it stays opt-in for now.
+        ``cache_index`` (ADR-005, **on by default**) writes the built indexes to a
+        sidecar on close and loads them at boot instead of rebuilding from a scan —
+        a warm reopen skips the O(extent) first-query rebuild. With the
+        cardinality-matched representation (#12 Design A: a ``Unique`` field is a
+        flat key→oid map, not per-key bitmaps; ``_last_values`` is rebuilt lazily on
+        the first write), a read-only warm reopen is **~14x faster on a 6.2M store**
+        and the sidecar ~2.5x smaller. The cache is never authoritative — a
+        watermark/marker mismatch, or a stale/corrupt/newer sidecar, silently
+        rebuilds from the records (it can never return a wrong answer; SIGKILL-
+        tested). Pass ``cache_index=False`` to skip the sidecar (e.g. a scratch
+        store, or one you never reopen).
         """
         import sqlite3  # noqa: PLC0415 — stays lazy (dep-budget fitness #3)
 

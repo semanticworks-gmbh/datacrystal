@@ -36,24 +36,22 @@ store.close()                                  # or: with dc.Store.open(...) as 
 ```
 
 `Store.open(path, *, durability="interval", lock_ttl=10.0, debug=False, lazy_timeout=None,
-cache_index=False)` (async: `await dc.aopen(...)`, same keywords — see
+cache_index=True)` (async: `await dc.aopen(...)`, same keywords — see
 [Concurrency and deployment](#concurrency-and-deployment)):
 
-- The directory holds `data.sqlite` (records as msgpack blobs, riding SQLite's journal) and
-  `used.lock`, the **single-writer lease**: a second process opening the same store gets a loud
-  `StoreLockedError` instead of silent corruption.
-- **Startup is instant; the *first* query per class isn't (by default).** Secondary indexes are
-  rebuildable derived data, built lazily on first use with a one-time O(extent) scan of that
-  class's records (the same is true of the `incoming()` reverse index). On a multi-million-row
-  store that first query can take tens of seconds.
-- `cache_index=True` (opt-in, [ADR-005](design/ADR-005-index-cache.md)) **persists the built
-  indexes to a watermark-stamped sidecar and loads them at boot instead of rescanning** — a warm
-  reopen skips that O(extent) rebuild (measured **~14× faster** on a 6.2M-row store; the sidecar
-  is ~2.5× smaller than a naïve one because a `Unique` field is stored as a flat key→oid map, not
-  per-key bitmaps). The cache is **never authoritative** (invariant 11): any watermark or
-  index-marker mismatch, or a corrupt/newer sidecar, silently rebuilds from the records — a stale
-  cache can never return a wrong answer. Off by default; turn it on where restarts are frequent
-  and the categorical indexes are worth not rebuilding.
+- The directory holds `data.sqlite` (records as msgpack blobs, riding SQLite's journal),
+  `used.lock` (the **single-writer lease**: a second process opening the same store gets a loud
+  `StoreLockedError` instead of silent corruption), and `index.cache` (below).
+- Secondary indexes are rebuildable derived data, built lazily on first use with a one-time
+  O(extent) scan of that class's records (the same is true of the `incoming()` reverse index).
+- `cache_index=True` (**on by default**, [ADR-005](design/ADR-005-index-cache.md)) **persists the
+  built indexes to a watermark-stamped sidecar and loads them at boot instead of rescanning** — so
+  a warm reopen of a large store skips that O(extent) first-query rebuild (measured **~14× faster**
+  on a 6.2M-row store; the sidecar is ~2.5× smaller than a naïve one because a `Unique` field is
+  stored as a flat key→oid map, not per-key bitmaps). The cache is **never authoritative**
+  (invariant 11): any watermark or index-marker mismatch, or a stale/corrupt/newer sidecar,
+  silently rebuilds from the records — it can never return a wrong answer (SIGKILL-tested). Pass
+  `cache_index=False` for a scratch store, or one you never reopen.
 - `durability` is a triad. `"commit"` fsyncs every commit (plus `F_FULLFSYNC` on macOS —
   honest, so a commit costs ~4 ms there); an acked commit survives even power loss.
   `"interval"` (default) group-commits: fsync happens at WAL checkpoints, so a **process**
