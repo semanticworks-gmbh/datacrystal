@@ -19,7 +19,7 @@ everything else runs as a residual Python predicate over the candidate set.
 from __future__ import annotations
 
 from itertools import islice
-from typing import Any, Iterable, TypeVar
+from typing import Any, Iterable, TypeVar, cast
 
 from datacrystal._errors import QueryError
 
@@ -230,6 +230,57 @@ def window_iter(candidate: Iterable[_T], limit: int | None, offset: int) -> list
     listing every OID."""
     stop = None if limit is None else offset + limit
     return list(islice(candidate, offset, stop))
+
+
+def order_by_values(matched: Iterable[int], value_of: Any, descending: bool) -> list[int]:
+    """``matched`` OIDs (in ascending-OID order) sorted by ``value_of(oid)`` for
+    an order_by on a **non-indexed** field (#25): NULLs last, stable
+    ascending-OID tiebreak. ``matched`` MUST already be ascending-OID so the
+    stable sort preserves OID order within equal values (deterministic paging)."""
+    present: list[int] = []
+    absent: list[int] = []
+    for oid in matched:
+        (absent if value_of(oid) is None else present).append(oid)
+    present.sort(key=value_of, reverse=descending)
+    return present + absent
+
+
+def parse_order_by(order_by: Any, ti: Any) -> tuple[str, bool]:
+    """Resolve the frozen ``order_by`` contract (#25) to ``(field_name,
+    descending)``. Accepts ``(field, direction)`` or a bare ``field`` (ascending),
+    where ``field`` is a :class:`FieldExpr` (``EntityClass.f`` / ``dc.fields(C).f``)
+    or a field-name str and ``direction`` is ``'asc'``/``'desc'``."""
+    field_ref: Any
+    direction: Any
+    if isinstance(order_by, tuple):
+        items = cast("tuple[Any, ...]", order_by)
+        if len(items) != 2:
+            raise QueryError(
+                "order_by=(field, direction) takes a (field, 'asc'|'desc') pair"
+            )
+        field_ref, direction = items
+    else:
+        field_ref, direction = order_by, "asc"
+    name: Any = field_ref.name if isinstance(field_ref, FieldExpr) else field_ref
+    if not isinstance(name, str):
+        raise QueryError(
+            "order_by field must be a field name or EntityClass.field, "
+            f"got {type(field_ref).__name__}"
+        )
+    field_name: str = name
+    if field_name not in ti.field_names:
+        raise QueryError(
+            f"{ti.cls.__name__} has no persisted field {field_name!r} to order by"
+        )
+    if direction not in ("asc", "desc"):
+        raise QueryError(f"order_by direction must be 'asc' or 'desc', got {direction!r}")
+    spec = ti.spec(field_name)
+    if spec is not None and spec.multivalued:
+        raise QueryError(
+            f"{ti.cls.__name__}.{field_name} is a multi-valued (list) field; "
+            "order_by needs a single orderable value"
+        )
+    return field_name, direction == "desc"
 
 
 def query_target(target: Any, method: str) -> tuple[type, Condition | None]:

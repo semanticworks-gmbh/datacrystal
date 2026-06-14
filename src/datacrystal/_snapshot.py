@@ -31,6 +31,7 @@ from datacrystal._conditions import (
     Or,
     Pred,
     apply_window,
+    parse_order_by,
     query_target,
     validate_window,
     window_iter,
@@ -50,6 +51,7 @@ from datacrystal._indexes import (
     build_class_indexes,
     explain_plan,
     harvest_ref_oids,
+    order_via_index,
     plan,
 )
 from datacrystal._lazy import Lazy
@@ -185,6 +187,17 @@ def _view_value(value: Any) -> Any:
     return value
 
 
+def _order_views(views: list[EntityView], field: str,
+                 descending: bool) -> list[EntityView]:
+    """EntityViews ordered by ``field`` for the un-indexed / residual snapshot
+    order_by path (#25): NULLs last, stable ascending-OID tiebreak (``views``
+    arrive ascending-OID from ``_views_for``)."""
+    present = [v for v in views if getattr(v, field) is not None]
+    absent = [v for v in views if getattr(v, field) is None]
+    present.sort(key=lambda v: getattr(v, field), reverse=descending)
+    return present + absent
+
+
 def _view_condition(cond: Condition) -> Condition:
     if isinstance(cond, Pred):
         if cond.op == "in":
@@ -315,12 +328,18 @@ class Snapshot:
             return view
 
     def all(self, cls_or_typename: type | str, *, limit: int | None = None,
-            offset: int = 0) -> list[EntityView]:
+            offset: int = 0, order_by: Any = None) -> list[EntityView]:
         """Every committed entity of one type, across its full lineage
         (old field shapes decode by name, exactly like the live engine).
 
         ``limit=``/``offset=`` window the result (#14, symmetric with the live
-        store); materialization stops once the window is filled."""
+        store); materialization stops once the window is filled.
+
+        ``order_by=(field, 'asc'|'desc')`` sorts the whole extent before the
+        window (#25, the live store's contract): NULLs last, ascending-OID
+        tiebreak. Ordering needs the live ``@entity`` class (a bare typename
+        string with no class loaded can't name a field) and, being a total
+        sort, forgoes the stop-early materialization."""
         validate_window(limit, offset)
         if isinstance(cls_or_typename, str):
             typename = cls_or_typename
@@ -332,6 +351,24 @@ class Snapshot:
                 f"all() takes an @entity class or a typename string, "
                 f"got {cls_or_typename!r}"
             )
+        if order_by is not None:
+            ti = TYPES_BY_NAME.get(typename)
+            if ti is None:
+                raise QueryError(
+                    f"all(order_by=...) needs the live @entity class for "
+                    f"{typename!r} to name the sort field"
+                )
+            ofield, descending = parse_order_by(order_by, ti)
+            with self._lock:
+                self._guard()
+                ci = self._class_indexes(ti)
+                if ofield in ci.eq:
+                    ordered = apply_window(
+                        order_via_index(ci, ci.extent, ofield, descending),
+                        limit, offset)
+                    return self._views_for(ordered)
+                views = self._views_for(list(ci.extent))
+            return apply_window(_order_views(views, ofield, descending), limit, offset)
         stop = None if limit is None else offset + limit
         out: list[EntityView] = []
         with self._lock:
@@ -391,7 +428,7 @@ class Snapshot:
             )
 
     def query(self, target: type | Condition, *, limit: int | None = None,
-              offset: int = 0) -> list[EntityView]:
+              offset: int = 0, order_by: Any = None) -> list[EntityView]:
         """:class:`EntityView` DTOs matching ``target`` at this watermark —
         a Condition, or an entity class for the full extent (symmetric
         with the live store, decided 2026-06-12; never live entities,
@@ -400,13 +437,20 @@ class Snapshot:
 
         ``limit=``/``offset=`` window the result (#14): a fully-indexed read
         builds views for only the windowed OIDs; a residual read filters,
-        then trims."""
+        then trims.
+
+        ``order_by=(field, 'asc'|'desc')`` carries the live store's order_by
+        contract to the snapshot (#25): the whole match set is sorted before the
+        window — NULLs last, ascending-OID tiebreak; an indexed sort field is
+        ordered from the snapshot-local index, an un-indexed one from each
+        matched view's decoded value."""
         validate_window(limit, offset)
         cls, cond = query_target(target, "query")
         ti = type_info(cls)
         if ti.typename not in self._cids_by_typename:
             self._warn_unseen(ti)
             return []
+        order = parse_order_by(order_by, ti) if order_by is not None else None
         with self._lock:
             self._guard()
             ci = self._class_indexes(ti)
@@ -415,10 +459,25 @@ class Snapshot:
             else:
                 bitmap, residual = plan(cond, ci)
             candidate = bitmap if bitmap is not None else ci.extent
-            # #51: no residual → window lazily; a residual needs all candidates
-            oids = (window_iter(candidate, limit, offset) if residual is None
-                    else list(candidate))
-            views = self._views_for(oids)
+            if order is not None:
+                ofield, descending = order
+                if residual is None and ofield in ci.eq:
+                    ordered = apply_window(
+                        order_via_index(ci, candidate, ofield, descending),
+                        limit, offset)
+                    return self._views_for(ordered)
+                views = self._views_for(list(candidate))
+            else:
+                # #51: no residual → window lazily; a residual needs all candidates
+                oids = (window_iter(candidate, limit, offset) if residual is None
+                        else list(candidate))
+                views = self._views_for(oids)
+        if order is not None:
+            ofield, descending = order
+            if residual is not None:
+                view_cond = _view_condition(residual)
+                views = [view for view in views if view_cond.evaluate(view)]
+            return apply_window(_order_views(views, ofield, descending), limit, offset)
         if residual is None:
             return views
         view_cond = _view_condition(residual)

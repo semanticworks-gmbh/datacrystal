@@ -596,5 +596,33 @@ def plan(cond: Condition, ci: ClassIndexes) -> tuple[BitMap64 | None, Condition 
     return None, cond
 
 
+def order_via_index(ci: ClassIndexes, matched: BitMap64, field: str,
+                    descending: bool) -> list[int]:
+    """``matched`` OIDs ordered by an **indexed** ``field`` straight from its
+    postings — no record decode (#25). A ``SortedIndex`` field's keys are already
+    sorted (ADR-004), so ordering is effectively free; any other indexed field
+    sorts its distinct keys once. NULLs sort last; within an equal key the OIDs
+    come out ascending (a roaring posting iterates ascending), giving the stable
+    ascending-OID tiebreak the offset-paging contract requires.
+
+    ``matched`` is the condition's candidate BitMap64; every matched OID appears
+    under exactly one ``eq[field]`` key (None included), so the result is a pure
+    reordering of ``matched``."""
+    postings = ci.eq[field]
+    if field in ci.sorted_fields:
+        keys = list(ci.sorted_keys[field])
+        if descending:
+            keys.reverse()
+    else:
+        keys = sorted((k for k in postings if k is not None), reverse=descending)
+    out: list[int] = []
+    for key in keys:
+        out.extend(postings[key] & matched)
+    none_posting = postings.get(None)
+    if none_posting is not None:
+        out.extend(none_posting & matched)  # NULLs last, both directions
+    return out
+
+
 def iter_oids(bm: BitMap64) -> Iterator[int]:
     return iter(bm)

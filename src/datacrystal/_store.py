@@ -40,6 +40,8 @@ from datacrystal._conditions import (
     Or,
     Pred,
     apply_window,
+    order_by_values,
+    parse_order_by,
     query_target,
     validate_window,
     window_iter,
@@ -77,7 +79,13 @@ from datacrystal._errors import (
 )
 from datacrystal._ids import FORMAT_VERSION, IdAllocator, OID_BASE, TID_BASE
 from datacrystal._index_cache import IndexCache
-from datacrystal._indexes import IndexManager, QueryPlan, explain_plan, plan
+from datacrystal._indexes import (
+    IndexManager,
+    QueryPlan,
+    explain_plan,
+    order_via_index,
+    plan,
+)
 from datacrystal._lazy import Lazy, LazyReferenceManager
 from datacrystal._pipeline import DeltaConsumer, build_delta
 from datacrystal._records import RefToken, crc as _crc, decode_payload, encode_payload
@@ -1071,7 +1079,7 @@ class Store:
         ]
 
     def query(self, target: type | Condition, *, limit: int | None = None,
-              offset: int = 0) -> list[Any]:
+              offset: int = 0, order_by: Any = None) -> list[Any]:
         """Hydrated committed entities matching ``target`` — a Condition,
         or an entity class for the **full extent**.
 
@@ -1086,7 +1094,16 @@ class Store:
         *before* hydration — ``query(C, limit=10)`` loads 10 records, not the
         extent. A residual predicate must decode-to-filter first, so the
         window there only trims the materialized list (it cannot prune the
-        scan). Result order is deterministic (ascending OID)."""
+        scan). Result order is deterministic (ascending OID).
+
+        ``order_by=(field, 'asc'|'desc')`` (or a bare ``field`` for ascending,
+        where ``field`` is ``EntityClass.f`` / ``dc.fields(C).f`` / a name str)
+        sorts the **whole** match set before the window (#25): NULLs sort last,
+        ties break on ascending OID (deterministic paging). On an **indexed**
+        sort field the order comes straight from the index — a ``SortedIndex``
+        field (ADR-004) is effectively free; an un-indexed sort field must
+        decode that field for every match first (an honest O(matches) cost, the
+        same scan a non-indexed predicate pays)."""
         self._enter()
         validate_window(limit, offset)
         cls, cond = query_target(target, "query")
@@ -1100,6 +1117,13 @@ class Store:
         else:
             bitmap, residual = plan(cond, ci)
         candidate = bitmap if bitmap is not None else ci.extent
+        if order_by is not None:
+            field, descending = parse_order_by(order_by, ti)
+            if residual is None:
+                ordered = self._order_oids(ti, ci, candidate, field, descending)
+                return self.get_many(apply_window(ordered, limit, offset))
+            objs = [o for o in self.get_many(list(candidate)) if residual.evaluate(o)]
+            return apply_window(_order_by_attr(objs, field, descending), limit, offset)
         if residual is None:
             # #51: take the window LAZILY — a small limit over a huge extent
             # stops after offset+limit instead of listing every candidate OID.
@@ -1107,6 +1131,17 @@ class Store:
         oids = list(candidate)  # a residual must consider every candidate, then window
         objs = [o for o in self.get_many(oids) if residual.evaluate(o)]
         return apply_window(objs, limit, offset)
+
+    def _order_oids(self, ti: TypeInfo, ci: Any, matched: Any,
+                    field: str, descending: bool) -> list[int]:
+        """``matched`` (a BitMap64) OIDs in order_by order (#25). An indexed
+        field orders straight from the index (no decode); an un-indexed field
+        decodes that one field for every matched OID, then sorts (NULLs last,
+        ascending-OID tiebreak)."""
+        if field in ci.eq:
+            return order_via_index(ci, matched, field, descending)
+        values = {oid: row[field] for oid, row in self._iter_raw(ti, list(matched))}
+        return order_by_values(matched, values.__getitem__, descending)
 
     def incoming(self, entity: Any) -> list[Any]:
         """Every committed entity that **references** ``entity`` — backlinks for
@@ -1253,7 +1288,8 @@ class Store:
         return matches
 
     def pluck(self, target: type | Condition, *fields: str,
-              limit: int | None = None, offset: int = 0) -> list[Any]:
+              limit: int | None = None, offset: int = 0,
+              order_by: Any = None) -> list[Any]:
         """Project fields without constructing entities — the decode-level
         column read (ROADMAP item 4; full columnar speed is the
         ``datacrystal[arrow]`` mirror's job).
@@ -1267,7 +1303,13 @@ class Store:
         ``limit=``/``offset=`` window the result (#14) with the same
         stop-early semantics as :meth:`query`: a fully-indexed read decodes
         only the windowed OIDs; a residual read decodes-to-filter, then
-        trims."""
+        trims.
+
+        ``order_by=(field, 'asc'|'desc')`` sorts the whole match set before
+        the window, with the same contract as :meth:`query` (NULLs last,
+        ascending-OID tiebreak; an indexed sort field is ordered from the index,
+        an un-indexed one decodes that field for every match first). The sort
+        field need not be among the projected ``fields``."""
         self._enter()
         validate_window(limit, offset)
         if not fields:
@@ -1290,20 +1332,40 @@ class Store:
         else:
             bitmap, residual = None, None
         candidate = bitmap if bitmap is not None else ci.extent
+        raw_cond = _raw_condition(residual) if residual is not None else None
+        single = fields[0] if len(fields) == 1 else None
+
+        def project(row: dict[str, Any]) -> Any:
+            if single is not None:
+                return _publish(row[single])
+            return tuple(_publish(row[name]) for name in fields)
+
+        if order_by is not None:
+            ofield, descending = parse_order_by(order_by, ti)
+            if residual is None and ofield in ci.eq:
+                # index-ordered (no decode of the sort field), then window, then
+                # decode+project only the windowed OIDs.
+                ordered = order_via_index(ci, candidate, ofield, descending)
+                oids = apply_window(ordered, limit, offset)
+                return [project(row) for _oid, row in self._iter_raw(ti, oids)]
+            # honest O(matches): decode every candidate, filter, order by the
+            # sort field's decoded value, then window + project.
+            rows = [
+                (oid, row) for oid, row in self._iter_raw(ti, list(candidate))
+                if raw_cond is None or raw_cond.evaluate(_RawView(row))
+            ]
+            rows = _order_rows(rows, ofield, descending)
+            return [project(row) for _oid, row in apply_window(rows, limit, offset)]
+
         windowed_early = residual is None
         # #51: no residual → take the window lazily (O(offset+limit)); a residual
         # must decode every candidate before the window can be applied.
         oids = window_iter(candidate, limit, offset) if windowed_early else list(candidate)
-        raw_cond = _raw_condition(residual) if residual is not None else None
-        single = fields[0] if len(fields) == 1 else None
         out: list[Any] = []
         for _oid, row in self._iter_raw(ti, oids):
             if raw_cond is not None and not raw_cond.evaluate(_RawView(row)):
                 continue
-            if single is not None:
-                out.append(_publish(row[single]))
-            else:
-                out.append(tuple(_publish(row[name]) for name in fields))
+            out.append(project(row))
         return out if windowed_early else apply_window(out, limit, offset)
 
     def query_iter(self, target: type | Condition) -> Iterator[Any]:
@@ -1827,6 +1889,27 @@ def _raw_value(value: Any) -> Any:
             raise QueryError("cannot match an unloaded Lazy without an OID")
         return RefToken(value.oid)
     return value
+
+
+def _order_by_attr(objs: list[Any], field: str, descending: bool) -> list[Any]:
+    """Hydrated entities ordered by a field for the residual order_by path (#25):
+    NULLs last, stable ascending-OID tiebreak (``objs`` arrive ascending-OID from
+    ``get_many``, and a stable sort preserves that within equal values)."""
+    present = [o for o in objs if getattr(o, field) is not None]
+    absent = [o for o in objs if getattr(o, field) is None]
+    present.sort(key=lambda o: getattr(o, field), reverse=descending)
+    return present + absent
+
+
+def _order_rows(rows: list[tuple[int, dict[str, Any]]], field: str,
+                descending: bool) -> list[tuple[int, dict[str, Any]]]:
+    """Decoded ``(oid, row)`` pairs ordered by ``row[field]`` for the residual /
+    un-indexed pluck order_by path (#25): NULLs last, stable ascending-OID
+    tiebreak (``rows`` arrive ascending-OID from the candidate scan)."""
+    present = [r for r in rows if r[1][field] is not None]
+    absent = [r for r in rows if r[1][field] is None]
+    present.sort(key=lambda r: r[1][field], reverse=descending)
+    return present + absent
 
 
 def _raw_condition(cond: Condition) -> Condition:
