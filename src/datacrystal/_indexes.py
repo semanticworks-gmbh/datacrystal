@@ -358,6 +358,23 @@ class IndexManager:
             else:
                 self._reverse_refs.pop(referrer, None)
 
+    def remove_reverse(self, deleted_oids: list[int]) -> None:
+        """P3: a committed delete (ADR-003) drops the OID as a *referrer* — its
+        outgoing edges vanish from the postings — but KEEPS it as a *target*:
+        entities still pointing at the dead OID are now dangling, and
+        ``incoming(dead)`` names exactly them (the checked-delete enumeration
+        ADR-003 waited for). Skips when the reverse index isn't built."""
+        rev = self._reverse
+        if rev is None:
+            return
+        for d in deleted_oids:
+            old = self._reverse_refs.pop(d, None)
+            if old is not None:
+                for t in old:
+                    posting = rev.get(t)
+                    if posting is not None:
+                        posting.discard(d)
+
 
 def plan(cond: Condition, ci: ClassIndexes) -> tuple[BitMap64 | None, Condition | None]:
     """Split a condition into (bitmap candidates, residual predicate).
