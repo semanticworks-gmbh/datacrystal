@@ -18,12 +18,14 @@ jurisdictions, the ~3M-entity multi-GB *scale* ingest) is optional — drop the
 On-demand eval, NOT a unit test (it downloads + ingests tens of MB). Run it
 during an evaluation phase:
 
-    curl -sL -o evals/data/gleif-rr.csv.zip \\
+    curl -sL --create-dirs -o evals/data/gleif-rr.csv.zip \\
       "https://goldencopy.gleif.org/api/v2/golden-copies/publishes/rr/latest.csv"
     # optional Level-1 enrichment + the vision-scale ingest (~466 MB zip):
-    # curl -sL -o evals/data/gleif-lei2.csv.zip \\
+    # curl -sL --create-dirs -o evals/data/gleif-lei2.csv.zip \\
     #   "https://goldencopy.gleif.org/api/v2/golden-copies/publishes/lei2/latest.csv"
     uv run python evals/proving_grounds/gleif.py
+
+(see evals/README.md for all proving grounds + fetch commands)
 
 Contains LEI data from the GLEIF Global LEI Index (https://www.gleif.org), made
 available under CC0 1.0. Not endorsed by or affiliated with GLEIF.

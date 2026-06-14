@@ -9,8 +9,11 @@ hydrate-vs-decode ratio.
 On-demand eval, NOT a unit test (it downloads + ingests tens of MB). Run it
 during an evaluation phase:
 
-    curl -sL -o evals/data/go-basic.obo https://current.geneontology.org/ontology/go-basic.obo
+    curl -sL --create-dirs -o evals/data/go-basic.obo \
+      https://current.geneontology.org/ontology/go-basic.obo
     uv run python evals/proving_grounds/gene_ontology.py
+
+(see evals/README.md for all proving grounds + fetch commands)
 
 Gene Ontology is CC BY 4.0 (http://geneontology.org).
 """

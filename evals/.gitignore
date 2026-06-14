@@ -1,2 +1,4 @@
+# Real datasets + the stores they build are fetched on demand, never committed
+# (see evals/README.md). Only the proving-ground scripts live in version control.
 data/
 *.store/
