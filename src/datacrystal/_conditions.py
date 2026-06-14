@@ -18,7 +18,8 @@ everything else runs as a residual Python predicate over the candidate set.
 
 from __future__ import annotations
 
-from typing import Any, TypeVar
+from itertools import islice
+from typing import Any, Iterable, TypeVar
 
 from datacrystal._errors import QueryError
 
@@ -218,6 +219,17 @@ def apply_window(seq: list[_T], limit: int | None, offset: int) -> list[_T]:
     if limit is not None:
         seq = seq[:limit]
     return seq
+
+
+def window_iter(candidate: Iterable[_T], limit: int | None, offset: int) -> list[_T]:
+    """The ``(offset, limit)`` window taken **lazily** from a sorted candidate
+    iterable (#51) — O(offset + limit), never materializing the whole candidate
+    set. Same result and order as ``apply_window(list(candidate), limit, offset)``
+    because the roaring candidate iterates in ascending OID; the win is that a
+    small ``limit`` over a huge extent stops after ``offset + limit`` instead of
+    listing every OID."""
+    stop = None if limit is None else offset + limit
+    return list(islice(candidate, offset, stop))
 
 
 def query_target(target: Any, method: str) -> tuple[type, Condition | None]:

@@ -33,6 +33,7 @@ from datacrystal._conditions import (
     apply_window,
     query_target,
     validate_window,
+    window_iter,
 )
 from datacrystal._entity import TYPES_BY_NAME, is_entity, oid_of, type_info
 from datacrystal._errors import (
@@ -413,9 +414,10 @@ class Snapshot:
                 bitmap, residual = None, None
             else:
                 bitmap, residual = plan(cond, ci)
-            oids = list(bitmap) if bitmap is not None else list(ci.extent)
-            if residual is None:
-                oids = apply_window(oids, limit, offset)
+            candidate = bitmap if bitmap is not None else ci.extent
+            # #51: no residual → window lazily; a residual needs all candidates
+            oids = (window_iter(candidate, limit, offset) if residual is None
+                    else list(candidate))
             views = self._views_for(oids)
         if residual is None:
             return views
