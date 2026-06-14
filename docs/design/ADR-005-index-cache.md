@@ -89,3 +89,31 @@ of truth. Amend invariant 11 accordingly.**
   for a *persisted sorted* index ride this same substrate — the Bigtable/HBase/Accumulo SSTable model.
 - Fitness: a same-run gate that a warm reopen reads the cache (no full scan) and that a
   stale/corrupt cache is detected + rebuilt (correctness independent of the cache).
+
+## Amendment — cardinality-matched representation (2026-06-14, #12 Design A)
+
+The first cut shipped opt-in and measured only **~1.3×** at 6.2M (35.0 s → 26.4 s): `load()`
+*reproduced* the rebuild's per-row Python work instead of skipping it. A 13-agent assessment (code
+diagnosis + empirical probe + best-practice research + adversarial review, on issue #12) found two
+O(corpus) culprits, both now fixed — **the records stay authoritative and every property above is
+preserved** (this amends *how* the cache is represented, not the contract):
+
+1. **A pure-Unique field carries no eq postings.** It was stored as one single-element `BitMap64` per
+   distinct key (6.2M containers for `mastr_nr`; a 30 B/key serialized floor) **and** the flat
+   `unique` value→oid map — redundantly, since `==`/`in_`/`contains`/`startswith` and the natural-key
+   `get()` path are all answerable from the map alone. The eq half is now dropped: eq-membership is
+   **Index/SortedIndex only** (a `Unique+Index`/`Unique+SortedIndex` field keeps eq); `plan()` answers
+   a Unique-only field from the map. Net: ~5× cheaper dump, smaller cache, and the in-RAM single-
+   element bitmaps (a chunk of the 3.9 GB at 6.2M) are gone.
+
+2. **The `_last_values` un-index memory is rebuilt lazily, not at open.** `load()` walked every
+   posting (`for oid in bm`) to rebuild the per-oid memory — the same O(corpus) loop the rebuild pays.
+   It is now deferred to the **first write** after a load (rebuilt from the loaded postings + unique
+   map, so additive schema evolution is already baked in — no record re-read, no fill logic). A
+   read-only reopen pays nothing. Measured: read-only reopen ~**4.1×** faster than the old design
+   (200k high-cardinality-unique probe), approaching the flat-map ceiling.
+
+A true zero-copy/mmap tier is **infeasible** with pyroaring 1.1.0 (no frozen-view), and a C/cffi shim
+would breach the `{msgspec, pyroaring}` budget — explicitly out of scope. The lazy key→offset
+directory (load-on-open, O(touched keys) for *any* index field) is the separate **ADR-006 / #69**
+epic, justified by a future high-cardinality non-unique workload, not the MaStR shape.
