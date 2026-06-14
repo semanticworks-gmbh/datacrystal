@@ -83,8 +83,8 @@ from datacrystal._indexes import (
     IndexManager,
     QueryPlan,
     explain_plan,
-    order_via_index,
     plan,
+    windowed_index_order,
 )
 from datacrystal._lazy import Lazy, LazyReferenceManager
 from datacrystal._pipeline import DeltaConsumer, build_delta
@@ -236,12 +236,15 @@ class Store:
         self._index_cache = (
             IndexCache(cache_dir / "index.cache") if cache_dir is not None else None
         )
-        cache_blobs = (
+        cached = (
             self._index_cache.read(self._last_tid)
             if self._index_cache is not None else None
         )
+        cache_blobs = cached["classes"] if cached is not None else None
+        reverse_blob = cached["reverse"] if cached is not None else None
         self._index = IndexManager(backend, self._lineage_for,
-                                   self._persisted_fields.keys, cache_blobs)
+                                   self._persisted_fields.keys, cache_blobs,
+                                   reverse_blob)
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -335,8 +338,9 @@ class Store:
         # the committed watermark; a no-op if nothing was indexed this session.
         if self._index_cache is not None:
             blobs = self._index.dump_for_cache()
-            if blobs:
-                self._index_cache.write(self._last_tid, blobs)
+            reverse = self._index.dump_reverse()  # #63: cache incoming()'s index too
+            if blobs or reverse is not None:
+                self._index_cache.write(self._last_tid, blobs, reverse)
         self._backend.close()
         if self._lock is not None:
             self._lock.release()
@@ -1122,8 +1126,9 @@ class Store:
         if order_by is not None:
             field, descending = parse_order_by(order_by, ti)
             if residual is None:
-                ordered = self._order_oids(ti, ci, candidate, field, descending)
-                return self.get_many(apply_window(ordered, limit, offset))
+                window = self._ordered_window(ti, ci, candidate, field, descending,
+                                              limit, offset)
+                return self.get_many(window)
             objs = [o for o in self.get_many(list(candidate)) if residual.evaluate(o)]
             return apply_window(_order_by_attr(objs, field, descending), limit, offset)
         if residual is None:
@@ -1134,16 +1139,19 @@ class Store:
         objs = [o for o in self.get_many(oids) if residual.evaluate(o)]
         return apply_window(objs, limit, offset)
 
-    def _order_oids(self, ti: TypeInfo, ci: Any, matched: Any,
-                    field: str, descending: bool) -> list[int]:
-        """``matched`` (a BitMap64) OIDs in order_by order (#25). An indexed
-        field orders straight from the index (no decode); an un-indexed field
-        decodes that one field for every matched OID, then sorts (NULLs last,
-        ascending-OID tiebreak)."""
+    def _ordered_window(self, ti: TypeInfo, ci: Any, matched: Any, field: str,
+                        descending: bool, limit: int | None, offset: int) -> list[int]:
+        """The ``(offset, limit)`` window of ``matched`` in order_by order
+        (#25/#66). An **indexed** field windows straight from the index,
+        short-circuiting to O(offset+limit) when ``limit`` is set (#66); an
+        **un-indexed** field decodes that one field for every matched OID (the
+        honest O(matches) ceiling), then sorts (NULLs last, ascending-OID
+        tiebreak) and slices."""
         if field in ci.eq:
-            return order_via_index(ci, matched, field, descending)
+            return windowed_index_order(ci, matched, field, descending, limit, offset)
         values = {oid: row[field] for oid, row in self._iter_raw(ti, list(matched))}
-        return order_by_values(matched, values.__getitem__, descending)
+        ordered = order_by_values(matched, values.__getitem__, descending)
+        return apply_window(ordered, limit, offset)
 
     def incoming(self, entity: Any) -> list[Any]:
         """Every committed entity that **references** ``entity`` — backlinks for
@@ -1345,10 +1353,10 @@ class Store:
         if order_by is not None:
             ofield, descending = parse_order_by(order_by, ti)
             if residual is None and ofield in ci.eq:
-                # index-ordered (no decode of the sort field), then window, then
-                # decode+project only the windowed OIDs.
-                ordered = order_via_index(ci, candidate, ofield, descending)
-                oids = apply_window(ordered, limit, offset)
+                # index-ordered (no decode of the sort field), short-circuiting to
+                # O(offset+limit) when limit is set (#66), then decode+project only
+                # the windowed OIDs.
+                oids = windowed_index_order(ci, candidate, ofield, descending, limit, offset)
                 return [project(row) for _oid, row in self._iter_raw(ti, oids)]
             # honest O(matches): decode every candidate, filter, order by the
             # sort field's decoded value, then window + project.

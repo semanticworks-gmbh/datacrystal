@@ -30,9 +30,11 @@ class IndexCache:
         self._path = path
 
     def read(self, watermark: int) -> dict[str, Any] | None:
-        """The ``{typename: index-blob}`` map IF the cache is at ``watermark`` and
-        the current format — else ``None`` (rebuild). Never raises on a missing,
-        truncated, or foreign-format cache: it is never authoritative."""
+        """``{"classes": {typename: blob}, "reverse": blob|None}`` IF the cache is
+        at ``watermark`` and the current format — else ``None`` (rebuild). Never
+        raises on a missing, truncated, or foreign-format cache: it is never
+        authoritative. ``reverse`` is optional (#63) — a pre-#63 sidecar simply
+        lacks it, so the reverse index rebuilds on demand as before."""
         try:
             raw = self._path.read_bytes()
         except OSError:
@@ -49,13 +51,16 @@ class IndexCache:
         classes = doc.get("classes")
         if not isinstance(classes, dict):
             return None
-        return cast("dict[str, Any]", classes)
+        return {"classes": cast("dict[str, Any]", classes), "reverse": doc.get("reverse")}
 
-    def write(self, watermark: int, blobs: dict[str, Any]) -> None:
-        """Stamp the built index blobs at ``watermark`` (temp file + atomic
-        rename, so a crash mid-write leaves the prior valid cache or none)."""
+    def write(self, watermark: int, blobs: dict[str, Any],
+              reverse: dict[str, Any] | None = None) -> None:
+        """Stamp the built forward index blobs (and the reverse index, if built —
+        #63) at ``watermark`` (temp file + atomic rename, so a crash mid-write
+        leaves the prior valid cache or none)."""
         payload = msgspec.msgpack.encode(
-            {"format": _CACHE_FORMAT, "watermark": watermark, "classes": blobs}
+            {"format": _CACHE_FORMAT, "watermark": watermark,
+             "classes": blobs, "reverse": reverse}
         )
         tmp = self._path.with_name(self._path.name + ".tmp")
         tmp.write_bytes(payload)
