@@ -503,6 +503,39 @@ removed-then-re-added with no default or `Glue`, a type the running code no long
 corrupt record. An empty list means the whole store reads cleanly. Run `verify()` before
 `migrate()`.
 
+### Recipe: deriving an *indexed* field (Glue + migrate)
+
+`Glue` and `RenamedFrom` are read-time markers and live only on **non-indexed** fields — putting
+one on a `dc.Index`/`dc.Unique` field raises at `@entity`. The reason is correctness, not
+arbitrariness: an index is built from the *persisted* value, not the glued one, so a glued index
+would silently index the wrong data. To end up with a *derived* field that is **also indexed**,
+split it into two steps and let `migrate()` bridge them:
+
+```python
+# Step 1 — derive on read (NON-indexed), so old records adapt immediately on load
+@dc.entity
+class Locality:
+    name: str
+    lat: Annotated[float, dc.Glue(lambda old: float(old["coords"].split(",")[0]))] = 0.0
+
+store = dc.Store.open("cabinet.store")
+store.migrate()        # Step 2 — materialize `lat` into a real persisted column on disk
+
+# Step 3 — `lat` is now a plain column; (re)declare it indexed and reopen
+@dc.entity
+class Locality:
+    name: str
+    lat: Annotated[float, dc.Index] = 0.0   # no Glue — a real, indexable column
+```
+
+After `migrate()`, every record physically carries `lat`, so adding `dc.Index` builds a **correct**
+index over real data. The ordering matters: keep the field non-indexed while the value is glued
+(the glue derives it on every read), and only add the index once `migrate()` has written the column
+to disk. The same recipe applies to a renamed field you want indexed (`RenamedFrom` → `migrate()` →
+`Index`). `migrate()` keeps existing indexes consistent automatically — it rewrites through the
+normal commit path, so committed records fold into any built index and a reopen rebuilds indexes
+from the newest records.
+
 How it works (one paragraph, so the behavior is predictable): the store keeps a **type
 lineage** — every field shape a class ever had gets its own row in the type dictionary, and
 each record decodes through the shape it was written with, by field name. Old records are never
