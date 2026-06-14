@@ -202,28 +202,36 @@ def main() -> None:
     t_open = time.perf_counter() - t0
     print(f"\nreopened cold:         {total:>10,} units   {t_open:7.2f}s (open + index build)")
 
-    # --- INDEXED QUERY (SOR / metadata persona) ------------------------------
+    # --- QUERY COST-LADDER (the SOR/metadata persona's whole surface) --------
     F = dc.fields(SolarUnit)
-    t0 = time.perf_counter()
-    bayern = s.count(F.bundesland == 1403)
-    t_q1 = (time.perf_counter() - t0) * 1000
-    t0 = time.perf_counter()
-    nrw_live = s.count((F.bundesland == 1409) & (F.betriebsstatus == 35))
-    t_q2 = (time.perf_counter() - t0) * 1000
-    print("\nindexed queries (bitmap, no record reads):")
-    print(f"  count(Bundesland == 1403 [{BUNDESLAND[1403]}]):              "
-          f"{bayern:>9,}   {t_q1:5.1f} ms")
-    print(f"  count(NRW & Betriebsstatus 35 [{BETRIEB[35]}]):  {nrw_live:>9,}   {t_q2:5.1f} ms")
 
-    # --- HYDRATE vs DECODE (capped if the extent is huge) --------------------
-    t0 = time.perf_counter()
-    keys = s.pluck(SolarUnit, "mastr_nr")  # decode-level, whole extent, no entities
-    t_pluck = time.perf_counter() - t0
-    sample = s.query(F.bundesland == 1403, limit=50_000)  # hydrate a bounded slice
-    print(f"\nfull extent ({len(keys):,} units):")
-    print(f"  pluck mastr_nr (decode-level, whole extent): {t_pluck:6.2f}s")
-    print(f"  query (hydrated, capped to {len(sample):,}): a bounded slice — "
-          "use pluck/[arrow] for analytics at this scale")
+    def timed(fn):  # returns (result, seconds)
+        t0 = time.perf_counter()
+        r = fn()
+        return r, time.perf_counter() - t0
+
+    keys = s.pluck(SolarUnit, "mastr_nr")            # whole extent, decode-level
+    _, t_get = timed(lambda: s.get(SolarUnit, mastr_nr=keys[0]))
+    bayern, t_c1 = timed(lambda: s.count(F.bundesland == 1403))
+    nrw, t_c2 = timed(lambda: s.count((F.bundesland == 1409) & (F.betriebsstatus == 35)))
+    names, t_pl = timed(lambda: s.pluck(F.bundesland == 1403, "name"))
+    _, t_hy = timed(lambda: s.query(F.bundesland == 1403, limit=100_000))
+    big, t_rg = timed(lambda: s.count(F.bruttoleistung >= 1000.0))   # residual full scan
+
+    print(f"\nquery cost-ladder on {total:,} units  (indexed: mastr_nr·bundesland·"
+          "betriebsstatus·plz):")
+    print(f"  get(mastr_nr)              unique lookup    {t_get * 1000:8.2f} ms   O(1)")
+    print(f"  count(Bundesland==1403)    {bayern:>9,} hits  {t_c1 * 1000:8.2f} ms   bitmap")
+    print(f"  count(NRW & In-Betrieb)    {nrw:>9,} hits  {t_c2 * 1000:8.2f} ms   bitmap AND")
+    print(f"  pluck(==1403, name)        {len(names):>9,} hits  {t_pl * 1000:8.0f} ms   "
+          "decode-level, O(hits)")
+    print(f"  query(==1403, limit=100k)    100,000 live  {t_hy * 1000:8.0f} ms   "
+          "hydrate, O(hits)")
+    print("  ── GAP (#18): a range / non-indexed predicate has NO index → full scan ──")
+    print(f"  count(Bruttoleistung>=1MW) {big:>9,} hits  {t_rg:8.2f} s    "
+          f"scans all {total:,} (~{t_rg / max(t_c1, 1e-9):,.0f}x the indexed count)")
+    print("  → range queries (leistung > X, registered between dates) are O(extent) "
+          "today; see #18")
 
     # --- CORRECTNESS ---------------------------------------------------------
     one = s.get(SolarUnit, mastr_nr=keys[0])
