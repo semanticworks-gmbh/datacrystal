@@ -154,6 +154,61 @@ def test_phrase_and_type_filter(store_factory, tmp_path) -> None:
     idx.close()
 
 
+def test_multi_term_ranked_search_is_or_by_default(store_factory, tmp_path) -> None:
+    """#54 karen-sparck-jones rule — a natural-language query must not require
+    EVERY term in one document (AND collapses recall). Default ``match="any"``
+    OR-s the terms so BM25 ranks the union; a doc matching SOME terms still
+    surfaces (and a fully-matching doc outranks it). ``match="all"`` keeps the
+    precise-filter AND for the cases that want it.
+    """
+    store = store_factory()
+    idx = fresh_index(tmp_path, fulltext=GEM_FULLTEXT)
+    store.attach(idx)
+    store.root = [
+        # matches ALL three query terms ("statin drugs cancer")
+        Gemstone(qid="Q1", name="full",
+                 description="statin drugs may influence cancer risk"),
+        # matches only ONE term ("cancer") — must still be retrievable
+        Gemstone(qid="Q2", name="partial",
+                 description="dietary fibre and cancer prevention"),
+        # matches NONE — must never appear
+        Gemstone(qid="Q3", name="off-topic",
+                 description="hexagonal prisms in clear quartz"),
+    ]
+    store.commit()
+
+    # search "statin drugs cancer" → expect BOTH the full and partial docs
+    # (Y in top-N), the full match ranked first.
+    any_hits = idx.search("statin drugs cancer")
+    any_qids = [store.get_many([h.oid])[0].qid for h in any_hits]
+    assert len(any_hits) == 2, "OR default must retrieve the partial-match doc"
+    assert any_qids[0] == "Q1", "the all-terms doc must rank above the one-term doc"
+    assert set(any_qids) == {"Q1", "Q2"}  # the no-term doc Q3 is absent
+
+    # match="all" requires every term: only the full doc, partial drops out.
+    all_hits = idx.search("statin drugs cancer", match="all")
+    assert {store.get_many([h.oid])[0].qid for h in all_hits} == {"Q1"}
+
+    # a query where NO doc has all terms returns nothing under "all" but the
+    # union under "any" (the recall-collapse the issue is about).
+    assert idx.search("statin fibre quartz", match="all") == []
+    assert idx.search("statin fibre quartz")  # any: union is non-empty
+
+    # a quoted phrase stays ONE unit under BOTH modes — the term-join must
+    # never split a phrase into AND-of-words (karen-sparck-jones review #3):
+    # "cancer risk" is adjacent only in Q1, so even match="all" finds it,
+    # while the reversed order occurs nowhere.
+    assert {store.get_many([h.oid])[0].qid
+            for h in idx.search('"cancer risk"', match="all")} == {"Q1"}
+    assert idx.search('"risk cancer"', match="all") == []
+
+    # an invalid mode is loud, not silently misinterpreted.
+    with pytest.raises(ValueError):
+        idx.search("statin", match="both")
+    store.close()
+    idx.close()
+
+
 def test_bare_fulltext_is_fold_only(store_factory, tmp_path) -> None:
     store = store_factory()
     idx = fresh_index(tmp_path, fulltext=GEM_FULLTEXT)
