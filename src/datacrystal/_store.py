@@ -75,6 +75,7 @@ from datacrystal._errors import (
     WrongThreadError,
 )
 from datacrystal._ids import FORMAT_VERSION, IdAllocator, OID_BASE, TID_BASE
+from datacrystal._index_cache import IndexCache
 from datacrystal._indexes import IndexManager, QueryPlan, explain_plan, plan
 from datacrystal._lazy import Lazy, LazyReferenceManager
 from datacrystal._pipeline import DeltaConsumer, build_delta
@@ -130,7 +131,8 @@ class Store:
     def __init__(self, backend: StorageBackend, lock: Any | None, *,
                  p2_inline: bool = False, debug: bool = False,
                  lazy_timeout: float | None = None,
-                 lazy_clock: Callable[[], float] | None = None) -> None:
+                 lazy_clock: Callable[[], float] | None = None,
+                 cache_dir: Path | None = None) -> None:
         self._backend = backend
         self._lock = lock
         self._owner = threading.get_ident()
@@ -219,8 +221,18 @@ class Store:
             self._durable_cids.add(cid)
         self._ti_by_cid: dict[int, TypeInfo] = {}
         self._plan_by_cid: dict[int, list[tuple[Any, int | None, Any]]] = {}
+        # Index cache (ADR-005 / #12): a sidecar beside the store; read at boot
+        # only if its watermark matches (else the index rebuilds from records —
+        # the cache is never authoritative, invariant 11). Disk stores only.
+        self._index_cache = (
+            IndexCache(cache_dir / "index.cache") if cache_dir is not None else None
+        )
+        cache_blobs = (
+            self._index_cache.read(self._last_tid)
+            if self._index_cache is not None else None
+        )
         self._index = IndexManager(backend, self._lineage_for,
-                                   self._persisted_fields.keys)
+                                   self._persisted_fields.keys, cache_blobs)
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -266,7 +278,7 @@ class Store:
             # Off-thread P2 shares the connection with owner-thread reads;
             # that requires a serialized sqlite3 build (CPython's default).
             return cls(backend, lock, p2_inline=sqlite3.threadsafety < 3,
-                       debug=debug, lazy_timeout=lazy_timeout)
+                       debug=debug, lazy_timeout=lazy_timeout, cache_dir=directory)
         except BaseException:
             lock.release()
             raise
@@ -296,6 +308,13 @@ class Store:
                 )
         if self._io is not None:
             self._io.shutdown(wait=True)
+        # Persist the built indexes to the sidecar (ADR-005 / #12) so the next
+        # open loads them instead of rebuilding — outside any txn, stamped with
+        # the committed watermark; a no-op if nothing was indexed this session.
+        if self._index_cache is not None:
+            blobs = self._index.dump_for_cache()
+            if blobs:
+                self._index_cache.write(self._last_tid, blobs)
         self._backend.close()
         if self._lock is not None:
             self._lock.release()

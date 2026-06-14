@@ -200,6 +200,61 @@ class ClassIndexes:
         the frozen snapshot views — that map is pure O(extent) waste."""
         self._last_values.clear()
 
+    def dump(self) -> dict[str, Any]:
+        """Serialize to a msgpack-able structure for the index cache (ADR-005 /
+        #12): bitmaps as ``BitMap64`` bytes; keys live in lists (never as map
+        keys) so any scalar key type round-trips. ``sorted_keys`` and the
+        incremental ``_last_values`` memory are NOT stored — they reconstruct
+        from the postings on load."""
+        return {
+            "extent": self.extent.serialize(),
+            "eq": [[f, [[k, bm.serialize()] for k, bm in posts.items()]]
+                   for f, posts in self.eq.items()],
+            "unique": [[f, list(holders.items())] for f, holders in self.unique.items()],
+            "list_fields": sorted(self.list_fields),
+            "sorted_fields": sorted(self.sorted_fields),
+        }
+
+    @classmethod
+    def load(cls, blob: dict[str, Any], ti: TypeInfo) -> "ClassIndexes | None":
+        """Rebuild from a cached ``dump()`` — but ONLY if the cached index
+        surface still matches the live class's markers (else ``None`` → the
+        caller rebuilds from records; the cache is never authoritative). The
+        sorted runs and the ``_last_values`` un-index memory are reconstructed
+        from the postings, so a loaded index supports further commits."""
+        indexed = [f for f, _ in blob["eq"]]
+        unique = [f for f, _ in blob["unique"]]
+        list_fields = list(blob["list_fields"])
+        sorted_fields = list(blob["sorted_fields"])
+        want = sorted(s.name for s in ti.specs if s.indexed or s.unique or s.sorted)
+        if (sorted(indexed) != want
+                or sorted(unique) != sorted(s.name for s in ti.specs if s.unique)
+                or sorted(list_fields) != sorted(s.name for s in ti.specs if s.multivalued)
+                or sorted(sorted_fields) != sorted(s.name for s in ti.specs if s.sorted)):
+            return None  # the code's index markers changed → rebuild
+        ci = cls(indexed, unique, list_fields, sorted_fields)
+        ci.extent = BitMap64.deserialize(blob["extent"])
+        last: dict[int, dict[str, Any]] = {}
+        for field, posts in blob["eq"]:
+            is_list = field in ci.list_fields
+            col = ci.eq[field]
+            for key, bm_bytes in posts:
+                bm = BitMap64.deserialize(bm_bytes)
+                col[key] = bm
+                for oid in bm:
+                    entry = last.setdefault(oid, {})
+                    if is_list:
+                        if key is not None:
+                            entry.setdefault(field, []).append(key)
+                    else:
+                        entry[field] = key
+        for field, items in blob["unique"]:
+            ci.unique[field] = dict(items)
+        for field in ci.sorted_fields:
+            ci.sorted_keys[field] = sorted(k for k in ci.eq[field] if k is not None)
+        ci._last_values = last
+        return ci
+
 
 def build_class_indexes(
     ti: TypeInfo,
@@ -281,11 +336,16 @@ class IndexManager:
 
     def __init__(self, backend: StorageBackend,
                  lineage_for: Callable[[TypeInfo], list[tuple[int, list[str]]]],
-                 all_cids: Callable[[], Iterable[int]]) -> None:
+                 all_cids: Callable[[], Iterable[int]],
+                 cache_blobs: dict[str, Any] | None = None) -> None:
         self._backend = backend
         self._lineage_for = lineage_for
         self._all_cids = all_cids
         self._by_cls: dict[type, ClassIndexes] = {}
+        # Index cache (ADR-005 / #12): per-typename blobs loaded from the sidecar
+        # at boot IF its watermark matched the store's; consumed (lazily, per
+        # class) by ensure(). None = no usable cache → build from records.
+        self._cache_blobs = cache_blobs
         # Reverse-reference index (#20): target OID → referrer OIDs, plus each
         # referrer's own outgoing set for incremental diffing. Global (cross
         # class), rebuildable, never persisted (invariant 11). None = not built.
@@ -295,10 +355,23 @@ class IndexManager:
     def ensure(self, ti: TypeInfo) -> ClassIndexes:
         ci = self._by_cls.get(ti.cls)
         if ci is None:
-            ci = build_class_indexes(ti, self._lineage_for(ti),
-                                     self._backend.scan_type)
+            if self._cache_blobs is not None:
+                blob = self._cache_blobs.get(ti.typename)
+                if blob is not None:
+                    ci = ClassIndexes.load(blob, ti)  # None if the markers changed
+            if ci is None:
+                ci = build_class_indexes(ti, self._lineage_for(ti),
+                                         self._backend.scan_type)
             self._by_cls[ti.cls] = ci
         return ci
+
+    def dump_for_cache(self) -> dict[str, Any]:
+        """The built per-class indexes as ``{typename: blob}`` for the sidecar —
+        the live store's forward indexes only (the reverse index is not cached
+        in this first cut)."""
+        from datacrystal._entity import type_info  # lazy: _entity imports us
+
+        return {type_info(cls).typename: ci.dump() for cls, ci in self._by_cls.items()}
 
     def check_unique(self, entries: list[tuple[int, TypeInfo, dict[str, Any]]],
                      deleted: frozenset[int] | set[int] = frozenset()) -> None:
