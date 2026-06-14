@@ -44,6 +44,13 @@ stale venv shebangs — `rm -rf .venv && uv sync`.
 - `docs/design/ADR-003-delete-semantics.md` — accepted unchecked-delete contract
   (`store.delete()`, tombstone deltas, `CommitBatch.deletes`, `DanglingRefError`);
   checked delete waits for the v1 reverse-reference index.
+- `docs/design/ADR-004-sorted-range-index.md` — accepted sorted/range index (`dc.SortedIndex`
+  marker + a third deterministic planning rule for `>=`/`<`/`between`, live OLTP, opt-in per
+  field, in-memory first; #18). Not a cost-based optimizer — still rule-based.
+- `docs/design/ADR-005-index-cache.md` — accepted index cache (#12): **amends invariant 11** —
+  indexes may be cached on disk (watermark-validated, rebuilt-on-mismatch, never authoritative),
+  a manifest-LSM sidecar outside the commit txn. ADR-004+005 converge on a persisted sorted index
+  (sorted runs + zone-maps + bloom) — the Bigtable/SSTable shape on the existing segment substrate.
 - `docs/design/COMMIT-DELTA-v1.md` — the delta/watermark contract (**LOCKED v1**, 2026-06-12).
   The applier + replay vectors are normative and byte-pinned; changes now mean a NEW contract
   version, never an edit.
@@ -127,7 +134,9 @@ stale venv shebangs — `rm -rf .venv && uv sync`.
 9. Format honesty: opening a newer store raises `NewerStoreError`; on-disk migrations (like the
    types-table UNIQUE drop) must be idempotent.
 10. One writer per store (lease lock); a lost lease refuses to write (`LeaseLostError`).
-11. Indexes are rebuildable derived data — never persisted, never inside the commit txn.
+11. Indexes are rebuildable derived data; they **may be cached on disk** (watermark-stamped,
+    rebuilt on any mismatch, **never the source of truth** — ADR-005), but are never inside the
+    store's commit txn. (Pre-ADR-005 this read "never persisted"; the records stay authoritative.)
 12. Fitness/perf gates are same-run ratios, operation counts, or byte counts — never absolute
     wall-clock.
 
