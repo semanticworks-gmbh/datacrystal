@@ -28,8 +28,14 @@ from typing import Iterator, cast
 from datacrystal._errors import CorruptRecordError, NewerStoreError
 from datacrystal._ids import FORMAT_VERSION
 from datacrystal._records import crc as _crc
-from datacrystal._storage.protocol import BootInfo, CommitBatch, StoredRecord
+from datacrystal._storage.protocol import BootInfo, CommitBatch, StoredBlob, StoredRecord
 
+# A plain rowid table (NOT WITHOUT ROWID): a future streamed read uses
+# sqlite3.Connection.blobopen, which needs the oid to be a rowid alias
+# (ADR-007 §2). Blobs are TYPELESS — no cid column (a blob has no class or
+# lineage; this is a deliberate deviation from the schema listed in ADR-007,
+# whose `cid` column is meaningless for an opaque value). crc is the torn-blob
+# guard, mirroring the objects table.
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
@@ -48,6 +54,14 @@ CREATE TABLE IF NOT EXISTS objects (
     crc     INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS objects_by_cid ON objects (cid);
+CREATE TABLE IF NOT EXISTS blobs (
+    oid  INTEGER PRIMARY KEY,
+    tid  INTEGER NOT NULL,
+    size INTEGER NOT NULL,
+    hash BLOB NOT NULL,
+    crc  INTEGER NOT NULL,
+    data BLOB NOT NULL
+);
 """
 
 _LOAD_CHUNK = 500
@@ -81,6 +95,20 @@ def _scan_type(conn: sqlite3.Connection, cid: int) -> Iterator[StoredRecord]:
     ):
         _check_crc(oid, payload, stored_crc)
         yield StoredRecord(oid=oid, cid=cid, tid=tid, payload=payload)
+
+
+def _load_blob(conn: sqlite3.Connection, oid: int) -> StoredBlob | None:
+    row = conn.execute(
+        "SELECT tid, size, hash, crc, data FROM blobs WHERE oid=?", (oid,)
+    ).fetchone()
+    if row is None:
+        return None
+    tid, size, h, stored_crc, data = cast("tuple[int, int, bytes, int, bytes]", row)
+    if _crc(data) != stored_crc:  # torn-blob guard (ADR-007), CRC checked here
+        raise CorruptRecordError(
+            f"blob oid={oid} failed its checksum — the store file is damaged"
+        )
+    return StoredBlob(oid=oid, tid=tid, size=size, hash=h, data=data)
 
 
 def _read_meta_and_types(conn: sqlite3.Connection) -> BootInfo:
@@ -121,6 +149,9 @@ class SqliteReadView:
 
     def scan_type(self, cid: int) -> Iterator[StoredRecord]:
         return _scan_type(self._conn, cid)
+
+    def load_blob(self, oid: int) -> StoredBlob | None:
+        return _load_blob(self._conn, oid)
 
     def close(self) -> None:
         if self._closed:
@@ -218,6 +249,9 @@ class SqliteBackend:
     def scan_type(self, cid: int) -> Iterator[StoredRecord]:
         return _scan_type(self._conn, cid)
 
+    def load_blob(self, oid: int) -> StoredBlob | None:
+        return _load_blob(self._conn, oid)
+
     def read_view(self) -> SqliteReadView:
         """A snapshot-isolated read view (own connection, pinned WAL read
         transaction). Safe to call from any thread — it never touches the
@@ -241,6 +275,15 @@ class SqliteBackend:
                     for r in batch.records
                 ],
             )
+            if batch.blobs:  # out-of-line bytes (ADR-007), same atomic txn
+                conn.executemany(
+                    "INSERT OR REPLACE INTO blobs (oid, tid, size, hash, crc, data) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    [
+                        (b.oid, b.tid, b.size, b.hash, _crc(b.data), b.data)
+                        for b in batch.blobs
+                    ],
+                )
             if batch.deletes:  # physical removal (ADR-003) — no tombstone rows
                 conn.executemany(
                     "DELETE FROM objects WHERE oid=?",

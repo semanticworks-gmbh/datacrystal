@@ -26,6 +26,7 @@ the root graph keeps stable identity.
 
 from __future__ import annotations
 
+import hashlib
 import threading
 import warnings
 from collections import deque
@@ -86,12 +87,24 @@ from datacrystal._indexes import (
     plan,
     windowed_index_order,
 )
-from datacrystal._lazy import Lazy, LazyReferenceManager
+from datacrystal._lazy import BlobHandle, Lazy, LazyReferenceManager
 from datacrystal._pipeline import DeltaConsumer, build_delta
-from datacrystal._records import RefToken, crc as _crc, decode_payload, encode_payload
+from datacrystal._records import (
+    BlobToken,
+    RefToken,
+    crc as _crc,
+    decode_payload,
+    encode_payload,
+    fingerprint_payload,
+)
 from datacrystal._registry import ObjectRegistry
 from datacrystal._snapshot import Ref, Snapshot
-from datacrystal._storage.protocol import CommitBatch, StorageBackend, StoredRecord
+from datacrystal._storage.protocol import (
+    CommitBatch,
+    StorageBackend,
+    StoredBlob,
+    StoredRecord,
+)
 from datacrystal.contract.applier import DeltaGapError
 
 # Exact-type membership for the hydration fast path (decode produces exact
@@ -660,15 +673,35 @@ class Store:
         self._index.check_unique(index_entries, deleted=set(self._deleted))
         new_types: list[tuple[int, str, list[str]]] = []
         encoded: list[tuple[int, int, bytes]] = []
+        # Out-of-line blob values this commit writes (ADR-007 / #82). Each
+        # dc.Blob field with a non-None value is split out here: its bytes go to
+        # the blobs table, the record keeps only a tiny BLOB_EXT descriptor. The
+        # blob OID rides the existing partitioned OID space (invariant 6). The
+        # sink runs DURING encoding — before the TID is allocated — so it records
+        # (oid, size, hash, data) tuples now and the StoredBlobs are stamped with
+        # this commit's tid once it is known (a blob's descriptor carries no tid).
+        blob_data: list[tuple[int, int, bytes, bytes]] = []
+
+        def blob_sink(value: bytes) -> tuple[int, int, bytes]:
+            blob_oid = self._alloc.next_oid()
+            digest = hashlib.sha256(value).digest()
+            blob_data.append((blob_oid, len(value), digest, value))
+            return blob_oid, len(value), digest
+
         for oid, obj in pending.items():
             ti = type_info(obj)
             cid = self._cid_for(ti, new_types)
             values = [getattr(obj, name) for name in ti.field_names]
+            blob_positions = self._blob_positions(ti)
             # Encoding can reject values (e.g. ints beyond msgpack's 64-bit
             # range) — it must run BEFORE the TID allocation so a rejected
             # commit consumes no TID and the buffers stay intact for a
             # fixed-up retry (gapless sequence, invariant 5).
-            encoded.append((oid, cid, encode_payload(values, self._oid_for_encode)))
+            encoded.append((oid, cid, encode_payload(
+                values, self._oid_for_encode,
+                blob_positions=blob_positions,
+                blob_sink=blob_sink if blob_positions else None,
+            )))
         # Prior payloads for the delta stream (COMMIT-DELTA-v1 §3): read
         # back the last durable payload of every already-persisted record —
         # O(delta) reads, only while consumers watch, and like encoding
@@ -719,6 +752,10 @@ class Store:
                 "format_version": str(FORMAT_VERSION),
             },
             deletes=[oid for oid, _, _ in deletes],
+            blobs=[
+                StoredBlob(oid=boid, tid=tid, size=size, hash=h, data=data)
+                for boid, size, h, data in blob_data
+            ],
         )
         delta = (
             build_delta(tid, records, new_types, self._root_oid, priors, delete_ops)
@@ -785,8 +822,20 @@ class Store:
         self._pending_upserts.clear()  # the committed unique map takes over
         self._durable_cids.update(cid for cid, _, _ in capture.batch.new_types)
         if self._debug:
+            # For a blob-bearing entity the stored payload carries the real
+            # blob OID, but the sweep recomputes a content-only (oid-0)
+            # descriptor — so fingerprint such entities through the same
+            # _fingerprint_payload epoch (the live object still holds raw bytes
+            # here, pre-rehydration). Non-blob records keep the cheap stored-crc.
+            flipped_by_oid = {oid: obj for oid, obj, _ in capture.flipped}
             for rec in capture.batch.records:
-                self._fingerprints[rec.oid] = _crc(rec.payload)
+                obj = flipped_by_oid.get(rec.oid)
+                if obj is not None and self._blob_positions(type_info(obj)):
+                    self._fingerprints[rec.oid] = _crc(
+                        self._fingerprint_payload(obj, type_info(obj))
+                    )
+                else:
+                    self._fingerprints[rec.oid] = _crc(rec.payload)
         self._last_tid = capture.tid
         if capture.delta is not None:
             self._deliver(capture.delta)
@@ -833,10 +882,7 @@ class Store:
                 continue
             ti = type_info(obj)
             try:
-                payload = encode_payload(
-                    [getattr(obj, name) for name in ti.field_names],
-                    self._oid_for_encode,
-                )
+                payload = self._fingerprint_payload(obj, ti)
                 changed = _crc(payload) != expected
             except BaseException:
                 # It encoded fine when its fingerprint was taken, so the
@@ -1588,6 +1634,56 @@ class Store:
             )
         return oid
 
+    def _blob_positions(self, ti: TypeInfo) -> frozenset[int]:
+        """The indices (in ``ti.field_names`` order) of ``dc.Blob`` fields —
+        the spec-driven split signal ``encode_payload`` needs (ADR-007 §2: a
+        bytes value alone can't be told apart from an inline ``bytes`` scalar).
+        Cached on the TypeInfo's specs, so this is a cheap per-record lookup."""
+        return frozenset(
+            i for i, spec in enumerate(ti.specs) if spec.blob
+        )
+
+    def _fingerprint_payload(self, obj: Any, ti: TypeInfo) -> bytes:
+        """Re-encode an entity to a stable payload for the debug fingerprint
+        net, WITHOUT re-storing or fetching any blob (ADR-007). A hydrated
+        ``dc.Blob`` field holds a ``BlobHandle``, whose descriptor (size/hash) is
+        already stable; a live ``bytes`` value (an untracked raw assignment) is
+        descriptor-ized from its own bytes. The fingerprint only needs
+        determinism, not durability — no OID is minted, the blobs table is never
+        touched. ``oid`` is pinned to 0: a fingerprint is only ever compared to
+        another taken in the SAME representation epoch (re-stamped on every
+        hydrate/commit), so the real blob OID is irrelevant to mismatch
+        detection."""
+        values = [getattr(obj, name) for name in ti.field_names]
+        positions = self._blob_positions(ti)
+        if not positions:
+            return encode_payload(values, self._oid_for_encode)
+        # Present each blob slot as its (0, size, hash) descriptor: a BlobHandle
+        # carries size/hash already; a live bytes value is hashed in place.
+        fp_values: list[Any] = list(values)
+        for i in positions:
+            v = values[i]
+            if isinstance(v, BlobHandle):
+                fp_values[i] = BlobToken(0, v.size, v.hash)
+            elif isinstance(v, bytes):
+                fp_values[i] = BlobToken(0, len(v), hashlib.sha256(v).digest())
+        return fingerprint_payload(fp_values, self._oid_for_encode)
+
+    def _load_blob_bytes(self, blob_oid: int) -> bytes:
+        """Fetch one whole blob value for a :class:`~datacrystal.Blob` handle
+        (ADR-007). Re-asserts the ADR-001 owner-thread contract before any I/O —
+        the same confinement the live read path enforces — then returns the raw
+        bytes (the backend has already CRC-checked them)."""
+        self._guard()
+        stored = self._backend.load_blob(blob_oid)
+        if stored is None:
+            raise DanglingRefError(
+                f"no blob for oid {blob_oid} in the store — deleted (v0.x "
+                "deletes are unchecked, ADR-003) or never committed; the blob "
+                "reference you followed is stale"
+            )
+        return stored.data
+
     def _lineage_for(self, ti: TypeInfo) -> list[tuple[int, list[str]]]:
         """Every (cid, persisted field list) this typename ever committed."""
         return [
@@ -1783,10 +1879,9 @@ class Store:
             # field may hold a not-yet-filled child shell — fine, the encode
             # only needs its OID.
             try:
-                self._fingerprints[rec.oid] = _crc(encode_payload(
-                    [getattr(obj, name) for name in ti.field_names],
-                    self._oid_for_encode,
-                ))
+                self._fingerprints[rec.oid] = _crc(
+                    self._fingerprint_payload(obj, ti)
+                )
             except BaseException:
                 self._fingerprints.pop(rec.oid, None)
 
@@ -1794,6 +1889,11 @@ class Store:
                  link: Callable[[int], Any]) -> Any:
         if value is None or isinstance(value, (str, float, int, bytes)):
             return value  # scalar fast path: nothing to swizzle back
+        if isinstance(value, BlobToken):
+            # A dc.Blob field hydrates to a lazy BlobHandle, never raw bytes
+            # (ADR-007 §3): .size/.hash are free from the descriptor, .bytes()
+            # fetches on first touch and demotes like Lazy.
+            return BlobHandle._bind(value.blob_oid, value.size, value.hash, self)  # pyright: ignore[reportPrivateUsage]
         if isinstance(value, RefToken):
             if lazy:
                 existing = self._registry.get(value.oid)
@@ -1860,6 +1960,17 @@ def _ref_target_oid(value: Any) -> int | None:
     return None
 
 
+def _blob_hash(value: Any) -> bytes | None:
+    """The sha256 of a blob-field value for upsert equivalence (ADR-007): a
+    hydrated ``BlobHandle`` carries it free; a raw ``bytes`` value is hashed;
+    anything else (e.g. None) is not a blob."""
+    if isinstance(value, BlobHandle):
+        return value.hash
+    if isinstance(value, bytes):
+        return hashlib.sha256(value).digest()
+    return None
+
+
 def _equivalent(cur: Any, new: Any) -> bool:
     """Would persisting ``new`` over ``cur`` write the same bytes? Decides
     whether upsert() skips a field. Conservative: references match by
@@ -1869,6 +1980,12 @@ def _equivalent(cur: Any, new: Any) -> bool:
     plain ones they came from."""
     if cur is new:
         return True
+    # Blob fields compare by content hash (a hydrated BlobHandle carries the
+    # sha256; raw bytes are hashed): so an upsert that re-supplies the IDENTICAL
+    # blob is a no-op (no re-store, no new OID), and an unchanged blob behind a
+    # reopened entity is never rewritten (ADR-007). A blob-vs-None differs.
+    if isinstance(cur, BlobHandle) or isinstance(new, BlobHandle):
+        return _blob_hash(cur) == _blob_hash(new) and _blob_hash(cur) is not None
     cur_ref, new_ref = _ref_target_oid(cur), _ref_target_oid(new)
     if cur_ref is not None or new_ref is not None:
         return cur_ref == new_ref and cur_ref is not None
@@ -1939,7 +2056,14 @@ def _raw_condition(cond: Condition) -> Condition:
 
 def _publish(value: Any) -> Any:
     """Decoded payload value → pluck() output: refs become public Ref
-    tokens (get_many() hydrates them), containers plain lists/dicts."""
+    tokens (get_many() hydrates them), containers plain lists/dicts.
+
+    A blob field plucks as its inert :class:`~datacrystal._records.BlobToken`
+    descriptor (``.blob_oid``/``.size``/``.hash``) — the bytes are NEVER read by
+    a decode-level scan (ADR-007): pluck/count/query around a blob-bearing type
+    touch only the 48-byte descriptor, not the blobs table."""
+    if isinstance(value, BlobToken):
+        return value
     if isinstance(value, RefToken):
         return Ref(value.oid)
     if isinstance(value, list):

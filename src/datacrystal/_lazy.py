@@ -121,6 +121,110 @@ class Lazy[T]:
         return f"Lazy(<unloaded oid={self._oid}>)"
 
 
+class BlobHandle:
+    """A lazy handle to an out-of-line raw-bytes field (ADR-007 / #83).
+
+    "Lazy for opaque bytes": a ``dc.Blob`` field hydrates to one of these, NOT
+    to raw ``bytes``. ``.size``/``.hash`` come straight from the descriptor in
+    the record (no fetch); ``.bytes()`` fetches the whole value once from the
+    sibling ``blobs`` table (CRC already checked in the backend), caches it, and
+    returns it — a second call does not re-fetch. The cached bytes are
+    *demotable*: the same :class:`LazyReferenceManager` that idles out ``Lazy``
+    handles drops them after the timeout (the slot layout mirrors ``Lazy`` —
+    ``_obj`` holds the bytes, ``_oid`` the blob OID, so ``track``/``sweep`` work
+    unchanged), and the next ``.bytes()`` reloads.
+
+    A blob is immutable (ADR-007): changing the field mints a fresh blob OID, so
+    a cached value is never stale. Reading ``.bytes()`` goes through the store,
+    which re-asserts the ADR-001 owner-thread contract before any I/O — the same
+    confinement the live read path enforces. (The live handle is owner-confined;
+    the cross-thread blob read is a later slice — ``store.open_blob`` over a
+    read view — not built here.)
+
+    Note the write/read asymmetry (documented intentionally): you assign plain
+    ``bytes`` to a ``dc.Blob`` field, and the *live* value stays ``bytes`` until
+    commit; after a reopen (or a fresh hydration) the same field reads back as a
+    ``Blob`` handle. The bytes are identical either way."""
+
+    __slots__ = ("_obj", "_oid", "_size", "_hash", "_storeref",
+                 "_atime", "_clock", "__weakref__")
+
+    # Mirror Lazy's slot annotations so the manager's duck-typed sweep
+    # (_obj / _oid / _atime / _clock) operates on a Blob with no special-casing.
+    _obj: bytes | None
+    _oid: int
+    _size: int
+    _hash: bytes
+    _storeref: weakref.ref[Any] | None
+    _atime: float
+    _clock: Callable[[], float] | None
+
+    def __init__(self) -> None:
+        raise TypeError("dc.Blob handles are created by the engine on hydration")
+
+    @classmethod
+    def _bind(cls, blob_oid: int, size: int, hash: bytes, store: Any) -> "BlobHandle":
+        """Engine path: a handle for a decoded :class:`BlobToken`, bound to its
+        store but with the bytes still on disk (fetched on first ``.bytes()``)."""
+        self = object.__new__(cls)
+        self._obj = None
+        self._oid = blob_oid
+        self._size = size
+        self._hash = hash
+        self._storeref = weakref.ref(store)
+        self._atime = 0.0
+        self._clock = None
+        return self
+
+    @property
+    def size(self) -> int:
+        """The blob's byte length — from the descriptor, no fetch."""
+        return self._size
+
+    @property
+    def hash(self) -> bytes:
+        """The blob's sha256 digest (32 bytes) — from the descriptor, no fetch."""
+        return self._hash
+
+    @property
+    def blob_oid(self) -> int:
+        """The blob's OID (its row in the ``blobs`` table). Lets the encode path
+        re-emit a hydrated blob's existing descriptor unchanged — an immutable
+        blob is never re-stored when a sibling field of its entity is edited
+        (ADR-007)."""
+        return self._oid
+
+    @property
+    def loaded(self) -> bool:
+        """Whether the bytes are currently cached in memory."""
+        return self._obj is not None
+
+    def bytes(self) -> bytes:
+        """The whole blob value (lazy, cached, demotable). The first call reads
+        it from the store (CRC checked in the backend); later calls return the
+        cached bytes until the manager demotes the handle."""
+        obj = self._obj
+        if obj is None:
+            storeref = self._storeref
+            store = storeref() if storeref is not None else None
+            if store is None:
+                raise StoreClosedError(
+                    "blob handle cannot load: its store is closed or gone"
+                )
+            obj = store._load_blob_bytes(self._oid)
+            self._obj = obj
+            manager = store._lazyman
+            if manager is not None:
+                manager.track(self)
+        elif self._clock is not None:
+            self._atime = self._clock()  # refresh idle time for the manager
+        return obj
+
+    def __repr__(self) -> str:
+        state = "cached" if self._obj is not None else "on-disk"
+        return f"BlobHandle(oid={self._oid}, size={self._size}, {state})"
+
+
 class LazyReferenceManager:
     """Demotes idle loaded ``Lazy`` handles back to unloaded (timeout-only).
 
