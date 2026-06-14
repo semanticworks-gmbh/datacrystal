@@ -1960,6 +1960,17 @@ def _ref_target_oid(value: Any) -> int | None:
     return None
 
 
+def _blob_hash(value: Any) -> bytes | None:
+    """The sha256 of a blob-field value for upsert equivalence (ADR-007): a
+    hydrated ``BlobHandle`` carries it free; a raw ``bytes`` value is hashed;
+    anything else (e.g. None) is not a blob."""
+    if isinstance(value, BlobHandle):
+        return value.hash
+    if isinstance(value, bytes):
+        return hashlib.sha256(value).digest()
+    return None
+
+
 def _equivalent(cur: Any, new: Any) -> bool:
     """Would persisting ``new`` over ``cur`` write the same bytes? Decides
     whether upsert() skips a field. Conservative: references match by
@@ -1969,6 +1980,12 @@ def _equivalent(cur: Any, new: Any) -> bool:
     plain ones they came from."""
     if cur is new:
         return True
+    # Blob fields compare by content hash (a hydrated BlobHandle carries the
+    # sha256; raw bytes are hashed): so an upsert that re-supplies the IDENTICAL
+    # blob is a no-op (no re-store, no new OID), and an unchanged blob behind a
+    # reopened entity is never rewritten (ADR-007). A blob-vs-None differs.
+    if isinstance(cur, BlobHandle) or isinstance(new, BlobHandle):
+        return _blob_hash(cur) == _blob_hash(new) and _blob_hash(cur) is not None
     cur_ref, new_ref = _ref_target_oid(cur), _ref_target_oid(new)
     if cur_ref is not None or new_ref is not None:
         return cur_ref == new_ref and cur_ref is not None

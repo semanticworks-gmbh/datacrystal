@@ -35,7 +35,7 @@ from typing import Any, Callable, cast
 import msgspec
 
 from datacrystal._entity import is_entity
-from datacrystal._lazy import Lazy
+from datacrystal._lazy import BlobHandle, Lazy
 
 REF_EXT_CODE = 1
 NAIVE_DATETIME_EXT_CODE = 2  # ISO text; tz-aware datetimes use msgpack timestamps
@@ -119,6 +119,16 @@ def swizzle(value: Any, oid_for: Callable[[Any], int]) -> Any:
     """
     if isinstance(value, _SCALARS):
         return value
+    if isinstance(value, BlobHandle):
+        # A BlobHandle reaching swizzle means a field holding blob data is NOT a
+        # blob position any more — i.e. `dc.Blob` was removed from a field that
+        # still has out-of-line bytes. We can't inline those bytes back here
+        # (they live in the blobs table); fail loudly with the remedy.
+        raise TypeError(
+            "a field holding a dc.Blob value was un-marked dc.Blob — its bytes "
+            "live out-of-line and cannot be inlined here; keep the dc.Blob "
+            "marker, or run store.migrate() to rewrite the records (ADR-007)"
+        )
     if is_entity(value):
         return _ref_ext(oid_for(value))
     if isinstance(value, Lazy):
@@ -179,10 +189,17 @@ def encode_payload(
     out: list[Any] = []
     for i, v in enumerate(values):
         if i in blob_positions and v is not None:
-            if blob_sink is None:  # pragma: no cover - the store always supplies one
+            if isinstance(v, BlobHandle):
+                # An already-stored blob, hydrated as a handle (e.g. a reopened
+                # entity whose sibling field was edited): re-emit its EXISTING
+                # descriptor — a blob is immutable, so it is never re-stored or
+                # given a new OID just because its entity was re-committed.
+                out.append(_blob_ext(v.blob_oid, v.size, v.hash))
+            elif blob_sink is None:  # pragma: no cover - the store always supplies one
                 raise TypeError("a blob field needs a blob_sink to encode")
-            blob_oid, size, h = blob_sink(v)
-            out.append(_blob_ext(blob_oid, size, h))
+            else:
+                blob_oid, size, h = blob_sink(v)
+                out.append(_blob_ext(blob_oid, size, h))
         else:
             out.append(swizzle(v, oid_for))
     return _ENCODER.encode(out)

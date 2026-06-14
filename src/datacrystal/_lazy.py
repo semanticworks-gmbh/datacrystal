@@ -187,6 +187,14 @@ class BlobHandle:
         return self._hash
 
     @property
+    def blob_oid(self) -> int:
+        """The blob's OID (its row in the ``blobs`` table). Lets the encode path
+        re-emit a hydrated blob's existing descriptor unchanged — an immutable
+        blob is never re-stored when a sibling field of its entity is edited
+        (ADR-007)."""
+        return self._oid
+
+    @property
     def loaded(self) -> bool:
         """Whether the bytes are currently cached in memory."""
         return self._obj is not None

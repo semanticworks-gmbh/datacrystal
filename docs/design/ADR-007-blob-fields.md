@@ -90,9 +90,16 @@ storage-representation decision, not an API flag.**
   SQLite/S3 only).
 - **No new core dep:** `sqlite3` (blobopen/zeroblob, stdlib 3.11+, repo on 3.14), `hashlib`, `io` are
   stdlib; an S3 client stays a `datacrystal[s3]` extra (dep-isolation gate).
-- **Schema evolution:** marking a field `dc.Blob` (or unmarking) is a field-shape change → **new cid**;
-  old inline records still decode by name through their own persisted shape (invariant 8) — gated by a
-  fabricated-class evolution test.
+- **Schema evolution (honest v1 behaviour):** marking a field `dc.Blob` does **not** mint a new cid —
+  the cid splits on the field-NAME shape, which is unchanged — so the decode is **value-driven**: a
+  pre-marker payload carries inline bytes and reads back as `bytes`, a post-marker payload carries a
+  descriptor and reads back as a `BlobHandle`. No data is lost, but the same field can read either way
+  until normalized. `migrate()` does **not** yet rewrite old inline records into blob rows (the cid never
+  changes, so its stale-lineage scan finds nothing). **Un-marking** a `dc.Blob` field that still has
+  out-of-line data fails loudly on re-commit (the descriptor can't be inlined) — keep the marker or
+  migrate. Making the blob flag part of the cid shape signature (so marking/unmarking splits the lineage
+  and `migrate()` normalizes) is a follow-on; the re-commit path correctly re-emits a hydrated blob's
+  existing descriptor so editing a sibling field never re-stores or wedges the blob.
 - **No-pickle holds:** the descriptor decodes to an inert `BlobToken` (RefToken precedent), structurally
   incapable of executing the bytes it addresses. `BlobToken` gets `__eq__`/`__hash__` by `blob_oid` so
   `count()`/`pluck()` match/skip a blob field without fetching bytes.

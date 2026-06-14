@@ -335,7 +335,11 @@ def test_inline_bytes_to_blob_evolution(store_factory):
     assert not isinstance(scan.image, dc.BlobHandle)
 
     # A NEW record written under the v2 shape stores out-of-line and reads back
-    # as a handle (the mode change minted a new cid — additive lineage).
+    # as a handle. NOTE: marking a field dc.Blob does NOT mint a new cid (the cid
+    # splits on the field-NAME shape, unchanged here), so the asymmetry is
+    # value-driven — old payloads carry inline bytes → bytes, new ones a
+    # descriptor → handle. migrate() does not yet normalize old inline records
+    # into blob rows; cid-shape-aware mode change is a follow-on (#76 sibling).
     reopened.store(V2(qid="Q2", image=b"out-of-line-bytes"))
     reopened.commit()
     reopened.close()
@@ -418,3 +422,80 @@ def test_optional_bytes_blob_is_allowed():
     from datacrystal._entity import type_info
     spec = type_info(Ok).spec("data")
     assert spec is not None and spec.blob
+
+
+# -- regression: re-committing a REOPENED blob entity (adversarial review) ----
+# The encode/upsert paths must understand a hydrated BlobHandle, or a reopened
+# blob entity cannot be updated and upsert silently re-stores/wipes the blob.
+
+
+def test_edit_sibling_field_of_reopened_blob_preserves_blob(store_factory):
+    store = store_factory()
+    store.root = [Scan(qid="S1", label="draft", image=IMG)]
+    store.commit()
+    store.close()
+
+    reopened = store_factory()
+    scan = reopened.get(Scan, qid="S1")
+    assert isinstance(scan.image, dc.BlobHandle)   # reopened → a handle, not bytes
+    scan.label = "final"                            # edit a SIBLING field
+    reopened.commit()                               # must NOT raise (was the crash)
+    reopened.close()
+
+    third = store_factory()
+    scan = third.get(Scan, qid="S1")
+    assert scan.label == "final"
+    assert scan.image.bytes() == IMG               # the blob survived untouched
+    assert scan.image.hash == hashlib.sha256(IMG).digest()
+    third.close()
+
+
+def test_upsert_resupplying_identical_blob_does_not_restore(store_factory):
+    store = store_factory()
+    store.root = []
+    store.upsert(Scan(qid="S1", label="v1", image=IMG))
+    store.commit()
+    oid1 = store.get(Scan, qid="S1").image.blob_oid
+
+    store.upsert(Scan(qid="S1", label="v2", image=IMG))   # same image, new label
+    store.commit()
+    scan = store.get(Scan, qid="S1")
+    assert scan.label == "v2"
+    assert scan.image.bytes() == IMG
+    assert scan.image.blob_oid == oid1               # identical blob → not re-stored
+    store.close()
+
+
+def test_upsert_with_a_changed_blob_restores(store_factory):
+    store = store_factory()
+    store.root = []
+    store.upsert(Scan(qid="S1", label="v1", image=IMG))
+    store.commit()
+    oid1 = store.get(Scan, qid="S1").image.blob_oid
+
+    bigger = IMG + b"!"
+    store.upsert(Scan(qid="S1", label="v1", image=bigger))
+    store.commit()
+    scan = store.get(Scan, qid="S1")
+    assert scan.image.bytes() == bigger
+    assert scan.image.blob_oid != oid1               # changed → a fresh blob OID
+    store.close()
+
+
+def test_unmarking_a_blob_field_errors_clearly(store_factory):
+    # store a blob, then re-declare the field as plain `bytes` (drop dc.Blob):
+    # the old descriptor record hydrates to a handle the inline encoder can't
+    # write — fail loudly with the remedy, never a cryptic msgpack error.
+    blobbed = _evolve_scan(Annotated[bytes, dc.Blob])
+    store = store_factory()
+    store.root = [blobbed(qid="Q1", image=b"x" * 100)]
+    store.commit()
+    store.close()
+
+    _evolve_scan(bytes)  # same typename, field now plain bytes
+    reopened = store_factory()
+    scan = reopened.get(_evolve_scan(bytes), qid="Q1")
+    reopened.mark_dirty(scan)
+    with pytest.raises(TypeError, match="un-marked dc.Blob"):
+        reopened.commit()
+    reopened.close()
