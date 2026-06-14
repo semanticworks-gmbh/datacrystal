@@ -29,7 +29,15 @@ from typing import TYPE_CHECKING
 
 from datacrystal._conditions import fields
 from datacrystal._containers import PersistentDict, PersistentList
-from datacrystal._entity import FullText, Glue, Index, RenamedFrom, Unique, entity
+from datacrystal._entity import (
+    FullText,
+    Glue,
+    Index,
+    RenamedFrom,
+    SortedIndex,
+    Unique,
+    entity,
+)
 from datacrystal._errors import (
     ConsumerDetachedWarning,
     CorruptRecordError,
@@ -84,6 +92,7 @@ __all__ = [
     "FullText",
     "RenamedFrom",
     "Glue",
+    "SortedIndex",
     "PersistentList",
     "PersistentDict",
     "Snapshot",

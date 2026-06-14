@@ -601,7 +601,7 @@ class Store:
         index_entries: list[tuple[int, TypeInfo, dict[str, Any]]] = []
         for oid, obj in pending.items():
             ti = type_info(obj)
-            relevant = {s.name for s in ti.specs if s.indexed or s.unique}
+            relevant = {s.name for s in ti.specs if s.indexed or s.unique or s.sorted}
             if relevant:
                 index_entries.append(
                     (oid, ti, {name: getattr(obj, name) for name in relevant})

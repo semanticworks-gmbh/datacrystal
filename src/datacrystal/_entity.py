@@ -69,6 +69,7 @@ class _Marker:
 
 Index = _Marker("Index")      # secondary bitmap index (pyroaring)
 Unique = _Marker("Unique")    # unique secondary key (SDA delta 1)
+SortedIndex = _Marker("SortedIndex")  # sorted index → range queries (>=/</between), ADR-004
 
 
 class _FullText(_Marker):
@@ -188,6 +189,7 @@ class FieldSpec:
     multivalued: bool = False  # indexed list field — inverted (element) postings (#13)
     renamed_from: str | None = None  # old persisted field name (RenamedFrom, #26 (a))
     glue: Callable[[Mapping[str, Any]], Any] | None = None  # derive-when-absent (Glue, #26 (b))
+    sorted: bool = False  # sorted index → range queries (SortedIndex, ADR-004 / #18)
 
 
 class TypeInfo:
@@ -239,7 +241,7 @@ class TypeInfo:
         return self._defaults
 
     def indexed_fields(self) -> tuple[FieldSpec, ...]:
-        return tuple(s for s in self.specs if s.indexed or s.unique)
+        return tuple(s for s in self.specs if s.indexed or s.unique or s.sorted)
 
     def __repr__(self) -> str:
         return f"<TypeInfo {self.typename} fields={self.field_names}>"
@@ -402,6 +404,7 @@ def _resolve_specs(cls: type, field_names: tuple[str, ...]) -> tuple[FieldSpec, 
         core = _strip_annotated(hint, markers)
         indexed = any(m is Index for m in markers)
         unique = any(m is Unique for m in markers)
+        srt = any(m is SortedIndex for m in markers)
         fulltext = next((m for m in markers if isinstance(m, _FullText)), None)
         renamed = next((m for m in markers if isinstance(m, RenamedFrom)), None)
         glued = next((m for m in markers if isinstance(m, Glue)), None)
@@ -413,21 +416,27 @@ def _resolve_specs(cls: type, field_names: tuple[str, ...]) -> tuple[FieldSpec, 
                 f"(str, int, float or bool, optionally | None) or a list of "
                 f"scalars, got {hint!r}"
             )
+        if srt and not _is_indexable(core):
+            raise TypeError(
+                f"{cls.__name__}.{name}: SortedIndex fields must be a scalar "
+                f"(str, int, float or bool, optionally | None) — a range index "
+                f"needs an orderable single value, got {hint!r}"
+            )
         if unique and is_list:
             raise TypeError(
                 f"{cls.__name__}.{name}: a Unique field cannot be a list "
                 f"(a multi-valued field has no single key), got {hint!r}"
             )
-        if renamed is not None and (indexed or unique):
+        if renamed is not None and (indexed or unique or srt):
             raise TypeError(
-                f"{cls.__name__}.{name}: RenamedFrom on an Index/Unique field is "
+                f"{cls.__name__}.{name}: RenamedFrom on an indexed field is "
                 "not supported yet — v0.2 scopes renames to non-indexed fields "
                 "read through live hydration; rename an indexed field via a "
                 "migration instead"
             )
-        if glued is not None and (indexed or unique):
+        if glued is not None and (indexed or unique or srt):
             raise TypeError(
-                f"{cls.__name__}.{name}: Glue on an Index/Unique field is not "
+                f"{cls.__name__}.{name}: Glue on an indexed field is not "
                 "supported yet — v0.2 scopes glue to non-indexed fields read "
                 "through live hydration / decode"
             )
@@ -444,6 +453,7 @@ def _resolve_specs(cls: type, field_names: tuple[str, ...]) -> tuple[FieldSpec, 
             multivalued=indexed and is_list,
             renamed_from=renamed.old_name if renamed is not None else None,
             glue=glued.fn if glued is not None else None,
+            sorted=srt,
         ))
     return tuple(specs)
 

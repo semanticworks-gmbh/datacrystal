@@ -68,7 +68,7 @@ class SolarUnit:
     plz: Annotated[str | None, dc.Index] = None              # Postleitzahl
     ort: str = ""
     landkreis: str = ""
-    bruttoleistung: float = 0.0                              # kW
+    bruttoleistung: Annotated[float, dc.SortedIndex] = 0.0   # kW — range-queryable (#18)
     nettonennleistung: float = 0.0
     anzahl_module: int = 0
     inbetriebnahme: str | None = None                        # ISO date string
@@ -216,22 +216,23 @@ def main() -> None:
     nrw, t_c2 = timed(lambda: s.count((F.bundesland == 1409) & (F.betriebsstatus == 35)))
     names, t_pl = timed(lambda: s.pluck(F.bundesland == 1403, "name"))
     _, t_hy = timed(lambda: s.query(F.bundesland == 1403, limit=100_000))
-    big, t_rg = timed(lambda: s.count(F.bruttoleistung >= 1000.0))   # residual full scan
+    big, t_rg = timed(lambda: s.count(F.bruttoleistung >= 1000.0))     # SortedIndex range (#18)
+    resid, t_res = timed(lambda: s.count(F.ort == "München"))           # non-indexed residual
 
     print(f"\nquery cost-ladder on {total:,} units  (indexed: mastr_nr·bundesland·"
-          "betriebsstatus·plz):")
+          "betriebsstatus·plz; sorted: bruttoleistung):")
     print(f"  get(mastr_nr)              unique lookup    {t_get * 1000:8.2f} ms   O(1)")
     print(f"  count(Bundesland==1403)    {bayern:>9,} hits  {t_c1 * 1000:8.2f} ms   bitmap")
     print(f"  count(NRW & In-Betrieb)    {nrw:>9,} hits  {t_c2 * 1000:8.2f} ms   bitmap AND")
+    print(f"  count(Bruttoleistung>=1MW) {big:>9,} hits  {t_rg * 1000:8.2f} ms   "
+          "SortedIndex range (#18 — was O(extent) scan)")
     print(f"  pluck(==1403, name)        {len(names):>9,} hits  {t_pl * 1000:8.0f} ms   "
           "decode-level, O(hits)")
     print(f"  query(==1403, limit=100k)    100,000 live  {t_hy * 1000:8.0f} ms   "
           "hydrate, O(hits)")
-    print("  ── GAP (#18): a range / non-indexed predicate has NO index → full scan ──")
-    print(f"  count(Bruttoleistung>=1MW) {big:>9,} hits  {t_rg:8.2f} s    "
-          f"scans all {total:,} (~{t_rg / max(t_c1, 1e-9):,.0f}x the indexed count)")
-    print("  → range queries (leistung > X, registered between dates) are O(extent) "
-          "today; see #18")
+    print("  ── the residual contrast (non-indexed field → full-extent scan): ──")
+    print(f"  count(ort=='München')      {resid:>9,} hits  {t_res:8.2f} s    "
+          f"scans all {total:,} (index the fields you filter on)")
 
     # --- CORRECTNESS ---------------------------------------------------------
     one = s.get(SolarUnit, mastr_nr=keys[0])
