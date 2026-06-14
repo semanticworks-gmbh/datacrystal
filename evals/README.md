@@ -70,12 +70,28 @@ MASTR_DIR=/path/to/Gesamtdatenexport_* \
   uv run python evals/proving_grounds/mastr.py   # full corpus (tens of GB, minutes)
 ```
 
+### #5 — BEIR / MIRACL · full-text search with a RELEVANCE oracle · CC-BY-SA / Apache-2.0
+
+The first ground with real relevance judgments (qrels), so it measures **ranking quality**
+(nDCG@10 / precision@k / nDCG against human judgments), not just throughput. Needs the `fts`
+extra. Default = BEIR NFCorpus (tiny, English, densely judged):
+
+```bash
+curl -sL --create-dirs -o evals/data/nfcorpus.zip \
+  https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/nfcorpus.zip
+(cd evals/data && unzip -o nfcorpus.zip)
+uv run --extra fts python evals/proving_grounds/search.py
+# German Snowball stemming + scale (BEIR-formatted MIRACL-de dir):
+# SEARCH_DIR=miracl-de SEARCH_LANG=german QRELS=dev uv run --extra fts python evals/proving_grounds/search.py
+```
+
 ## Attribution / licenses
 
 - Gene Ontology — CC-BY 4.0, http://geneontology.org
 - GLEIF LEI data — CC0 1.0, https://www.gleif.org. Not endorsed by or affiliated with GLEIF.
 - deps.dev (Open Source Insights), Google LLC — CC-BY 4.0, https://deps.dev
 - MaStR (Marktstammdatenregister, Bundesnetzagentur) — dl-de/by-2.0, https://www.govdata.de/dl-de/by-2-0. Not endorsed by or affiliated with the Bundesnetzagentur.
+- BEIR (NFCorpus etc.) — CC-BY-SA-4.0, https://github.com/beir-cellar/beir. MIRACL — Apache-2.0, https://github.com/project-miracl/miracl.
 
 Both datasets are free to redistribute, but we do **not** commit them — keep them in the
 git-ignored `evals/data/`.
