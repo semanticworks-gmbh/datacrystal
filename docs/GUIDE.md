@@ -479,8 +479,29 @@ like `RenamedFrom`).
 
 v0.2 scopes both `RenamedFrom` and `Glue` to **non-indexed** fields read through live hydration
 and decode (`get`/`query`/`pluck`); honoring them in the index, snapshot, and arrow decode
-paths, renaming an indexed field, and an offline `migrate`/`verify` that rewrites records to the
-newest shape are `[planned — v0.2]`.
+paths, and renaming an indexed field, are `[planned — v0.2]`.
+
+### Rewriting old records: `migrate` and `verify`
+
+`RenamedFrom` and `Glue` adapt old records *on read*. When you want the new shape **materialized
+on disk** — so a derived field becomes a real persisted column you can then index — run the
+offline `store.migrate()`:
+
+```python
+moved = store.migrate()   # re-encode every stale-shape record to the newest shape
+```
+
+`migrate()` hydrates each record persisted under an older lineage shape (through renames, glue and
+defaults) and re-commits it under the current shape — additive (a new lineage row, never a blob
+rewrite), owner-confined, lease-held, and crash-safe (it rides the normal commit; a partial run
+just resumes). It is **idempotent** (a second run rewrites nothing) and commits in `batch`-sized
+chunks (`store.migrate(batch=50_000)`) so peak memory tracks the batch, not the store.
+
+`store.verify()` is the read-only pre-flight: it decodes every record against the current code
+*without* mutating anything and returns the `(typename, oid)` pairs that **don't** decode — a field
+removed-then-re-added with no default or `Glue`, a type the running code no longer defines, or a
+corrupt record. An empty list means the whole store reads cleanly. Run `verify()` before
+`migrate()`.
 
 How it works (one paragraph, so the behavior is predictable): the store keeps a **type
 lineage** — every field shape a class ever had gets its own row in the type dictionary, and

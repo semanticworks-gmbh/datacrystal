@@ -22,6 +22,7 @@ from typing import Annotated
 import pytest
 
 import datacrystal as dc
+from datacrystal._entity import type_info
 
 REQUIRED = object()
 
@@ -364,3 +365,75 @@ def test_glue_applies_at_decode_level(store_factory):
     reopened = store_factory()
     assert sorted(reopened.pluck(V2, "lat")) == [1.0, 3.0]  # derived at decode level
     reopened.close()
+
+
+def test_migrate_rewrites_old_records_to_newest_shape(store_factory):
+    # #26 (c): migrate() re-encodes every stale-cid record under the current shape.
+    V1 = _evolve(name=(str, REQUIRED))
+    store = store_factory()
+    for nm in ("quartz", "azurite", "opal"):
+        store.store(V1(name=nm))
+    store.commit()
+    store.close()
+
+    V2 = _evolve(name=(str, REQUIRED), mohs=(float | None, None))
+    s = store_factory()
+    assert s.migrate() == 3          # all three old-shape records rewritten
+    assert s.migrate() == 0          # idempotent — nothing stale on a second run
+    assert sorted(m.name for m in s.query(V2)) == ["azurite", "opal", "quartz"]
+    assert all(m.mohs is None for m in s.query(V2))  # the added field reads its default
+    s.close()
+
+
+def test_migrate_materializes_glue_into_a_real_column(store_factory):
+    # migrate() turns a read-time Glue derivation into a persisted column — so a
+    # LATER class without the glue still reads the value (not the bare default).
+    V1 = _evolve(name=(str, REQUIRED), coords=(str, REQUIRED))
+    store = store_factory()
+    store.store(V1(name="Tsumeb", coords="48.1,11.5"))
+    store.commit()
+    store.close()
+
+    V2 = _evolve(
+        name=(str, REQUIRED),
+        lat=(Annotated[float, dc.Glue(lambda old: float(old["coords"].split(",")[0]))], 0.0),
+    )
+    s = store_factory()
+    assert s.migrate() == 1  # the old `coords` record rewritten with lat materialized
+    assert s.query(V2)[0].lat == 48.1
+    s.close()
+
+    V3 = _evolve(name=(str, REQUIRED), lat=(float, 0.0))  # NO glue — plain field
+    reopened = store_factory()
+    assert reopened.query(V3)[0].lat == 48.1  # the migrated value, not the 0.0 default
+    reopened.close()
+
+
+def test_verify_clean_store_returns_no_failures(store_factory):
+    V1 = _evolve(name=(str, REQUIRED), mohs=(float | None, None))
+    store = store_factory()
+    store.store(V1(name="quartz", mohs=7.0))
+    store.commit()
+    store.close()
+
+    s = store_factory()  # same shape → everything decodes cleanly
+    assert s.verify() == []
+    s.close()
+
+
+def test_verify_names_unreadable_records(store_factory):
+    # A field added WITHOUT a default (and no Glue) cannot decode old records —
+    # verify() names exactly those (typename, oid) pairs instead of crashing.
+    V1 = _evolve(name=(str, REQUIRED))
+    store = store_factory()
+    store.store(V1(name="quartz"))
+    store.store(V1(name="azurite"))
+    store.commit()
+    store.close()
+
+    V2 = _evolve(name=(str, REQUIRED), crystal_system=(str, REQUIRED))  # required, no default
+    s = store_factory()
+    failures = s.verify()
+    assert len(failures) == 2                              # both old records named
+    assert {tn for tn, _ in failures} == {type_info(V2).typename}  # all the Evolving type
+    s.close()
