@@ -47,10 +47,21 @@ curl -sL --create-dirs -o evals/data/gleif-lei2.csv.zip \
   "https://goldencopy.gleif.org/api/v2/golden-copies/publishes/lei2/latest.csv"   # ~466 MB
 ```
 
+### #3 — deps.dev · CYCLIC software-dependency graph (the #29 reproducer) · CC-BY 4.0
+
+Unlike #1/#2 this one **fetches its own data** from the keyless deps.dev REST API (a BFS over a
+small npm seed set) and caches every response into `evals/data/` — no manual download, and
+re-runs touch no network:
+
+```bash
+uv run python evals/proving_grounds/deps_dev.py
+```
+
 ## Attribution / licenses
 
 - Gene Ontology — CC-BY 4.0, http://geneontology.org
 - GLEIF LEI data — CC0 1.0, https://www.gleif.org. Not endorsed by or affiliated with GLEIF.
+- deps.dev (Open Source Insights), Google LLC — CC-BY 4.0, https://deps.dev
 
 Both datasets are free to redistribute, but we do **not** commit them — keep them in the
 git-ignored `evals/data/`.
