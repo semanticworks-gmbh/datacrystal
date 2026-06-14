@@ -117,3 +117,10 @@ A true zero-copy/mmap tier is **infeasible** with pyroaring 1.1.0 (no frozen-vie
 would breach the `{msgspec, pyroaring}` budget — explicitly out of scope. The lazy key→offset
 directory (load-on-open, O(touched keys) for *any* index field) is the separate **ADR-006 / #69**
 epic, justified by a future high-cardinality non-unique workload, not the MaStR shape.
+
+**Default-on activated (2026-06-14, v0.4.0).** The first cut shipped opt-in because the 1.3× win
+didn't justify a default change. With Design A (the 14× win re-measured on the real 6.2M store),
+the resurrect-after-unbuilt-delete correctness gap closed (#71), and a real-SIGKILL durability test
+in place (#63), `cache_index` now defaults to **`True`** — realizing the ADR's §5 intent ("on by
+default"). Empty/un-queried stores still write no sidecar (nothing built to dump); `cache_index=False`
+opts out. The cache remains never-authoritative, so the default change cannot affect correctness.
