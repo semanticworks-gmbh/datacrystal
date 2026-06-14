@@ -50,6 +50,7 @@ import re
 import sqlite3
 import unicodedata
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -134,11 +135,21 @@ def _tokens(text: str) -> list[str]:
     return _TOKEN.findall(unicodedata.normalize("NFC", text).lower())
 
 
+@lru_cache(maxsize=1 << 20)
 def _fold_token(token: str) -> str:
     """NFKD-fold one token: strip diacritics, normalize compatibility forms
     (``m²`` → ``m2``, ``ﬁ`` → ``fi``), lowercase — applied identically to
     column content and query terms, so matching is fold-consistent by
-    construction."""
+    construction.
+
+    Memoized (#55): folding is a pure char-by-char NFKD pass and was the
+    index-build hot spot — at index scale the same surface forms and stems
+    recur en masse (a natural-language corpus folds the same ~tens-of-
+    thousands of distinct tokens 30×+ over), so a per-token cache collapses
+    millions of folds to the distinct vocabulary. The cache is keyed on the
+    exact input token, so it can NEVER change the output bytes — fold/stem
+    symmetry and BM25 relevance are untouched. Bounded so a giant vocabulary
+    cannot grow it without limit (it is an LRU, not a leak)."""
     return "".join(
         ch for ch in unicodedata.normalize("NFKD", token)
         if not unicodedata.combining(ch)
