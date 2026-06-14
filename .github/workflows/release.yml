@@ -77,10 +77,21 @@ jobs:
               patch += 1
           new = f"{major}.{minor}.{patch}"
           p.write_text(text[:m.start(1)] + new + text[m.end(1):])
+          # Keep the in-code __version__ mirror in lockstep — drift bit us at v0.1.0.
+          init = pathlib.Path("src/datacrystal/__init__.py")
+          inew, n = re.subn(r'(^__version__ = ")[^"]+(")',
+                            lambda mm: mm.group(1) + new + mm.group(2),
+                            init.read_text(), flags=re.M)
+          if n != 1:
+              sys.exit(f"expected exactly one __version__ in __init__.py, found {n}")
+          init.write_text(inew)
           with open(os.environ["GITHUB_OUTPUT"], "a") as out:
               out.write(f"version={new}\n")
           print(f"{cur} -> {new}  ({bump})")
           PY
+
+      - name: Re-lock so uv.lock carries the new version
+        run: uv lock
 
       - name: Guard — tag must not already exist
         run: |
@@ -129,7 +140,7 @@ jobs:
           v="${{ steps.bump.outputs.version }}"
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -q pyproject.toml -m "release: datacrystal v$v"
+          git commit -q pyproject.toml src/datacrystal/__init__.py uv.lock -m "release: datacrystal v$v"
           git tag -a "v$v" -m "datacrystal v$v"
           git push origin HEAD:main
           git push origin "v$v"
