@@ -187,8 +187,10 @@ def main() -> None:
     print(f"ingested:              {n:>10,} solar units   {secs:7.2f}s  "
           f"({n / secs:,.0f} units/s)")
     print(f"  on disk:             {on_disk:>10.1f} MB   ({on_disk * 1e6 / n:.0f} B/unit)")
-    print(f"  peak RSS:            {rss:>10.0f} MB   (batch={BATCH:,} — bounded by the "
-          "batch, NOT the corpus)")
+    print(f"  peak RSS:            {rss:>10.0f} MB   (the batch={BATCH:,} entity working set "
+          "is bounded; the in-RAM")
+    print("                                     unique/index maps are NOT — they grow with "
+          "the corpus, invariant 11)")
     print(f"  → vision-scale absolute ingest number: {n / secs:,.0f} units/s "
           f"on {n:,} real records")
     gc.collect()
