@@ -57,11 +57,25 @@ re-runs touch no network:
 uv run python evals/proving_grounds/deps_dev.py
 ```
 
+### #4 — MaStR (German Marktstammdatenregister) · SOR/metadata at vision SCALE · dl-de/by-2.0
+
+The only **local** dataset — the Gesamtdatenexport is portal-download only (no URL). Point
+`MASTR_DIR` at the unpacked export directory; tune the run with `MASTR_MAX` (0 = full corpus,
+~22 GB / millions) and `MASTR_BATCH` (records/commit, the RAM-vs-batch lever):
+
+```bash
+MASTR_DIR=/path/to/Gesamtdatenexport_* MASTR_MAX=500000 \
+  uv run python evals/proving_grounds/mastr.py   # quick (a few hundred k)
+MASTR_DIR=/path/to/Gesamtdatenexport_* \
+  uv run python evals/proving_grounds/mastr.py   # full corpus (tens of GB, minutes)
+```
+
 ## Attribution / licenses
 
 - Gene Ontology — CC-BY 4.0, http://geneontology.org
 - GLEIF LEI data — CC0 1.0, https://www.gleif.org. Not endorsed by or affiliated with GLEIF.
 - deps.dev (Open Source Insights), Google LLC — CC-BY 4.0, https://deps.dev
+- MaStR (Marktstammdatenregister, Bundesnetzagentur) — dl-de/by-2.0, https://www.govdata.de/dl-de/by-2-0. Not endorsed by or affiliated with the Bundesnetzagentur.
 
 Both datasets are free to redistribute, but we do **not** commit them — keep them in the
 git-ignored `evals/data/`.
