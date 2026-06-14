@@ -1441,8 +1441,15 @@ class Store:
                 continue
             walked.add(oid)
             if oid in self._new or oid in self._dirty:
-                for name in type_info(current).field_names:
-                    self._walk_value(getattr(current, name), queue)
+                ti = type_info(current)
+                # Flat-entity fast-path (#52): a type none of whose fields can
+                # hold an entity ref (a SOR row of scalars/strings, FKs kept as
+                # plain str) has nothing to discover — skip the per-field walk
+                # entirely. has_entity_refs mirrors _walk_value's leaf set, so a
+                # ref-bearing field is never wrongly skipped.
+                if ti.has_entity_refs:
+                    for name in ti.field_names:
+                        self._walk_value(getattr(current, name), queue)
         return oid_of(obj)  # type: ignore[return-value]
 
     def _discover_new_graphs(self) -> None:
