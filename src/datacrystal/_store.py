@@ -1082,9 +1082,10 @@ class Store:
         it, then it is maintained incrementally at each commit.
 
         Counts both eager and ``Lazy`` referrers, in scalar fields and inside
-        list/dict containers. v0.2 covers live-store reads; deletes are not yet
-        folded into the reverse index, and ``Snapshot.incoming()`` parity is the
-        next sub-story of item 8."""
+        list/dict containers. Deletes fold incrementally (a deleted referrer
+        drops out; a deleted *target* keeps its postings, so ``incoming(dead)``
+        names the now-dangling referrers — ADR-003). The same backlinks at a
+        pinned watermark are :meth:`Snapshot.incoming`."""
         self._enter()
         if not is_entity(entity):
             raise NotAnEntityError(
