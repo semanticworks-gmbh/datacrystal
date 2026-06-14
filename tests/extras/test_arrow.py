@@ -526,3 +526,124 @@ def test_bootstrap_suppresses_compaction_thrash(store_factory, tmp_path,
         ArrowMirror.bootstrap(tmp_path / "boot", snap, batch=1, max_segments=4)
     assert compactions == [], f"bootstrap compacted {compactions} — must suppress"
     store.close()
+
+
+# -- analytics: "filter in datacrystal, aggregate in DuckDB" (#53) ----------------
+#
+# The documented recipe (GUIDE → Arrow mirrors → "Analytics at scale"): a
+# datacrystal-side bitmap query yields OIDs; DuckDB aggregates over the parquet
+# mirror restricted to those OIDs via ``ArrowMirror.OID_COLUMN``. These tests run
+# that exact path and assert the result equals a plain-Python oracle. DuckDB is a
+# dev dependency, not part of the [arrow] extra — each test importorskips it (so
+# the pyarrow-only tests above still run when it is absent, and the returned
+# module stays non-optional for the type checker).
+
+
+def _cabinet(store_factory):
+    """A small cabinet of Finds: indexed grade, a mass measure, some Nones."""
+    store = store_factory()
+    finds = [
+        Find(label="azurite", mass_g=412.5, grade="A"),
+        Find(label="malachite", mass_g=120.0, grade="A"),
+        Find(label="pyrite", mass_g=66.0, grade="B"),
+        Find(label="quartz", mass_g=300.0, grade="B"),
+        Find(label="fluorite", mass_g=None, grade="B"),   # null measure
+        Find(label="opal", mass_g=58.0, grade="C"),
+        Find(label="rubble", mass_g=9.0, grade=None),     # null group key
+    ]
+    return store, finds
+
+
+def test_groupby_aggregate_matches_python_oracle(store_factory, tmp_path) -> None:
+    """Pure-columnar path: total + average mass per grade, computed in DuckDB
+    over the whole mirror, equals a Python aggregation of the same rows."""
+    duckdb = pytest.importorskip("duckdb", reason="pip install duckdb")
+    store, finds = _cabinet(store_factory)
+    mirror = fresh_mirror(tmp_path)
+    store.attach(mirror)
+    store.root = finds
+    store.commit()
+
+    finds_tbl = mirror.table(Find)  # noqa: F841 — DuckDB replacement-scans it
+    got = duckdb.query(
+        "SELECT grade, count(*) AS n, sum(mass_g) AS total, avg(mass_g) AS mean "
+        "FROM finds_tbl WHERE grade IS NOT NULL GROUP BY grade ORDER BY grade"
+    ).fetchall()
+
+    oracle: dict[str, list[float]] = {}
+    for f in finds:
+        if f.grade is None:
+            continue
+        oracle.setdefault(f.grade, []).append(f.mass_g)  # type: ignore[arg-type]
+    expected = [
+        (
+            g,
+            len(ms),
+            sum(m for m in ms if m is not None),
+            (lambda nn: sum(nn) / len(nn) if nn else None)(
+                [m for m in ms if m is not None]
+            ),
+        )
+        for g, ms in sorted(oracle.items())
+    ]
+    assert got == expected
+    store.close()
+    mirror.close()
+
+
+def test_oid_handoff_filter_then_aggregate(store_factory, tmp_path) -> None:
+    """The headline recipe: a datacrystal bitmap query (on the indexed grade)
+    yields OIDs; DuckDB sums the measure over ONLY those rows via OID_COLUMN —
+    equal to summing the same hits in Python (the slow ``pluck`` path)."""
+    duckdb = pytest.importorskip("duckdb", reason="pip install duckdb")
+    store, finds = _cabinet(store_factory)
+    mirror = fresh_mirror(tmp_path)
+    store.attach(mirror)
+    store.root = finds
+    store.commit()
+
+    F = dc.fields(Find)
+    # Bitmap filter in datacrystal, at the mirror's watermark, no hydration.
+    with store.snapshot() as snap:
+        assert snap.tid == mirror.watermark
+        hit_oids = [v.oid for v in snap.query(F.grade == "B")]
+
+    finds_tbl = mirror.table(Find)  # noqa: F841 — DuckDB replacement-scans it
+    (total,) = duckdb.execute(
+        f"SELECT sum(mass_g) FROM finds_tbl WHERE {ArrowMirror.OID_COLUMN} IN "
+        "(SELECT * FROM UNNEST(?))",
+        [hit_oids],
+    ).fetchone()
+
+    # Python oracle: the pluck()+sum path #53 is replacing.
+    py_total = sum(v for v in store.pluck(F.grade == "B", "mass_g") if v is not None)
+    assert total == py_total == 366.0
+    # the handoff really restricted the scan to the bitmap hits, not the extent
+    assert len(hit_oids) == 3
+    store.close()
+    mirror.close()
+
+
+def test_parquet_dir_read_after_compact(store_factory, tmp_path) -> None:
+    """After ``compact()`` the per-type ``parquet_dir()`` is plain parquet —
+    DuckDB ``read_parquet`` over it (off the owner thread) equals ``table()``."""
+    duckdb = pytest.importorskip("duckdb", reason="pip install duckdb")
+    store, finds = _cabinet(store_factory)
+    mirror = fresh_mirror(tmp_path)
+    store.attach(mirror)
+    store.root = finds
+    store.commit()
+    store.detach(mirror)
+    mirror.compact()
+
+    directory = mirror.parquet_dir(Find)
+    assert directory.is_dir()
+    glob = str(directory / "*.parquet").replace("'", "''")
+    # compact() leaves one fold-free file, tombstones already dropped, so a raw
+    # read over the directory is the exact live set (count + measure sum).
+    (n, total) = duckdb.execute(
+        f"SELECT count(*), sum(mass_g) FROM read_parquet('{glob}')"
+    ).fetchone()
+    assert n == len(finds)
+    assert total == sum(f.mass_g for f in finds if f.mass_g is not None)
+    mirror.close()
