@@ -344,6 +344,33 @@ Query semantics:
   hits = store.query((M.crystal_system == "cubic") & (M.mohs >= 6.0))
   ```
 
+### Backlinks: who references this? — `incoming()`
+
+`store.incoming(entity)` returns every committed entity that **references** `entity` — the
+inverse of following a ref. Backlinks power impact analysis, orphan detection, and
+digital-twin / system-of-record traversal ("which records point at this one?").
+
+```python
+quartz = store.get(Mineral, qid="Q43010")
+for referrer in store.incoming(quartz):     # every entity that points at quartz —
+    print(referrer)                         # eager AND Lazy refs, in scalar fields
+                                            # and inside list/dict containers
+```
+
+- Answered from a **rebuildable in-memory reverse-reference index** (never persisted,
+  invariant 11): the first `incoming()` scans the store once to build it (one-time
+  O(extent), like the lazy forward indexes), then it is maintained incrementally at every
+  commit — a second, unrelated backlink is an O(1) posting lookup.
+- An unwatched store pays **nothing**: the reverse index is built only on first use, so if
+  you never call `incoming()` your commits are byte-identical and free of its upkeep.
+- A deleted **target** keeps its postings, so `incoming(dead)` enumerates the entities now
+  **dangling** at the dead OID (OIDs are never reused) — exactly the referrers a checked
+  delete would act on ([ADR-003](design/ADR-003-delete-semantics.md)). A deleted
+  **referrer** drops out. Checked delete itself (refuse-if-referenced, cascades) is
+  `[planned — v1]`.
+- The same backlinks at a pinned watermark are `snap.incoming(...)` — see
+  [Snapshots](#snapshots-and-the-commit-delta-pipeline).
+
 ## Identity and memory
 
 - One live instance per stored object: every path to an entity yields the same Python object,
@@ -534,6 +561,12 @@ def report(store: dc.Store) -> int:        # runs on any thread
   O(extent) per class, cached for the snapshot's lifetime). `snap.index_bitmaps(Cls)`
   exposes them directly as frozen bitmaps/mappings (`dc.SnapshotIndexes`) — the bootstrap
   material for index-shaped sidecars.
+- `snap.incoming(view_or_ref_or_oid)` answers **backlinks at the watermark** — the frozen
+  twin of `store.incoming()`, built from a snapshot-local reverse index (never shared with
+  the owner's). Takes the snapshot's own currency (an `EntityView`, a `dc.Ref`, or a raw
+  OID), returns `EntityView` referrers; a referrer committed *after* the snapshot is absent,
+  and a deleted target still names its dangling referrers (the ADR-003 enumeration seam)
+  even when `snap.get(dead)` raises `DanglingRefError`.
 - `snap.tid` is the pinned watermark; `snap.types` is the type lineage at that watermark
   (what a delta consumer needs to bootstrap, see below).
 - Close promptly (use the context manager): on the sqlite backend an open snapshot holds a
@@ -756,7 +789,7 @@ Sequencing follows the ratified [roadmap](design/ROADMAP.md) and the
 | Feature | Where it lands |
 |---|---|
 | v0.1.0 tag: API freeze (incl. the COMMIT-DELTA-v1 lock); PyPI publication follows | M4 — current milestone (the `[fts]`/`[arrow]` extras landed pre-tag, 2026-06-12, as the contract's real-consumer validators) |
-| **reverse-reference index** (`incoming()`) — backlinks, impact analysis | early post-tag v0.x (promoted 2026-06-12 — digital-twin/SOR personas) |
+| **object-store (S3) primary backend** — "the only infra is a blob store" | `[planned — v0.2+, item 16]`; feasibility spiked (manifest-LSM + conditional-PUT CAS), gated on the retained log |
 | **GraphQL / FastAPI** — `datacrystal[web]` with strawberry integration | extension package, after the v1 core freeze |
 | vector search — `datacrystal[vector]`, usearch, ≥2 vector fields per entity | extension package, after v1 |
 | property-graph recipes, cross-mirror DuckDB recipes | v1 |
