@@ -240,7 +240,7 @@ class Store:
     @classmethod
     def open(cls, path: str | Path, *, durability: str = "interval",
              lock_ttl: float = 10.0, debug: bool = False,
-             lazy_timeout: float | None = None) -> "Store":
+             lazy_timeout: float | None = None, cache_index: bool = False) -> "Store":
         """Open (creating if needed) the store directory at ``path``.
 
         The directory holds ``data.sqlite`` and the single-writer lease file
@@ -264,6 +264,16 @@ class Store:
         releasing the subgraph behind the cut point. Demotion runs only on
         the owner (sweeps piggyback on your store calls; under ``aopen()``
         an owner-loop task sweeps). Timeout-only in v0.1.
+
+        ``cache_index`` (ADR-005, opt-in) writes the built indexes to a sidecar
+        on close and loads them at boot instead of rebuilding from a scan.
+        **Off by default**: the win is workload-dependent — large for
+        low-cardinality indexes, but only ~1.3x when a high-cardinality
+        ``Unique`` index dominates (deserializing N postings ≈ rebuilding them,
+        measured on a 6.2M store). Turn it on where your indexes are categorical
+        and restarts are frequent. The cache is never authoritative (a
+        watermark/marker mismatch rebuilds from records); a crash test +
+        read-only fast-path are pending (#63).
         """
         import sqlite3  # noqa: PLC0415 — stays lazy (dep-budget fitness #3)
 
@@ -279,7 +289,8 @@ class Store:
             # Off-thread P2 shares the connection with owner-thread reads;
             # that requires a serialized sqlite3 build (CPython's default).
             return cls(backend, lock, p2_inline=sqlite3.threadsafety < 3,
-                       debug=debug, lazy_timeout=lazy_timeout, cache_dir=directory)
+                       debug=debug, lazy_timeout=lazy_timeout,
+                       cache_dir=directory if cache_index else None)
         except BaseException:
             lock.release()
             raise
