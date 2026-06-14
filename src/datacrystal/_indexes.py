@@ -464,11 +464,21 @@ class IndexManager:
                     )
                 seen[key] = oid
 
+    def _invalidate_stale_blob(self, ti: TypeInfo) -> None:
+        """A commit changed this class's records before its index was built, so
+        the boot-loaded cache blob now predates the change (#71). Drop it — a
+        later ``ensure()`` rebuilds from the now-current records rather than
+        loading a stale blob (which would resurrect a deleted OID or miss a new
+        one). The cache is never authoritative (invariant 11)."""
+        if self._cache_blobs is not None:
+            self._cache_blobs.pop(ti.typename, None)
+
     def apply(self, entries: list[tuple[int, TypeInfo, dict[str, Any]]]) -> None:
         """P3: fold a committed batch into every already-built index."""
         for oid, ti, values in entries:
             ci = self._by_cls.get(ti.cls)
             if ci is None:
+                self._invalidate_stale_blob(ti)  # #71: don't let ensure() load a pre-commit blob
                 continue  # not built yet; a later build scans these records
             maintained = set(_maintained_fields(ti))  # eq fields + unique fields
             ci.insert(oid, {f: v for f, v in values.items() if f in maintained})
@@ -478,7 +488,9 @@ class IndexManager:
         (unbuilt indexes scan the post-delete records and never see them)."""
         for oid, ti in deletes:
             ci = self._by_cls.get(ti.cls)
-            if ci is not None:
+            if ci is None:
+                self._invalidate_stale_blob(ti)  # #71: a stale blob would resurrect the OID
+            else:
                 ci.remove(oid)
 
     @property
