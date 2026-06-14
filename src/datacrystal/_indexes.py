@@ -393,7 +393,8 @@ class IndexManager:
     def __init__(self, backend: StorageBackend,
                  lineage_for: Callable[[TypeInfo], list[tuple[int, list[str]]]],
                  all_cids: Callable[[], Iterable[int]],
-                 cache_blobs: dict[str, Any] | None = None) -> None:
+                 cache_blobs: dict[str, Any] | None = None,
+                 reverse_blob: dict[str, Any] | None = None) -> None:
         self._backend = backend
         self._lineage_for = lineage_for
         self._all_cids = all_cids
@@ -404,9 +405,20 @@ class IndexManager:
         self._cache_blobs = cache_blobs
         # Reverse-reference index (#20): target OID → referrer OIDs, plus each
         # referrer's own outgoing set for incremental diffing. Global (cross
-        # class), rebuildable, never persisted (invariant 11). None = not built.
+        # class), rebuildable; cached on the same sidecar (#63). None = not built.
         self._reverse: dict[int, BitMap64] | None = None
         self._reverse_refs: dict[int, BitMap64] = {}
+        # The cached reverse postings, loaded at boot at the doc watermark and
+        # materialized lazily by ensure_reverse(). Invalidated (→ None) by any
+        # commit that lands before it materializes (the #71 contract, for the
+        # reverse index): ensure_reverse() then rebuilds from current records.
+        self._reverse_blob = reverse_blob
+        # Only `_reverse` (target→referrers, what incoming() reads) is cached; the
+        # `_reverse_refs` diff memory (referrer→targets, needed only to fold a
+        # commit) would be N single-element bitmaps — the same cardinality
+        # pathology #12 fixed — so it is rebuilt from `_reverse` on the first fold
+        # after a cache load. A read-only reopen never pays it.
+        self._reverse_refs_dirty = False
 
     def ensure(self, ti: TypeInfo) -> ClassIndexes:
         ci = self._by_cls.get(ti.cls)
@@ -475,6 +487,9 @@ class IndexManager:
 
     def apply(self, entries: list[tuple[int, TypeInfo, dict[str, Any]]]) -> None:
         """P3: fold a committed batch into every already-built index."""
+        if entries and self._reverse is None and self._reverse_blob is not None:
+            self._reverse_blob = None  # #63/#71: a write before the reverse index
+            #                            materializes makes the cached blob stale
         for oid, ti, values in entries:
             ci = self._by_cls.get(ti.cls)
             if ci is None:
@@ -506,6 +521,16 @@ class IndexManager:
         field of every record."""
         if self._reverse is not None:
             return self._reverse
+        if self._reverse_blob is not None:
+            # Served from the cache (#63): no O(corpus) re-harvest of every field
+            # of every record. The blob was watermark-validated at boot and would
+            # have been invalidated by any commit since (apply/remove_reverse).
+            blob = self._reverse_blob
+            self._reverse_blob = None
+            self._reverse = {t: BitMap64.deserialize(b) for t, b in blob["rev"]}
+            self._reverse_refs = {}
+            self._reverse_refs_dirty = True  # rebuilt from _reverse on the first fold
+            return self._reverse
         rev: dict[int, BitMap64] = {}
         refs: dict[int, BitMap64] = {}
         for cid in self._all_cids():
@@ -519,6 +544,26 @@ class IndexManager:
         self._reverse_refs = refs
         return rev
 
+    def dump_reverse(self) -> dict[str, Any] | None:
+        """The built reverse postings (target → referrers) for the sidecar (#63),
+        or None if the reverse index was never built this session. Only this
+        direction is cached — what ``incoming()`` reads; the referrer → targets
+        diff memory is rebuilt from it on the first fold (see ``__init__``)."""
+        if self._reverse is None:
+            return None
+        return {"rev": [[t, bm.serialize()] for t, bm in self._reverse.items()]}
+
+    def _rebuild_reverse_refs(self) -> None:
+        """Reconstruct the referrer → targets diff memory by inverting the loaded
+        ``_reverse`` (target → referrers) — deferred from a cache load to the
+        first fold (#63), so a read-only reopen never pays it. No record decode."""
+        refs: dict[int, BitMap64] = {}
+        for target, referrers in (self._reverse or {}).items():
+            for referrer in referrers:
+                refs.setdefault(referrer, BitMap64()).add(target)
+        self._reverse_refs = refs
+        self._reverse_refs_dirty = False
+
     def apply_reverse(self, ref_entries: list[tuple[int, set[int]]]) -> None:
         """P3: fold a committed batch's outgoing refs into the reverse postings,
         diffing old-vs-new per referrer (like the multi-valued index). Skips when
@@ -527,6 +572,8 @@ class IndexManager:
         rev = self._reverse
         if rev is None:
             return
+        if self._reverse_refs_dirty:  # first fold after a cache load (#63)
+            self._rebuild_reverse_refs()
         for referrer, targets in ref_entries:
             old = self._reverse_refs.get(referrer)
             if old is not None:
@@ -547,9 +594,14 @@ class IndexManager:
         entities still pointing at the dead OID are now dangling, and
         ``incoming(dead)`` names exactly them (the checked-delete enumeration
         ADR-003 waited for). Skips when the reverse index isn't built."""
+        if deleted_oids and self._reverse is None and self._reverse_blob is not None:
+            self._reverse_blob = None  # #63/#71: a delete before the reverse index
+            #                            materializes makes the cached blob stale
         rev = self._reverse
         if rev is None:
             return
+        if self._reverse_refs_dirty:  # first fold after a cache load (#63)
+            self._rebuild_reverse_refs()
         for d in deleted_oids:
             old = self._reverse_refs.pop(d, None)
             if old is not None:

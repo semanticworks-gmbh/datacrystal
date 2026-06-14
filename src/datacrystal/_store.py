@@ -236,12 +236,15 @@ class Store:
         self._index_cache = (
             IndexCache(cache_dir / "index.cache") if cache_dir is not None else None
         )
-        cache_blobs = (
+        cached = (
             self._index_cache.read(self._last_tid)
             if self._index_cache is not None else None
         )
+        cache_blobs = cached["classes"] if cached is not None else None
+        reverse_blob = cached["reverse"] if cached is not None else None
         self._index = IndexManager(backend, self._lineage_for,
-                                   self._persisted_fields.keys, cache_blobs)
+                                   self._persisted_fields.keys, cache_blobs,
+                                   reverse_blob)
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -335,8 +338,9 @@ class Store:
         # the committed watermark; a no-op if nothing was indexed this session.
         if self._index_cache is not None:
             blobs = self._index.dump_for_cache()
-            if blobs:
-                self._index_cache.write(self._last_tid, blobs)
+            reverse = self._index.dump_reverse()  # #63: cache incoming()'s index too
+            if blobs or reverse is not None:
+                self._index_cache.write(self._last_tid, blobs, reverse)
         self._backend.close()
         if self._lock is not None:
             self._lock.release()
