@@ -720,5 +720,38 @@ def order_via_index(ci: ClassIndexes, matched: BitMap64, field: str,
     return out
 
 
+def windowed_index_order(ci: ClassIndexes, matched: BitMap64, field: str,
+                         descending: bool, limit: int | None, offset: int) -> list[int]:
+    """The ``(offset, limit)`` window of ``matched`` ordered by an **indexed**
+    ``field`` (#66) — short-circuiting to **O(offset + limit + keys_touched)**
+    when ``limit`` is set, instead of materializing the full order. Walks the
+    field's keys in order, unioning ``posting & matched``, and stops once
+    ``offset + limit`` OIDs are in hand. A ``SortedIndex`` field's keys are
+    already sorted (free); any other indexed field sorts its distinct keys once.
+    NULLs (``eq[None]``) come last, reached only if the window isn't filled by
+    non-None keys. Same order as :func:`order_via_index` then sliced — verified
+    by the order_by oracle — but without touching the long tail of keys past the
+    window."""
+    if limit is None:  # no window to stop at → the full order, offset-sliced
+        ordered = order_via_index(ci, matched, field, descending)
+        return ordered[offset:] if offset else ordered
+    stop = offset + limit
+    postings = ci.eq[field]
+    if field in ci.sorted_fields:
+        keys: Iterator[Any] = (reversed(ci.sorted_keys[field]) if descending
+                               else iter(ci.sorted_keys[field]))
+    else:
+        keys = iter(sorted((k for k in postings if k is not None), reverse=descending))
+    out: list[int] = []
+    for key in keys:
+        out.extend(postings[key] & matched)
+        if len(out) >= stop:
+            return out[offset:stop]
+    none_posting = postings.get(None)
+    if none_posting is not None and len(out) < stop:
+        out.extend(none_posting & matched)  # NULLs last, only if the window needs them
+    return out[offset:stop]
+
+
 def iter_oids(bm: BitMap64) -> Iterator[int]:
     return iter(bm)

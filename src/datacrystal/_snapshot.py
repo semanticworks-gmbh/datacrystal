@@ -51,8 +51,8 @@ from datacrystal._indexes import (
     build_class_indexes,
     explain_plan,
     harvest_ref_oids,
-    order_via_index,
     plan,
+    windowed_index_order,
 )
 from datacrystal._lazy import Lazy
 from datacrystal._records import RefToken, decode_payload
@@ -363,10 +363,9 @@ class Snapshot:
                 self._guard()
                 ci = self._class_indexes(ti)
                 if ofield in ci.eq:
-                    ordered = apply_window(
-                        order_via_index(ci, ci.extent, ofield, descending),
-                        limit, offset)
-                    return self._views_for(ordered)
+                    window = windowed_index_order(ci, ci.extent, ofield,
+                                                  descending, limit, offset)
+                    return self._views_for(window)
                 views = self._views_for(list(ci.extent))
             return apply_window(_order_views(views, ofield, descending), limit, offset)
         stop = None if limit is None else offset + limit
@@ -462,10 +461,9 @@ class Snapshot:
             if order is not None:
                 ofield, descending = order
                 if residual is None and ofield in ci.eq:
-                    ordered = apply_window(
-                        order_via_index(ci, candidate, ofield, descending),
-                        limit, offset)
-                    return self._views_for(ordered)
+                    window = windowed_index_order(ci, candidate, ofield,
+                                                  descending, limit, offset)
+                    return self._views_for(window)
                 views = self._views_for(list(candidate))
             else:
                 # #51: no residual → window lazily; a residual needs all candidates

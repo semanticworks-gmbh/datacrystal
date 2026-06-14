@@ -202,6 +202,57 @@ def test_multivalued_order_field_rejected(items_store):
         items_store.query(Item, order_by=Item.tags)
 
 
+class _CountingPostings(dict):
+    """A postings map that counts ``__getitem__`` — i.e. how many distinct keys
+    the order_by walk actually touches. Proves the #66 short-circuit visits
+    O(offset+limit) keys, not O(extent)."""
+
+    def __init__(self, base):
+        super().__init__(base)
+        self.gets = 0
+
+    def __getitem__(self, key):
+        self.gets += 1
+        return super().__getitem__(key)
+
+
+def test_order_by_limit_short_circuits_on_sorted_index(store):
+    from datacrystal._entity import type_info
+
+    # 300 distinct grades, one Item each → each key contributes exactly one OID,
+    # so "keys touched" == "OIDs collected": a clean op-count.
+    for i in range(300):
+        store.store(Item(code=f"i{i:03d}", grade=float(i)))
+    store.commit()
+    ci = store._index.ensure(type_info(Item))  # pyright: ignore[reportPrivateUsage]
+    counter = _CountingPostings(ci.eq["grade"])
+    ci.eq["grade"] = counter
+
+    # limit=5 ascending → touches ~5 keys, NOT 300, and is correct
+    res = store.query(Item, order_by=(Item.grade, "asc"), limit=5)
+    assert [r.code for r in res] == [f"i{i:03d}" for i in range(5)]
+    assert counter.gets <= 8, f"touched {counter.gets} keys for limit=5 (want ~5 of 300)"
+
+    # offset+limit also short-circuits (touches ~offset+limit keys) and pages right
+    counter.gets = 0
+    page2 = store.query(Item, order_by=(Item.grade, "asc"), limit=5, offset=5)
+    assert [r.code for r in page2] == [f"i{i:03d}" for i in range(5, 10)]
+    assert counter.gets <= 12, counter.gets
+
+    # descending walks from the top, same short-circuit
+    counter.gets = 0
+    desc = store.query(Item, order_by=(Item.grade, "desc"), limit=3)
+    assert [r.code for r in desc] == ["i299", "i298", "i297"]
+    assert counter.gets <= 6, counter.gets
+
+    # the no-limit path is the honest contrast: it visits EVERY key (proving the
+    # gate above is real, not a vacuous bound)
+    counter.gets = 0
+    full = store.query(Item, order_by=(Item.grade, "asc"))
+    assert len(full) == 300
+    assert counter.gets >= 300
+
+
 def test_order_by_is_additive_default_none(items_store):
     # the surface stays frozen: no order_by behaves exactly as before (OID order)
     plain = [it.code for it in items_store.query(Item)]
