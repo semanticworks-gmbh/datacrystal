@@ -107,3 +107,56 @@ def test_incoming_rejects_non_entity_and_unstored(store):
     with pytest.raises(dc.NotAnEntityError):
         store.incoming({"not": "an entity"})
     assert store.incoming(Locality(qid="ghost", name="never stored")) == []
+
+
+# --- #20-B: delete-fold + rebuild equivalence -------------------------------
+
+def test_incoming_drops_a_deleted_referrer(store):
+    loc = Locality(qid="L", name="loc")
+    m1 = Mineral(qid="M1", name="m1", type_locality=dc.Lazy.of(loc))
+    m2 = Mineral(qid="M2", name="m2", type_locality=dc.Lazy.of(loc))
+    for e in (loc, m1, m2):
+        store.store(e)
+    store.commit()
+    assert sorted(m.qid for m in store.incoming(loc)) == ["M1", "M2"]  # builds the index
+    store.delete(m1)
+    store.commit()  # delete-fold removes m1 as a referrer
+    assert sorted(m.qid for m in store.incoming(loc)) == ["M2"]
+
+
+def test_incoming_on_deleted_target_names_dangling_referrers(store):
+    # ADR-003: deleting a TARGET leaves its referrers dangling — incoming(dead)
+    # enumerates exactly them (the checked-delete seam).
+    loc = Locality(qid="L", name="loc")
+    m = Mineral(qid="M", name="m", type_locality=dc.Lazy.of(loc))
+    for e in (loc, m):
+        store.store(e)
+    store.commit()
+    assert [x.qid for x in store.incoming(loc)] == ["M"]  # builds the index
+    store.delete(loc)
+    store.commit()
+    # loc's record is gone, but m still points at its OID → incoming() still
+    # names m as the now-dangling referrer (OIDs are never reused).
+    assert [x.qid for x in store.incoming(loc)] == ["M"]
+
+
+def test_reverse_index_rebuild_equals_incremental(store_factory):
+    s = store_factory()
+    locs = [Locality(qid=f"L{i}", name=f"l{i}") for i in range(3)]
+    mins = [Mineral(qid=f"M{i}", name=f"m{i}", type_locality=dc.Lazy.of(locs[i % 3]))
+            for i in range(9)]
+    for e in [*locs, *mins]:
+        s.store(e)
+    s.commit()
+    _ = s.incoming(locs[0])         # build the index → maintained incrementally below
+    mins[0].type_locality = dc.Lazy.of(locs[1])  # re-point a referrer
+    s.delete(mins[1])                            # delete a referrer
+    s.commit()
+    incremental = {loc.qid: sorted(m.qid for m in s.incoming(loc)) for loc in locs}
+    s.close()
+
+    s2 = store_factory()  # fresh IndexManager → reverse index rebuilt from a cold scan
+    rebuilt = {q: sorted(m.qid for m in s2.incoming(s2.get(Locality, qid=q)))
+               for q in incremental}
+    s2.close()
+    assert rebuilt == incremental  # invariant 11: incremental == rebuilt

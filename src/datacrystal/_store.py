@@ -727,6 +727,7 @@ class Store:
         self._index.apply(capture.index_entries)
         self._index.apply_reverse(capture.ref_entries)  # #20 reverse-ref fold
         self._index.apply_deletes([(oid, ti) for oid, ti, _ in capture.deletes])
+        self._index.remove_reverse([oid for oid, _, _ in capture.deletes])  # #20-B delete-fold
         for oid, _, obj in capture.deletes:
             # The identity contract ends with the record: write-bar any live
             # instance (incl. twins hydrated after the delete was buffered),
