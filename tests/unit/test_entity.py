@@ -5,7 +5,7 @@ from __future__ import annotations
 import weakref
 from dataclasses import field
 from datetime import datetime
-from typing import Annotated
+from typing import Annotated, Any
 
 import pytest
 
@@ -144,6 +144,38 @@ def test_renamed_from_on_indexed_field_rejected():
         crystal_system: Annotated[str | None, dc.Index, dc.RenamedFrom("system")] = None
 
     with pytest.raises(TypeError, match="RenamedFrom on an Index"):
+        dc.entity(Bad)
+
+
+def test_glue_marker_harvested():
+    # #26 (b): Glue records a derive-from-old-record callable on the spec.
+    @dc.entity
+    class Derived:
+        lat: Annotated[float, dc.Glue(lambda old: float(old["coords"].split(",")[0]))] = 0.0
+
+    spec = {s.name: s for s in type_info(Derived).specs}["lat"]
+    assert spec.glue is not None and spec.glue({"coords": "48.1,11.5"}) == 48.1
+    assert repr(dc.Glue(lambda old: old)) == "datacrystal.Glue(...)"
+    not_callable: Any = 42
+    with pytest.raises(TypeError, match="callable"):
+        dc.Glue(not_callable)
+
+
+def test_glue_on_indexed_field_rejected():
+    # Scope (b): glue is non-indexed-only, same boundary as RenamedFrom.
+    class Bad:
+        code: Annotated[str, dc.Index, dc.Glue(lambda old: old["x"])] = ""
+
+    with pytest.raises(TypeError, match="Glue on an Index"):
+        dc.entity(Bad)
+
+
+def test_glue_with_renamed_from_rejected():
+    # The two fill-when-absent markers are mutually exclusive — pick one.
+    class Bad:
+        v: Annotated[float, dc.RenamedFrom("old"), dc.Glue(lambda old: 0.0)] = 0.0
+
+    with pytest.raises(TypeError, match="cannot declare both"):
         dc.entity(Bad)
 
 

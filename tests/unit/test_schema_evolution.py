@@ -290,3 +290,77 @@ def test_renamed_from_prefers_new_name_when_present(store_factory):
     reopened = store_factory()
     assert reopened.root[0].mohs == 5.5
     reopened.close()
+
+
+def test_glue_splits_old_field_into_two(store_factory):
+    # #26 (b): V1 persists `coords="lat,lon"`; V2 splits it into lat/lon via Glue,
+    # which derives each absent field from the old record (additive, no rewrite).
+    V1 = _evolve(name=(str, REQUIRED), coords=(str, REQUIRED))
+    store = store_factory()
+    store.root = [V1(name="Tsumeb", coords="48.1,11.5")]
+    store.commit()
+    store.close()
+
+    V2 = _evolve(
+        name=(str, REQUIRED),
+        lat=(Annotated[float, dc.Glue(lambda old: float(old["coords"].split(",")[0]))], 0.0),
+        lon=(Annotated[float, dc.Glue(lambda old: float(old["coords"].split(",")[1]))], 0.0),
+    )
+    reopened = store_factory()
+    loc = reopened.root[0]
+    assert isinstance(loc, V2)
+    assert (loc.lat, loc.lon) == (48.1, 11.5)  # both derived from old `coords`
+    reopened.close()
+
+
+def test_glue_no_op_when_field_already_present(store_factory):
+    # Once data is written in the new shape, glue does NOT fire — the persisted
+    # value wins (correct for an already-migrated record).
+    V2 = _evolve(
+        name=(str, REQUIRED),
+        lat=(Annotated[float, dc.Glue(lambda old: 999.0)], 0.0),
+    )
+    store = store_factory()
+    store.root = [V2(name="opal", lat=12.5)]
+    store.commit()
+    store.close()
+
+    reopened = store_factory()
+    assert reopened.root[0].lat == 12.5  # not 999.0 — glue never fired
+    reopened.close()
+
+
+def test_glue_merges_multiple_old_fields(store_factory):
+    # Glue sees the WHOLE old record, so it merges as well as splits.
+    V1 = _evolve(first=(str, REQUIRED), last=(str, REQUIRED))
+    store = store_factory()
+    store.root = [V1(first="Marie", last="Curie")]
+    store.commit()
+    store.close()
+
+    V2 = _evolve(
+        full_name=(Annotated[str, dc.Glue(lambda old: f"{old['first']} {old['last']}")], ""),
+    )
+    reopened = store_factory()
+    merged = reopened.root[0]
+    assert isinstance(merged, V2)
+    assert merged.full_name == "Marie Curie"
+    reopened.close()
+
+
+def test_glue_applies_at_decode_level(store_factory):
+    # Glue works through pluck() (decode-level), same scope as RenamedFrom.
+    V1 = _evolve(name=(str, REQUIRED), coords=(str, REQUIRED))
+    store = store_factory()
+    store.store(V1(name="a", coords="1.0,2.0"))
+    store.store(V1(name="b", coords="3.0,4.0"))
+    store.commit()
+    store.close()
+
+    V2 = _evolve(
+        name=(str, REQUIRED),
+        lat=(Annotated[float, dc.Glue(lambda old: float(old["coords"].split(",")[0]))], 0.0),
+    )
+    reopened = store_factory()
+    assert sorted(reopened.pluck(V2, "lat")) == [1.0, 3.0]  # derived at decode level
+    reopened.close()

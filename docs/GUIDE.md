@@ -454,15 +454,33 @@ You can evolve entity classes between runs; old records adapt **on load**:
 | add a field **without a default** | `SchemaMismatchError` naming the field — add a default |
 | add a `dc.Unique` field | must default to `None`, else `SchemaMismatchError` (a shared non-None default would collide) |
 | rename a field | mark the new field `Annotated[T, dc.RenamedFrom("old")]` — the old values follow ✔ (see below) |
-| change a field's type | not checked (annotations are not validated on load) — avoid, or migrate |
+| split / merge / derive a field | mark the new field `Annotated[T, dc.Glue(fn)]` — `fn(old_record)` computes it from the old record ✔ (see below) |
+| change a field's type | not checked (annotations are not validated on load) — avoid, or use `dc.Glue` to convert on load |
 
 To rename a field without losing data, mark the new field with its old persisted name:
 `mohs: Annotated[float | None, dc.RenamedFrom("hardness")]`. On load, a record that lacks
 `mohs` but still has `hardness` binds the old column, so the rename follows your code —
 additively, never rewriting the record (and the new name wins once data is written under it).
-v0.2 scopes `RenamedFrom` to **non-indexed** fields read through live hydration; renaming an
-indexed field, declarative reshaping glue, and an offline `migrate`/`verify` that rewrites
-records to the newest shape are `[planned — v0.2]`.
+When a change needs the data *reshaped* — split one field into two, merge two into one, or
+convert a type — mark the new field with `dc.Glue(fn)`. On load, a record that lacks the field
+calls `fn(old)` with the old record as a read-only `{name: value}` mapping and uses the result:
+
+```python
+@dc.entity
+class Locality:
+    # old records persisted coords="48.1,11.5"; lat/lon now follow your code
+    lat: Annotated[float, dc.Glue(lambda old: float(old["coords"].split(",")[0]))] = 0.0
+    lon: Annotated[float, dc.Glue(lambda old: float(old["coords"].split(",")[1]))] = 0.0
+```
+
+Glue fires **only when the field is absent** from a record's persisted shape — so once data is
+written in the new shape it is a no-op, and old records are never rewritten in place (additive,
+like `RenamedFrom`).
+
+v0.2 scopes both `RenamedFrom` and `Glue` to **non-indexed** fields read through live hydration
+and decode (`get`/`query`/`pluck`); honoring them in the index, snapshot, and arrow decode
+paths, renaming an indexed field, and an offline `migrate`/`verify` that rewrites records to the
+newest shape are `[planned — v0.2]`.
 
 How it works (one paragraph, so the behavior is predictable): the store keeps a **type
 lineage** — every field shape a class ever had gets its own row in the type dictionary, and
