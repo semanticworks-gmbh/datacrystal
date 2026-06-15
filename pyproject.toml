@@ -27,6 +27,11 @@ fts = [
 arrow = [
     "pyarrow>=21",
 ]
+web = [
+    "pydantic>=2",
+    "fastapi",
+    "strawberry-graphql",
+]
 
 [dependency-groups]
 dev = [
