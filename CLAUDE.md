@@ -4,11 +4,16 @@ datacrystal: an embedded object-graph database for Python (EclipseStore-inspired
 objects ARE the database; pickle-free msgpack records, roaring-bitmap queries, SQLite-blob
 durability, and two released-shape extras: `datacrystal[fts]` (FTS5 + Snowball) and
 `datacrystal[arrow]` (persistent parquet mirrors). Solo maintainer: Sven Hodapp. Version
-`0.2.0` — v0.1.0 was the **API-freeze baseline (2026-06-13)**; **v0.2.0 ships the additive
-surface** (multi-valued list index, `limit`/`offset` + `query_iter` streaming, `RenamedFrom`,
-streaming `ArrowMirror.bootstrap`, iterative graph read-path + `list[Lazy]` adjacency, eager
-Index/Unique validation). Extras are pre-tag contract validators, COMMIT-DELTA-v1 LOCKED,
-pyright-strict CI-gated. PyPI publication deferred (names reserved).
+`0.5.0` — v0.1.0 was the **API-freeze baseline (2026-06-13)**; v0.2–0.5 ship a purely
+**additive surface** (the v0.1.0 freeze is never broken): **0.2** = query ergonomics
+(multi-valued list index, `limit`/`offset` + `query_iter`, `RenamedFrom`, streaming
+`ArrowMirror.bootstrap`, iterative graph read-path + `list[Lazy]` adjacency, `store.incoming()`);
+**0.3–0.4** = the persisted index cache (Design A, cardinality-matched, **default-on**) + `order_by`
+top-K + reverse-index caching; **0.5** = `dc.Blob` out-of-line blobs — lazy `BlobHandle`, streamed
+`store.open_blob()`/`snapshot.open_blob()` reads + `dc.BlobSource`/`blob_from_path` streamed write.
+Extras are pre-tag contract validators, COMMIT-DELTA-v1 LOCKED, pyright-strict CI-gated. PyPI
+publication deferred (names reserved). Releases run through `release.yml` (workflow_dispatch,
+pick bump) — never bump versions by hand.
 
 ## Commands
 
