@@ -52,13 +52,16 @@ stale venv shebangs — `rm -rf .venv && uv sync`.
   a manifest-LSM sidecar outside the commit txn. ADR-004+005 converge on a persisted sorted index
   (sorted runs + zone-maps + bloom) — the Bigtable/SSTable shape on the existing segment substrate.
   (ADR-006 reserved for the index-cache lazy key→offset directory, #69 — not yet written.)
-- `docs/design/ADR-007-blob-fields.md` — accepted `dc.Blob` fields (#75): `Annotated[bytes, dc.Blob]`
-  stores bytes **out-of-line raw** in a sibling `blobs` table (record holds a `BLOB_EXT` descriptor),
-  whole-vs-streamed is a **read-time choice** (`.bytes()` / `store.open_blob() -> BinaryIO` via SQLite
-  `blobopen`), no `stream=` flag; v1 single raw cell (size-known, ~954 MiB ceiling), chunked layout =
-  #76 (single-cell→chunked migration, never both). NO engine code shipped yet — this is the gate.
-  The applier + replay vectors are normative and byte-pinned; changes now mean a NEW contract
-  version, never an edit.
+- `docs/design/ADR-007-blob-fields.md` — accepted `dc.Blob` fields (#75), **now SHIPPED**:
+  `Annotated[bytes, dc.Blob]` stores bytes **out-of-line raw** in a sibling `blobs` table (record holds
+  a `BLOB_EXT` descriptor, ext code 5). Whole-vs-streamed is a **read-time choice** — `.bytes()` on the
+  hydrated `BlobHandle`, or streamed `store.open_blob()/snapshot.open_blob() -> BinaryIO` (SQLite
+  `blobopen` on a read view; memory = `BytesIO` fallback). Streamed **write** = assign a
+  `dc.BlobSource(size, open_chunks)` / `dc.blob_from_path` (zeroblob + chunked fill **inside** the commit
+  txn; source hashed before the TID, re-hashed during the fill). No `stream=` flag; v1 single raw cell
+  (size-known, ~954 MiB ceiling), chunked layout = #76 (single-cell→chunked migration, never both).
+  Lazy-whole landed in #88 (#81-83); streamed read/write in #90 (#84/#85). The `BLOB_EXT`/`StreamedBlob`
+  byte format is LOCKED — a change means a NEW contract version, never an edit.
 - `docs/GUIDE.md` — user-facing semantics. Documentation honesty rule: features that do not
   exist are marked `[planned — milestone]`, never described as if real.
 - `docs/design/EVAL-STRATEGY.md` — the **eval feedback loop + the curated real-dataset portfolio**
@@ -98,7 +101,7 @@ stale venv shebangs — `rm -rf .venv && uv sync`.
 
 | Module | Role |
 |---|---|
-| `_store.py` | facade: open/root/store/delete/upsert/commit/get/query/explain/count/pluck/get_many/attach/detach/snapshot; query/count/pluck/explain all take class-or-Condition (symmetry, 2026-06-12); explain() reports the two-rule QueryPlan — NEVER grow an optimizer (DuckDB over the mirror owns that tier); P1 capture (+ prior reads + delta build when consumers watch) → P2 backend I/O → P3 flip + delta delivery; type lineage + hydration plans; decode-level reads (count/pluck) construct no entities; deletes are unchecked per ADR-003 (DanglingRefError on follow); upsert merges into the surviving instance, writing only changed fields |
+| `_store.py` | facade: open/root/store/delete/upsert/commit/get/query/explain/count/pluck/get_many/attach/detach/snapshot/open_blob; query/count/pluck/explain all take class-or-Condition (symmetry, 2026-06-12); explain() reports the two-rule QueryPlan — NEVER grow an optimizer (DuckDB over the mirror owns that tier); P1 capture (+ prior reads + delta build when consumers watch) → P2 backend I/O → P3 flip + delta delivery; type lineage + hydration plans; decode-level reads (count/pluck) construct no entities; deletes are unchecked per ADR-003 (DanglingRefError on follow); upsert merges into the surviving instance, writing only changed fields |
 | `_pipeline.py` | COMMIT-DELTA-v1 emission: `DeltaConsumer` protocol + `build_delta`; delivery in P3 post-durability; a raising consumer detaches loudly (never holds writes hostage) |
 | `_snapshot.py` | `store.snapshot()` frozen `EntityView`/`Ref` reads at a commit watermark, callable from any thread (ADR-002 read views); bitmap `query()`/`count()` + `index_bitmaps()` over snapshot-local indexes rebuilt from the pinned view (never shared with the owner's) |
 | `testing.py` | public conformance kit `check_delta_consumer` + `CountingConsumer` (incl. the snapshot-bootstrap recipe for mid-life attach) |
