@@ -65,7 +65,8 @@ never from :mod:`._reflect` — so plain ``import datacrystal`` stays inside the
 
 from __future__ import annotations
 
-from typing import Any
+from collections.abc import Mapping
+from typing import Any, cast
 
 from strawberry.annotation import StrawberryAnnotation
 from strawberry.dataloader import DataLoader
@@ -74,7 +75,10 @@ from strawberry.types import Info
 from strawberry.types.field import StrawberryField
 from strawberry.types.fields.resolver import StrawberryResolver
 
-from datacrystal._entity import TypeInfo, _is_list_of_scalar
+from datacrystal._entity import (
+    TypeInfo,
+    _is_list_of_scalar,  # pyright: ignore[reportPrivateUsage]  # engine leaf-set predicate, no second "scalar" definition
+)
 from datacrystal._snapshot import EntityView, Ref, Snapshot
 from datacrystal.web._reflect import FieldDescriptor, referenced_entities, reflect
 
@@ -205,12 +209,12 @@ def _relation_field(name: str) -> StrawberryField:
 def _loader_from(info: Info[Any, Any]) -> SnapshotLoader:
     """Pull the per-request :class:`SnapshotLoader` off the GraphQL context, or
     fail loudly if the request was not wired with :func:`snapshot_context`."""
-    context = info.context
-    loader = (
-        context.get(LOADER_CONTEXT_KEY)
-        if isinstance(context, dict)
-        else getattr(context, LOADER_CONTEXT_KEY, None)
-    )
+    context: object = info.context
+    if isinstance(context, Mapping):
+        mapping = cast("Mapping[object, object]", context)
+        loader: object = mapping.get(LOADER_CONTEXT_KEY)
+    else:
+        loader = getattr(context, LOADER_CONTEXT_KEY, None)
     if not isinstance(loader, SnapshotLoader):
         raise RuntimeError(
             "GraphQL relation resolver found no per-request SnapshotLoader on "
@@ -228,7 +232,9 @@ def _is_scalar_field(desc: FieldDescriptor) -> bool:
     (:func:`datacrystal._entity._is_indexable` / ``_is_list_of_scalar``) so the
     GraphQL scalar set is exactly the leaf set the engine treats as plain data —
     no second definition of "scalar" to drift."""
-    from datacrystal._entity import _is_indexable
+    from datacrystal._entity import (
+        _is_indexable,  # pyright: ignore[reportPrivateUsage]  # engine leaf-set predicate, no second "scalar" definition
+    )
 
     return _is_indexable(desc.core_type) or _is_list_of_scalar(desc.core_type)
 
