@@ -17,11 +17,14 @@ The deployment doctrine, in one breath (GUIDE "FastAPI/Strawberry deployment")
   the second one to open the directory fails with ``StoreLockedError``. The
   lifespan opens exactly one store for the process and pins it on ``app.state``.
 * **Reads scale through snapshots, not the live graph.** A read dependency
-  (:func:`read_snapshot`) hands each request a frozen ``store.snapshot()`` — an
+  (:func:`read_snapshot`) hands each request a frozen snapshot — an
   any-thread/any-loop read view (ADR-002) — so a sync route dispatched to a
   threadpool worker, or an async route on the loop, reads committed state without
   ever touching a live entity or violating owner confinement (ADR-001). The
-  snapshot is closed when the request ends (it holds a WAL read txn).
+  snapshot is **pooled per commit watermark** (:class:`_SnapshotPool`, #104), not
+  rebuilt per request: its query index is built once per commit and reused, so a
+  read is O(n)/commit not O(n)/request. The WAL read txn is released when a commit
+  supersedes the watermark (last reader drained) or on shutdown.
 * **Writes serialize through the owner.** A foreign thread may not mutate the
   graph (``WrongThreadError``, unchanged); it **ships a closure** to the owner
   via :func:`submit_write`. The mutation + commit runs on the owner thread, and
@@ -38,6 +41,7 @@ bare ``import datacrystal`` never touches this package; importing
 from __future__ import annotations
 
 import asyncio
+import threading
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import AbstractAsyncContextManager
 from pathlib import Path
@@ -64,6 +68,116 @@ __all__ = [
 #: lifespan and the dependencies can never disagree on the name — the same
 #: discipline as :data:`._strawberry.LOADER_CONTEXT_KEY`.
 STORE_STATE_KEY = "dc_store"
+
+#: The attribute on ``app.state`` under which the lifespan (or the first read)
+#: pins the per-store :class:`_SnapshotPool` (#104). Distinct from the store key
+#: so a hand-wired app that pins only the store still gets a pool lazily.
+SNAPSHOT_POOL_STATE_KEY = "dc_snapshot_pool"
+
+
+class _PooledSnapshot:
+    """One shared snapshot at a single watermark, refcounted (#104).
+
+    A superseded snapshot is closed only once its **last in-flight reader**
+    releases it — so a request mid-query is never reading a closed view, while a
+    snapshot whose watermark a commit has passed does not linger (its sqlite WAL
+    read txn is released promptly, the GUIDE rule). ``refs`` and ``retired`` are
+    mutated only under the owning :class:`_SnapshotPool`'s lock.
+    """
+
+    __slots__ = ("snapshot", "tid", "refs", "retired")
+
+    def __init__(self, snapshot: Snapshot) -> None:
+        self.snapshot = snapshot
+        self.tid = snapshot.tid  # the watermark this snapshot pins (the cache key)
+        self.refs = 0
+        self.retired = False
+
+
+class _SnapshotPool:
+    """Watermark-keyed snapshot cache for the web read path (#104).
+
+    **Why this exists.** A per-request ``store.snapshot()`` rebuilds the
+    snapshot-local query index over the WHOLE store on its first query —
+    snapshot indexes are never shared with the owner's live ones (ADR-002) — an
+    O(store-size) cost paid by *every* request (~52 ms at 38k records, measured
+    on real Gene Ontology in proving ground #93). Reads were therefore O(n) per
+    request, not O(1).
+
+    **What it does.** It pools ONE snapshot per commit watermark: the index is
+    built once (lazily, on the first read at that watermark) and reused by every
+    subsequent read at the same watermark (sub-millisecond), so the cost is
+    O(n)/commit, not O(n)/request. When a commit advances ``store.last_tid`` the
+    next reader builds a fresh snapshot and the old one is retired + closed once
+    drained. Every reader at a watermark sees the same consistent committed state
+    (ADR-002), and the GraphQL DataLoader stays fresh per request (#100) — only
+    the underlying snapshot is shared, and only within one watermark.
+
+    Thread-safe: ``acquire``/``release`` are the only mutators and both take the
+    lock; the snapshot build is cheap (the expensive index build happens later,
+    lazily, under the snapshot's own lock outside this one).
+    """
+
+    __slots__ = ("_store", "_lock", "_current")
+
+    def __init__(self, store: Store) -> None:
+        self._store = store
+        self._lock = threading.Lock()
+        self._current: _PooledSnapshot | None = None
+
+    def acquire(self) -> _PooledSnapshot:
+        """Return the shared snapshot for the current watermark, refcount += 1."""
+        with self._lock:
+            wm = self._store.last_tid  # cheap int read; building under the lock is
+            cur = self._current        # fine — snapshot() is O(1), index build is lazy
+            if cur is None or cur.tid != wm:
+                if cur is not None:
+                    cur.retired = True
+                    self._maybe_close(cur)
+                cur = _PooledSnapshot(self._store.snapshot())
+                self._current = cur
+            cur.refs += 1
+            return cur
+
+    def release(self, pooled: _PooledSnapshot) -> None:
+        """Drop one reader; close a retired snapshot once its last reader is gone."""
+        with self._lock:
+            pooled.refs -= 1
+            self._maybe_close(pooled)
+
+    def _maybe_close(self, pooled: _PooledSnapshot) -> None:
+        # caller holds the lock. Snapshot.close() is idempotent (guards _closed).
+        if pooled.retired and pooled.refs <= 0:
+            pooled.snapshot.close()
+
+    def close(self) -> None:
+        """Close the live snapshot on shutdown (lifespan exit drains requests first)."""
+        with self._lock:
+            cur, self._current = self._current, None
+            if cur is not None:
+                cur.snapshot.close()
+
+
+_POOL_CREATE_LOCK = threading.Lock()
+
+
+def _get_pool(request: Request) -> _SnapshotPool:
+    """The per-store snapshot pool off ``app.state`` (#104), created on first use.
+
+    The lifespan pins it eagerly; a hand-wired app that pins only the store (e.g.
+    a test or the proving ground building the app over an injected store) gets it
+    lazily here. Double-checked under a module lock so two concurrent first
+    requests never build two pools.
+    """
+    app = request.app
+    pool = getattr(app.state, SNAPSHOT_POOL_STATE_KEY, None)
+    if not isinstance(pool, _SnapshotPool):
+        with _POOL_CREATE_LOCK:
+            pool = getattr(app.state, SNAPSHOT_POOL_STATE_KEY, None)
+            if not isinstance(pool, _SnapshotPool):
+                pool = _SnapshotPool(get_store(request))
+                setattr(app.state, SNAPSHOT_POOL_STATE_KEY, pool)
+    return pool
 
 
 def store_lifespan(
@@ -121,8 +235,17 @@ class _StoreLifespan:
         store = Store.open(self._path, **self._open_kwargs)
         self.store = store
         setattr(self._app.state, STORE_STATE_KEY, store)
+        # The watermark-keyed snapshot pool (#104): one snapshot per commit, not
+        # one per request. Pinned eagerly here; reads reach it via _get_pool.
+        setattr(self._app.state, SNAPSHOT_POOL_STATE_KEY, _SnapshotPool(store))
 
     async def __aexit__(self, *exc: object) -> bool | None:
+        # Close the pool's live snapshot BEFORE the store (the snapshot holds a
+        # read view of it); request draining means no reader is mid-query here.
+        pool = getattr(self._app.state, SNAPSHOT_POOL_STATE_KEY, None)
+        if isinstance(pool, _SnapshotPool):
+            pool.close()
+            setattr(self._app.state, SNAPSHOT_POOL_STATE_KEY, None)
         store = self.store
         if store is not None:
             store.close()  # drains the IO worker, persists the index sidecar
@@ -149,7 +272,7 @@ def get_store(request: Request) -> Store:
 
 
 def read_snapshot(request: Request) -> Iterator[Snapshot]:
-    """Yield a per-request ``store.snapshot()``, closed when the request ends.
+    """Yield the **pooled** snapshot for the current watermark (#104).
 
     The **read** dependency: ``snap: Snapshot = Depends(read_snapshot)``. A
     snapshot is a frozen read view at the durable watermark, callable from **any
@@ -159,14 +282,23 @@ def read_snapshot(request: Request) -> Iterator[Snapshot]:
     or in a threadpool worker (sync ``def``). Owner confinement is never at risk
     because nothing here touches the live graph (ADR-001).
 
-    A generator dependency (``yield``) so FastAPI closes the snapshot in the
-    request's teardown even if the handler raises — important on the sqlite
-    backend, where an open snapshot holds a WAL read txn that blocks checkpoint
-    truncation (close promptly, the GUIDE rule).
+    The snapshot is **not** rebuilt per request: a fresh ``store.snapshot()``
+    rebuilds its query index over the whole store on first query (ADR-002:
+    snapshot indexes are never the owner's), an O(store-size) cost. The
+    :class:`_SnapshotPool` shares ONE snapshot per commit watermark — built once,
+    reused by every read at that watermark — so reads are O(n)/commit not
+    O(n)/request (proving ground #93: ~52 ms → sub-ms at 38k records). A
+    generator dependency (``yield``) so the refcount is released in the request's
+    teardown even if the handler raises; the snapshot's WAL read txn is released
+    when a commit supersedes its watermark and its last reader drains, or on
+    shutdown — not per request.
     """
-    store = get_store(request)
-    with store.snapshot() as snap:
-        yield snap
+    pool = _get_pool(request)
+    pooled = pool.acquire()
+    try:
+        yield pooled.snapshot
+    finally:
+        pool.release(pooled)
 
 
 async def submit_write(request: Request) -> "_OwnerWriter":
@@ -227,10 +359,9 @@ def graphql_context_getter(
 
     Pass as the Strawberry ``GraphQLRouter(context_getter=...)``. The snapshot is
     injected from :func:`read_snapshot` (a FastAPI **generator** dependency), so
-    its WAL read txn is closed in the request teardown — Strawberry's
-    ``context_getter`` has no teardown hook of its own, and reusing the read
-    dependency is what gives the GraphQL request the same promptly-closed snapshot
-    a REST route gets.
+    the GraphQL request reads the **same pooled snapshot** a REST route gets
+    (#104, one per commit watermark) and its refcount is released in the request
+    teardown — Strawberry's ``context_getter`` has no teardown hook of its own.
 
     From that one snapshot the context carries a **fresh**
     :class:`~datacrystal.web.SnapshotLoader` (``cache=False``) via

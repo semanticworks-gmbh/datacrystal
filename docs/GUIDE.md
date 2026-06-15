@@ -769,10 +769,16 @@ The **deployment doctrine** — and *why* each rule holds:
   datacrystal app scales **within** one process, not across writer processes (how that still
   scales: [SCALING.md](design/SCALING.md)).
 - **Reads scale through snapshots, never the live graph.** `read_snapshot` hands each request a
-  frozen `store.snapshot()` — an any-thread/any-loop read view (ADR-002) closed when the request
-  ends. A sync route runs in a threadpool worker (off the owner thread) and is *still correct*,
-  because a snapshot is read-only committed state that can never violate owner confinement or
-  dirty-tracking. Routes read `EntityView`s / DTOs (`to_pydantic`), never live entities.
+  frozen snapshot — an any-thread/any-loop read view (ADR-002). A sync route runs in a threadpool
+  worker (off the owner thread) and is *still correct*, because a snapshot is read-only committed
+  state that can never violate owner confinement or dirty-tracking. Routes read `EntityView`s /
+  DTOs (`to_pydantic`), never live entities. The snapshot is **pooled per commit watermark**: a
+  fresh `store.snapshot()` rebuilds its query index over the whole store on first query (ADR-002 —
+  snapshot indexes are never the owner's), so building one per request is O(store-size) per
+  request. Instead one snapshot is shared by every read at a watermark — index built once,
+  rebuilt only when a commit advances it — so a read is **O(n)/commit, not O(n)/request** (on real
+  Gene Ontology, 38k terms: ~52 ms → ~0.7 ms p50). Its WAL read txn is released when a commit
+  supersedes the watermark or on shutdown.
 - **Writes serialize through the owner.** A foreign thread may not mutate the graph — a direct
   live write still raises `WrongThreadError`, unchanged. `submit_write` instead *ships a closure*
   to the owner via `store.submit()`; the mutation **and commit** run on the owner thread, and

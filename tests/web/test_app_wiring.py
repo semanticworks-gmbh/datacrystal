@@ -282,10 +282,11 @@ def test_get_store_without_lifespan_fails_loudly(tmp_path) -> None:
         assert resp.status_code == 500
 
 
-def test_read_snapshot_is_closed_after_the_request(tmp_path) -> None:
-    """read_snapshot is a generator dependency: FastAPI closes the snapshot in
-    the request teardown (its WAL read txn must not leak). We capture the
-    snapshot the route saw and assert it is closed once the response returns."""
+def test_read_snapshot_is_pooled_per_watermark(tmp_path) -> None:
+    """#104: reads at one watermark share ONE pooled snapshot (index built once,
+    not per request) and it is closed on SHUTDOWN — not per request. The identity
+    check is the same-run proof that only one snapshot is built across many reads
+    at a watermark: O(n)/commit, not O(n)/request (proving ground #93)."""
     path = str(tmp_path / "cab.store")
     _seed(path)
     seen: list[Snapshot] = []
@@ -299,9 +300,40 @@ def test_read_snapshot_is_closed_after_the_request(tmp_path) -> None:
 
     with TestClient(app) as client:
         assert client.get("/peek").status_code == 200
-    assert len(seen) == 1
-    # The snapshot the route used was closed by the dependency teardown.
-    assert seen[0]._closed  # pyright: ignore[reportPrivateUsage]  # asserting teardown closed it
+        assert client.get("/peek").status_code == 200
+        # Same watermark → the SAME pooled snapshot, NOT rebuilt or closed between
+        # requests (the one O(n) index build is amortised across every read).
+        assert len(seen) == 2
+        assert seen[0] is seen[1]
+        assert not seen[0]._closed  # pyright: ignore[reportPrivateUsage]
+    # Shutdown closed the pooled snapshot (its WAL read txn released).
+    assert seen[0]._closed  # pyright: ignore[reportPrivateUsage]
+
+
+def test_snapshot_pool_refreshes_when_a_commit_advances_the_watermark(tmp_path) -> None:
+    """#104: when a commit advances ``store.last_tid`` the next read builds a
+    FRESH pooled snapshot at the new watermark, and the superseded one is closed
+    once its last reader drained — reads never go stale, the old WAL txn is freed."""
+    path = str(tmp_path / "cab.store")
+    _seed(path)
+    seen: list[Snapshot] = []
+
+    app = _make_rest_app(path)
+
+    @app.get("/peek")
+    def peek(snap: Snapshot = Depends(read_snapshot)):  # noqa: ANN202
+        seen.append(snap)
+        return {"tid": snap.tid}
+
+    with TestClient(app) as client:
+        assert client.get("/peek").status_code == 200                 # snapshot A @ tid T
+        assert client.post("/minerals/NEW", params={"name": "Beryl"}).status_code == 200  # → T+1
+        assert client.get("/peek").status_code == 200                 # snapshot B @ tid T+1
+    assert len(seen) == 2
+    assert seen[0] is not seen[1]
+    assert seen[0].tid < seen[1].tid
+    # The superseded snapshot A was retired + closed (no reader still holds it).
+    assert seen[0]._closed  # pyright: ignore[reportPrivateUsage]
 
 
 def test_store_lifespan_factory_builds_the_lifespan_cm(tmp_path) -> None:
