@@ -733,6 +733,66 @@ store.close()
 - Hydration faults (`Lazy.get()`, queries) load synchronously on the loop — the explicit
   `Lazy[T]` cut points make where that can happen visible in your model.
 
+### FastAPI / Strawberry deployment: `datacrystal[web]`
+
+The `datacrystal[web]` extra wires a store into a FastAPI/Strawberry app so your routes and
+resolvers never have to learn the threading rules. It is **glue, not a new engine** — under it
+are the same `store.snapshot()` (reads), `store.submit()` / `aopen()` (writes) and per-request
+DataLoader you would wire by hand. Three primitives, one doctrine:
+
+```python
+from datacrystal.web import (
+    create_app, read_snapshot, submit_write, get_store, graphql_context_getter,
+)
+
+app = create_app("cabinet.store")           # opens ONE store on startup, closes on shutdown
+
+@app.get("/minerals/{qid}")                  # READ: a per-request snapshot, any thread
+def read_one(qid: str, snap = Depends(read_snapshot)):
+    hit = snap.query(Mineral.qid == qid)
+    return to_pydantic(hit[0], face="public") if hit else Response(status_code=404)
+
+@app.post("/minerals")                       # WRITE: fan the mutation into the owner
+async def create(body: MineralCreate, write = Depends(submit_write)):
+    def do(store):                           # runs ON the owner thread, then commits
+        store.store(from_pydantic(body, Mineral))
+        return store.commit()                # return plain data (a TID), never a live entity
+    return {"committed_tid": await write(do)}
+```
+
+The **deployment doctrine** — and *why* each rule holds:
+
+- **One store per worker — run `workers=1`.** A store is single-writer (the lease lock); the
+  lifespan `create_app`/`store_lifespan` builds opens exactly one store for the process, on the
+  startup thread (which becomes its owner thread, ADR-001). `uvicorn --workers 4` is *four
+  processes*, and the second one to open the directory fails with `StoreLockedError` — so a
+  datacrystal app scales **within** one process, not across writer processes (how that still
+  scales: [SCALING.md](design/SCALING.md)).
+- **Reads scale through snapshots, never the live graph.** `read_snapshot` hands each request a
+  frozen `store.snapshot()` — an any-thread/any-loop read view (ADR-002) closed when the request
+  ends. A sync route runs in a threadpool worker (off the owner thread) and is *still correct*,
+  because a snapshot is read-only committed state that can never violate owner confinement or
+  dirty-tracking. Routes read `EntityView`s / DTOs (`to_pydantic`), never live entities.
+- **Writes serialize through the owner.** A foreign thread may not mutate the graph — a direct
+  live write still raises `WrongThreadError`, unchanged. `submit_write` instead *ships a closure*
+  to the owner via `store.submit()`; the mutation **and commit** run on the owner thread, and
+  `await write(fn)` resolves only once it is durable (back-pressure by construction). Write
+  routes are `async def` so they run on the owner loop and the closure runs inline; return plain
+  data from the closure (an OID or a DTO) — a live entity in the result raises `EntityEscapeError`.
+- **GraphQL gets a per-request snapshot *and* a per-request DataLoader.** Pass
+  `GraphQLRouter(schema, context_getter=graphql_context_getter)`: each request's context carries
+  one pinned snapshot and a **fresh** `SnapshotLoader` (`cache=False`) over it. This is
+  mandatory, not an optimization — a process-lifetime loader caches by default and would leak
+  resolved entities across requests *and* across snapshot watermarks (a stale read after a
+  commit). Every field on the request reads from the one watermark, so a nested graph traversal
+  is internally consistent even while the owner keeps committing — and sibling reference edges
+  batch into one `Snapshot.get_many` instead of N+1-ing the store.
+
+`get_store` exposes the one process store directly (for a route that needs it, e.g. to call
+`submit_write` itself); it raises if the app was not built with the lifespan. The frameworks
+(`fastapi`/`strawberry`/`pydantic`) live only inside `datacrystal.web` — a bare
+`import datacrystal` never pulls them, staying inside the `{msgspec, pyroaring}` budget.
+
 ## Snapshots and the commit-delta pipeline
 
 ### `store.snapshot()` — reading from any thread
