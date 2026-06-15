@@ -17,7 +17,7 @@ protocol — that is the whole point of keeping it this small:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Iterator, Protocol
+from typing import BinaryIO, Callable, Iterable, Iterator, Protocol
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,6 +44,25 @@ class StoredBlob:
     data: bytes
 
 
+@dataclass(frozen=True, slots=True)
+class StreamedBlob:
+    """A blob written by STREAMING (ADR-007 §4): the bytes are NOT resident.
+
+    ``open_chunks()`` yields them on demand, and the backend fills a
+    ``zeroblob(size)`` cell in place inside ``apply()``'s transaction — so a
+    100 MB PDF is committed without ever holding it whole in RAM. ``size`` and
+    ``hash`` (sha256) are already final (computed in the engine's pre-TID
+    hashing pass); the backend recomputes only the ``crc`` as it fills. The
+    in-memory fake, which has no ``blobopen``, materializes the chunks instead
+    (the one backend difference for streaming)."""
+
+    oid: int
+    tid: int
+    size: int
+    hash: bytes
+    open_chunks: Callable[[], Iterable[bytes]]
+
+
 @dataclass(slots=True)
 class CommitBatch:
     """Everything one commit persists, applied atomically by the backend.
@@ -67,6 +86,10 @@ class CommitBatch:
     # both survive a crash or neither does. Blobs are immutable: a changed blob
     # mints a new OID, the old cell is never touched.
     blobs: list[StoredBlob] = field(default_factory=list[StoredBlob])
+    # Out-of-line blobs written by STREAMING (ADR-007 §4) — same atomic
+    # transaction, but filled chunk-by-chunk from a source rather than handed
+    # over whole. Disjoint from ``blobs``: a value is either resident or streamed.
+    blob_streams: list[StreamedBlob] = field(default_factory=list[StreamedBlob])
 
 
 @dataclass(slots=True)
@@ -92,6 +115,18 @@ class StorageReadView(Protocol):
     def scan_type(self, cid: int) -> Iterator[StoredRecord]: ...
 
     def load_blob(self, oid: int) -> StoredBlob | None: ...
+
+    def open_blob_stream(
+        self, oid: int, on_close: Callable[[], None] | None = None
+    ) -> BinaryIO:
+        """A file-like reader over one blob's raw bytes (ADR-007 §3 streamed
+        read): ``read(n)``/``seek``/``tell`` touch only the spanned bytes, so a
+        range read of a big blob is RSS-bounded. ``on_close`` (if given) runs
+        when the stream closes — the engine passes a dedicated read view's
+        ``close`` so the pinned read transaction is released with the stream.
+        Raises :class:`~datacrystal._errors.DanglingRefError` if the blob OID is
+        absent (deleted per ADR-003, or never committed)."""
+        ...
 
     def close(self) -> None: ...
 

@@ -85,6 +85,29 @@ uv run --extra fts python evals/proving_grounds/search.py
 # SEARCH_DIR=miracl-de SEARCH_LANG=german QRELS=dev uv run --extra fts python evals/proving_grounds/search.py
 ```
 
+### #6 — Blob store · real PDFs/documents (enterprise-search + SOR-archive persona) · local
+
+Like MaStR, this one is **local-first** — point `BLOB_DIR` at a directory of documents you have
+(the persona is literally "your invoice/scan archive"). It proves the two blob claims (ADR-007):
+the object table stays flat no matter how many GB of PDF you store, and streamed write/read keep
+peak RSS far below the bytes. Correctness oracle: every blob's sha256 round-trips.
+
+```bash
+BLOB_DIR=/path/to/your/pdfs uv run python evals/proving_grounds/blob_store.py
+# knobs: BLOB_GLOB='**/*.pdf' (default) · BLOB_MAX=0 (all) · BLOB_CHUNK=1048576
+```
+
+No corpus handy? Any folder of files works (PDFs are ideal — multi-MB, real shape). A quick
+public-domain set, e.g. a few NASA technical reports (US-gov, public domain):
+
+```bash
+mkdir -p evals/data/pdfs && cd evals/data/pdfs
+for id in 19950020935 19930091059 20040031234; do
+  curl -sL -o "$id.pdf" "https://ntrs.nasa.gov/api/citations/$id/downloads/$id.pdf"
+done
+cd - && BLOB_DIR=evals/data/pdfs uv run python evals/proving_grounds/blob_store.py
+```
+
 ## Attribution / licenses
 
 - Gene Ontology — CC-BY 4.0, http://geneontology.org

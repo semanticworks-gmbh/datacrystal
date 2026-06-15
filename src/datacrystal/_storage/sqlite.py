@@ -20,12 +20,20 @@ Durability is the KICKOFF M2 fsync triad (per-commit / interval / never):
 
 from __future__ import annotations
 
+import hashlib
+import io
 import sqlite3
 import sys
+import zlib
 from pathlib import Path
-from typing import Iterator, cast
+from typing import Any, BinaryIO, Callable, Iterator, cast
 
-from datacrystal._errors import CorruptRecordError, NewerStoreError
+from datacrystal._errors import (
+    CorruptRecordError,
+    DanglingRefError,
+    NewerStoreError,
+    StoreClosedError,
+)
 from datacrystal._ids import FORMAT_VERSION
 from datacrystal._records import crc as _crc
 from datacrystal._storage.protocol import BootInfo, CommitBatch, StoredBlob, StoredRecord
@@ -120,6 +128,121 @@ def _read_meta_and_types(conn: sqlite3.Connection) -> BootInfo:
     return BootInfo(meta=meta, types=types)
 
 
+def _closed_underneath() -> StoreClosedError:
+    return StoreClosedError(
+        "this blob stream's store/snapshot read view was closed underneath it — "
+        "a blob stream must not outlive the snapshot or store it came from"
+    )
+
+
+class _SqliteBlobReader(io.RawIOBase):
+    """A raw reader over a ``sqlite3.Blob`` (ADR-007 §3 streamed read).
+
+    ``readinto``/``seek``/``tell`` delegate to the open blob handle, so wrapped
+    in an ``io.BufferedReader`` a ``read(n)``/range read pulls only the spanned
+    bytes off disk — peak RSS is the buffer, never the blob size. ``seek`` past
+    EOF is allowed (standard file semantics, matching the memory fallback's
+    ``BytesIO``): the cursor parks at EOF and reads return ``b""``. Closing also
+    runs ``on_close`` (the engine passes its dedicated read view's ``close``, so
+    the pinned WAL read transaction is released exactly when the stream is).
+
+    If the connection is closed out from under the stream (a stream that outlived
+    its snapshot), every op translates the raw ``sqlite3.ProgrammingError`` to
+    :class:`StoreClosedError` — the public surface stays DataCrystalError-only."""
+
+    def __init__(self, blob: sqlite3.Blob, on_close: Callable[[], None] | None) -> None:
+        self._blob = blob
+        self._on_close = on_close
+        self._len = len(blob)
+        self._overshoot = 0  # bytes the logical cursor sits PAST EOF (seek-past-end)
+
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return True
+
+    def readinto(self, b: Any) -> int:  # type: ignore[override]  # buffer protocol
+        if self._overshoot:  # cursor parked past EOF → no bytes (file semantics)
+            return 0
+        try:
+            chunk = self._blob.read(len(b))
+        except sqlite3.ProgrammingError as exc:
+            raise _closed_underneath() from exc
+        n = len(chunk)
+        b[:n] = chunk
+        return n
+
+    def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
+        if whence == io.SEEK_SET:
+            target = offset
+        elif whence == io.SEEK_CUR:
+            target = self.tell() + offset
+        elif whence == io.SEEK_END:
+            target = self._len + offset
+        else:
+            raise ValueError(f"invalid whence {whence!r}")
+        if target < 0:
+            raise ValueError("negative seek position")
+        try:
+            if target > self._len:  # park at EOF, remember the overshoot
+                self._blob.seek(self._len)
+                self._overshoot = target - self._len
+            else:
+                self._blob.seek(target)
+                self._overshoot = 0
+        except sqlite3.ProgrammingError as exc:
+            raise _closed_underneath() from exc
+        return target
+
+    def tell(self) -> int:
+        try:
+            return self._blob.tell() + self._overshoot
+        except sqlite3.ProgrammingError as exc:
+            raise _closed_underneath() from exc
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        try:
+            try:
+                self._blob.close()
+            except sqlite3.ProgrammingError:
+                pass  # connection already torn down — nothing left to release here
+        finally:
+            try:
+                if self._on_close is not None:
+                    self._on_close()
+            finally:
+                super().close()
+
+
+def _open_blob_stream(
+    conn: sqlite3.Connection, oid: int, on_close: Callable[[], None] | None
+) -> BinaryIO:
+    try:
+        blob = conn.blobopen("blobs", "data", oid, readonly=True)
+    except sqlite3.OperationalError as exc:  # no row with that rowid in `blobs`
+        if on_close is not None:
+            on_close()
+        raise DanglingRefError(
+            f"no blob for oid {oid} in the store — deleted (v0.x deletes are "
+            "unchecked, ADR-003) or never committed; the blob reference you "
+            "followed is stale"
+        ) from exc
+    except BaseException:  # any other failure: still release the dedicated view
+        if on_close is not None:
+            on_close()
+        raise
+    try:
+        return io.BufferedReader(_SqliteBlobReader(blob, on_close))
+    except BaseException:  # reader construction failed: don't leak the blob/view
+        blob.close()
+        if on_close is not None:
+            on_close()
+        raise
+
+
 class SqliteReadView:
     """A pinned WAL read transaction over its own connection (ADR-002).
 
@@ -152,6 +275,11 @@ class SqliteReadView:
 
     def load_blob(self, oid: int) -> StoredBlob | None:
         return _load_blob(self._conn, oid)
+
+    def open_blob_stream(
+        self, oid: int, on_close: Callable[[], None] | None = None
+    ) -> BinaryIO:
+        return _open_blob_stream(self._conn, oid, on_close)
 
     def close(self) -> None:
         if self._closed:
@@ -283,6 +411,51 @@ class SqliteBackend:
                         (b.oid, b.tid, b.size, b.hash, _crc(b.data), b.data)
                         for b in batch.blobs
                     ],
+                )
+            for sb in batch.blob_streams:  # streamed fill (ADR-007 §4), same txn
+                # Allocate the cell, then fill it in place — the bytes are never
+                # whole in RAM. crc is accumulated over the chunks and patched in
+                # once the fill is verified complete (all inside this txn → still
+                # atomic; a torn fill rolls back with the record).
+                conn.execute(
+                    "INSERT OR REPLACE INTO blobs (oid, tid, size, hash, crc, data) "
+                    "VALUES (?, ?, ?, ?, 0, zeroblob(?))",
+                    (sb.oid, sb.tid, sb.size, sb.hash, sb.size),
+                )
+                written = 0
+                running_crc = 0
+                hasher = hashlib.sha256()
+                with conn.blobopen("blobs", "data", sb.oid) as cell:
+                    for chunk in sb.open_chunks():
+                        if written + len(chunk) > sb.size:
+                            raise ValueError(
+                                f"streamed blob oid={sb.oid} produced more than "
+                                f"its declared size {sb.size} bytes"
+                            )
+                        cell.write(chunk)
+                        running_crc = zlib.crc32(chunk, running_crc)
+                        hasher.update(chunk)
+                        written += len(chunk)
+                if written != sb.size:
+                    raise ValueError(
+                        f"streamed blob oid={sb.oid} produced {written} bytes "
+                        f"but declared size {sb.size} (a sized streamed write "
+                        "must fill the whole cell)"
+                    )
+                if hasher.digest() != sb.hash:
+                    # The fill pass disagreed with the pre-TID hashing pass: a
+                    # non-deterministic source (or a file edited mid-commit). The
+                    # descriptor hash would lie about the stored bytes — reject,
+                    # rolling the whole commit back gaplessly (invariant 5).
+                    raise ValueError(
+                        f"streamed blob oid={sb.oid} bytes changed between the "
+                        "hashing pass and the fill pass (the source is "
+                        "non-deterministic) — refusing to store a descriptor "
+                        "hash that would not match the bytes"
+                    )
+                conn.execute(
+                    "UPDATE blobs SET crc=? WHERE oid=?",
+                    (running_crc & 0xFFFFFFFF, sb.oid),
                 )
             if batch.deletes:  # physical removal (ADR-003) — no tombstone rows
                 conn.executemany(

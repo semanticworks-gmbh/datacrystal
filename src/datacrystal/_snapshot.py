@@ -20,7 +20,7 @@ from __future__ import annotations
 import threading
 import warnings
 from types import MappingProxyType
-from typing import Any, Iterator, Mapping, cast
+from typing import Any, BinaryIO, Iterator, Mapping, cast
 
 from pyroaring import BitMap64, FrozenBitMap64
 
@@ -55,7 +55,7 @@ from datacrystal._indexes import (
     windowed_index_order,
 )
 from datacrystal._lazy import Lazy
-from datacrystal._records import RefToken, decode_payload
+from datacrystal._records import BlobToken, RefToken, decode_payload
 from datacrystal._storage.protocol import StorageReadView
 
 _VIEW_CHUNK = 8192  # records per load_many in snapshot scans (peak-RAM bound)
@@ -326,6 +326,33 @@ class Snapshot:
                     )
                 view = self._materialize(rec.oid, rec.cid, rec.payload)
             return view
+
+    def open_blob(self, view: "EntityView | Ref | int", field: str) -> BinaryIO:
+        """Open a committed ``dc.Blob`` field as a binary stream (ADR-007 §3) —
+        the fully off-owner sibling of ``Store.open_blob``. Streams over THIS
+        snapshot's pinned read view, so it needs no owner thread and shares the
+        snapshot's watermark; closing the stream does NOT close the snapshot
+        (close the snapshot itself when done). A ``None`` blob raises
+        ``ValueError``; a non-blob field raises ``TypeError``."""
+        ev = view if isinstance(view, EntityView) else self.get(view)
+        fields = ev.fields()
+        if field not in fields:
+            raise QueryError(
+                f"{ev.typename} snapshot view has no field {field!r}"
+            )
+        value = fields[field]
+        if isinstance(value, BlobToken):
+            with self._lock:
+                self._guard()
+                # on_close=None: the stream rides the snapshot's shared view, so
+                # closing it must not tear down the snapshot's read transaction.
+                return self._view.open_blob_stream(value.blob_oid)
+        if value is None:
+            raise ValueError(f"{ev.typename}.{field} is None — no blob to open")
+        raise TypeError(
+            f"{ev.typename}.{field} is not a dc.Blob field — open_blob() streams "
+            "out-of-line blob values only"
+        )
 
     def all(self, cls_or_typename: type | str, *, limit: int | None = None,
             offset: int = 0, order_by: Any = None) -> list[EntityView]:

@@ -1,6 +1,6 @@
 """Helper app for the kill -9 blob crash test (ADR-007 atomicity).
 
-    python _crash_blob_app.py write  <store-dir>
+    python _crash_blob_app.py write  <store-dir> [whole|stream]
     python _crash_blob_app.py verify <store-dir> <minimum-batch>
 
 Each batch commits one Scan whose image is an out-of-line dc.Blob, with the
@@ -9,13 +9,21 @@ each batch AFTER its commit() returned — every printed batch is acked and must
 survive the SIGKILL with BOTH halves intact: the referrer record AND its blob
 row (the referrer's handle.bytes() must equal the expected bytes). This is the
 ADR-007 claim that a record and its blob land in one atomic transaction.
+
+``whole`` writes the bytes resident (StoredBlob); ``stream`` writes them via a
+``dc.BlobSource`` (zeroblob + incremental blobopen fill, ADR-007 §4) — proving
+the streamed fill rides the SAME atomic transaction, so a torn streamed commit
+can never leave a half-filled zeroblob behind a surviving record.
 """
+# Assigning a dc.BlobSource to a bytes-typed dc.Blob field is the documented
+# write-asymmetry (ADR-007 §4) — untypeable like the magic-query syntax.
+# pyright: reportArgumentType=false
 
 from __future__ import annotations
 
 import hashlib
 import sys
-from typing import Annotated
+from typing import Annotated, Iterator
 
 import datacrystal as dc
 
@@ -31,11 +39,19 @@ def _bytes_for(batch: int) -> bytes:
     return (f"batch-{batch}-".encode() * 256)
 
 
-def write(path: str) -> None:
+def write(path: str, mode: str = "whole") -> None:
     store = dc.Store.open(path, lock_ttl=0.5, durability="commit")
     batch = 0
     while True:
-        store.store(Scan(batch=batch, image=_bytes_for(batch)))
+        data = _bytes_for(batch)
+        if mode == "stream":
+            def chunks(data: bytes = data) -> Iterator[bytes]:
+                for i in range(0, len(data), 512):
+                    yield data[i:i + 512]
+            image: bytes | dc.BlobSource = dc.BlobSource(len(data), chunks)
+        else:
+            image = data
+        store.store(Scan(batch=batch, image=image))
         store.commit()
         print(batch, flush=True)
         batch += 1
@@ -63,6 +79,6 @@ def verify(path: str, minimum_batch: int) -> None:
 
 if __name__ == "__main__":
     if sys.argv[1] == "write":
-        write(sys.argv[2])
+        write(sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else "whole")
     else:
         verify(sys.argv[2], int(sys.argv[3]))
