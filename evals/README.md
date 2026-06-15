@@ -108,6 +108,43 @@ done
 cd - && BLOB_DIR=evals/data/pdfs uv run python evals/proving_grounds/blob_store.py
 ```
 
+### #7 — Web tier · FastAPI + Strawberry over the Gene Ontology polyhierarchy · CC-BY 4.0 · ~31 MB
+
+The `datacrystal[web]` proving ground: a **real** FastAPI REST boundary and a real
+Strawberry GraphQL boundary, both over the Gene Ontology graph from #1. The deep
+`is_a` polyhierarchy is the point — a nested GraphQL `term → parents → parents → …`
+query is exactly the shape that triggers GraphQL's N+1 read amplification, so it is
+the honest real-shape proof of the per-request DataLoader (#100) and the #101
+op-count gate. Needs the `web` extra (`fastapi`/`strawberry`/`pydantic`) and `httpx`
+(the `TestClient` transport).
+
+It reports honest absolutes — a REST list endpoint p50/p99 + throughput, a nested
+GraphQL query p50/p99 + throughput — and asserts two correctness oracles:
+
+- **the N+1 oracle** — the store-load COUNT per GraphQL request is `O(depth)`, not
+  `O(nodes)`: a depth-`D` ancestor walk that fans out across each level issues
+  exactly `D` `get_many` batches (one per relation level), proving the DataLoader
+  actually batches on real shape (the property `tests/fitness/test_graphql_no_n_plus_1.py`
+  pins on the mineral cabinet, here on the real graph);
+- **the zero-Pydantic oracle** — the GraphQL path resolves off frozen `EntityView`s
+  via `getattr` and builds **zero** Pydantic models; REST validates one DTO per row,
+  so the tax is REST-only.
+
+```bash
+curl -sL --create-dirs -o evals/data/go-basic.obo \
+  https://current.geneontology.org/ontology/go-basic.obo
+uv run --extra web python evals/proving_grounds/web_api.py
+```
+
+A FAST self-check (no download) verifies the whole harness — the app boots, REST +
+the nested-GraphQL endpoint respond, and **both oracles fire** — over a tiny
+synthetic GO-shaped graph (deep `is_a` chains). It runs automatically when the OBO
+file is absent, and on demand:
+
+```bash
+WEB_SMOKE=1 uv run --extra web python evals/proving_grounds/web_api.py
+```
+
 ## Attribution / licenses
 
 - Gene Ontology — CC-BY 4.0, http://geneontology.org
