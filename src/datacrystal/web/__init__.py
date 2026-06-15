@@ -30,7 +30,13 @@ from datacrystal.web._reflect import FieldDescriptor, reflect
 from datacrystal.web import _pydantic  # noqa: F401  # pyright: ignore[reportUnusedImport]  # extra home #96-98
 
 # --- _strawberry: GraphQL boundary (#99-#101) ---------------------------------
-from datacrystal.web._strawberry import StrawberryReflector, reflect_strawberry_type
+from datacrystal.web._strawberry import (
+    LOADER_CONTEXT_KEY,
+    SnapshotLoader,
+    StrawberryReflector,
+    reflect_strawberry_type,
+    snapshot_context,
+)
 
 # --- _app: FastAPI app wiring (#92) -------------------------------------------
 from datacrystal.web import _app  # noqa: F401  # pyright: ignore[reportUnusedImport]  # extra home #92
@@ -43,5 +49,9 @@ __all__ = [
     # _strawberry (#99-#101)
     "StrawberryReflector",
     "reflect_strawberry_type",
+    # _strawberry (#100): per-request DataLoader over a snapshot
+    "LOADER_CONTEXT_KEY",
+    "SnapshotLoader",
+    "snapshot_context",
     # _app (#92): append the app factory
 ]

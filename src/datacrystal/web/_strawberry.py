@@ -19,11 +19,36 @@ What this story (#99) builds, and where it stops:
   live entity crosses the request edge.
 * **Entity-reference fields** (``FieldSpec.entity_ref`` / ``lazy_refs``) become
   GraphQL *object* fields whose declared type is the referenced ``@entity``'s
-  reflected Strawberry type. They too carry **no resolver** here — the default
-  resolver returns the raw :class:`~datacrystal._snapshot.Ref` token sitting in
-  the view. Turning that ``Ref`` into the referenced view is the **relation
-  resolver wired in #100 (S6b)**, batched per-request by a DataLoader (#101) —
-  not hand-hydrated here.
+  reflected Strawberry type. Since #100 (S6b) they carry an **async relation
+  resolver** (:func:`_relation_resolver`): it reads the raw
+  :class:`~datacrystal._snapshot.Ref` token the default resolver would have
+  returned and hands the OID to a **per-request DataLoader**, so a query
+  following N sibling refs in one resolver tick batches into **one**
+  ``Snapshot.get_many`` instead of N+1-ing the store.
+
+The DataLoader (the N+1 killer)
+-------------------------------
+
+The relation resolver pulls a :class:`SnapshotLoader` off ``info.context`` (the
+key :data:`LOADER_CONTEXT_KEY`) and awaits ``loader.load(oid)``. The loader
+is **built per request, not defaulted** (:func:`snapshot_context` /
+:meth:`SnapshotLoader.__init__`):
+
+* its ``load_fn`` is :meth:`Snapshot.get_many` over the **one** snapshot pinned
+  for that request/operation — the same watermark every field on the request
+  reads from (ADR-002 read views);
+* it is constructed with ``cache=False``. Strawberry's vendored DataLoader
+  defaults to ``cache=True`` (``dataloader.py:139``), a **lifetime** cache that
+  would leak resolved entities across requests *and* across snapshot watermarks
+  (a stale read after a commit). Request scoping is a property we *build* by
+  turning that off and constructing the loader fresh per request — never a
+  default we inherit (:func:`test_loader_is_request_scoped_not_lifetime_cached`);
+* a tick's ``.load()`` calls coalesce into one batch by Strawberry's
+  ``call_soon`` scheduling (``dataloader.py:248``), so the load_fn receives the
+  whole sibling-set of OIDs at once;
+* a deleted/dangling ``Ref`` rides ``get_many``'s None-on-miss (ADR-003,
+  unchecked deletes) — the loader returns ``None`` in that slot and the field
+  resolves to GraphQL ``null``, never a 500.
 
 Mutually- and self-referential entities (``Mineral`` ↔ ``Locality``) are built
 with the type registry in :class:`StrawberryReflector`: each entity gets one
@@ -43,13 +68,156 @@ from __future__ import annotations
 from typing import Any
 
 from strawberry.annotation import StrawberryAnnotation
+from strawberry.dataloader import DataLoader
 from strawberry.tools import create_type
+from strawberry.types import Info
 from strawberry.types.field import StrawberryField
+from strawberry.types.fields.resolver import StrawberryResolver
 
 from datacrystal._entity import TypeInfo, _is_list_of_scalar
+from datacrystal._snapshot import EntityView, Ref, Snapshot
 from datacrystal.web._reflect import FieldDescriptor, referenced_entities, reflect
 
-__all__ = ["StrawberryReflector", "reflect_strawberry_type"]
+__all__ = [
+    "LOADER_CONTEXT_KEY",
+    "SnapshotLoader",
+    "StrawberryReflector",
+    "reflect_strawberry_type",
+    "snapshot_context",
+]
+
+#: The key under which a per-request :class:`SnapshotLoader` lives on the
+#: GraphQL ``info.context``. The relation resolver looks it up here; the request
+#: wiring (#92) and :func:`snapshot_context` put it there. A module-level
+#: constant (not a bare string at the call sites) so the resolver and the
+#: context builder can never disagree on the name.
+LOADER_CONTEXT_KEY = "dc_snapshot_loader"
+
+
+class SnapshotLoader:
+    """A per-request DataLoader over one pinned snapshot — the N+1 killer (#100).
+
+    Holds a :class:`strawberry.dataloader.DataLoader` whose ``load_fn`` is this
+    snapshot's :meth:`~datacrystal._snapshot.Snapshot.get_many` (#94): a batch of
+    OIDs collected in one resolver tick resolves in a single
+    :meth:`~datacrystal._snapshot.Snapshot.get_many` round-trip, aligned 1:1 and
+    ``None``-tolerant on a dangling reference (ADR-003 unchecked deletes).
+
+    **Request-scoped by construction, not by default.** Strawberry's vendored
+    DataLoader defaults to ``cache=True`` (``dataloader.py:139``) — a *lifetime*
+    cache keyed by OID that would survive across requests and across snapshot
+    watermarks, serving a pre-commit entity after a later commit changed it. We
+    build the loader with ``cache=False`` and construct one fresh per request
+    (:func:`snapshot_context`), so the only thing scoping a batch is the request
+    itself. The tick-coalescing that turns N sibling ``.load()`` calls into one
+    ``get_many`` is Strawberry's ``call_soon`` batch dispatch (``dataloader.py:248``),
+    which ``cache=False`` does not disturb.
+
+    One loader binds one snapshot: every field on the request reads from the same
+    committed watermark (ADR-002 read views), so a graph traversal is internally
+    consistent even while the owner thread keeps committing.
+    """
+
+    __slots__ = ("snapshot", "loader")
+
+    def __init__(self, snapshot: Snapshot) -> None:
+        self.snapshot = snapshot
+
+        async def load_fn(oids: list[int]) -> list[EntityView | None]:
+            # get_many is sync (a snapshot read view); the DataLoader contract is
+            # an async load_fn returning a list aligned 1:1 with the keys —
+            # exactly get_many's shape (#94), None where an OID is gone.
+            return snapshot.get_many(oids)
+
+        # cache=False is the load-bearing argument (see the class docstring): the
+        # default cache=True is a lifetime cache that leaks across watermarks.
+        self.loader: DataLoader[int, EntityView | None] = DataLoader(
+            load_fn=load_fn, cache=False
+        )
+
+    async def load(self, oid: int) -> EntityView | None:
+        """Resolve one OID through the batched loader (``None`` if gone)."""
+        return await self.loader.load(oid)
+
+
+def snapshot_context(snapshot: Snapshot) -> dict[str, Any]:
+    """Build a fresh GraphQL ``context`` carrying a per-request
+    :class:`SnapshotLoader` over ``snapshot`` (#100).
+
+    Call this **once per request/operation** with the snapshot pinned for that
+    request, then pass the result as ``context_value`` to ``schema.execute`` /
+    ``execute_sync`` (or return it from the FastAPI GraphQL ``context_getter``,
+    #92). Building it per request — rather than sharing one loader on the schema —
+    is what scopes batching and caching to the request and pins every field to
+    one watermark (ADR-002). The dict is the caller's to extend with other
+    per-request values; the relation resolver only reads
+    :data:`LOADER_CONTEXT_KEY`."""
+    return {LOADER_CONTEXT_KEY: SnapshotLoader(snapshot)}
+
+
+def _make_relation_resolver(name: str) -> Any:
+    """Build the async relation resolver for the reference field ``name`` (#100).
+
+    Returned as a closure (the field name captured, never a GraphQL argument) so
+    Strawberry sees a resolver of exactly ``(root, info)`` — ``root`` untyped is
+    the source :class:`~datacrystal._snapshot.EntityView`, ``info`` annotated
+    :class:`strawberry.types.Info` is the context injection. The field's GraphQL
+    type comes from the patched ``type_annotation`` (``_resolve_pending``), not
+    from this resolver, so the resolver carries no return annotation — which also
+    lets a cycle's target type be unbuilt when the closure is made.
+
+    The default resolver would return the view's raw
+    :class:`~datacrystal._snapshot.Ref` token (#99); this one takes that token's
+    OID to the per-request DataLoader, so a tick's sibling references batch into
+    one :meth:`~datacrystal._snapshot.Snapshot.get_many` (the N+1 killer). An
+    absent edge (``None``) short-circuits without touching the loader; a
+    dangling/deleted reference rides ``get_many``'s None-on-miss (ADR-003) and
+    resolves to GraphQL ``null`` — never a 500."""
+
+    async def resolve(root: Any, info: Info[Any, Any]) -> Any:
+        ref = getattr(root, name)
+        if ref is None:
+            return None
+        loader = _loader_from(info)
+        # The view stores edges as Ref tokens; tolerate a bare OID defensively.
+        oid = ref.oid if isinstance(ref, Ref) else ref
+        return await loader.load(oid)
+
+    resolve.__name__ = f"resolve_{name}"
+    resolve.__qualname__ = f"_make_relation_resolver.resolve_{name}"
+    return resolve
+
+
+def _relation_field(name: str) -> StrawberryField:
+    """A reference field named ``name`` carrying the async relation resolver.
+
+    The ``type_annotation`` is a placeholder (``object``) here; it is patched to
+    the nullable target Strawberry type in
+    :meth:`StrawberryReflector._resolve_pending` once every endpoint type is
+    cached (the cycle break)."""
+    return StrawberryField(
+        python_name=name,
+        type_annotation=StrawberryAnnotation(object),
+        base_resolver=StrawberryResolver(_make_relation_resolver(name)),
+    )
+
+
+def _loader_from(info: Info[Any, Any]) -> SnapshotLoader:
+    """Pull the per-request :class:`SnapshotLoader` off the GraphQL context, or
+    fail loudly if the request was not wired with :func:`snapshot_context`."""
+    context = info.context
+    loader = (
+        context.get(LOADER_CONTEXT_KEY)
+        if isinstance(context, dict)
+        else getattr(context, LOADER_CONTEXT_KEY, None)
+    )
+    if not isinstance(loader, SnapshotLoader):
+        raise RuntimeError(
+            "GraphQL relation resolver found no per-request SnapshotLoader on "
+            f"info.context[{LOADER_CONTEXT_KEY!r}] — execute the query with "
+            "context_value=dc.web.snapshot_context(snapshot) (#100)"
+        )
+    return loader
 
 
 def _is_scalar_field(desc: FieldDescriptor) -> bool:
@@ -132,10 +300,12 @@ class StrawberryReflector:
         reflected *after* the current type is cached (never recursed into here —
         that would loop on a cycle before the cache entry exists).
 
-        Resolver-less by design: the default ``getattr`` resolver reads scalars
-        straight off the :class:`~datacrystal._snapshot.EntityView` and returns a
-        reference field's :class:`~datacrystal._snapshot.Ref` token verbatim
-        (#100 swaps in the batched relation resolver)."""
+        Scalar fields are resolver-less: the default ``getattr`` resolver reads
+        them straight off the :class:`~datacrystal._snapshot.EntityView`. A
+        reference field instead carries the **async relation resolver** (#100),
+        which takes the view's :class:`~datacrystal._snapshot.Ref` token through
+        the per-request DataLoader (the N+1 killer) rather than returning it
+        raw."""
         if _is_scalar_field(desc):
             return _plain_field(desc.name, desc.core_type)
         targets = referenced_entities(desc.core_type)
@@ -152,7 +322,10 @@ class StrawberryReflector:
             return None
         target = targets[0]
         target_info, _ = reflect(target)
-        field = _plain_field(desc.name, object)  # placeholder, patched in resolve
+        # The type annotation is a placeholder here (the target's Strawberry type
+        # may not exist yet on a cycle) — patched in ``_resolve_pending`` once
+        # every endpoint is cached. The relation resolver (#100) is bound now.
+        field = _relation_field(desc.name)
         self._pending_refs.append((field, target_info.typename))
         referents.append(target)
         return field
