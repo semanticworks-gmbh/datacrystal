@@ -400,7 +400,7 @@ def test_get_many_uses_one_round_trip_per_chunk(store_factory):
     counting = _CountingReadView(store._backend.read_view())
     snap = Snapshot(counting)  # pyright: ignore[reportArgumentType]  # structural read view
     try:
-        views = snap.get_many(oids)
+        views = snap.get_many(oids)  # pyright: ignore[reportArgumentType]  # oid_of -> int | None
         assert len(views) == n
         assert all(v is not None for v in views)
         assert counting.load_calls == math.ceil(n / _VIEW_CHUNK)
@@ -417,12 +417,12 @@ def test_get_many_is_cache_aware(store_factory):
     counting = _CountingReadView(store._backend.read_view())
     snap = Snapshot(counting)  # pyright: ignore[reportArgumentType]  # structural read view
     try:
-        first = snap.get_many(oids)
+        first = snap.get_many(oids)  # pyright: ignore[reportArgumentType]  # oid_of -> int | None
         assert all(v is not None for v in first)
         calls_after_first = counting.load_calls
         assert calls_after_first >= 1
         # second pass: every OID is cached now -> no further storage round-trips
-        second = snap.get_many(oids)
+        second = snap.get_many(oids)  # pyright: ignore[reportArgumentType]  # oid_of -> int | None
         assert [v.qid for v in second if v is not None] == \
             [v.qid for v in first if v is not None]
         assert counting.load_calls == calls_after_first
