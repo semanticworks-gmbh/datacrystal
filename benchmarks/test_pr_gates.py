@@ -205,6 +205,40 @@ def _timed_deltas(store: dc.Store, prefix: str) -> list[float]:
     return times
 
 
+def test_to_pydantic_vs_view_read(big_store) -> None:
+    """datacrystal[web] ``to_pydantic`` ratio gate (#97): the FULL cost of turning
+    a record into a validated Pydantic DTO must stay ≤ 2× the EntityView read
+    floor — materializing the same record into an EntityView (decode + freeze).
+    A breach means accidental ref-hydration or per-call re-reflection crept on top
+    of the read — both forbidden by #97 (a load is never forced, the model is
+    cached per class).
+
+    Same-run ratio: each round opens a FRESH snapshot so ``get`` truly decodes
+    (the view cache resets), so the floor is a genuine read and the engine pays
+    read + project + validate (invariant 12, no wall-clock)."""
+    pytest.importorskip("pydantic", reason="datacrystal[web] extra not installed")
+    from datacrystal.web import to_pydantic
+
+    keys = big_store.pluck(_gen.Specimen, "specimen_no")[:1_000]
+    oids = [s.__dc_oid__ for s in big_store.get_many(_gen.Specimen, specimen_no=keys)]
+
+    def floor_run() -> None:
+        # the EntityView read floor: decode each record into a frozen view
+        with big_store.snapshot() as snap:
+            for oid in oids:
+                snap.get(oid)
+
+    def engine_run() -> None:
+        # read + project + validate: the full to_pydantic cost over the same reads
+        with big_store.snapshot() as snap:
+            for oid in oids:
+                to_pydantic(snap.get(oid))
+
+    floor = time_it(floor_run, rounds=3)
+    engine = time_it(engine_run, rounds=3)
+    gate("to_pydantic (read+convert+validate / view-read floor)", engine / floor, 2.0)
+
+
 def test_watermark_apply_fixed_delta(small_store, big_store) -> None:
     """KICKOFF ``watermark_apply_fixed_delta``: applying a fixed-size delta
     must cost the same on a big store as on a small one — O(delta), never
