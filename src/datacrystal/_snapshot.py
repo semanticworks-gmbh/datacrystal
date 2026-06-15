@@ -20,7 +20,7 @@ from __future__ import annotations
 import threading
 import warnings
 from types import MappingProxyType
-from typing import Any, BinaryIO, Iterator, Mapping, cast
+from typing import Any, BinaryIO, Iterable, Iterator, Mapping, cast
 
 from pyroaring import BitMap64, FrozenBitMap64
 
@@ -327,6 +327,27 @@ class Snapshot:
                 view = self._materialize(rec.oid, rec.cid, rec.payload)
             return view
 
+    def get_many(self, refs: Iterable["EntityView | Ref | int"]) -> list["EntityView | None"]:
+        """Batch-resolve OIDs to :class:`EntityView` DTOs in one storage
+        round-trip per chunk — the snapshot twin of ``Store.get_many`` (#94,
+        for the ``datacrystal[web]`` GraphQL DataLoader and REST batch reads,
+        which must never N+1 the store).
+
+        Accepts an iterable of OIDs, :class:`Ref` tokens or :class:`EntityView`
+        DTOs and returns a ``list[EntityView | None]`` aligned 1:1 with the
+        input order — the DataLoader contract. **Miss-tolerant** (unlike the
+        private :meth:`_views_for`): an absent or deleted OID yields ``None`` in
+        its slot rather than raising, because v0.x deletes are unchecked and a
+        referenced OID can legitimately be gone (ADR-003).
+
+        Cache-aware (OIDs already materialized in this snapshot cost no extra
+        ``load_many``) and callable from any thread under the snapshot lock,
+        including on the mid-life bootstrap path (ADR-002 read views)."""
+        oids = [r.oid if isinstance(r, (EntityView, Ref)) else r for r in refs]
+        with self._lock:
+            self._guard()
+            return self._views_for_tolerant(oids)
+
     def open_blob(self, view: "EntityView | Ref | int", field: str) -> BinaryIO:
         """Open a committed ``dc.Blob`` field as a binary stream (ADR-007 §3) —
         the fully off-owner sibling of ``Store.open_blob``. Streams over THIS
@@ -604,9 +625,13 @@ class Snapshot:
         self._reverse = rev
         return rev
 
-    def _views_for(self, oids: list[int]) -> list[EntityView]:
-        """Batch-materialize EntityViews (caller holds the lock), loading
-        cache misses in chunks to bound peak memory."""
+    def _load_missing(self, oids: list[int], *, tolerant: bool) -> None:
+        """Materialize uncached OIDs into ``self._cache`` (caller holds the
+        lock), one ``load_many`` per ``_VIEW_CHUNK`` of *misses* — never per
+        OID. Intolerant (``tolerant=False``, the index-driven path): every OID
+        is known-present (it came from a snapshot-local bitmap), so a missing
+        record is internal corruption and raises. Tolerant: a missing OID is
+        simply left absent from the cache (deleted/never-committed, ADR-003)."""
         missing = [oid for oid in oids if oid not in self._cache]
         for start in range(0, len(missing), _VIEW_CHUNK):
             chunk = missing[start:start + _VIEW_CHUNK]
@@ -614,12 +639,27 @@ class Snapshot:
             for oid in chunk:
                 rec = records.get(oid)
                 if rec is None:
+                    if tolerant:
+                        continue
                     raise DataCrystalError(
                         f"internal error: indexed oid {oid} has no record "
                         f"at watermark {self._tid}"
                     )
                 self._materialize(rec.oid, rec.cid, rec.payload)
+
+    def _views_for(self, oids: list[int]) -> list[EntityView]:
+        """Batch-materialize EntityViews for known-present OIDs (caller holds
+        the lock); raises on any miss — the internal, index-driven path."""
+        self._load_missing(oids, tolerant=False)
         return [self._cache[oid] for oid in oids]
+
+    def _views_for_tolerant(self, oids: list[int]) -> list[EntityView | None]:
+        """The miss-tolerant sibling of :meth:`_views_for` (caller holds the
+        lock): an absent/deleted OID yields ``None`` in its slot. The engine
+        seam behind the public :meth:`get_many` (#94, the datacrystal[web]
+        DataLoader contract)."""
+        self._load_missing(oids, tolerant=True)
+        return [self._cache.get(oid) for oid in oids]
 
     def _warn_unseen(self, ti: Any) -> None:
         warnings.warn(

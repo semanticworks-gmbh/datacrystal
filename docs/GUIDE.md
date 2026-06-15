@@ -752,6 +752,13 @@ def report(store: dc.Store) -> int:        # runs on any thread
   explicit `dc.Ref` tokens you resolve via `snap.get(ref)`, lists come back as tuples,
   dicts as read-only mappings. Never live entities — nothing a worker thread does with a
   snapshot can violate confinement or dirty tracking.
+- `snap.get_many(refs)` batch-resolves an iterable of OIDs / `dc.Ref` tokens / `EntityView`s
+  to a `list[EntityView | None]` aligned 1:1 with the input — the snapshot twin of
+  `store.get_many()` and the seam the `datacrystal[web]` GraphQL DataLoader and REST list
+  endpoints build on (never N+1: one storage round-trip per chunk, cached OIDs cost nothing).
+  Unlike `snap.get()` it is **miss-tolerant** — an absent or deleted OID yields `None` in its
+  slot rather than raising `DanglingRefError`, exactly what a key-aligned loader needs (v0.x
+  deletes are unchecked, ADR-003).
 - `snap.query(cond)` and `snap.count(target)` answer the full Condition AST at the
   watermark — bitmap-indexed like the live store, results as `EntityView`s. The indexes
   behind them are **snapshot-local**, rebuilt from the pinned view on first use (one-time

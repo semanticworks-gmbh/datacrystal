@@ -11,12 +11,15 @@ schema-evolution convention); the pragma below exists only for that.
 
 from __future__ import annotations
 
+import math
 from concurrent.futures import ThreadPoolExecutor
 from types import MappingProxyType
 
 import pytest
 
 import datacrystal as dc
+from datacrystal._entity import oid_of
+from datacrystal._snapshot import Snapshot, _VIEW_CHUNK
 from tests.conftest import Locality, Mineral
 
 MINERAL_T = "tests.conftest:Mineral"
@@ -295,6 +298,136 @@ def test_thread_pool_reads_snapshots_while_the_owner_commits(store_factory):
 
     for tid, mineral_count in results:
         assert mineral_count == tid  # one mineral per commit, never torn
+    store.close()
+
+
+# -- get_many: miss-tolerant batch read (#94, datacrystal[web] DataLoader) -----
+
+
+def test_get_many_aligns_results_with_input_order(store_factory):
+    store = store_factory()
+    _seed(store)
+    quartz = store.get(Mineral, qid="Q43010")
+    azurite = store.get(Mineral, qid="Q193563")
+    assert quartz is not None and azurite is not None
+    with store.snapshot() as snap:
+        # input order is preserved 1:1 (the DataLoader contract)
+        views = snap.get_many([oid_of(azurite), oid_of(quartz)])
+        assert [v.qid for v in views if v is not None] == ["Q193563", "Q43010"]
+    store.close()
+
+
+def test_get_many_is_miss_tolerant_for_deleted_oids(store_factory):
+    """[live, deleted] -> [EntityView, None]: an absent/deleted OID yields
+    ``None`` in its slot, never raises (ADR-003 unchecked deletes)."""
+    store = store_factory()
+    _seed(store)
+    quartz = store.get(Mineral, qid="Q43010")
+    azurite = store.get(Mineral, qid="Q193563")
+    assert quartz is not None and azurite is not None
+    live_oid = oid_of(quartz)
+    gone_oid = oid_of(azurite)
+    store.delete(azurite)
+    store.commit()
+    with store.snapshot() as snap:
+        views = snap.get_many([live_oid, gone_oid])
+        assert len(views) == 2
+        assert isinstance(views[0], dc.EntityView) and views[0].qid == "Q43010"
+        assert views[1] is None
+    store.close()
+
+
+def test_get_many_accepts_refs_and_views(store_factory):
+    """Accepts OIDs, snapshot ``Ref`` tokens and ``EntityView`` DTOs alike."""
+    store = store_factory()
+    _seed(store)
+    with store.snapshot() as snap:
+        root = snap.root  # a tuple of Ref
+        ref0, ref1 = root[0], root[1]
+        view0 = snap.get(ref0)
+        # mix a Ref and an already-materialized EntityView
+        out = snap.get_many([ref1, view0])
+        assert {v.qid for v in out if v is not None} == {"Q43010", "Q193563"}
+    store.close()
+
+
+def test_get_many_empty_input_returns_empty(store_factory):
+    store = store_factory()
+    _seed(store)
+    with store.snapshot() as snap:
+        assert snap.get_many([]) == []
+    store.close()
+
+
+class _CountingReadView:
+    """Delegates to a real read view, counting ``load_many`` calls — proves the
+    round-trip budget (one ``load_many`` per ``_VIEW_CHUNK`` of misses, not N).
+    Constructing a ``Snapshot`` over it also exercises the direct-construction /
+    mid-life bootstrap path (ADR-002 read views)."""
+
+    def __init__(self, inner) -> None:
+        self._inner = inner
+        self.load_calls = 0
+
+    def load_many(self, oids):
+        self.load_calls += 1
+        return self._inner.load_many(oids)
+
+    def boot(self):
+        return self._inner.boot()
+
+    def scan_type(self, cid):
+        return self._inner.scan_type(cid)
+
+    def load_blob(self, oid):
+        return self._inner.load_blob(oid)
+
+    def open_blob_stream(self, oid, on_close=None):
+        return self._inner.open_blob_stream(oid, on_close)
+
+    def close(self) -> None:
+        self._inner.close()
+
+
+def test_get_many_uses_one_round_trip_per_chunk(store_factory):
+    """``load_calls == ceil(N / _VIEW_CHUNK)``, never N — the whole point of a
+    batch read for the DataLoader (no N+1)."""
+    store = store_factory()
+    n = _VIEW_CHUNK + 5  # forces exactly two chunks
+    store.root = [Mineral(qid=f"Q{i}", name=f"specimen {i}") for i in range(n)]
+    store.commit()
+    oids = [oid_of(m) for m in store.root]
+    counting = _CountingReadView(store._backend.read_view())
+    snap = Snapshot(counting)  # pyright: ignore[reportArgumentType]  # structural read view
+    try:
+        views = snap.get_many(oids)
+        assert len(views) == n
+        assert all(v is not None for v in views)
+        assert counting.load_calls == math.ceil(n / _VIEW_CHUNK)
+    finally:
+        snap.close()
+    store.close()
+
+
+def test_get_many_is_cache_aware(store_factory):
+    """OIDs already materialized in the snapshot cost zero extra ``load_many``."""
+    store = store_factory()
+    _seed(store)
+    oids = [oid_of(m) for m in store.root]
+    counting = _CountingReadView(store._backend.read_view())
+    snap = Snapshot(counting)  # pyright: ignore[reportArgumentType]  # structural read view
+    try:
+        first = snap.get_many(oids)
+        assert all(v is not None for v in first)
+        calls_after_first = counting.load_calls
+        assert calls_after_first >= 1
+        # second pass: every OID is cached now -> no further storage round-trips
+        second = snap.get_many(oids)
+        assert [v.qid for v in second if v is not None] == \
+            [v.qid for v in first if v is not None]
+        assert counting.load_calls == calls_after_first
+    finally:
+        snap.close()
     store.close()
 
 
