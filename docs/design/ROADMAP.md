@@ -89,8 +89,8 @@ Ratified next work, now issues under milestones (decision rationale in each issu
 | 8 | Reverse-reference index + `incoming()` traversal — the ratified next step (🥇 Golden Ticket) | #20 | Sprint 3 |
 | 9 | DuckPGQ property-graph recipe (docs-only) | #21 | backlog |
 | 11 | `datacrystal[vector]` — usearch sidecar (≥2 `@Vector` fields) | #22 | backlog |
-| 12 | `datacrystal[web]` — FastAPI + strawberry GraphQL | #23 | backlog |
-| 13 | read-only snapshot readers (open-at-watermark) | #24 | backlog |
+| 12 | `datacrystal[web]` — FastAPI + strawberry GraphQL | #23 | Sprint 9 |
+| 13 | read-only snapshot readers (open-at-watermark) | #24 | Sprint 9 ✅ |
 | — | Schema migration — renames + glue reshaping + migrate/verify (DESIGN amendment-7) | #26 | Sprint 1 |
 
 Milestones are **sprints** (planned waves); product goals are `theme:` labels (cross-cutting);

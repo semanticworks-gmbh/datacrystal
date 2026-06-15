@@ -205,6 +205,40 @@ def _timed_deltas(store: dc.Store, prefix: str) -> list[float]:
     return times
 
 
+def test_to_pydantic_vs_view_read(big_store) -> None:
+    """datacrystal[web] ``to_pydantic`` ratio gate (#97): the FULL cost of turning
+    a record into a validated Pydantic DTO must stay ≤ 2× the EntityView read
+    floor — materializing the same record into an EntityView (decode + freeze).
+    A breach means accidental ref-hydration or per-call re-reflection crept on top
+    of the read — both forbidden by #97 (a load is never forced, the model is
+    cached per class).
+
+    Same-run ratio: each round opens a FRESH snapshot so ``get`` truly decodes
+    (the view cache resets), so the floor is a genuine read and the engine pays
+    read + project + validate (invariant 12, no wall-clock)."""
+    pytest.importorskip("pydantic", reason="datacrystal[web] extra not installed")
+    from datacrystal.web import to_pydantic
+
+    keys = big_store.pluck(_gen.Specimen, "specimen_no")[:1_000]
+    oids = [s.__dc_oid__ for s in big_store.get_many(_gen.Specimen, specimen_no=keys)]
+
+    def floor_run() -> None:
+        # the EntityView read floor: decode each record into a frozen view
+        with big_store.snapshot() as snap:
+            for oid in oids:
+                snap.get(oid)
+
+    def engine_run() -> None:
+        # read + project + validate: the full to_pydantic cost over the same reads
+        with big_store.snapshot() as snap:
+            for oid in oids:
+                to_pydantic(snap.get(oid))
+
+    floor = time_it(floor_run, rounds=3)
+    engine = time_it(engine_run, rounds=3)
+    gate("to_pydantic (read+convert+validate / view-read floor)", engine / floor, 2.0)
+
+
 def test_watermark_apply_fixed_delta(small_store, big_store) -> None:
     """KICKOFF ``watermark_apply_fixed_delta``: applying a fixed-size delta
     must cost the same on a big store as on a small one — O(delta), never
@@ -285,3 +319,47 @@ def test_watermark_apply_fixed_delta_extras(small_store, big_store, tmp_path,
         f"(t@{SPECIMENS}/t@{SMALL_SPECIMENS})",
         t_big / t_small, 1.2,
     )
+
+
+def test_snapshot_open_read(big_store) -> None:
+    """KICKOFF ``snapshot_open_read`` (#92): the per-request read tax a
+    ``datacrystal[web]`` route pays — open a fresh ``store.snapshot()``, read one
+    record, close it — must stay within 25× a same-run **owner** read of the same
+    record. The web tier reads every request off a snapshot (any-thread, ADR-002)
+    rather than the live graph; this gate keeps that choice negligible, so a
+    snapshot-per-request never becomes the cost center.
+
+    Same-run, apples-to-apples ratio (invariant 12, no wall-clock): both runs do
+    the **same number of single-record reads** of the same OIDs — the floor reads
+    each via a live owner ``get_many([oid])`` (no snapshot lifecycle, the read a
+    route would do if it could touch the owner graph), the engine opens a **fresh
+    snapshot per read** and closes it. The ONLY difference between the two is the
+    per-request snapshot open+close, so the ratio isolates exactly that tax — the
+    lifecycle ``read_snapshot`` drives once per request.
+
+    Why 25× and not a tighter ratio: the owner ``get_many([oid])`` floor is a
+    **warm identity-registry hit** (the entity is already live — no decode), so it
+    is near-free; the snapshot open+close (a WAL read txn + a fresh view cache) is
+    a small but real constant against that near-zero baseline (~11× observed). The
+    gate's job is to catch a *regression* in the snapshot lifecycle (e.g. an
+    accidental O(extent) index rebuild on every open), not to make the negligible
+    look big — the absolute cost stays ≈ 0.094 ms per request (the AC's measured
+    floor)."""
+    keys = big_store.pluck(_gen.Specimen, "specimen_no")[:1_000]
+    oids = [s.__dc_oid__ for s in big_store.get_many(_gen.Specimen, specimen_no=keys)]
+
+    def floor_run() -> None:
+        # owner read floor: one live single-record read per OID, no snapshot
+        for oid in oids:
+            big_store.get_many([oid])
+
+    def engine_run() -> None:
+        # the per-request snapshot tax: a fresh snapshot per single-record read
+        for oid in oids:
+            with big_store.snapshot() as snap:
+                snap.get(oid)
+
+    floor = time_it(floor_run, rounds=3)
+    engine = time_it(engine_run, rounds=3)
+    gate("snapshot_open_read (snapshot open+read+close / owner read)",
+         engine / floor, 25.0)

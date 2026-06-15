@@ -27,10 +27,16 @@ fts = [
 arrow = [
     "pyarrow>=21",
 ]
+web = [
+    "pydantic>=2",
+    "fastapi",
+    "strawberry-graphql",
+]
 
 [dependency-groups]
 dev = [
     "duckdb>=1.5.3",
+    "httpx>=0.28",
     "hypothesis>=6.155.2",
     "pytest>=9.0.3",
     "ruff>=0.15.16",

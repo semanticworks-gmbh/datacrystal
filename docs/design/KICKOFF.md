@@ -179,6 +179,7 @@ store.close()
 | `unique_key_lookup` | ≈O(1) natural-key lookup | t(@1M)/t(@10k) ≤ 2; ≤ 50× same-run dict lookup | PR; nightly @1M |
 | `watermark_apply_fixed_delta` | O(delta), never O(corpus) | bitmap-only path: t(@big)/t(@small) ≤ 1.2 over **median of ≥ 10 consecutive deltas**; FTS path (when it lands): pinned merge policy + merge-to-quiescence before timing | PR (10k vs 100k) + nightly (10k vs 1M) |
 | `snapshot_cost` | ADR-001 rider 2 pressure valve | t(@1M)/t(@100k) ≤ 3 | nightly |
+| `snapshot_open_read` | `datacrystal[web]` per-request read stays negligible (#92) | open-snapshot-read-close ≤ 25× same-run owner read of the same record (the owner read is a warm registry hit, so the ratio is the snapshot-lifecycle tax over a near-free baseline — absolute floor: snapshot open+close ≈ 0.094 ms, the per-request tax a FastAPI route pays) | every PR |
 | `file_size_amplification` | SQLite-blob churn honesty | disk / Σ live payload ≤ 1.6 clean; ≤ 3.0 after 10× churn + housekeeping | nightly |
 
 Generation speed is a **trend tripwire** via `extra_info`, never a gate. Recovery/crash benches are correctness tests, not perf.
