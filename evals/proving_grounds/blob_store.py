@@ -141,9 +141,9 @@ def main() -> None:
     print(f"  on disk:             {on_disk:>9.1f} MB   process peak RSS {rss_ingest:.0f} MB")
     print(f"  ingest HEAP peak:    {peak_ingest / 1e6:>9.1f} MB   "
           f"(chunk={chunk / 1e6:.1f} MB, largest file {largest[1] / 1e6:.1f} MB)")
-    print(f"    → streamed write holds ~one chunk, NOT the file: heap peak tracks "
-          f"BLOB_CHUNK, not size\n      (on files larger than one chunk it is << the "
-          f"file — the whole point)")
+    print("    → streamed write holds ~one chunk, NOT the file: heap peak tracks "
+          "BLOB_CHUNK, not size\n      (on files larger than one chunk it is << the "
+          "file — the whole point)")
     store.close()
 
     # --- THE OBJECT TABLE STAYS FAST -----------------------------------------
