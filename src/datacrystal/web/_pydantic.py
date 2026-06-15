@@ -15,23 +15,35 @@ to a Pydantic ``(annotation, FieldInfo)`` pair and builds a model via
 diverges from the live engine type where the engine type is not transport-shaped:
 a reference field (a ``Lazy`` handle or a directly-typed ``@entity``) crosses the
 edge as its **OID** (an ``int``), never the live object — the request edge must
-not carry an engine instance (and the DTO has no store to hydrate against). The
-``to_pydantic`` / ``from_pydantic`` conversion direction lands in #97-#98.
+not carry an engine instance (and the DTO has no store to hydrate against).
+
+``to_pydantic`` (#97) is the value direction: a live entity (read on the owner
+thread) **or** an already-detached :class:`~datacrystal.EntityView` becomes a
+validated DTO instance of its ``entity_model``. The projection mirrors the
+engine's own read transforms — ``swizzle`` for a live entity, ``_freeze`` /
+``_view_value`` for a snapshot view — so a reference always crosses as its OID
+(``peek()``-else-``.oid``, never a forced load) and containers decay to plain
+``list`` / ``dict``. The DTO holds **no** reference to the live entity, the
+registry or the store — owner-confinement-safe by construction, the EntityView
+rule (ADR-001). ``from_pydantic`` lands in #98.
 """
 
 from __future__ import annotations
 
 import types
-from typing import Annotated, Any, Union, get_args, get_origin
+from typing import Annotated, Any, Union, cast, get_args, get_origin
 
 import pydantic
 from pydantic import ConfigDict, Field, create_model
 from pydantic.fields import FieldInfo
 
-from datacrystal._entity import EntityMeta
+from datacrystal._entity import EntityMeta, is_entity, oid_of, type_info
+from datacrystal._lazy import BlobHandle, Lazy
+from datacrystal._records import BlobToken, RefToken
+from datacrystal._snapshot import EntityView, Ref
 from datacrystal.web._reflect import FieldDescriptor, reflect
 
-__all__ = ["entity_model"]
+__all__ = ["entity_model", "to_pydantic"]
 
 # entity_model is pure reflection over a class object, so its result is a
 # function of the class alone — cache it (keyed by the class) and hand the same
@@ -88,6 +100,172 @@ def entity_model(cls: type) -> type[pydantic.BaseModel]:
     )
     _MODEL_CACHE[cls] = model
     return model
+
+
+def to_pydantic(source: Any, *, nested: int = 0) -> pydantic.BaseModel:
+    """Project a live entity **or** an :class:`~datacrystal.EntityView` into a
+    detached, validated Pydantic DTO of its :func:`entity_model` (#97 / #49 S3).
+
+    Two accepted inputs, one detached result:
+
+    * an :class:`~datacrystal.EntityView` (a ``store.snapshot()`` read) — already
+      immutable plain data, thread-safe and store-free, so it is the **preferred**
+      input: no owner thread is touched and the projection only has to decay the
+      frozen shape (``Ref`` → OID, ``tuple`` → ``list``, read-only mapping →
+      ``dict``);
+    * a **live entity**, read on the owner thread. The ADR-001 owner-confinement
+      guard is re-asserted before any field is read (a foreign thread raises
+      :class:`~datacrystal.WrongThreadError`, never a torn read), so the call is
+      owner-confined exactly like the live read path it mirrors.
+
+    The returned DTO holds **no** reference to the live entity, the identity
+    registry or the store — it is plain validated data (the EntityView guarantee,
+    ADR-001), safe to hand to a FastAPI response without leaking the engine.
+
+    Reference projection mirrors the engine's own transforms — ``swizzle`` for a
+    live entity, ``_freeze`` / ``_view_value`` for a snapshot view — so it is
+    honest by construction: a reference field crosses as its **OID**
+    (``peek()``-else-``.oid``; an unloaded ``Lazy`` with no OID raises, the same
+    error the store raises — a load is **never** forced). Containers decay to
+    plain ``list`` / ``dict``, tuples to ``list``, and ``datetime`` / ``date`` /
+    ``time`` pass through native.
+
+    ``nested`` opts in to **bounded** referent recursion (default ``0`` = every
+    ref → OID, the no-auto-hydrate default that can never re-introduce N+1). With
+    ``nested=N`` a reference whose referent is **already resident** — a live
+    directly-typed ``@entity`` field, or a ``Lazy`` that ``peek()`` resolves —
+    recurses into its own ``to_pydantic(referent, nested=N-1)`` DTO; an unloaded
+    ``Lazy``, a snapshot :class:`~datacrystal.Ref` and any ref at depth ``0`` stay
+    an OID. Recursion only ever follows referents the caller already holds in
+    RAM — it never calls ``.get()``, so it cannot force a load or N+1 the store.
+    A nested DTO sits in its ``int``-typed ref slot via ``model_construct`` (the
+    boundary annotation from #96 is frozen at ``int``; the nested object is placed
+    without re-validating that slot)."""
+    cls: type
+    values: dict[str, Any]
+    if isinstance(source, EntityView):
+        cls = _type_info_for_view(source)
+        values = dict(source.fields())
+    elif is_entity(source):
+        ti = type_info(source)
+        cls = ti.cls  # the canonical class (typed), not type(source) (Unknown)
+        _guard_owner(source)  # ADR-001: read on the owner thread, pre-read
+        values = {name: getattr(source, name) for name in ti.field_names}
+    else:
+        raise TypeError(
+            f"to_pydantic() takes a live @entity or an EntityView, got "
+            f"{type(source).__name__!r} — for a cross-thread read pass a "
+            "store.snapshot() view"
+        )
+    model = entity_model(cls)
+    data = {name: _dto_value(value, nested) for name, value in values.items()}
+    # A nested DTO lives in an int-typed ref slot (the #96 boundary annotation is
+    # frozen at int). model_validate would reject the nested object there; with no
+    # nested objects present (nested=0, the headline path) we validate fully.
+    if nested > 0 and _has_nested_dto(data):
+        return model.model_construct(**data)
+    return model.model_validate(data)
+
+
+def _type_info_for_view(view: EntityView) -> type:
+    """The live ``@entity`` class named by a snapshot view's typename.
+
+    A view carries only its typename (it is store-free by design), so resolve it
+    back to the live class to build the model. The class must be loaded in this
+    process — the same precondition every snapshot read that names fields has."""
+    from datacrystal._entity import TYPES_BY_NAME
+
+    ti = TYPES_BY_NAME.get(view.typename)
+    if ti is None:
+        raise TypeError(
+            f"to_pydantic() needs the live @entity class for {view.typename!r} "
+            "to build its model — import the class in this process first"
+        )
+    return ti.cls
+
+
+def _dto_value(value: Any, nested: int) -> Any:
+    """One field value → its detached DTO representation (the #97 projection).
+
+    Mirrors the engine's read transforms at boundary granularity so the DTO is
+    honest by construction: a reference becomes its OID (``swizzle`` for a live
+    entity / ``Lazy``, ``_freeze``'s :class:`Ref`/:class:`RefToken` for a view),
+    a container decays to a plain ``list`` / ``dict``, and a scalar / temporal
+    passes through. ``nested`` bounds referent recursion (see :func:`to_pydantic`):
+    a resident referent at depth > 0 becomes its own nested DTO; everything else
+    stays an OID. No branch ever forces a load."""
+    if isinstance(value, Ref):
+        return value.oid
+    if isinstance(value, RefToken):  # raw decoded token (defensive; views freeze)
+        return value.oid
+    if isinstance(value, (BlobToken, BlobHandle)):
+        # A dc.Blob field addresses out-of-line bytes by an OID, exactly parallel
+        # to a reference — project the blob OID, never .bytes() (that would force
+        # the load to-disk this method must avoid; stream it via store.open_blob
+        # / snapshot.open_blob instead — ADR-007 §3).
+        return value.blob_oid
+    if is_entity(value):
+        oid = oid_of(value)
+        if oid is None:
+            raise ValueError(
+                "cannot project an entity that was never stored — it has no OID "
+                "(store and commit it first)"
+            )
+        if nested > 0:
+            return to_pydantic(value, nested=nested - 1)
+        return oid
+    if isinstance(value, Lazy):
+        handle = cast("Lazy[Any]", value)
+        target = handle.peek()  # mirror swizzle()/_view_value(): a loaded handle
+        if target is not None:  # is best — recurse only into what is resident
+            return _dto_value(target, nested)
+        if handle.oid is None:
+            raise ValueError("cannot project an unloaded Lazy without an OID")
+        return handle.oid
+    if isinstance(value, (list, tuple)):
+        # PersistentList (a live container) IS a list; a view's container is a
+        # tuple — both decay to a plain list with each item projected.
+        return [_dto_value(item, nested) for item in cast("list[Any]", value)]
+    if isinstance(value, dict):
+        # PersistentDict IS a dict; a view's container is a MappingProxyType —
+        # both decay to a plain dict (a view never has @entity keys).
+        return {k: _dto_value(v, nested) for k, v in cast("dict[Any, Any]", value).items()}
+    return value  # scalars, None, datetime/date/time pass native
+
+
+def _has_nested_dto(data: dict[str, Any]) -> bool:
+    """True if any projected value carries a nested DTO (a resident referent was
+    recursed into), so :func:`to_pydantic` knows to ``model_construct`` rather
+    than ``model_validate`` (a DTO would not validate against an ``int`` slot)."""
+    return any(_contains_model(v) for v in data.values())
+
+
+def _contains_model(value: Any) -> bool:
+    if isinstance(value, pydantic.BaseModel):
+        return True
+    if isinstance(value, list):
+        return any(_contains_model(v) for v in cast("list[Any]", value))
+    if isinstance(value, dict):
+        return any(_contains_model(v) for v in cast("dict[Any, Any]", value).values())
+    return False
+
+
+def _guard_owner(entity: Any) -> None:
+    """Re-assert the ADR-001 owner-thread contract before reading a live entity.
+
+    The same pre-mutation guard the store enforces on every write path, applied
+    here to the read: a foreign thread raises ``WrongThreadError`` (with the
+    snapshot escape recipe) **before** any field is read, so ``to_pydantic`` can
+    never tear a value out from under the owner. The owner store is reached via
+    the entity's ``__dc_store__`` weakref; a never-stored or GC'd-store entity has
+    no owner to violate, so the guard is a no-op there."""
+    try:
+        storeref = object.__getattribute__(entity, "__dc_store__")
+    except AttributeError:
+        return  # never stored — no owner to confine to
+    store = storeref() if storeref is not None else None
+    if store is not None:
+        store._guard()  # raises WrongThreadError off the owner thread (ADR-001)
 
 
 def _boundary_annotation(d: FieldDescriptor) -> Any:
