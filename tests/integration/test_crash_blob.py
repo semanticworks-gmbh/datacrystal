@@ -13,13 +13,16 @@ import subprocess
 import sys
 import time
 
+import pytest
+
 APP = pathlib.Path(__file__).with_name("_crash_blob_app.py")
 
 
-def test_sigkill_mid_commit_keeps_record_and_blob_atomic(tmp_path):
+@pytest.mark.parametrize("mode", ["whole", "stream"])
+def test_sigkill_mid_commit_keeps_record_and_blob_atomic(tmp_path, mode):
     store_dir = str(tmp_path / "crash-blob-store")
     writer = subprocess.Popen(
-        [sys.executable, str(APP), "write", store_dir],
+        [sys.executable, str(APP), "write", store_dir, mode],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,

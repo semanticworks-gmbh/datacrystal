@@ -61,7 +61,7 @@ from datacrystal._errors import (
     WrongThreadError,
 )
 from datacrystal._indexes import QueryPlan
-from datacrystal._lazy import BlobHandle, Lazy
+from datacrystal._lazy import BlobHandle, BlobSource, Lazy, blob_from_path
 from datacrystal._pipeline import DeltaConsumer
 from datacrystal._snapshot import EntityView, Ref, Snapshot, SnapshotIndexes
 from datacrystal._store import Store
@@ -96,6 +96,8 @@ __all__ = [
     "SortedIndex",
     "Blob",
     "BlobHandle",
+    "BlobSource",
+    "blob_from_path",
     "PersistentList",
     "PersistentDict",
     "Snapshot",

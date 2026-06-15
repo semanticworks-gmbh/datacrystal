@@ -27,12 +27,13 @@ the root graph keeps stable identity.
 from __future__ import annotations
 
 import hashlib
+import io
 import threading
 import warnings
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator, cast
+from typing import Any, BinaryIO, Callable, Iterable, Iterator, cast
 
 from datacrystal._conditions import (
     And,
@@ -87,7 +88,7 @@ from datacrystal._indexes import (
     plan,
     windowed_index_order,
 )
-from datacrystal._lazy import BlobHandle, Lazy, LazyReferenceManager
+from datacrystal._lazy import BlobHandle, BlobSource, Lazy, LazyReferenceManager
 from datacrystal._pipeline import DeltaConsumer, build_delta
 from datacrystal._records import (
     BlobToken,
@@ -104,6 +105,7 @@ from datacrystal._storage.protocol import (
     StorageBackend,
     StoredBlob,
     StoredRecord,
+    StreamedBlob,
 )
 from datacrystal.contract.applier import DeltaGapError
 
@@ -130,14 +132,15 @@ class _Capture:
     """Everything P1 hands to P2/P3 — and enough to compensate a failed P2."""
 
     __slots__ = ("tid", "batch", "index_entries", "ref_entries", "flipped",
-                 "delta", "deletes")
+                 "delta", "deletes", "blob_swaps")
 
     def __init__(self, tid: int, batch: CommitBatch,
                  index_entries: list[tuple[int, TypeInfo, dict[str, Any]]],
                  ref_entries: list[tuple[int, set[int]]],
                  flipped: list[tuple[int, Any, int]],
                  delta: dict[str, Any] | None,
-                 deletes: list[tuple[int, TypeInfo, Any | None]]) -> None:
+                 deletes: list[tuple[int, TypeInfo, Any | None]],
+                 blob_swaps: list[tuple[Any, str, int, int, bytes]]) -> None:
         self.tid = tid
         self.batch = batch
         self.index_entries = index_entries
@@ -145,6 +148,9 @@ class _Capture:
         self.flipped = flipped  # (oid, obj, state before the P1 flip)
         self.delta = delta  # COMMIT-DELTA-v1 map; built only when consumers watch
         self.deletes = deletes  # (oid, ti, live instance or None) — ADR-003
+        # (obj, field, blob_oid, size, hash): swap each committed streamed-write
+        # source to a readable BlobHandle in P3, AFTER durability (ADR-007 §4).
+        self.blob_swaps = blob_swaps
 
 
 class Store:
@@ -681,12 +687,41 @@ class Store:
         # (oid, size, hash, data) tuples now and the StoredBlobs are stamped with
         # this commit's tid once it is known (a blob's descriptor carries no tid).
         blob_data: list[tuple[int, int, bytes, bytes]] = []
+        # Streamed blobs (ADR-007 §4): (oid, size, hash, open_chunks) — the bytes
+        # are NOT resident; they fill a zeroblob cell in P2.
+        stream_data: list[tuple[int, int, bytes, Callable[[], Iterable[bytes]]]] = []
+        # (obj, field, blob_oid, size, hash) — applied in P3 after durability.
+        blob_swaps: list[tuple[Any, str, int, int, bytes]] = []
 
-        def blob_sink(value: bytes) -> tuple[int, int, bytes]:
+        def blob_sink(value: Any) -> tuple[int, int, bytes]:
             blob_oid = self._alloc.next_oid()
-            digest = hashlib.sha256(value).digest()
-            blob_data.append((blob_oid, len(value), digest, value))
-            return blob_oid, len(value), digest
+            if isinstance(value, BlobSource):
+                # Pre-TID pass 1: hash + length-check WITHOUT holding the bytes
+                # whole. A size mismatch raises here, before the TID is taken →
+                # the sequence stays gapless (invariant 5). P2 reads the source
+                # AGAIN to fill the cell (hence BlobSource must be re-readable).
+                hasher = hashlib.sha256()
+                total = 0
+                for chunk in value.open_chunks():
+                    hasher.update(chunk)
+                    total += len(chunk)
+                if total != value.size:
+                    raise ValueError(
+                        f"a dc.BlobSource declared size {value.size} but its "
+                        f"bytes total {total} — fix the size or the source"
+                    )
+                digest = hasher.digest()
+                stream_data.append((blob_oid, value.size, digest, value.open_chunks))
+                return blob_oid, value.size, digest
+            if isinstance(value, (bytes, bytearray)):
+                data = bytes(value)
+                digest = hashlib.sha256(data).digest()
+                blob_data.append((blob_oid, len(data), digest, data))
+                return blob_oid, len(data), digest
+            raise TypeError(
+                f"a dc.Blob field accepts bytes or a dc.BlobSource, not "
+                f"{type(value).__name__}"
+            )
 
         for oid, obj in pending.items():
             ti = type_info(obj)
@@ -697,11 +732,26 @@ class Store:
             # range) — it must run BEFORE the TID allocation so a rejected
             # commit consumes no TID and the buffers stay intact for a
             # fixed-up retry (gapless sequence, invariant 5).
-            encoded.append((oid, cid, encode_payload(
+            payload = encode_payload(
                 values, self._oid_for_encode,
                 blob_positions=blob_positions,
                 blob_sink=blob_sink if blob_positions else None,
-            )))
+            )
+            encoded.append((oid, cid, payload))
+            # Record streamed-source fields for the P3 swap, reading each field's
+            # blob descriptor straight from the just-encoded payload — so two
+            # fields sharing ONE BlobSource each pick up their OWN blob OID
+            # (id(value) keying would alias both to the last-allocated one).
+            streamed_positions = [
+                i for i in blob_positions if isinstance(values[i], BlobSource)
+            ]
+            if streamed_positions:
+                decoded = decode_payload(payload)
+                for i in streamed_positions:
+                    tok = cast("BlobToken", decoded[i])  # the field's BLOB_EXT descriptor
+                    blob_swaps.append(
+                        (obj, ti.field_names[i], tok.blob_oid, tok.size, tok.hash)
+                    )
         # Prior payloads for the delta stream (COMMIT-DELTA-v1 §3): read
         # back the last durable payload of every already-persisted record —
         # O(delta) reads, only while consumers watch, and like encoding
@@ -756,6 +806,10 @@ class Store:
                 StoredBlob(oid=boid, tid=tid, size=size, hash=h, data=data)
                 for boid, size, h, data in blob_data
             ],
+            blob_streams=[
+                StreamedBlob(oid=boid, tid=tid, size=size, hash=h, open_chunks=oc)
+                for boid, size, h, oc in stream_data
+            ],
         )
         delta = (
             build_delta(tid, records, new_types, self._root_oid, priors, delete_ops)
@@ -779,7 +833,8 @@ class Store:
         self._new.clear()
         self._dirty.clear()
         self._deleted.clear()
-        return _Capture(tid, batch, index_entries, ref_entries, flipped, delta, deletes)
+        return _Capture(tid, batch, index_entries, ref_entries, flipped, delta,
+                        deletes, blob_swaps)
 
     def _run_p2(self, batch: CommitBatch) -> None:
         """P2: backend I/O on bytes only, off the owner thread."""
@@ -821,12 +876,23 @@ class Store:
             self._fingerprints.pop(oid, None)
         self._pending_upserts.clear()  # the committed unique map takes over
         self._durable_cids.update(cid for cid, _, _ in capture.batch.new_types)
+        # A streamed-write source has now been consumed and durably stored; swap
+        # the live field from the opaque BlobSource to a readable BlobHandle so
+        # .bytes()/open_blob work without a reopen (ADR-007 §4). Untracked
+        # (set_field) — this is the post-commit rehydration, not a mutation. A
+        # plain bytes value is left as-is (it stays readable as itself).
+        for obj, field, boid, size, digest in capture.blob_swaps:
+            # engine-only BlobHandle constructor (users never call _bind)
+            handle = BlobHandle._bind(boid, size, digest, self)  # pyright: ignore[reportPrivateUsage]
+            set_field(obj, field, handle)
         if self._debug:
             # For a blob-bearing entity the stored payload carries the real
             # blob OID, but the sweep recomputes a content-only (oid-0)
             # descriptor — so fingerprint such entities through the same
-            # _fingerprint_payload epoch (the live object still holds raw bytes
-            # here, pre-rehydration). Non-blob records keep the cheap stored-crc.
+            # _fingerprint_payload epoch. (A streamed BlobSource was just swapped
+            # to a BlobHandle above; a whole-write bytes value is still resident
+            # bytes here — both descriptor-ize identically.) Non-blob records
+            # keep the cheap stored-crc.
             flipped_by_oid = {oid: obj for oid, obj, _ in capture.flipped}
             for rec in capture.batch.records:
                 obj = flipped_by_oid.get(rec.oid)
@@ -1033,6 +1099,58 @@ class Store:
         if self._closed:
             raise StoreClosedError("this store has been closed")
         return Snapshot(self._backend.read_view())
+
+    def open_blob(self, entity: Any, field: str) -> BinaryIO:
+        """Open a committed ``dc.Blob`` field as a binary stream (ADR-007 §3).
+
+        Returns a file-like ``io.BufferedReader`` (``read(n)``/``seek``/``tell``,
+        a context manager) over the blob's raw bytes. A range read pulls only the
+        spanned bytes off disk, so peak RSS is bounded by the read buffer, never
+        the blob size — this is the way to read a big value (a PDF, a scan)
+        without materializing it whole, the streamed sibling of
+        :meth:`BlobHandle.bytes`.
+
+        The stream rides a private snapshot-isolated read view (ADR-002): once
+        opened it is safe to keep reading from **another thread** while the owner
+        commits, and an immutable blob row is never torn mid-read. Close it
+        promptly (it pins a WAL read transaction) — it is a context manager.
+
+        Resolving ``field`` reads the live ``entity``, so this call is
+        owner-confined; the returned stream is not. (For a fully off-owner read,
+        open from a :meth:`snapshot` view instead.) An unknown field raises
+        ``QueryError`` and a non-``dc.Blob`` field ``TypeError``; a ``None`` blob
+        raises ``ValueError``. An uncommitted raw-bytes value streams from an
+        in-memory ``BytesIO`` (nothing is saved by it yet); an uncommitted
+        ``dc.BlobSource`` raises ``ValueError`` — ``commit()`` it first, since its
+        bytes are not resident."""
+        self._enter()
+        ti = type_info(entity)
+        spec = ti.spec(field)
+        if spec is None:
+            raise QueryError(f"{ti.typename} has no field {field!r}")
+        if not spec.blob:
+            raise TypeError(
+                f"{ti.typename}.{field} is not a dc.Blob field — open_blob() "
+                "streams out-of-line blob values only"
+            )
+        value = getattr(entity, field)
+        if value is None:
+            raise ValueError(f"{ti.typename}.{field} is None — no blob to open")
+        if isinstance(value, BlobHandle):
+            view = self._backend.read_view()
+            return view.open_blob_stream(value.blob_oid, on_close=view.close)
+        if isinstance(value, (bytes, bytearray)):
+            # Uncommitted raw assignment: already whole in RAM, stream a copy.
+            return io.BytesIO(bytes(value))
+        if isinstance(value, BlobSource):
+            raise ValueError(
+                f"{ti.typename}.{field} holds an uncommitted dc.BlobSource — "
+                "commit() before opening a streamed-write blob for reading"
+            )
+        raise TypeError(
+            f"{ti.typename}.{field} holds an unexpected blob value "
+            f"{type(value).__name__!r}"
+        )
 
     def get(self, cls: type, **unique_key: Any) -> Any | None:
         """Look up one entity by a unique secondary key, e.g.
@@ -1667,6 +1785,14 @@ class Store:
                 fp_values[i] = BlobToken(0, v.size, v.hash)
             elif isinstance(v, bytes):
                 fp_values[i] = BlobToken(0, len(v), hashlib.sha256(v).digest())
+            elif isinstance(v, BlobSource):
+                # Dead-defensive total-encode fallback: a fingerprint is only ever
+                # taken on a committed/hydrated holder (a BlobHandle) or a CLEAN
+                # sweep target — and assigning a BlobSource marks the holder DIRTY,
+                # which the sweep skips, while P3 swaps it to a BlobHandle before
+                # the post-commit fingerprint. So this branch is unreachable in
+                # practice; kept only so the encode never chokes on a stray source.
+                fp_values[i] = BlobToken(0, v.size, b"")
         return fingerprint_payload(fp_values, self._oid_for_encode)
 
     def _load_blob_bytes(self, blob_oid: int) -> bytes:
@@ -1962,11 +2088,13 @@ def _ref_target_oid(value: Any) -> int | None:
 
 def _blob_hash(value: Any) -> bytes | None:
     """The sha256 of a blob-field value for upsert equivalence (ADR-007): a
-    hydrated ``BlobHandle`` carries it free; a raw ``bytes`` value is hashed;
-    anything else (e.g. None) is not a blob."""
+    hydrated ``BlobHandle`` carries it free; a raw ``bytes``/``bytearray`` value
+    is hashed (the write path accepts both, so equivalence must too — else an
+    identical ``bytearray`` upsert spuriously re-stores); anything else (e.g.
+    None, or a streamed ``BlobSource`` with no resident hash) is not a blob."""
     if isinstance(value, BlobHandle):
         return value.hash
-    if isinstance(value, bytes):
+    if isinstance(value, (bytes, bytearray)):
         return hashlib.sha256(value).digest()
     return None
 
@@ -1983,8 +2111,11 @@ def _equivalent(cur: Any, new: Any) -> bool:
     # Blob fields compare by content hash (a hydrated BlobHandle carries the
     # sha256; raw bytes are hashed): so an upsert that re-supplies the IDENTICAL
     # blob is a no-op (no re-store, no new OID), and an unchanged blob behind a
-    # reopened entity is never rewritten (ADR-007). A blob-vs-None differs.
-    if isinstance(cur, BlobHandle) or isinstance(new, BlobHandle):
+    # reopened entity is never rewritten (ADR-007). A blob-vs-None differs. A
+    # dc.BlobSource has no resident hash to compare cheaply (re-reading it would
+    # defeat streaming), so _blob_hash is None for it → an upsert that supplies a
+    # streamed source always re-writes (the safe, conservative choice).
+    if isinstance(cur, (BlobHandle, BlobSource)) or isinstance(new, (BlobHandle, BlobSource)):
         return _blob_hash(cur) == _blob_hash(new) and _blob_hash(cur) is not None
     cur_ref, new_ref = _ref_target_oid(cur), _ref_target_oid(new)
     if cur_ref is not None or new_ref is not None:

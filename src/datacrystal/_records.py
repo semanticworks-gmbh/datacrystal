@@ -35,7 +35,7 @@ from typing import Any, Callable, cast
 import msgspec
 
 from datacrystal._entity import is_entity
-from datacrystal._lazy import BlobHandle, Lazy
+from datacrystal._lazy import BlobHandle, BlobSource, Lazy
 
 REF_EXT_CODE = 1
 NAIVE_DATETIME_EXT_CODE = 2  # ISO text; tz-aware datetimes use msgpack timestamps
@@ -129,6 +129,16 @@ def swizzle(value: Any, oid_for: Callable[[Any], int]) -> Any:
             "live out-of-line and cannot be inlined here; keep the dc.Blob "
             "marker, or run store.migrate() to rewrite the records (ADR-007)"
         )
+    if isinstance(value, BlobSource):
+        # A streamed-write source only makes sense in a dc.Blob field (where the
+        # blob_sink consumes it). Anywhere else — a non-blob field, or nested in
+        # a list/dict — it cannot be persisted; fail loudly instead of letting
+        # msgspec choke on an opaque object.
+        raise TypeError(
+            "a dc.BlobSource may only be assigned to a dc.Blob field "
+            "(Annotated[bytes, dc.Blob]) — it is a streamed-write token, not a "
+            "general value"
+        )
     if is_entity(value):
         return _ref_ext(oid_for(value))
     if isinstance(value, Lazy):
@@ -174,7 +184,7 @@ def encode_payload(
     oid_for: Callable[[Any], int],
     *,
     blob_positions: frozenset[int] = frozenset(),
-    blob_sink: Callable[[bytes], tuple[int, int, bytes]] | None = None,
+    blob_sink: Callable[[Any], tuple[int, int, bytes]] | None = None,
 ) -> bytes:
     """Encode a field-value list (schema order) to a record payload.
 
@@ -182,10 +192,11 @@ def encode_payload(
     a ``bytes`` value is an ordinary msgpack scalar in ``swizzle``, so the only
     reliable signal that a field is out-of-line is its FieldSpec — the store
     passes the blob field indices in ``blob_positions``. For each such position
-    holding a non-None ``bytes`` value, ``blob_sink`` allocates the blob OID and
-    records its bytes for storage, returning ``(blob_oid, size, hash)``; we emit
-    a tiny ``BLOB_EXT`` descriptor in the record instead of the bytes. A None
-    blob value encodes as msgpack None (the field is simply absent)."""
+    holding a non-None value (raw ``bytes`` for a whole write, or a
+    ``dc.BlobSource`` for a streamed write), ``blob_sink`` allocates the blob OID
+    and records the value for storage, returning ``(blob_oid, size, hash)``; we
+    emit a tiny ``BLOB_EXT`` descriptor in the record instead of the bytes. A
+    None blob value encodes as msgpack None (the field is simply absent)."""
     out: list[Any] = []
     for i, v in enumerate(values):
         if i in blob_positions and v is not None:

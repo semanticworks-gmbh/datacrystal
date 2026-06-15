@@ -23,7 +23,8 @@ from __future__ import annotations
 import threading
 import time
 import weakref
-from typing import Any, Callable, cast
+from pathlib import Path
+from typing import Any, Callable, Iterable, Iterator, cast
 
 from datacrystal._errors import StoreClosedError
 
@@ -137,9 +138,9 @@ class BlobHandle:
     A blob is immutable (ADR-007): changing the field mints a fresh blob OID, so
     a cached value is never stale. Reading ``.bytes()`` goes through the store,
     which re-asserts the ADR-001 owner-thread contract before any I/O — the same
-    confinement the live read path enforces. (The live handle is owner-confined;
-    the cross-thread blob read is a later slice — ``store.open_blob`` over a
-    read view — not built here.)
+    confinement the live read path enforces. (This live handle is owner-confined;
+    for a cross-thread streamed read use ``store.open_blob`` (over a private read
+    view) or ``snapshot.open_blob`` (over a snapshot's pinned view) instead.)
 
     Note the write/read asymmetry (documented intentionally): you assign plain
     ``bytes`` to a ``dc.Blob`` field, and the *live* value stays ``bytes`` until
@@ -223,6 +224,66 @@ class BlobHandle:
     def __repr__(self) -> str:
         state = "cached" if self._obj is not None else "on-disk"
         return f"BlobHandle(oid={self._oid}, size={self._size}, {state})"
+
+
+class BlobSource:
+    """A sized, re-readable source for a streamed blob WRITE (ADR-007 §4).
+
+    Assign one to a ``dc.Blob`` field to store a large value (a PDF, a scan)
+    WITHOUT ever holding it whole in RAM — the engine fills a SQLite
+    ``zeroblob(size)`` cell in place, chunk by chunk, inside the commit
+    transaction. The read-side twin is :class:`BlobHandle` / ``store.open_blob``.
+
+    Two constraints make the streamed write correct and atomic:
+
+    * **The size must be known up front** — SQLite pre-allocates the cell, so
+      the byte count cannot grow during the fill. An unknown-length producer
+      buffers to a temp file first and streams *that* (the size becomes the file
+      size); a genuinely unbounded stream is #76 (the chunked-page layout).
+    * **``open_chunks`` must return a FRESH iterable each call** — the engine
+      reads the source **twice**: once before the commit's TID is allocated, to
+      hash the bytes and check the length (so a wrong ``size`` rejects the commit
+      *gaplessly*, invariant 5), and once inside the commit transaction to fill
+      the cell. Neither pass holds more than one chunk in memory. A one-shot
+      iterator would be empty on the second pass — pass a factory, a file, or
+      use :func:`blob_from_path`.
+
+    After the commit the field reads back as a :class:`BlobHandle` (the source is
+    a consumed, opaque write token, unlike a plain ``bytes`` value which stays
+    readable as itself — ADR-007 §3 asymmetry)."""
+
+    __slots__ = ("size", "open_chunks")
+
+    size: int
+    open_chunks: Callable[[], Iterable[bytes]]
+
+    def __init__(self, size: int, open_chunks: Callable[[], Iterable[bytes]]) -> None:
+        if size < 0:
+            raise ValueError(f"a blob size must be >= 0, got {size!r}")
+        self.size = size
+        self.open_chunks = open_chunks
+
+    def __repr__(self) -> str:
+        return f"BlobSource(size={self.size})"
+
+
+def blob_from_path(path: str | Path, *, chunk_size: int = 1 << 20) -> BlobSource:
+    """A :class:`BlobSource` reading a file in ``chunk_size`` blocks (default
+    1 MiB) — the invoice/PDF-archival recipe (ADR-007 §4). The size is the
+    file's size at call time; the file is re-opened on each of the two read
+    passes, so it must stay unchanged across the commit."""
+    p = Path(path)
+    size = p.stat().st_size
+
+    def open_chunks() -> Iterator[bytes]:
+        with p.open("rb") as fh:
+            while True:
+                chunk = fh.read(chunk_size)
+                if not chunk:
+                    return
+                yield chunk
+
+    return BlobSource(size, open_chunks)
 
 
 class LazyReferenceManager:
