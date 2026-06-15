@@ -39,7 +39,15 @@ from datacrystal.web._strawberry import (
 )
 
 # --- _app: FastAPI app wiring (#92) -------------------------------------------
-from datacrystal.web import _app  # noqa: F401  # pyright: ignore[reportUnusedImport]  # extra home #92
+from datacrystal.web._app import (
+    SNAPSHOT_CONTEXT_KEY,
+    create_app,
+    get_store,
+    graphql_context_getter,
+    read_snapshot,
+    store_lifespan,
+    submit_write,
+)
 
 __all__ = [
     # _reflect
@@ -56,5 +64,12 @@ __all__ = [
     "LOADER_CONTEXT_KEY",
     "SnapshotLoader",
     "snapshot_context",
-    # _app (#92): append the app factory
+    # _app (#92): FastAPI lifespan + per-request read/write/context deps
+    "SNAPSHOT_CONTEXT_KEY",
+    "create_app",
+    "get_store",
+    "graphql_context_getter",
+    "read_snapshot",
+    "store_lifespan",
+    "submit_write",
 ]
