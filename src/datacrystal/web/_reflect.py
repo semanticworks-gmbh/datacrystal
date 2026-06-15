@@ -23,7 +23,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Annotated, Any, get_args, get_origin, get_type_hints
 
-from datacrystal._entity import FieldSpec, TypeInfo, type_info
+from datacrystal._entity import EntityMeta, FieldSpec, TypeInfo, type_info
+from datacrystal._lazy import Lazy
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,6 +56,42 @@ def _strip_annotated(hint: Any) -> Any:
     while get_origin(hint) is Annotated:
         hint = get_args(hint)[0]
     return hint
+
+
+def referenced_entities(core_type: Any) -> tuple[type, ...]:
+    """The ``@entity`` classes a field's core type can point at (deduped, in order).
+
+    Walks the marker-stripped annotation — through ``Lazy[...]``, ``| None``
+    unions, and ``list``/``tuple``/``set``/``dict`` containers — and collects
+    every ``@entity`` class it bottoms out on. ``Mineral.type_locality:
+    Lazy[Locality] | None`` yields ``(Locality,)``; ``list[Mineral]`` yields
+    ``(Mineral,)``; a scalar field yields ``()``.
+
+    Both web targets reflect a reference field into a *typed* edge (a Strawberry
+    object field in :mod:`._strawberry`, a nested DTO on the REST side), so both
+    need to name the referent class from the same stripped annotation the engine
+    persists — keeping the two surfaces' relation shapes identical by
+    construction (the module's mirror-the-engine rule)."""
+    seen: dict[int, type] = {}
+    _collect_entities(core_type, seen)
+    return tuple(seen.values())
+
+
+def _collect_entities(hint: Any, seen: dict[int, type]) -> None:
+    while get_origin(hint) is Annotated:
+        hint = get_args(hint)[0]
+    if isinstance(hint, EntityMeta):
+        seen.setdefault(id(hint), hint)
+        return
+    origin = get_origin(hint)
+    if origin is Lazy or hint is Lazy:
+        for arg in get_args(hint):
+            _collect_entities(arg, seen)
+        return
+    for arg in get_args(hint):
+        if arg is type(None) or arg is Ellipsis:
+            continue
+        _collect_entities(arg, seen)
 
 
 def reflect(cls: type) -> tuple[TypeInfo, tuple[FieldDescriptor, ...]]:
