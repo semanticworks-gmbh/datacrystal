@@ -25,13 +25,33 @@ engine's own read transforms — ``swizzle`` for a live entity, ``_freeze`` /
 (``peek()``-else-``.oid``, never a forced load) and containers decay to plain
 ``list`` / ``dict``. The DTO holds **no** reference to the live entity, the
 registry or the store — owner-confinement-safe by construction, the EntityView
-rule (ADR-001). ``from_pydantic`` lands in #98.
+rule (ADR-001).
+
+``from_pydantic`` (#98) closes the REST round-trip — the *request* direction. A
+boundary DTO (a parsed request body, or any of the three faces below) is turned
+back into a live ``@entity`` via the **public** ``cls(**field_values)``
+constructor, so the new instance enters lifecycle state ``STATE_NEW`` through the
+engine's own ``__new__``/``__init__`` and earns its OID + dirty-tracking on the
+next ``store.root``/``upsert``+``commit`` — ``from_pydantic`` **never** writes the
+``__dc_*`` engine slots itself (#98 acceptance criterion). A reference field's OID
+stays an OID/``Ref`` (no live object materialised) unless the caller passes a
+``store``, in which case each ref OID is resolved to its live entity *on the owner
+thread* — the store's existing ``WrongThreadError`` guard (ADR-001) covers
+confinement, so there is no new thread check here.
+
+Two derived **faces** support the SQLModel-style input/output split (#98): an
+``entity_model(cls, face="create")`` input model (no ``oid``) for a POST body and
+an ``entity_model(cls, face="public")`` output model (with ``oid``) for a
+``response_model=``. Both — and the default ``face="plain"`` model — carry
+``ConfigDict(from_attributes=True)`` so ``EntityPublic.model_validate(view)`` reads
+fields by name straight off a live read (an :class:`~datacrystal.EntityView`
+exposes ``.oid``; the public face's ``oid`` resolves from it).
 """
 
 from __future__ import annotations
 
 import types
-from typing import Annotated, Any, Union, cast, get_args, get_origin
+from typing import Annotated, Any, Literal, Union, cast, get_args, get_origin
 
 import pydantic
 from pydantic import ConfigDict, Field, create_model
@@ -43,16 +63,22 @@ from datacrystal._records import BlobToken, RefToken
 from datacrystal._snapshot import EntityView, Ref
 from datacrystal.web._reflect import FieldDescriptor, reflect
 
-__all__ = ["entity_model", "to_pydantic"]
+__all__ = ["entity_model", "from_pydantic", "to_pydantic"]
 
 # entity_model is pure reflection over a class object, so its result is a
-# function of the class alone — cache it (keyed by the class) and hand the same
-# generated model back on every call. Keyed on the @entity class itself, which
-# is a stable, hashable singleton per entity type.
-_MODEL_CACHE: dict[type, type[pydantic.BaseModel]] = {}
+# function of the class *and the requested face* — cache it (keyed by both) and
+# hand the same generated model back on every call. Keyed on the @entity class
+# (a stable hashable singleton per entity type) plus the face string.
+Face = Literal["plain", "create", "public"]
+_MODEL_CACHE: dict[tuple[type, Face], type[pydantic.BaseModel]] = {}
+
+# The three faces' generated class-name suffixes; "plain" keeps the bare class
+# name (the #96/#97 default), so existing reflection/projection callers are
+# unchanged.
+_FACE_SUFFIX: dict[Face, str] = {"plain": "", "create": "Create", "public": "Public"}
 
 
-def entity_model(cls: type) -> type[pydantic.BaseModel]:
+def entity_model(cls: type, *, face: Face = "plain") -> type[pydantic.BaseModel]:
     """Reflect an ``@entity`` class into a Pydantic model mirroring its fields.
 
     The model's fields follow the persisted schema order (``TypeInfo.field_names``,
@@ -60,10 +86,22 @@ def entity_model(cls: type) -> type[pydantic.BaseModel]:
     marker-stripped core types, so a FastAPI route can declare a typed request /
     response body that can never drift from the entity (#23 / #49 spike S2).
 
-    The result is **cached per class** — entity_model is a pure function of the
-    class, so repeated calls (every request handler import, every router build)
-    return the *same* model object rather than rebuilding it. Reflection goes
-    through :func:`reflect` → ``type_info(cls)``, never ``getattr(cls, field)``
+    Three **faces** (#98), the SQLModel ``HeroCreate``/``HeroPublic`` split derived
+    rather than hand-written:
+
+    * ``"plain"`` (default) — the entity's declared fields verbatim; class name =
+      ``cls.__name__``. The #96/#97 model, unchanged;
+    * ``"create"`` — an *input* DTO for a request body: the same declared fields,
+      class name ``{cls.__name__}Create`` (no ``oid`` — the store stamps it);
+    * ``"public"`` — an *output* DTO for ``response_model=``: the declared fields
+      **plus** a required ``oid: int``, class name ``{cls.__name__}Public``. The
+      ``oid`` resolves off a snapshot read via ``from_attributes`` (an
+      :class:`~datacrystal.EntityView` exposes ``.oid``).
+
+    The result is **cached per (class, face)** — entity_model is a pure function
+    of its inputs, so repeated calls (every request handler import, every router
+    build) return the *same* model object rather than rebuilding it. Reflection
+    goes through :func:`reflect` → ``type_info(cls)``, never ``getattr(cls, field)``
     (class-attribute access returns a query ``FieldExpr`` via the metaclass).
 
     Field mapping (#96 acceptance criteria):
@@ -77,32 +115,42 @@ def entity_model(cls: type) -> type[pydantic.BaseModel]:
       a **required** field;
     * an ``@entity(frozen=True)`` class → ``ConfigDict(frozen=True)`` so the DTO
       is immutable like its record-shaped source;
+    * every face carries ``from_attributes=True`` (#98) so ``model_validate`` reads
+      fields by name straight off a live read;
     * the engine's marker flags ride along as ``json_schema_extra`` (``unique`` →
       ``candidate_key``, ``indexed`` → ``queryable``, ``fulltext`` →
       ``searchable``) so generated OpenAPI advertises them.
     """
-    cached = _MODEL_CACHE.get(cls)
+    cached = _MODEL_CACHE.get((cls, face))
     if cached is not None:
         return cached
 
     info, descriptors = reflect(cls)
     field_defs: dict[str, Any] = {}
+    if face == "public":
+        # The output face carries the engine-assigned identity; required, since a
+        # response is only ever built from a committed (OID-bearing) read.
+        field_defs["oid"] = (int, Field(json_schema_extra={"primary_key": True}))
     for d in descriptors:
         annotation = _boundary_annotation(d)
         field_info = _field_info(info.defaults.get(d.name), d)
         field_defs[d.name] = (annotation, field_info)
 
-    config = ConfigDict(frozen=True) if info.frozen else None
+    # from_attributes lets model_validate read fields by name off a live read
+    # (the EntityView guarantee); a frozen @entity stays an immutable DTO.
+    config = ConfigDict(from_attributes=True, frozen=info.frozen)
     model = create_model(
-        cls.__name__,
+        cls.__name__ + _FACE_SUFFIX[face],
         __config__=config,
         **field_defs,
     )
-    _MODEL_CACHE[cls] = model
+    _MODEL_CACHE[(cls, face)] = model
     return model
 
 
-def to_pydantic(source: Any, *, nested: int = 0) -> pydantic.BaseModel:
+def to_pydantic(
+    source: Any, *, nested: int = 0, face: Face = "plain"
+) -> pydantic.BaseModel:
     """Project a live entity **or** an :class:`~datacrystal.EntityView` into a
     detached, validated Pydantic DTO of its :func:`entity_model` (#97 / #49 S3).
 
@@ -140,31 +188,103 @@ def to_pydantic(source: Any, *, nested: int = 0) -> pydantic.BaseModel:
     RAM — it never calls ``.get()``, so it cannot force a load or N+1 the store.
     A nested DTO sits in its ``int``-typed ref slot via ``model_construct`` (the
     boundary annotation from #96 is frozen at ``int``; the nested object is placed
-    without re-validating that slot)."""
+    without re-validating that slot).
+
+    ``face`` selects which :func:`entity_model` face the DTO is an instance of
+    (#98): ``"plain"`` (default), the input-shaped ``"create"`` (same fields), or
+    the output-shaped ``"public"`` — which carries the source's ``oid`` (``view.oid``
+    for a snapshot view, the engine OID for a live entity) so a FastAPI route can
+    return it under ``response_model=EntityPublic``."""
     cls: type
     values: dict[str, Any]
+    oid: int | None
     if isinstance(source, EntityView):
         cls = _type_info_for_view(source)
         values = dict(source.fields())
+        oid = source.oid
     elif is_entity(source):
         ti = type_info(source)
         cls = ti.cls  # the canonical class (typed), not type(source) (Unknown)
         _guard_owner(source)  # ADR-001: read on the owner thread, pre-read
         values = {name: getattr(source, name) for name in ti.field_names}
+        oid = oid_of(source)
     else:
         raise TypeError(
             f"to_pydantic() takes a live @entity or an EntityView, got "
             f"{type(source).__name__!r} — for a cross-thread read pass a "
             "store.snapshot() view"
         )
-    model = entity_model(cls)
+    model = entity_model(cls, face=face)
     data = {name: _dto_value(value, nested) for name, value in values.items()}
+    if face == "public":
+        if oid is None:
+            raise ValueError(
+                "to_pydantic(face='public') needs an OID-bearing source — the "
+                "entity was never committed (store and commit it first)"
+            )
+        data["oid"] = oid
     # A nested DTO lives in an int-typed ref slot (the #96 boundary annotation is
     # frozen at int). model_validate would reject the nested object there; with no
     # nested objects present (nested=0, the headline path) we validate fully.
     if nested > 0 and _has_nested_dto(data):
         return model.model_construct(**data)
     return model.model_validate(data)
+
+
+def from_pydantic(model_instance: pydantic.BaseModel, cls: type, *, store: Any = None) -> Any:
+    """Reconstruct a live ``@entity`` of ``cls`` from a boundary DTO — the request
+    direction that closes the REST round-trip (#98 / #49 spike S4, build plan #23).
+
+    The DTO (a parsed request body, or any :func:`entity_model` face) is rebuilt
+    through the **public** ``cls(**field_values)`` constructor, so the result is a
+    fresh ``STATE_NEW`` instance that earns its OID and dirty-tracking through the
+    engine on the next ``store.root``/``upsert`` + ``commit`` — this function
+    **never** stamps the ``__dc_*`` engine slots itself (#98 acceptance criterion).
+    A ``frozen=True`` entity reconstructs the same way: the DTO's frozen config
+    constrains the *DTO*, not the constructor, so ``cls(**values)`` still runs.
+
+    Only the entity's declared fields are passed to the constructor — a ``public``
+    face's extra ``oid`` is **ignored** here, since the engine, not the caller,
+    assigns identity (a DTO-supplied OID would collide with the store's own
+    sequence). Missing fields (a ``create`` DTO that omits a defaulted field) fall
+    to the dataclass default exactly as a hand-written ``cls(...)`` would.
+
+    Reference fields (a ``Lazy`` ref or a directly-typed ``@entity`` field, which
+    cross the edge as an ``int`` OID — #96) stay **OIDs** by default: with no
+    ``store`` the reconstructed entity holds the raw OID, the honest no-hydrate
+    default that never silently touches storage. Pass ``store=`` to resolve each
+    ref OID to its live entity (a ``Lazy`` field is rewrapped as ``Lazy.of(target)``,
+    a direct field assigned the entity): resolution goes through the public
+    ``store.get_many`` on the **owner thread**, so the store's existing
+    ``WrongThreadError`` guard (ADR-001) confines it — no new thread check is added
+    here."""
+    _, descriptors = reflect(cls)  # raises NotAnEntityError loudly for a non-@entity class
+    field_values: dict[str, Any] = {}
+    ref_oids: list[tuple[str, int, FieldDescriptor]] = []
+    for d in descriptors:
+        if not hasattr(model_instance, d.name):
+            continue  # absent on this face/DTO → fall to the dataclass default
+        value = getattr(model_instance, d.name)
+        is_ref = d.spec.lazy_refs or _contains_entity(d.core_type)
+        if is_ref and store is not None and isinstance(value, int):
+            ref_oids.append((d.name, value, d))  # resolve in one round-trip below
+            continue
+        field_values[d.name] = value  # scalar / container / OID-as-is (no store)
+
+    if ref_oids:
+        # ref_oids is only populated when a store was passed (the branch above), so
+        # store is non-None here — assert it to re-narrow for the type checker.
+        assert store is not None
+        # One owner-thread round-trip (store.get_many guards the thread, ADR-001).
+        resolved: list[Any] = store.get_many([oid for _, oid, _ in ref_oids])
+        for (name, _, d), target in zip(ref_oids, resolved, strict=True):
+            # A Lazy field carries a handle; a directly-typed @entity field the
+            # entity itself — mirror the engine's two ref shapes. ``Lazy[Any].of``
+            # binds T explicitly (the engine's idiom in _store.py for a loosely
+            # typed store path) — a bare ``Lazy.of`` would infer ``Lazy[Unknown]``.
+            field_values[name] = Lazy[Any].of(target) if d.spec.lazy_refs else target
+
+    return cls(**field_values)  # public constructor → STATE_NEW; never pokes __dc_* slots
 
 
 def _type_info_for_view(view: EntityView) -> type:

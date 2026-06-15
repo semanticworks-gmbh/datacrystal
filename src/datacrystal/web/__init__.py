@@ -27,7 +27,7 @@ from __future__ import annotations
 from datacrystal.web._reflect import FieldDescriptor, reflect
 
 # --- _pydantic: REST boundary (#96-#98) ---------------------------------------
-from datacrystal.web._pydantic import entity_model, to_pydantic
+from datacrystal.web._pydantic import entity_model, from_pydantic, to_pydantic
 
 # --- _strawberry: GraphQL boundary (#99-#101) ---------------------------------
 from datacrystal.web import _strawberry  # noqa: F401  # pyright: ignore[reportUnusedImport]  # extra home #99-101
@@ -39,8 +39,9 @@ __all__ = [
     # _reflect
     "FieldDescriptor",
     "reflect",
-    # _pydantic (#96-#98): append from_pydantic below
+    # _pydantic (#96-#98)
     "entity_model",
+    "from_pydantic",
     "to_pydantic",
     # _strawberry (#99-#101): append the Strawberry reflection surface
     # _app (#92): append the app factory
