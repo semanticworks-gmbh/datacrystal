@@ -61,12 +61,12 @@ No item moves on this note alone; it records the lens.
 shipped, what we will **not** build (Punted / Never, below) and *why*, and the ratified decision log
 above. Single source of truth: **GitHub owns "what we're building & when"; this file owns "what we
 decided & won't build."** Per-item design rationale lives in each issue body (open work) or in the
-ADRs / [GUIDE.md](GUIDE.md) / CLAUDE.md architecture map (shipped work).
+ADRs / [GUIDE.md](../GUIDE.md) / CLAUDE.md architecture map (shipped work).
 
 ## Shipped in v0.1.0
 
 The v0.x core landed and the API froze at the v0.1.0 tag (2026-06-13); contracts live in the ADRs,
-[COMMIT-DELTA-v1](COMMIT-DELTA-v1.md), [GUIDE.md](GUIDE.md), and the CLAUDE.md architecture map.
+[COMMIT-DELTA-v1](COMMIT-DELTA-v1.md), [GUIDE.md](../GUIDE.md), and the CLAUDE.md architecture map.
 
 | # | Item | Where the detail lives now |
 |---|------|----------------------------|

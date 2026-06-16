@@ -28,4 +28,4 @@ You came here to build, not to administer a database. Declare, deploy, ship — 
 ---
 > *Today:* single node, with Litestream / parquet-on-S3. The multi-instance + S3-native arc is the
 > **direction** ([ROADMAP.md](ROADMAP.md) items 16 & 21), not yet shipped — honesty rule:
-> [GUIDE.md](GUIDE.md).
+> [GUIDE.md](../GUIDE.md).
