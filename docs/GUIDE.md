@@ -94,7 +94,8 @@ class Mineral:
 - Field markers go inside `typing.Annotated`:
   - `dc.Index` — adds the field to the roaring-bitmap indexes; `==` and `.in_()` queries on it
     answer from bitmaps. Index/Unique fields must be scalar (`str | int | float | bool`,
-    optionally `| None`) — or a **`list` of scalars** for a multi-valued (inverted) index
+    optionally `| None`; `datetime`/`date` are supported as `dc.SortedIndex` keys — see the
+    `dc.SortedIndex` notes below) — or a **`list` of scalars** for a multi-valued (inverted) index
     (`Annotated[list[str], dc.Index]`), queried with `.contains(elem)` for exact element
     membership. A bad index type is rejected at `@dc.entity` definition, not first `commit()`.
   - `dc.Unique` — unique secondary key (e.g. URIs, slugs, external ids). Duplicates are
@@ -450,6 +451,13 @@ Query semantics:
   still shows exactly what answers from the index and what falls to a residual. On real data a
   range query drops from an O(extent) scan to a sorted slice (measured: a 6.2M-row
   "capacity ≥ 1 MW" went from ~20 s to ~85 ms).
+  `datetime`/`date` are valid `dc.SortedIndex` key types (a timestamp field then answers
+  range, `order_by`, **and** `==`/`.in_()` from the one index). Store timestamps
+  **timezone-aware** (`datetime.now(timezone.utc)`); aware values order by their UTC instant,
+  and `None` sorts last as usual. Mixing naive and aware values on one temporal index raises
+  `dc.MixedTemporalIndexError` at `commit()` — before the TID is allocated, so the commit
+  sequence stays gapless — instead of a confusing comparison failure; naive-only and
+  aware-only fields both work.
 - A condition uses fields of **one entity class** — cross-entity joins are
   `[planned — v1, on Arrow mirrors]`.
 - `query()` and `get()` reflect **committed** state; uncommitted buffered changes are not
@@ -1116,6 +1124,7 @@ Everything derives from `dc.DataCrystalError`:
 | `NewerStoreError` | store written by a newer format version |
 | `CorruptRecordError` | a record failed its checksum — the file is damaged |
 | `QueryError` | malformed condition (two classes mixed, missing parentheses, …) |
+| `MixedTemporalIndexError` | a `datetime`/`date` `SortedIndex` field mixed naive and aware values — store timestamps timezone-aware |
 | `DeletedEntityError` | write/`store()` on a `store.delete()`d instance — it is detached; create a new entity |
 | `DanglingRefError` | a reference to a deleted (or never-existing) record was followed (see [Deleting](#deleting)) |
 

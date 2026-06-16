@@ -33,6 +33,7 @@ forward references resolve once all classes exist).
 from __future__ import annotations
 
 import dataclasses
+import datetime as _dt
 import types
 import weakref
 from typing import (
@@ -174,7 +175,14 @@ class Glue(_Marker):
         return "datacrystal.Glue(...)"
 
 
-_INDEXABLE_TYPES = (str, int, float, bool)
+# Orderable scalar leaf types admitted as Index/Unique/SortedIndex keys.
+# datetime/date join the original str/int/float/bool set (#106, amending
+# ADR-004 §1 which pre-authorized naive date/time as range keys): both are
+# total-ordered and round-trip natively through the msgpack codec (_records.py
+# — aware datetimes ride msgspec's timestamp ext as a UTC instant, naive ones
+# an ISO-text ext). The aware-vs-naive comparability fork is handled in the
+# sorted run (_indexes.py), not here at the type gate.
+_INDEXABLE_TYPES = (str, int, float, bool, _dt.datetime, _dt.date)
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -455,14 +463,14 @@ def _resolve_specs(cls: type, field_names: tuple[str, ...]) -> tuple[FieldSpec, 
         if (indexed or unique) and not (_is_indexable(core) or is_list):
             raise TypeError(
                 f"{cls.__name__}.{name}: Index/Unique fields must be scalar "
-                f"(str, int, float or bool, optionally | None) or a list of "
-                f"scalars, got {hint!r}"
+                f"(str, int, float, bool, datetime or date, optionally | None) "
+                f"or a list of scalars, got {hint!r}"
             )
         if srt and not _is_indexable(core):
             raise TypeError(
                 f"{cls.__name__}.{name}: SortedIndex fields must be a scalar "
-                f"(str, int, float or bool, optionally | None) — a range index "
-                f"needs an orderable single value, got {hint!r}"
+                f"(str, int, float, bool, datetime or date, optionally | None) — "
+                f"a range index needs an orderable single value, got {hint!r}"
             )
         if unique and is_list:
             raise TypeError(
@@ -535,7 +543,11 @@ def _is_union(hint: Any) -> bool:
 
 
 def _is_indexable(hint: Any) -> bool:
-    """A scalar (str/int/float/bool) or optional scalar (``| None``).
+    """A scalar (str/int/float/bool/datetime/date) or optional scalar (``| None``).
+
+    datetime/date are admitted because they are total-ordered and round-trip
+    natively (#106 / ADR-004 §1) — the same key set Index/Unique/SortedIndex and
+    the web extra's ``_is_scalar_field`` all read.
 
     Deliberately rejects ``list[scalar]`` — that is a *multi-valued* index
     (:func:`_is_list_of_scalar`), maintained with element-wise postings, not a
@@ -557,7 +569,8 @@ def _is_indexable(hint: Any) -> bool:
 # inside list/tuple/set/dict/union. Everything else — an @entity class, Lazy,
 # Any, object, a bare/unparameterised container, an unknown type — is treated as
 # possibly ref-bearing, so the walk is never wrongly skipped.
-_REF_FREE_LEAVES = (str, int, float, bool, bytes, type(None))
+_REF_FREE_LEAVES = (str, int, float, bool, bytes, _dt.datetime, _dt.date, _dt.time,
+                    type(None))
 
 
 def _may_hold_entity(hint: Any) -> bool:

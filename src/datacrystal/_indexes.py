@@ -25,6 +25,7 @@ OIDs live above 2**32, hence ``BitMap64``.
 from __future__ import annotations
 
 import dataclasses
+import datetime as _dt
 from bisect import bisect_left, bisect_right, insort
 from typing import Any, Callable, Iterable, Iterator, cast
 
@@ -32,9 +33,50 @@ from pyroaring import BitMap64
 
 from datacrystal._conditions import And, Condition, Or, Pred
 from datacrystal._entity import TypeInfo
-from datacrystal._errors import SchemaMismatchError, UniqueViolationError
+from datacrystal._errors import (
+    MixedTemporalIndexError,
+    SchemaMismatchError,
+    UniqueViolationError,
+)
 from datacrystal._records import RefToken, decode_payload
 from datacrystal._storage.protocol import StorageBackend, StoredRecord
+
+
+def _guard_temporal_comparable(field: str, new_key: Any, existing_key: Any) -> None:
+    """Reject a SortedIndex datetime field that mixes naive and aware values
+    (#106 / ADR-004 §4) — Python cannot order a tz-aware against a tz-naive
+    ``datetime``, so a mixed sorted run would raise a bare ``TypeError`` deep in
+    ``bisect``/``insort``. We catch it at the door with a named datacrystal error.
+
+    Only ``datetime`` carries an offset; ``date``/``time``/``str``/numeric keys
+    are uniformly comparable, so the guard is a no-op for them. Compares the
+    incoming key against any one already-indexed key (all keys in a single sorted
+    run share one convention once this guard has held)."""
+    if (isinstance(new_key, _dt.datetime) and isinstance(existing_key, _dt.datetime)
+            and (new_key.tzinfo is None) != (existing_key.tzinfo is None)):
+        raise MixedTemporalIndexError(
+            f"SortedIndex field {field!r} mixes timezone-naive and timezone-aware "
+            "datetimes — they are not mutually orderable; store every value with "
+            "the same convention (aware, e.g. datetime.now(timezone.utc), is "
+            "recommended)"
+        )
+
+
+def _sorted_run(field: str, keys: Iterable[Any]) -> list[Any]:
+    """Sort a sorted field's distinct non-None keys into its run, turning the
+    bare ``TypeError`` a naive-vs-aware datetime mix raises in ``sorted()`` into a
+    named :class:`MixedTemporalIndexError` (#106 / ADR-004 §4). Used by the bulk
+    build's ``finalize_build`` and the cache ``load`` — the from-scan/from-cache
+    rebuild paths where the whole run is sorted at once."""
+    try:
+        return sorted(keys)
+    except TypeError as exc:
+        raise MixedTemporalIndexError(
+            f"SortedIndex field {field!r} mixes timezone-naive and timezone-aware "
+            "datetimes — they are not mutually orderable; store every value with "
+            "the same convention (aware, e.g. datetime.now(timezone.utc), is "
+            "recommended)"
+        ) from exc
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -132,8 +174,8 @@ class ClassIndexes:
         """After a bulk build, derive each sorted field's sorted run from its eq
         keys in one O(K log K) sort (incremental updates after this insort)."""
         for field in self.sorted_fields:
-            self.sorted_keys[field] = sorted(
-                k for k in self.eq[field] if k is not None
+            self.sorted_keys[field] = _sorted_run(
+                field, (k for k in self.eq[field] if k is not None)
             )
         self._building = False
 
@@ -211,15 +253,20 @@ class ClassIndexes:
             if eq_col is not None:
                 postings = eq_col.get(value)
                 if postings is None:
-                    postings = BitMap64()
-                    eq_col[value] = postings
                     # a genuinely new key on a sorted field enters the sorted run
                     # (None never participates in ordering — SQL-NULL-like). During
                     # a bulk build the insort is deferred to finalize_build()
-                    # (O(K^2)→one sort); incremental commits insort directly.
+                    # (O(K^2)→one sort); incremental commits insort directly. A
+                    # datetime field that would mix naive+aware values is rejected
+                    # before insort's comparison fails (#106 / ADR-004 §4).
                     if (field in self.sorted_fields and value is not None
                             and not self._building):
-                        insort(self.sorted_keys[field], value)
+                        run = self.sorted_keys[field]
+                        if run:
+                            _guard_temporal_comparable(field, value, run[0])
+                        insort(run, value)
+                    postings = BitMap64()
+                    eq_col[value] = postings
                 postings.add(oid)
             if field in self._unique_fields and value is not None:
                 self.unique[field][value] = oid
@@ -287,7 +334,9 @@ class ClassIndexes:
         for field, items in blob["unique"]:
             ci.unique[field] = dict(items)
         for field in ci.sorted_fields:
-            ci.sorted_keys[field] = sorted(k for k in ci.eq[field] if k is not None)
+            ci.sorted_keys[field] = _sorted_run(
+                field, (k for k in ci.eq[field] if k is not None)
+            )
         # Defer the O(corpus) _last_values reconstruction to the first write (#12
         # Design A): a read-only reopen never pays it; the first insert()/remove()
         # rebuilds it from these postings + the unique map.
@@ -475,6 +524,44 @@ class IndexManager:
                         f"{ti.cls.__name__}.{field}={value!r}"
                     )
                 seen[key] = oid
+
+    def check_sorted_temporal(
+        self, entries: list[tuple[int, TypeInfo, dict[str, Any]]]
+    ) -> None:
+        """P1 validation: a SortedIndex datetime field may not mix timezone-naive
+        and timezone-aware values (#106 / ADR-004 §4) — they are not mutually
+        orderable, so a mixed sorted run would fail with a bare ``TypeError`` in
+        ``bisect``/``insort``. Raising here (BEFORE the TID is allocated) keeps the
+        TID sequence gapless on rejection (invariant 5) and never half-mutates the
+        live index.
+
+        Validates the commit batch against itself and against any already-built
+        index, without forcing a build: a not-yet-built index's first build path
+        (:func:`build_class_indexes`/``finalize_build``) carries the same guard, so
+        a mix already on disk is caught the same way when the index is first read.
+        """
+        first: dict[tuple[type, str], Any] = {}  # one already-seen key per field
+        for _oid, ti, values in entries:
+            sorted_fields = [s.name for s in ti.specs if s.sorted]
+            if not sorted_fields:
+                continue
+            ci = self._by_cls.get(ti.cls)  # only an already-built index — never build
+            for field in sorted_fields:
+                value = values.get(field)
+                if not isinstance(value, _dt.datetime):
+                    continue
+                key = (ti.cls, field)
+                existing = first.get(key)
+                if existing is None and ci is not None:
+                    run = ci.sorted_keys.get(field)
+                    if run:
+                        existing = run[0]
+                if existing is not None:
+                    _guard_temporal_comparable(
+                        f"{ti.cls.__name__}.{field}", value, existing
+                    )
+                else:
+                    first[key] = value
 
     def _invalidate_stale_blob(self, ti: TypeInfo) -> None:
         """A commit changed this class's records before its index was built, so

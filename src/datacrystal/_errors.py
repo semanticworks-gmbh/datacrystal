@@ -81,6 +81,17 @@ class CorruptRecordError(DataCrystalError):
     """A stored record failed its checksum — the store file is damaged."""
 
 
+class MixedTemporalIndexError(DataCrystalError):
+    """A SortedIndex datetime field holds both timezone-naive and timezone-aware
+    values (#106 / ADR-004 §4).
+
+    Aware datetimes order by their UTC instant; naive datetimes carry no offset.
+    Python refuses to compare the two, so a sorted run that mixed them would raise
+    a bare ``TypeError`` deep in ``bisect``/``insort``. datacrystal rejects the mix
+    loudly at insert/build instead — pick one convention per field (store every
+    timestamp aware, e.g. ``datetime.now(timezone.utc)``, is the recommendation)."""
+
+
 class QueryError(DataCrystalError):
     """A condition is malformed — e.g. it mixes fields of two entity classes
     (cross-entity joins are a v1 feature on Arrow mirrors, not v0.x)."""

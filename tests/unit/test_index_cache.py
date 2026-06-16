@@ -5,13 +5,16 @@ index markers no longer match the live class (never authoritative)."""
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from typing import Annotated
 
 import msgspec.msgpack
+import pytest
 
 import datacrystal as dc
 from datacrystal._entity import oid_of, type_info
 from datacrystal._indexes import ClassIndexes, plan
+from datacrystal._records import decode_scalar_tree, encode_scalar_tree
 
 
 @dc.entity
@@ -142,3 +145,56 @@ def test_commit_before_build_invalidates_stale_cache_blob(tmp_path):
     assert s3.count(Rock) == 1
     assert sorted(r.name for r in s3.query(Rock)) == ["b"]
     s3.close()
+
+
+# --- datetime SortedIndex keys survive the cache codec (#106) -----------------
+
+
+@dc.entity
+class Dated:
+    seq: Annotated[int, dc.Unique]
+    at: Annotated[datetime | None, dc.SortedIndex] = None
+
+
+DF = dc.fields(Dated)
+
+
+@pytest.mark.parametrize("tz", [None, timezone.utc], ids=["naive", "aware"])
+def test_datetime_keys_survive_cache_codec_roundtrip(tz):
+    # The cache codec must route datetime keys through the record ext codes
+    # (encode_scalar_tree/decode_scalar_tree, #106): msgspec's DEFAULT msgpack
+    # encoding silently turns a *naive* datetime into a bare ISO str, which would
+    # corrupt the sorted run (a later range bisect of a datetime vs str crashes).
+    base = datetime(2021, 1, 1, 9, 0, tzinfo=tz)
+    blob = {"classes": {"x": [base + timedelta(days=i) for i in range(3)]}}
+    back = decode_scalar_tree(encode_scalar_tree(blob))
+    keys = back["classes"]["x"]
+    assert keys == [base + timedelta(days=i) for i in range(3)]
+    assert all(isinstance(k, datetime) for k in keys)  # NOT decoded back as str
+
+
+@pytest.mark.parametrize("tz", [None, timezone.utc], ids=["naive", "aware"])
+def test_datetime_sorted_index_range_survives_reopen_via_cache(tmp_path, monkeypatch, tz):
+    import datacrystal._indexes as _idx
+
+    path = tmp_path / "cabinet"
+    base = datetime(2021, 1, 1, 9, 0, tzinfo=tz)
+    s = dc.Store.open(path, cache_index=True)
+    for i in range(5):
+        s.store(Dated(seq=i, at=base + timedelta(days=i)))
+    s.store(Dated(seq=99, at=None))
+    s.commit()
+    assert s.count(DF.at >= base + timedelta(days=2)) == 3  # builds + caches the index
+    s.close()
+
+    built: list[int] = []
+    real = _idx.build_class_indexes
+    monkeypatch.setattr(_idx, "build_class_indexes",
+                        lambda *a, **k: built.append(1) or real(*a, **k))
+    s2 = dc.Store.open(path, cache_index=True)
+    cut = base + timedelta(days=2)
+    assert sorted(e.seq for e in s2.query(DF.at >= cut)) == [2, 3, 4]  # range intact
+    assert [e.seq for e in s2.query(Dated, order_by=(DF.at, "desc"))] == \
+        [4, 3, 2, 1, 0, 99]                                            # order intact
+    assert built == []  # served from the cache — the datetime run reconstructed, not rebuilt
+    s2.close()
