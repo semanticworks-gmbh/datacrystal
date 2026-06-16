@@ -992,6 +992,79 @@ The **deployment doctrine** — and *why* each rule holds:
 (`fastapi`/`strawberry`/`pydantic`) live only inside `datacrystal.web` — a bare
 `import datacrystal` never pulls them, staying inside the `{msgspec, pyroaring}` budget.
 
+#### Reflecting `@entity` into Pydantic models and Strawberry types
+
+The `MineralCreate` type above is **reflected**, not hand-written: one reflection engine reads the
+entity's persisted shape (its engine `TypeInfo`) and projects it into either a **Pydantic** model
+(the REST boundary) or a **Strawberry** type (the GraphQL boundary). Because both targets read the
+*same* field analysis, the two surfaces can never disagree on which fields an entity exposes or
+what core type each carries — a field the engine persists is the field the web layer reflects, with
+the marker (`Index`/`Unique`/`FullText`/…) stripped off to the type a caller actually sees.
+
+```python
+from datacrystal.web import (
+    entity_model, to_pydantic, from_pydantic,        # REST: @entity ↔ Pydantic DTO
+    reflect_strawberry_type, StrawberryReflector,    # GraphQL: @entity → Strawberry type
+    reflect, FieldDescriptor,                         # the shared reflection (both targets)
+    snapshot_context, LOADER_CONTEXT_KEY, SNAPSHOT_CONTEXT_KEY,  # GraphQL request wiring
+)
+
+# --- REST: reflect Mineral into a Pydantic DTO, in three faces ----------------
+MineralModel  = entity_model(Mineral)                   # plain: the declared fields
+MineralCreate = entity_model(Mineral, face="create")    # input DTO for a POST body (no oid)
+MineralPublic = entity_model(Mineral, face="public")    # output DTO for response_model= (with oid)
+
+# A reference field (Lazy[Locality]) crosses the edge as its OID (an int), never a live object;
+# a defaulted field becomes optional; a frozen @entity becomes a frozen DTO. The result is
+# cached per (class, face) — entity_model is a pure function of its inputs.
+
+# --- GraphQL: reflect Mineral (and everything it references) into a type ------
+MineralType = reflect_strawberry_type(Mineral)          # one root → one Strawberry type
+# A graph of mutually-referential entities shares ONE reflector so each referent maps to a single
+# GraphQL type (Strawberry rejects two types with the same name), and cycles terminate:
+reflector = StrawberryReflector()
+mineral_gql  = reflector.reflect(Mineral)               # reflects Locality too (the referent)
+locality_gql = reflector.reflect(Locality)              # the SAME cached type, not a rebuild
+```
+
+- **`reflect(cls)`** is the shared step both targets call: it returns the entity's `TypeInfo` plus a
+  tuple of **`FieldDescriptor`**s, in persisted-schema order. A `FieldDescriptor` is one reflected
+  field — its `name`, its marker-stripped `core_type` (the shape a Pydantic/Strawberry field should
+  carry), a `has_default` flag (so a generated model can mark it optional), and the engine's
+  `FieldSpec` verbatim (for targets that need the marker flags — lazy refs, blob, indexed). A
+  non-`@entity` class raises `NotAnEntityError` loudly at reflection time.
+- **`entity_model(cls, face=...)`** reflects into a Pydantic model: `"plain"` (declared fields),
+  `"create"` (input DTO, no `oid`), `"public"` (output DTO with a required `oid: int`). The engine's
+  marker flags ride along as OpenAPI `json_schema_extra` (`unique`→`candidate_key`,
+  `indexed`→`queryable`, `fulltext`→`searchable`).
+- **`to_pydantic(source, face=...)`** projects a live entity *or* an `EntityView` into a detached,
+  validated DTO; **`from_pydantic(dto, cls, store=...)`** rebuilds a live `@entity` through the
+  public constructor (`STATE_NEW`, never poking the engine slots). Both are shown in use in the
+  routes above.
+- **`reflect_strawberry_type(cls)`** is the convenience for one reflected root; **`StrawberryReflector`**
+  is the type registry to share when reflecting several entities into one schema (one GraphQL type
+  per entity, cached by typename, cycles broken by patching reference-field targets in after both
+  endpoint types exist). Scalar fields resolve straight off the frozen `EntityView` via Strawberry's
+  default `getattr` resolver; reference fields carry the per-request DataLoader resolver (the N+1
+  killer).
+- **`snapshot_context(snapshot)`** builds a GraphQL `context` carrying a fresh per-request
+  `SnapshotLoader` over that snapshot — call it once per request and pass the result as
+  `context_value` (or let `graphql_context_getter` call it for you, as above). The relation resolver
+  finds the loader on `info.context` under the constant **`LOADER_CONTEXT_KEY`** (`"dc_snapshot_loader"`);
+  `graphql_context_getter` additionally stashes the pinned snapshot under **`SNAPSHOT_CONTEXT_KEY`**
+  (`"dc_snapshot"`). Both are module constants (not bare strings at the call sites) so the resolver
+  and the context builder can never disagree on the name.
+
+```python
+# Drive a reflected schema by hand (what graphql_context_getter does per request):
+import strawberry
+schema = strawberry.Schema(query=QueryType)              # QueryType fields return MineralType, …
+with store.snapshot() as snap:
+    result = schema.execute_sync(query, context_value=snapshot_context(snap))
+    # context_value carries a fresh SnapshotLoader under LOADER_CONTEXT_KEY; sibling reference
+    # edges in one resolver tick batch into a single Snapshot.get_many (no N+1).
+```
+
 ## Snapshots and the commit-delta pipeline
 
 ### `store.snapshot()` — reading from any thread

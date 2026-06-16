@@ -23,10 +23,10 @@ Two honesty contracts, both CI-enforced:
    ``dc.RenamedFrom`` already ships" — so an exported token is only a violation when it
    is NOT qualified as already-shipping on its line.)
 
-**Scope: core ``datacrystal.__all__`` ONLY.** ``datacrystal.web.__all__`` is deliberately
-excluded for now: 8 of its symbols are knowingly undocumented, tracked in #129. Extending
-this guard to the web surface is gated on #129 closing — see ``test_web_surface_documented``
-below (xfail placeholder).
+**Scope: core ``datacrystal.__all__`` AND ``datacrystal.web.__all__``.** Since #129 the web
+extra's public surface is held to the same honesty bar: every name in ``datacrystal.web.__all__``
+is documented in the GUIDE's ``datacrystal[web]`` section (a runnable/inline-code mention) — see
+``test_web_surface_documented`` below (now a hard assertion, no longer an xfail placeholder).
 """
 
 from __future__ import annotations
@@ -131,16 +131,23 @@ def test_no_shipped_feature_listed_as_planned():
     )
 
 
-# --- #129: extending the documentation drift-guard to datacrystal.web -------------
-# datacrystal.web exports 8 symbols that are knowingly undocumented in the GUIDE today.
-# This guard is intentionally NOT enforced against the web surface until #129 lands the
-# missing web docs. Kept as an xfail so the day #129 closes, this turns green and we can
-# flip it to a hard gate (drop the xfail). Do NOT delete — it is the tracking signal.
-@pytest.mark.xfail(reason="#129: datacrystal.web public surface not yet fully documented", strict=False)
+# --- #129: the documentation drift-guard now covers datacrystal.web ----------------
+# Mirror the core-__all__ API check over datacrystal.web.__all__: every exported web symbol
+# (the REST/GraphQL reflection surface — entity_model, reflect, reflect_strawberry_type,
+# StrawberryReflector, FieldDescriptor, snapshot_context, the context-key constants, …) must
+# appear as code somewhere in the GUIDE. Adding a new datacrystal.web.__all__ name without
+# documenting it turns this gate red — the same Definition-of-Done discipline as core (#129
+# closed the original 8-symbol gap; this assertion is the standing guard). The web extra's
+# symbols are all API (no exception/warning classes), so the runnable-mention check is the whole
+# contract. importorskip so the bare suite (no web extra) stays green.
 def test_web_surface_documented():
+    pytest.importorskip("strawberry", reason="datacrystal[web] extra not installed")
     web = importlib.import_module("datacrystal.web")
     guide = GUIDE.read_text()
     code = _code_mentions(guide)
     web_names = [n for n in getattr(web, "__all__", ()) if n != "__version__"]
     undocumented = [n for n in web_names if not _mentioned(code, n)]
-    assert not undocumented, f"datacrystal.web names undocumented in GUIDE (#129): {undocumented}"
+    assert not undocumented, (
+        "datacrystal.web.__all__ names missing a runnable/inline-code mention in docs/GUIDE.md "
+        f"(document them in the datacrystal[web] section, #129): {undocumented}"
+    )
