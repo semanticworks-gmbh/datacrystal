@@ -351,7 +351,8 @@ never truncates).
 > same kind of write-asymmetry as assigning `bytes` and reading back a `BlobHandle` — a type
 > checker sees `bytes` and flags the `BlobSource`. Add a `# type: ignore[assignment]` at that line
 > (or a per-file `# pyright: reportArgumentType=false` in code that writes many). The runtime is
-> exact; only the static type is approximate, by design.
+> exact; only the static type is approximate, by design. This and the other checker quirks are
+> collected in one place — see [Typing](#typing).
 
 ### When to reach for a `Blob` entity + `dc.Lazy` instead
 
@@ -484,6 +485,9 @@ Query semantics:
   M = dc.fields(Mineral)
   hits = store.query((M.crystal_system == "cubic") & (M.mohs >= 6.0))
   ```
+
+  This is the first of the type-checker quirks; the full set lives in one place — see
+  [Typing](#typing).
 
 ### Backlinks: who references this? — `incoming()`
 
@@ -1205,6 +1209,68 @@ Each guarantee above is exactly as strong as its cited test or setting — no mo
   `sqlite3.backup`/Litestream PITR recipes are `[planned — docs, v0.x]`.
 - Opening a store written by a **newer** library version raises `NewerStoreError` naming both
   versions — never a misread.
+
+## Typing
+
+datacrystal is typed-Python-first, and the **runtime is always exact**. But three spots use Python
+in ways a static checker (pyright/basedpyright/mypy) cannot follow, so they flag a false positive.
+This section is the single, authoritative list — meet them once here, apply the blessed workaround,
+and your checker is clean with **zero** behavior change. (A pyright/mypy plugin that would erase
+these is `[planned]`; see *Deferred* below.)
+
+### 1. Class-attribute conditions read as the field's value type
+
+`Mineral.mohs >= 6.0` is the documented primary query form, but a checker sees `Mineral.mohs` as
+`float | None` and reads the whole thing as `float >= float -> bool`, not a `Condition`. The
+**workaround** is the typed field proxy `dc.fields(C)` — it returns a `FieldProxy` whose attributes
+are `FieldExpr`s, so the comparison types as a `Condition`:
+
+```python
+M = dc.fields(Mineral)
+hits = store.query((M.crystal_system == "cubic") & (M.mohs >= 6.0))   # checker-clean
+```
+
+Both forms are identical at runtime; `dc.fields(C)` is purely for the checker. (Also covered inline
+in [Reading](#reading-get-query-lazy-references).)
+
+### 2. A `dc.Blob` field reads back as `dc.BlobHandle`, not `bytes`
+
+A field declared `Annotated[bytes, dc.Blob]` hydrates to a `dc.BlobHandle` (lazy — `.size`/`.hash`
+are free, `.bytes()` fetches once). `BlobHandle` is **not** a `bytes` subclass, so a checker that
+trusts the `bytes` declaration flags `.bytes()`/`.size` on the field. There is no pragma that fixes
+this cleanly — treat the handle as the real shape (the declared `bytes` is the *write*-side type),
+and reach for `.bytes()` / streamed `store.open_blob()` as documented in
+[Storing binary blobs](#storing-binary-blobs-pdfs-scans-invoices).
+
+### 3. Assigning a `dc.BlobSource` to a `bytes`-typed `dc.Blob` field
+
+The streamed-write form assigns a `dc.BlobSource` (or `dc.blob_from_path(...)`) to a field typed
+`bytes`, which a checker flags `[assignment]`. The **workaround** is a `# type: ignore[assignment]`
+on that line (or a per-file `# pyright: reportArgumentType=false` in code that writes many):
+
+```python
+inv.pdf = dc.blob_from_path("/tmp/2026-0042.pdf")   # type: ignore[assignment]
+store.commit()
+```
+
+This is the same write/read asymmetry as #2, from the write side. (Also noted inline in
+[Writing a big blob](#writing-a-big-blob-without-holding-it-whole-in-ram).)
+
+### Not a false positive: `list`/`dict` read back as persistent containers
+
+For completeness — a field declared `list[str]` (or `dict[...]`) reads back as a
+`dc.PersistentList` / `dc.PersistentDict`. This is **not** a checker quirk and needs **no
+workaround**: `PersistentList` subclasses `list` and `PersistentDict` subclasses `dict`, so the
+read-back value stays assignable to the declared type and the checker is happy. The only semantic to
+remember is the runtime one, not a typing one: **assignment copies** (mutate *through* the field —
+see [Lists and dicts](#lists-and-dicts-inside-entities)).
+
+### Deferred
+
+A pyright/mypy plugin (or `.pyi` overloads) that would type `EntityClass.field <op> value` as a
+`Condition` and reflect the real read-back types (`BlobHandle`, `PersistentList[T]`) — erasing
+quirks 1–3 without any pragma — is **out of scope here and deferred** to its own backlog issue. The
+runtime exactness above is unaffected by whether it ever ships.
 
 ## Errors
 
