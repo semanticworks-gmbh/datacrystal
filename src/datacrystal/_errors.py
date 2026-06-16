@@ -145,3 +145,14 @@ class UntrackedMutationWarning(UserWarning):
     mutable non-container object like a ``bytearray``). The safety net
     commits the entity anyway — fix the write path it names (KICKOFF risk 1:
     silent lost writes were the #1 DX killer in both ancestor systems)."""
+
+
+class DanglingDeleteWarning(UserWarning):
+    """``debug=True`` committed a delete that left a *surviving* record still
+    pointing at the just-deleted OID — a dangle that ADR-003 makes loud only
+    later, at dereference (``DanglingRefError``). The dev net turns that spooky
+    deferred failure into an at-the-delete diagnostic, naming the referrers it
+    found via the reverse-reference index (``incoming(dead)``, #110). The commit
+    proceeds (unchecked deletes are uniform, ADR-003); ``strict_deletes=True``
+    promotes this to a raised ``DanglingRefError`` instead. This is the dev-time
+    bridge until v1 checked-deletes/cascades land — NOT referential integrity."""

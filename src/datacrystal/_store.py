@@ -64,6 +64,7 @@ from datacrystal._entity import (
 from datacrystal._state import STATE_CLEAN, STATE_DELETED, STATE_DIRTY, STATE_NEW
 from datacrystal._errors import (
     ConsumerDetachedWarning,
+    DanglingDeleteWarning,
     DanglingRefError,
     DataCrystalError,
     DeletedEntityError,
@@ -158,6 +159,7 @@ class Store:
 
     def __init__(self, backend: StorageBackend, lock: Any | None, *,
                  p2_inline: bool = False, debug: bool = False,
+                 strict_deletes: bool = False,
                  lazy_timeout: float | None = None,
                  lazy_clock: Callable[[], float] | None = None,
                  cache_dir: Path | None = None) -> None:
@@ -195,6 +197,13 @@ class Store:
         # work and one int per live entity for detection — development tool.
         self._debug = debug
         self._fingerprints: dict[int, int] = {}
+        # strict_deletes (#110, ADR-003 dev-time bridge): the eager dangling-ref
+        # check at commit. debug=True arms it as a WARN (DanglingDeleteWarning) so
+        # a bulk re-import is never bricked; strict_deletes=True promotes the same
+        # finding to a raised DanglingRefError — the stricter knob. Either arms the
+        # check; unarmed, the commit path is byte-for-byte unchanged (the reverse
+        # index stays unbuilt, spec §5: an unwatched store pays nothing).
+        self._strict_deletes = strict_deletes
         # lazy_timeout=None means no demotion (the default): root pinning
         # plus explicit Lazy cut points already bound memory; the manager
         # adds *time*-based release on top (timeout-only in v0.1).
@@ -270,6 +279,7 @@ class Store:
     @classmethod
     def open(cls, path: str | Path, *, durability: str = "interval",
              lock_ttl: float = 10.0, debug: bool = False,
+             strict_deletes: bool = False,
              lazy_timeout: float | None = None, cache_index: bool = True) -> "Store":
         """Open (creating if needed) the store directory at ``path``.
 
@@ -287,7 +297,22 @@ class Store:
         re-encodes the live CLEAN entities and raises an
         ``UntrackedMutationWarning`` for (and commits) any that changed
         without the dirty-tracking hook firing. Development tool — it costs
-        O(live entities) per commit.
+        O(live entities) per commit. It also arms the eager dangling-ref
+        check (see ``strict_deletes``) in its lenient WARN mode.
+
+        ``strict_deletes`` (#110, the ADR-003 dev-time bridge) arms an eager
+        dangling-reference check: at each ``commit()`` that deletes an OID a
+        *surviving* record still points at, datacrystal names the referrer(s)
+        immediately — turning a later mystery ``DanglingRefError`` (raised far
+        away, at the eventual dereference) into an at-the-delete diagnostic.
+        ``strict_deletes=True`` **raises** ``DanglingRefError`` at the offending
+        commit; ``debug=True`` alone runs the same check but only **warns**
+        (``DanglingDeleteWarning``) so a bulk re-import is never bricked. The
+        flagged set is exactly ``incoming(dead)`` after this commit's index
+        folds — prior-commit AND same-commit-new referrers, never co-deleted
+        ones. Unarmed (the default) the commit path is unchanged and pays
+        nothing. This is a dev-time *bridge*, NOT checked deletes — referential
+        integrity / cascades arrive with the v1 reverse-reference index.
 
         ``lazy_timeout`` (seconds) enables the LazyReferenceManager: loaded
         ``Lazy`` handles idle past the timeout demote back to unloaded,
@@ -321,7 +346,8 @@ class Store:
             # Off-thread P2 shares the connection with owner-thread reads;
             # that requires a serialized sqlite3 build (CPython's default).
             return cls(backend, lock, p2_inline=sqlite3.threadsafety < 3,
-                       debug=debug, lazy_timeout=lazy_timeout,
+                       debug=debug, strict_deletes=strict_deletes,
+                       lazy_timeout=lazy_timeout,
                        cache_dir=directory if cache_index else None)
         except BaseException:
             lock.release()
@@ -329,11 +355,12 @@ class Store:
 
     @classmethod
     def _from_backend(cls, backend: StorageBackend, *, debug: bool = False,
+                      strict_deletes: bool = False,
                       lazy_timeout: float | None = None,
                       lazy_clock: Callable[[], float] | None = None) -> "Store":
         """Open over an explicit backend (tests; no lock file)."""
-        return cls(backend, None, debug=debug, lazy_timeout=lazy_timeout,
-                   lazy_clock=lazy_clock)
+        return cls(backend, None, debug=debug, strict_deletes=strict_deletes,
+                   lazy_timeout=lazy_timeout, lazy_clock=lazy_clock)
 
     def close(self) -> None:
         """Close the store. Uncommitted changes are discarded (commit first)."""
@@ -670,12 +697,26 @@ class Store:
                 index_entries.append(
                     (oid, ti, {name: getattr(obj, name) for name in relevant})
                 )
+        # #110: the eager dangling-ref check (debug/strict_deletes) needs the
+        # reverse index BUILT to enumerate surviving referrers of a deleted OID
+        # — force it before the ref-harvest gate so ref_entries is populated and
+        # the check sees both prior-commit and same-commit referrers. Unarmed,
+        # this is skipped and the gate below stays lazy (spec §5: an unwatched
+        # store pays nothing — the reverse index stays unbuilt).
+        if (self._debug or self._strict_deletes) and deletes:
+            self._index.ensure_reverse()
         # #20: harvest outgoing refs for the reverse index — only when it is
         # already built (spec §5: an unwatched store pays nothing for it).
         ref_entries: list[tuple[int, set[int]]] = (
             [(oid, self._harvest_live_refs(obj)) for oid, obj in pending.items()]
             if self._index.reverse_built else []
         )
+        # #110: name any surviving record still pointing at a just-deleted OID,
+        # BEFORE the TID is allocated (a strict raise must leave the sequence
+        # gapless, invariant 5; validation precedes allocation, same as encoding
+        # and unique checks above).
+        if (self._debug or self._strict_deletes) and deletes:
+            self._check_dangling_deletes(deletes, ref_entries)
         self._index.check_unique(index_entries, deleted=set(self._deleted))
         # #106 / ADR-004 §4: reject a SortedIndex datetime field mixing naive +
         # aware values BEFORE the TID is allocated (gapless sequence, invariant 5)
@@ -937,6 +978,88 @@ class Store:
                     ),
                     stacklevel=4,
                 )
+
+    def _check_dangling_deletes(
+        self,
+        deletes: list[tuple[int, TypeInfo, Any | None]],
+        ref_entries: list[tuple[int, set[int]]],
+    ) -> None:
+        """#110 (the ADR-003 dev-time bridge): name any *surviving* record still
+        pointing at an OID this commit deletes — turning a later spooky
+        ``DanglingRefError`` (raised far away at the eventual dereference, ADR-003
+        rule 8) into an at-the-delete diagnostic. ``strict_deletes=True`` raises;
+        ``debug=True`` alone warns. Runs in P1 *before* the TID allocation so a
+        raise leaves the sequence gapless (invariant 5).
+
+        The flagged set must equal ``incoming(dead)`` *after* this commit's P3
+        folds (``apply_reverse``/``remove_reverse`` at :meth:`_p3_finalize`), which
+        is the user-meaningful set. At P1 the reverse map (forced built by
+        ``ensure_reverse`` in :meth:`_p1_capture`) still reflects the *pre-commit*
+        watermark, so this reconstructs the post-fold referrers per deleted OID:
+        the pre-commit referrers, reconciled against THIS commit's harvested
+        outgoing refs (a NEW/DIRTY referrer that now points at the dead OID is
+        added; a DIRTY referrer that dropped the ref is removed), minus the
+        co-deleted set (a referrer also deleted here drops out — ADR-003: its
+        outgoing edges vanish). The seam is ``incoming(dead)`` (ADR-003, line 108)."""
+        deleted_oids = {oid for oid, _, _ in deletes}
+        rev = self._index.ensure_reverse()  # pre-commit map (forced built by P1)
+        pending_targets = dict(ref_entries)  # referrer oid → its targets THIS commit
+        # deleted oid → its post-fold surviving referrers
+        flagged: dict[int, set[int]] = {}
+        for dead in deleted_oids:
+            referrers = set(rev.get(dead, ()))  # pre-commit referrers
+            for referrer, targets in pending_targets.items():
+                if dead in targets:
+                    referrers.add(referrer)  # NEW/DIRTY referrer points here now
+                else:
+                    referrers.discard(referrer)  # DIRTY referrer dropped the ref
+            referrers -= deleted_oids  # a co-deleted referrer is not a dangle
+            if referrers:
+                flagged[dead] = referrers
+        if not flagged:
+            return
+        typenames = self._typenames_for(
+            {r for refs in flagged.values() for r in refs}
+        )
+        deleted_typename = {oid: ti.typename for oid, ti, _ in deletes}
+        parts: list[str] = []
+        for dead, referrers in flagged.items():
+            named = ", ".join(
+                f"{typenames.get(r, '?')} (oid {r})" for r in sorted(referrers)
+            )
+            parts.append(
+                f"{deleted_typename.get(dead, '?')} (oid {dead}) is still "
+                f"referenced by {named}"
+            )
+        message = (
+            "this commit deletes records other surviving records still point at "
+            "(ADR-003 unchecked delete: following such a stale reference later "
+            "raises DanglingRefError). " + "; ".join(parts)
+        )
+        if self._strict_deletes:
+            raise DanglingRefError(message)
+        warnings.warn(DanglingDeleteWarning(message), stacklevel=4)
+
+    def _typenames_for(self, oids: set[int]) -> dict[int, str]:
+        """Resolve OID → typename for a set of referrer OIDs without hydrating.
+        A same-commit NEW/DIRTY referrer is not yet in the registry or on disk,
+        so consult the live commit buffers first, then a registry instance, then
+        one ``load_many`` via the persisted cid lineage. Best-effort — an OID
+        with no record (race) is simply absent (the message shows '?')."""
+        out: dict[int, str] = {}
+        unresolved: list[int] = []
+        for oid in oids:
+            live = self._new.get(oid) or self._dirty.get(oid) or self._registry.get(oid)
+            if live is not None:
+                out[oid] = type_info(live).typename
+            else:
+                unresolved.append(oid)
+        if unresolved:
+            for oid, rec in self._backend.load_many(unresolved).items():
+                name = self._typename_by_cid.get(rec.cid)
+                if name is not None:
+                    out[oid] = name
+        return out
 
     def _sweep_untracked(self) -> None:
         """debug=True: warn about (and rescue) CLEAN entities whose
