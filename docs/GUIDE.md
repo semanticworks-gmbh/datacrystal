@@ -489,6 +489,60 @@ Query semantics:
   This is the first of the type-checker quirks; the full set lives in one place — see
   [Typing](#typing).
 
+### Recipe: paging the newest/top-N by an indexed field
+
+For "the N newest" (or hardest, heaviest, …) by an indexed field, reach for a bare
+`order_by` + `limit` — **not** a `>= sentinel` predicate. Both are correct and return the same
+rows; one stays flat as the dataset grows and the other does not.
+
+```python
+@dc.entity
+class CatalogEvent:
+    seq: Annotated[int, dc.Unique]
+    at: Annotated[datetime | None, dc.SortedIndex] = None   # None = unrecorded time
+
+F = dc.fields(CatalogEvent)
+
+# FAST — streams the newest 100 straight off the SortedIndex head, O(limit).
+newest = store.query(CatalogEvent, order_by=(F.at, "desc"), limit=100)
+
+# SLOWER — same answer, but considers every matching candidate before windowing.
+sentinel = datetime(1970, 1, 1, tzinfo=timezone.utc)
+newest = store.query(F.at >= sentinel, order_by=(F.at, "desc"), limit=100)
+```
+
+Why the bare-`order_by` form wins:
+
+- It orders **straight from the `SortedIndex` run** and windows **lazily** — it materializes only
+  about `offset + limit` rows, so its cost is O(limit), flat no matter how big the class grows.
+- Because **NULLs sort last** (in *both* directions), rows with `at=None` (unrecorded /
+  unpublished) land in the tail and are skipped for free once the window fills — you don't need a
+  predicate to exclude them.
+- The `>= sentinel` form narrows the **candidate set** to every match first (it then windows the
+  *same* lazy way), so its cost grows with the number of matches. It is **not** slower because it
+  "scans records" or sorts everything — both forms stream from the index with **no** Python
+  residual; the difference is purely the candidate-set *size*. (A `>= sentinel` predicate also
+  drops `None`, since ordering comparisons never match `None` — so the two forms agree on which
+  rows they return.)
+
+`explain()` shows the tell — the `candidates: K of extent` line:
+
+```python
+store.explain(CatalogEvent)
+# CatalogEvent: full extent — query() hydrates all <extent> entities ...
+#   (the order_by form windows this lazily to ~offset+limit; it does NOT hydrate the extent)
+
+store.explain(F.at >= sentinel)
+# CatalogEvent: (CatalogEvent.at >= ...)
+#   candidates via bitmaps: <matches> of <extent>     # grows with the match count
+```
+
+This works directly on a `datetime` `SortedIndex` field (a timestamp answers range, `order_by`,
+**and** `==`/`.in_()` from the one index) — the newest-by-timestamp shape this recipe is for. It is
+the rule-based planner's **third** deterministic rule (the `SortedIndex` range slice), not an
+optimizer: `explain()` always shows exactly what answers from the index and what (if anything)
+falls to a residual.
+
 ### Backlinks: who references this? — `incoming()`
 
 `store.incoming(entity)` returns every committed entity that **references** `entity` — the
