@@ -26,6 +26,7 @@ freezes at the v0.1.0 tag.
 - [Transactional guarantees (A/C/I/D)](#transactional-guarantees-acid)
 - [Durability and crash safety](#durability-and-crash-safety)
 - [Typing](#typing)
+- [Glossary](#glossary)
 - [Errors](#errors)
 - [Planned features and when they land](#planned-features-and-when-they-land)
 
@@ -39,8 +40,9 @@ store = dc.Store.open("cabinet.store")        # a directory; created if needed
 store.close()                                  # or: with dc.Store.open(...) as store:
 ```
 
-`Store.open(path, *, durability="interval", lock_ttl=10.0, debug=False, lazy_timeout=None,
-cache_index=True)` (async: `await dc.aopen(...)`, same keywords — see
+`Store.open(path, *, durability="interval", lock_ttl=10.0, debug=False, strict_deletes=False,
+lazy_timeout=None, cache_index=True)` (async: `await dc.aopen(...)`, same keywords **except
+`strict_deletes`** — the eager dangling-ref check is sync-only — see
 [Concurrency and deployment](#concurrency-and-deployment)):
 
 - The directory holds `data.sqlite` (records as msgpack blobs, riding SQLite's journal),
@@ -69,6 +71,10 @@ cache_index=True)` (async: `await dc.aopen(...)`, same keywords — see
   `object.__setattr__` bypass, or in-place mutation of a `bytearray`), emits an
   `UntrackedMutationWarning` **and commits the change anyway** — detection plus rescue. It
   costs O(live entities) per commit; use it in development and tests.
+- `strict_deletes=True` arms the **eager dangling-ref check** (#110, the ADR-003 dev-time
+  bridge): a `commit()` that deletes an entity another record still references **raises**
+  `DanglingRefError` at the offending delete, rather than letting the follow fail later — see
+  [Deleting](#deleting). (`aopen()` does not take this keyword.)
 - `lazy_timeout=<seconds>` enables the **LazyReferenceManager** — see
   [Identity and memory](#identity-and-memory).
 
@@ -1196,7 +1202,8 @@ table.to_pandas()
 
 Aggregates over a filtered set — `sum`/`avg`/`min`/`max`, `GROUP BY` — have no fast path in
 the live object layer **on purpose**: the engine is rule-based and never grows an optimizer
-(see [`explain()`'s two rules](#querying)). `pluck` reads a column without building entities,
+(see [`explain()`'s two rules](#reading-get-query-lazy-references)). `pluck` reads a column
+without building entities,
 but you still pay O(hits) Python to fold it — summing 1.4 M values took ~5.6 s on the MaStR
 eval. The mirror is the columnar tier: hand its parquet to **DuckDB** and the same fold is a
 vectorized scan. Two shapes, both at the mirror's `watermark`:
@@ -1437,6 +1444,32 @@ A pyright/mypy plugin (or `.pyi` overloads) that would type `EntityClass.field <
 quirks 1–3 without any pragma — is **out of scope here and deferred** to its own backlog issue. The
 runtime exactness above is unaffected by whether it ever ships.
 
+## Glossary
+
+The core jargon, in one place — terms that appear above before they are defined:
+
+- **OID** — object identifier: the stable 64-bit identity of a persisted entity. One live
+  instance per OID (`a.friend is b` survives a restart).
+- **CID** — class identifier: the identity of a *class shape*. A field-shape change mints a new
+  CID, so old records keep decoding through their own persisted shape (additive schema evolution).
+- **TID** — transaction identifier: the sequence-derived id of a commit. Never wall-clock;
+  the sequence stays gapless even after a rejected commit, so replay is deterministic.
+- **watermark** — the latest committed TID (`store.last_tid`). Snapshots, the index cache, and
+  the delta pipeline are all pinned to / validated against a watermark.
+- **owner-confinement** — the concurrency contract (ADR-001): a store and its live entities are
+  bound to the thread that opened them; a foreign thread raises `WrongThreadError` before any
+  mutation lands. Snapshots are the cross-thread read path.
+- **P1 / P2 / P3** — the three commit phases: **P1** captures the change set (and builds the delta
+  when consumers are watching), **P2** does the backend I/O (durability), **P3** flips to the new
+  state and delivers deltas. `commit()` keeps this shape even when synchronous.
+- **extent** — every committed instance of a class. An indexed read costs `f(hits)`, never
+  `f(extent)`; a residual `query()` over a non-indexed predicate hydrates the whole extent.
+- **residual** — the part of a query the bitmap indexes can't answer, evaluated as a Python
+  filter over the candidate set. `explain()` shows what answers from the index vs. the residual.
+- **swizzle** — at encode time, an in-RAM reference to another entity is replaced by its OID (an
+  msgpack extension value); on decode the OID is resolved back to the one live instance. No
+  pickle, no code execution.
+
 ## Errors
 
 Everything derives from `dc.DataCrystalError`:
@@ -1481,9 +1514,9 @@ the store has no committed records of (the result is empty — first run, or a f
 ## Planned features and when they land
 
 Sequencing follows the ratified [roadmap](design/ROADMAP.md); the live backlog (in/order)
-is on [GitHub Issues](https://github.com/themerius/datacrystal/issues). **v0.1.0 (API freeze)
-and v0.2.0/v0.3.0 (the additive surface) are tagged; PyPI publication is still deferred (names
-reserved).**
+is on [GitHub Issues](https://github.com/themerius/datacrystal/issues). **v0.1.0 (the API-freeze
+baseline) and the purely additive surface through v0.6.0 are all tagged (the v0.1.0 freeze is
+never broken); PyPI publication is still deferred (names reserved).**
 
 | Feature | Where it lands |
 |---|---|
