@@ -316,7 +316,14 @@ class Snapshot:
         return self.get(self._root_oid).value
 
     def get(self, ref: Ref | int) -> EntityView:
-        """Resolve an OID or :class:`Ref` to its :class:`EntityView`."""
+        """Resolve an OID or :class:`Ref` to its :class:`EntityView`.
+
+        Raises:
+            DanglingRefError: no record for that OID at this watermark —
+                deleted (v0.x deletes are unchecked, ADR-003) or never
+                committed.
+            StoreClosedError: this snapshot has already been closed.
+        """
         oid = ref.oid if isinstance(ref, Ref) else ref
         with self._lock:
             self._guard()
@@ -348,6 +355,10 @@ class Snapshot:
         Cache-aware (OIDs already materialized in this snapshot cost no extra
         ``load_many``) and callable from any thread under the snapshot lock,
         including on the mid-life bootstrap path (ADR-002 read views).
+
+        Raises:
+            StoreClosedError: this snapshot has already been closed. (Misses
+                yield ``None`` in their slots, never raise.)
         """
         oids = [r.oid if isinstance(r, (EntityView, Ref)) else r for r in refs]
         with self._lock:
@@ -361,6 +372,14 @@ class Snapshot:
         snapshot's watermark; closing the stream does NOT close the snapshot
         (close the snapshot itself when done). A ``None`` blob raises
         ``ValueError``; a non-blob field raises ``TypeError``.
+
+        Raises:
+            QueryError: ``field`` is not a field of the resolved view.
+            ValueError: the blob value is ``None`` (no blob to open).
+            TypeError: ``field`` is not a ``dc.Blob`` field.
+            DanglingRefError: ``view`` is a :class:`Ref`/OID with no record
+                at this watermark (deleted or never committed, ADR-003).
+            StoreClosedError: this snapshot has already been closed.
         """
         ev = view if isinstance(view, EntityView) else self.get(view)
         fields = ev.fields()
@@ -501,6 +520,15 @@ class Snapshot:
         window — NULLs last, ascending-OID tiebreak; an indexed sort field is
         ordered from the snapshot-local index, an un-indexed one from each
         matched view's decoded value.
+
+        Raises:
+            NotAnEntityError: ``target`` is an entity class that is not an
+                ``@entity`` class.
+            TypeError: ``target`` is neither an ``@entity`` class nor a
+                Condition, or ``limit``/``offset`` are not ints.
+            ValueError: ``limit`` or ``offset`` is negative.
+            QueryError: ``order_by`` names an invalid field or direction.
+            StoreClosedError: this snapshot has already been closed.
         """
         validate_window(limit, offset)
         cls, cond = query_target(target, "query")
@@ -575,6 +603,10 @@ class Snapshot:
         A ``target`` whose own record is gone at this watermark (deleted, ADR-003
         — unchecked) still names its now-dangling referrers (OIDs are never
         reused): ``incoming(dead)`` is the checked-delete enumeration seam.
+
+        Raises:
+            StoreClosedError: this snapshot has already been closed. (A
+                ``target`` with no record yields an empty list, never raises.)
         """
         oid = target.oid if isinstance(target, (EntityView, Ref)) else target
         with self._lock:

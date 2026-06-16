@@ -146,6 +146,12 @@ class DeltaLog:
     ``bytes_flushed`` is a public diagnostic counter: bytes written by the
     most recent flush — pin your own O(delta) gates on it (fitness #9 shape),
     exactly like ``datacrystal.arrow``'s ``rows_flushed``.
+
+    Raises:
+        DeltaLogConfigError: ``flush_every`` is below 1, ``max_segment_bytes``
+            is too small for a single frame, or ``path`` holds a directory
+            that is not a datacrystal delta log or was written by a newer log
+            format than this build understands (the format-honesty stance).
     """
 
     def __init__(self, path: str | Path, *,
@@ -216,6 +222,14 @@ class DeltaLog:
         False on an idempotent skip (§4.2). Validates the §4 obligations and
         rejects malformed/unknown-op deltas *before* buffering anything — a
         refused delta leaves no trace (§4.4 shape).
+
+        Raises:
+            DeltaFormatError: the map is not a datacrystal delta (wrong
+                format marker), its contract version is newer than this build
+                supports, or it carries an unknown op (a consumer must be
+                total over the op vocabulary, never guess — §3).
+            DeltaGapError: the delta's TID skips past the watermark — deltas
+                are not retained (§5), so rebuild via :meth:`bootstrap`.
         """
         if delta.get("f") != FORMAT_MARKER:
             raise DeltaFormatError(f"not a datacrystal delta: f={delta.get('f')!r}")
@@ -258,6 +272,11 @@ class DeltaLog:
         (so ``store.attach()`` accepts it without a gap) and keeps the
         snapshot's type lineage (so a replay consumer can seed the pre-join
         types). Any existing log at ``path`` is replaced.
+
+        Raises:
+            DeltaLogConfigError: ``flush_every`` or ``max_segment_bytes`` is
+                below its minimum. (Any existing directory at ``path`` is
+                replaced, so its prior contents are never validated here.)
         """
         target = Path(path)
         if target.exists():
