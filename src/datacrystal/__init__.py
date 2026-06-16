@@ -42,6 +42,7 @@ from datacrystal._entity import (
 from datacrystal._errors import (
     ConsumerDetachedWarning,
     CorruptRecordError,
+    DanglingDeleteWarning,
     DanglingRefError,
     DataCrystalError,
     DeletedEntityError,
@@ -125,6 +126,7 @@ __all__ = [
     "QueryError",
     "DeletedEntityError",
     "DanglingRefError",
+    "DanglingDeleteWarning",
     "UnseenTypeWarning",
     "UntrackedMutationWarning",
     "__version__",

@@ -114,3 +114,23 @@ delete and instead provides the **enumeration** this ADR said v1 would need:
 Checked delete (the *policy* on top — refuse, cascade, orphan-sweep) remains
 deferred and additive: this ADR's unchecked contract is unchanged, and the
 reverse index is the rebuildable derived data (invariant 11) it consumes.
+
+## Dev-time bridge — eager dangling-ref check (2026-06-16, #110)
+
+A purely diagnostic, opt-in dev mode built on the enumeration seam above —
+**not** checked delete, the unchecked contract is byte-for-byte unchanged. At
+`commit()` (P1, before the TID is allocated so a raise stays gapless, invariant
+5) it consults the reverse index for any *surviving* record still pointing at an
+OID this commit deletes — i.e. exactly `incoming(dead)` evaluated *after* this
+commit's P3 folds — and names the referrers immediately, turning the spooky
+deferred `DanglingRefError` (rule 8, raised far away at the eventual dereference)
+into an at-the-delete diagnostic. `Store.open(..., strict_deletes=True)` **raises**
+`DanglingRefError`; `debug=True` alone runs the same check but only **warns**
+(`DanglingDeleteWarning`) so a bulk re-import is never bricked. Unarmed (the
+default) the commit path pays nothing — the reverse index stays unbuilt (spec
+§5). The check forces `ensure_reverse()` (else it would silently scan an empty
+map) and unions the pre-commit reverse map's referrers-of(deleted) with this
+commit's harvested outgoing refs, minus the co-deleted set — so prior-commit AND
+same-commit NEW/DIRTY referrers are flagged, and a co-deleted referrer is not.
+The real fix (refuse/cascade) still waits for v1 checked deletes; this only makes
+the existing dangle loud earlier.
