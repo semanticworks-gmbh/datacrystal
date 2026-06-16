@@ -64,9 +64,9 @@ extend-select = ["D"]
 # gates the rest immediately. Burn the nits down by deleting a line — never by
 # adding `# noqa` (src pragmas are reserved for the magic-query typing exception).
 extend-ignore = [
-    "D205", # blank-line-after-summary: the descriptive house style runs the
-            # summary straight into a multi-line first paragraph; a mechanical
-            # blank line would split a sentence mid-thought. Burn down by hand.
+    "D205", # blank-line-after-summary: OFF on purpose (a voice choice, not debt) — the
+            # descriptive house style runs the summary straight into a multi-line first
+            # paragraph; a mechanical blank line would split a sentence mid-thought.
     "D102", # undocumented-public-method: a handful of self-evident methods
             # (mostly protocol/dunder-adjacent) still lack a docstring.
     "D105", # undocumented-magic-method: __repr__/__eq__/__iter__ etc. — obvious

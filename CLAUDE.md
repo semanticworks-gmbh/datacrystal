@@ -180,7 +180,14 @@ stale venv shebangs — `rm -rf .venv && uv sync`.
 - pyright standard mode must stay at 0 errors. The magic class-attribute query syntax
   (`Mineral.mohs >= 6.0`) is untypeable by design — use `dc.fields(Mineral)` in typed code,
   keep per-file pragmas in tests that deliberately exercise the magic path.
-- Docstrings explain *why* and cite the design doc that ratified the behavior.
+- Docstrings explain *why* and cite the design doc that ratified the behavior. **Format = the
+  Google convention, enforced by ruff `D` (`[tool.ruff.lint.pydocstyle] convention = "google"`),
+  `src/` only** (tests/examples/benchmarks/evals are D-exempt). Two rules stay OFF on purpose —
+  they fight the descriptive voice, don't "fix" them: `D401` (imperative-mood summary; off via the
+  google convention) and `D205` (blank line after the summary; baselined). No `Args:` ceremony
+  (`D417` is inert with no `Args:` block) — add a Google `Args:`/`Returns:`/`Raises:` block only
+  where it earns its keep; a `Raises:` block on a throwing public method is the high-value one.
+  Never add `# noqa` to `src/` (pragmas are reserved for the magic-query typing exception).
 - Commit/PR style: small logical commits; CI (`.github/workflows/ci.yml`) runs on PRs and
   pushes to main.
 - Working with Sven: when a genuine scope fork exists, ask 1–3 sharp questions first
