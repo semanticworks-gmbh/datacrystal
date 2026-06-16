@@ -2,10 +2,10 @@
 
 [![ci](https://github.com/themerius/datacrystal/actions/workflows/ci.yml/badge.svg)](https://github.com/themerius/datacrystal/actions/workflows/ci.yml)
 
-**Your live objects, crystallized.** An embedded object-graph database for Python:
-your typed objects **are** the database. Mutate them, call `commit()` — datacrystal keeps the
-graph durable, queryable and identical across restarts. No ORM, no SQL, no schema files,
-no pickle.
+**Your live objects are the database.** Define plain typed dataclasses, mutate them, call
+`commit()` — datacrystal keeps the whole object graph durable, queryable and identical across
+restarts: same objects, same identities, same references. No ORM, no SQL, no schema files,
+no `save()`, no pickle.
 
 ```python
 from typing import Annotated
@@ -32,7 +32,7 @@ if store.root is None:                            # first run only — reruns fi
                 type_locality=dc.Lazy.of(tsumeb)),
     ]}
 store.root["runs"] += 1                           # in-place mutation is tracked — no ORM
-store.commit()                                    # session, no dirty flags, no save() calls
+store.commit()                                    # no session, no dirty flags, no save() calls
 
 hits = store.query(Mineral.crystal_system == "monoclinic")
 print(sorted(m.name for m in hits))               # ['azurite']
@@ -40,26 +40,71 @@ print(store.root["runs"])                         # increments every run — it'
 store.close()
 ```
 
-Why this exists: the workhorse trio — SQLite + ORM, JSON files, pickle — makes you either
-flatten a graph into tables, lose your types, or trust arbitrary code execution on load.
-datacrystal (inspired by [EclipseStore](https://eclipsestore.io)) takes the fourth path:
-slots-dataclasses as the canonical form, [msgspec](https://jcristharif.com/msgspec/) msgpack
-records (decoding is structurally incapable of executing code),
+## Why datacrystal
+
+Three things a real build kept coming back to — each verifiable in the code:
+
+**1. Persistence disappears.** Your `models.py` is just dataclasses. No session to open, no
+dirty flags to manage, no `save()` to remember, no ORM mapping between two worlds. You mutate
+Python objects and `commit()`; identity is preserved (`a.friend is b` survives a restart).
+Schema, indexes and search config live *in the type* via `Annotated[...]`, so there's no
+separate schema or migration file to drift out of sync.
+
+**2. Predictable beats fast-but-mysterious.** Queries run through a rule-based planner you can
+read with `explain()` — *"exactly two rules, never an optimizer"* (three, with sorted-range
+indexes). You can always reason about why a query costs what it costs; nothing second-guesses
+you. When you *want* a query optimizer, point DuckDB at the Arrow mirror — datacrystal stays
+the predictable live tier.
+
+**3. You draw the memory boundary.** Indexed reads cost `f(hits)`, never `f(extent)` — a
+guarantee enforced as a CI fitness function. `Lazy[T]` is the explicit cut point: walk a graph
+of any size and only the nodes on the path you follow hydrate (in the GLEIF proving ground, a
+deepest-path walk over a 180,000-node ownership graph loads **10** of them). Cold data lives in
+SQLite and faults in on first `.get()`; entities you drop are garbage-collected.
+
+## How it works
+
+The workhorse trio — SQLite + ORM, JSON files, pickle — makes you either flatten a graph into
+tables, lose your types, or trust arbitrary code execution on load. datacrystal (inspired by
+[EclipseStore](https://eclipsestore.io)) takes the fourth path: slots-dataclasses as the
+canonical form, [msgspec](https://jcristharif.com/msgspec/) msgpack records (decoding is
+structurally incapable of executing code),
 [pyroaring](https://github.com/Ezibenroc/PyRoaringBitMap) bitmap indexes for queries, SQLite's
 journal for crash safety, and one live instance per object — `a.friend is b` survives a restart.
 
-**Works today** (500+ tests, Python 3.14): entities, commit/reopen with identity, transparent
-dirty tracking incl. in-place list/dict mutation, lazy references, bitmap queries with a
-condition AST (+ decode-level `count()`/`pluck()` that build no entities), unique keys +
-upsert-by-natural-key, unchecked `delete()`, frozen (append-only) entities, additive schema
-evolution, single-writer lease lock, SIGKILL crash safety, async stores (`aopen`), thread-safe
-`store.snapshot()` (bitmap queries included) / `store.submit()`, the **COMMIT-DELTA-v1**
-watermark pipeline (locked contract + public conformance kit), and two extras riding it:
-**`datacrystal[fts]`** — FTS5 full-text search with per-language Snowball stemming and BM25
-ranking over `dc.FullText` fields — and **`datacrystal[arrow]`** — persistent parquet mirrors
-handing DuckDB/polars/pandas zero-copy Arrow tables.
-**Not yet** (see the [roadmap](docs/design/ROADMAP.md)): vector search, reverse-reference
-index (`incoming()`), GraphQL, cross-mirror join recipes.
+## Works today (Python 3.14, 990+ tests)
+
+**The model**
+- Entities are plain typed dataclasses — mutate them, call `commit()`. No session, no `save()`.
+- Identity preserved across restarts (`a.friend is b` survives reopen).
+- Transparent dirty tracking, including in-place `list`/`dict` mutation.
+
+**Query**
+- Bitmap queries with a composable condition AST; `explain()` shows the plan.
+- Decode-level `count()` / `pluck()` that build no entities.
+- Sorted/range indexes — `>=`, `<`, `between`, `order_by` — with a persisted, watermark-validated index cache.
+- Unique keys + `get()`; upsert by natural key; the reverse-reference index (`store.incoming()`).
+
+**Graph**
+- Lazy references and lazy adjacency — follow an edge, only the path you touch hydrates.
+
+**Data lifecycle**
+- Additive schema evolution: field renames, glue functions, and `migrate()`.
+- Out-of-line binary blobs (`dc.Blob`) — read or written whole or streamed.
+- Frozen (append-only) entities; unchecked `delete()`.
+
+**Durability & concurrency**
+- SQLite-blob durability; SIGKILL crash safety; single-writer lease lock.
+- Async stores (`aopen`); thread-safe `snapshot()` (bitmap queries included).
+- The COMMIT-DELTA-v1 watermark pipeline — locked contract + public conformance kit.
+
+**Three extras ride the pipeline**
+- **`datacrystal[fts]`** — FTS5 full-text search, per-language Snowball stemming + BM25 over `dc.FullText` fields.
+- **`datacrystal[arrow]`** — persistent Parquet mirrors → zero-copy Arrow tables for DuckDB/polars/pandas.
+- **`datacrystal[web]`** — reflect `@entity` into FastAPI/Pydantic REST **and** Strawberry GraphQL (per-request DataLoader, no N+1).
+
+**Not yet** (see the [roadmap](docs/design/ROADMAP.md)): vector search, an S3/object-store
+backend, cross-mirror join recipes.
 
 ## Try it
 
@@ -73,16 +118,15 @@ uv run pytest
 
 - **[docs/GUIDE.md](docs/GUIDE.md) — the user guide**: every feature that exists, every
   planned feature clearly marked as planned.
-- [docs/design/](docs/design/) — design documents: [DESIGN.md](docs/design/DESIGN.md)
-  (architecture), [ROADMAP.md](docs/design/ROADMAP.md) (ratified plan),
-  [KICKOFF.md](docs/design/KICKOFF.md) (active execution plan, milestones),
-  [ADR-001](docs/design/ADR-001-concurrency-contract.md) (owner-thread concurrency contract),
-  [SCALING.md](docs/design/SCALING.md), [NAME.md](docs/design/NAME.md) (the metaphor),
-  and the adversarial reviews.
+- [docs/design/](docs/design/) — design documents: [VISION.md](docs/design/VISION.md) (the
+  "why"), [DESIGN.md](docs/design/DESIGN.md) (architecture),
+  [ROADMAP.md](docs/design/ROADMAP.md) (scope authority),
+  [KICKOFF.md](docs/design/KICKOFF.md) (engineering standards + the v0.1 execution record),
+  the [ADRs](docs/design/) (ratified contract decisions),
+  [SCALING.md](docs/design/SCALING.md), [NAME.md](docs/design/NAME.md) (the metaphor), and the
+  adversarial reviews.
 - [docs/research/](docs/research/) — per-topic evidence (EclipseStore internals, ZODB prior
-  art, CPython mechanics with benchmarks, engine surveys). Snapshots predating the 2026-06-10
-  rename still say `pyrsistance`.
+  art, CPython mechanics with benchmarks, engine surveys).
 
-Status: **pre-release** (`0.1.0.dev0`, M4 endgame: milestones M0–M4 landed 2026-06-11/12,
-COMMIT-DELTA-v1 locked; v0.1.0 tag = API freeze, PyPI publication follows it).
-License: [MIT](LICENSE).
+Status: **0.6.0** — the API froze at the v0.1.0 baseline; v0.2–0.6 are purely additive.
+PyPI publication deferred (names reserved). License: [MIT](LICENSE).
