@@ -331,6 +331,14 @@ class Store:
         rebuilds from the records (it can never return a wrong answer; SIGKILL-
         tested). Pass ``cache_index=False`` to skip the sidecar (e.g. a scratch
         store, or one you never reopen).
+
+        Raises:
+            StoreLockedError: another process already holds the store's
+                single-writer lease (invariant 10) — e.g. a second
+                ``uvicorn`` worker opening the same directory.
+            NewerStoreError: the on-disk format is newer than this library
+                build understands; datacrystal refuses to open it rather
+                than misread it (invariant 9, format honesty).
         """
         import sqlite3  # noqa: PLC0415 — stays lazy (dep-budget fitness #3)
 
@@ -421,6 +429,11 @@ class Store:
         from ``store.root`` as tracked persistent containers (mutate them in
         place — ``commit()`` sees it), and new entities in the value are
         registered for the next commit.
+
+        Raises:
+            WrongThreadError: called from a thread other than the one that
+                opened the store (owner confinement, ADR-001).
+            StoreClosedError: the store has already been closed.
         """
         self._enter()
         if self._root_oid is None:
@@ -452,6 +465,15 @@ class Store:
     def store(self, obj: Any) -> int:
         """Register ``obj`` (and every new entity reachable from it) for the
         next commit; returns its OID.
+
+        Raises:
+            NotAnEntityError: ``obj`` is not an ``@entity`` class instance.
+            DeletedEntityError: ``obj`` (or a new entity reachable from it)
+                was deleted via ``store.delete()`` — OIDs are never reused,
+                so create a fresh entity instead.
+            WrongThreadError: called from a thread other than the store's
+                owner (ADR-001).
+            StoreClosedError: the store has already been closed.
         """
         self._enter()
         if not is_entity(obj):
@@ -464,6 +486,14 @@ class Store:
         """Explicitly buffer an entity for the next commit. Rarely needed —
         attribute writes and in-place container mutation are tracked
         automatically; this is the escape hatch for anything exotic.
+
+        Raises:
+            NotAnEntityError: ``obj`` is not an ``@entity`` class instance.
+            DeletedEntityError: ``obj`` was deleted via ``store.delete()``
+                (OIDs are never reused — create a new entity instead).
+            WrongThreadError: called from a thread other than the store's
+                owner (ADR-001).
+            StoreClosedError: the store has already been closed.
         """
         self._enter()
         if not is_entity(obj):
@@ -503,6 +533,21 @@ class Store:
         reverse-reference index. After the commit, a live instance you still
         hold is a detached plain object: reads work, writes raise
         :class:`~datacrystal._errors.DeletedEntityError`.
+
+        Raises:
+            NotAnEntityError: the positional argument is neither an
+                ``@entity`` instance nor an ``@entity`` class.
+            QueryError: the keyword field in the key-based shape is not a
+                ``dc.Unique`` field.
+            TypeError: the wrong call shape — the key-based form needs
+                exactly one unique-field keyword, the instance form takes
+                no keywords.
+            DataCrystalError: the given instance belongs to a different (or
+                closed) store, or it is the pinned root holder (assign
+                ``store.root`` instead of deleting it).
+            WrongThreadError: called from a thread other than the store's
+                owner (ADR-001).
+            StoreClosedError: the store has already been closed.
         """
         self._enter()
         if isinstance(obj_or_cls, type):
@@ -586,6 +631,19 @@ class Store:
         key twice). Entities buffered via plain ``store()`` are not matched
         — a duplicate there stays what it always was: a loud
         ``UniqueViolationError`` from ``commit()``.
+
+        Raises:
+            NotAnEntityError: ``obj`` is not an ``@entity`` class instance.
+            TypeError: ``key`` was omitted but the class has zero or several
+                ``dc.Unique`` fields (no single natural key to infer).
+            QueryError: ``key`` names a field that is not ``dc.Unique``, or
+                the natural-key value is ``None`` (None never matches).
+            UniqueViolationError: ``obj``'s key already belongs to another
+                entity and ``obj`` is itself registered with the store —
+                upsert a fresh (untracked) instance or the canonical one.
+            WrongThreadError: called from a thread other than the store's
+                owner (ADR-001).
+            StoreClosedError: the store has already been closed.
         """
         self._enter()
         if not is_entity(obj):
@@ -654,6 +712,32 @@ class Store:
     def commit(self) -> int | None:
         """Atomically persist all buffered changes; returns the new commit
         TID, or ``None`` if there was nothing to commit.
+
+        All validation runs in P1 *before* the TID is allocated, so any of
+        these leaves the TID sequence gapless (invariant 5) and the buffered
+        changes intact for a fixed-up retry.
+
+        Raises:
+            LeaseLostError: this process lost the single-writer lease
+                (invariant 10) — another process may own the store now, so
+                the write is refused.
+            UniqueViolationError: a buffered change would create a duplicate
+                value in a ``dc.Unique`` field (against committed state or
+                another entity in the same commit).
+            MixedTemporalIndexError: a ``dc.SortedIndex`` ``datetime`` field
+                would mix timezone-naive and timezone-aware values, which are
+                not mutually orderable (ADR-004 §4).
+            DanglingRefError: only under ``strict_deletes=True`` — this commit
+                deletes a record another surviving record still points at
+                (the eager ADR-003 dangling-ref check).
+            ValueError: a ``dc.BlobSource`` declared a size its bytes do not
+                total, or a value cannot be encoded (e.g. an int beyond
+                msgpack's 64-bit range).
+            TypeError: a ``dc.Blob`` field holds neither ``bytes`` nor a
+                ``dc.BlobSource``.
+            WrongThreadError: called from a thread other than the store's
+                owner (ADR-001).
+            StoreClosedError: the store has already been closed.
         """
         self._enter()
         capture = self._p1_capture()
@@ -1124,6 +1208,10 @@ class Store:
         ``aopen()`` the loop is woken instead. A result that would carry a
         live entity (directly or inside a container) fails the Future with
         ``EntityEscapeError`` — return plain data.
+
+        Raises:
+            StoreClosedError: the store has already been closed (so the
+                submission could never run).
         """
         if self._closed:
             raise StoreClosedError("this store has been closed")
@@ -1140,6 +1228,11 @@ class Store:
     def run_pending(self) -> int:
         """Execute all queued :meth:`submit` work now (owner thread only);
         returns the number of submissions run.
+
+        Raises:
+            WrongThreadError: called from a thread other than the store's
+                owner (ADR-001).
+            StoreClosedError: the store has already been closed.
         """
         self._guard()
         count = self._pump()
@@ -1195,6 +1288,15 @@ class Store:
         ``tid`` and ``types`` are exactly the bootstrap it needs). A
         consumer *ahead* of the store means the store was restored to an
         older point — the sidecar is stale and must be rebuilt (fitness #13).
+
+        Raises:
+            DeltaGapError: the consumer's watermark is behind the store
+                (deltas are not retained — rebuild from ``store.snapshot()``)
+                or ahead of it (the sidecar is stale — rebuild it).
+            DataCrystalError: this consumer is already attached.
+            WrongThreadError: called from a thread other than the store's
+                owner (ADR-001).
+            StoreClosedError: the store has already been closed.
         """
         self._enter()
         watermark = consumer.watermark
@@ -1216,7 +1318,14 @@ class Store:
         self._consumers.append(consumer)
 
     def detach(self, consumer: DeltaConsumer) -> None:
-        """Detach a previously attached delta consumer."""
+        """Detach a previously attached delta consumer.
+
+        Raises:
+            DataCrystalError: this consumer is not currently attached.
+            WrongThreadError: called from a thread other than the store's
+                owner (ADR-001).
+            StoreClosedError: the store has already been closed.
+        """
         self._enter()
         for i, existing in enumerate(self._consumers):
             if existing is consumer:
@@ -1233,6 +1342,10 @@ class Store:
         backend an open snapshot pins a WAL read transaction. Views are
         plain immutable data (:class:`EntityView`); references come back as
         :class:`Ref` tokens for ``snapshot.get()`` — never live entities.
+
+        Raises:
+            StoreClosedError: the store has already been closed. (No owner
+                guard — a snapshot is callable from any thread.)
         """
         # Deliberately NOT _enter(): no owner guard, no piggyback work.
         # The read view isolates itself from the live engine entirely.
@@ -1263,6 +1376,18 @@ class Store:
         in-memory ``BytesIO`` (nothing is saved by it yet); an uncommitted
         ``dc.BlobSource`` raises ``ValueError`` — ``commit()`` it first, since its
         bytes are not resident.
+
+        Raises:
+            NotAnEntityError: ``entity`` is not an ``@entity`` class instance.
+            QueryError: ``field`` is not a field of the entity.
+            TypeError: ``field`` is not a ``dc.Blob`` field (or holds an
+                unexpected blob value).
+            ValueError: the blob value is ``None``, or it holds an
+                uncommitted ``dc.BlobSource`` (whose bytes are not yet
+                resident — ``commit()`` first).
+            WrongThreadError: called from a thread other than the store's
+                owner (ADR-001); the returned stream itself is not confined.
+            StoreClosedError: the store has already been closed.
         """
         self._enter()
         ti = type_info(entity)
@@ -1297,6 +1422,15 @@ class Store:
         """Look up one entity by a unique secondary key, e.g.
         ``store.get(Mineral, qid="Q43010")``. Returns ``None`` if absent.
         Reflects committed state.
+
+        Raises:
+            NotAnEntityError: ``cls`` is not an ``@entity`` class.
+            QueryError: the keyword field is not a ``dc.Unique`` field
+                (``get`` looks up unique secondary keys only).
+            TypeError: not exactly one unique-field keyword was given.
+            WrongThreadError: called from a thread other than the store's
+                owner (ADR-001).
+            StoreClosedError: the store has already been closed.
         """
         self._enter()
         if len(unique_key) != 1:
@@ -1322,6 +1456,18 @@ class Store:
         The unique-key form returns a list aligned with the given values,
         ``None`` where a key is absent — the bulk twin of :meth:`get`, for
         ETL upserts that fetch thousands of natural keys at once.
+
+        Raises:
+            NotAnEntityError: an item in the iterable shape is not an OID,
+                ``Lazy``, ``Ref`` or entity; or, in the key shape, ``cls`` is
+                not an ``@entity`` class.
+            QueryError: the keyword field in the key shape is not a
+                ``dc.Unique`` field.
+            TypeError: the key shape was given a non-class first argument, or
+                not exactly one unique-field keyword.
+            WrongThreadError: called from a thread other than the store's
+                owner (ADR-001).
+            StoreClosedError: the store has already been closed.
         """
         self._enter()
         if unique_key:
@@ -1417,6 +1563,17 @@ class Store:
         field (ADR-004) is effectively free; an un-indexed sort field must
         decode that field for every match first (an honest O(matches) cost, the
         same scan a non-indexed predicate pays).
+
+        Raises:
+            NotAnEntityError: ``target`` is an entity class that is not an
+                ``@entity`` class.
+            TypeError: ``target`` is neither an ``@entity`` class nor a
+                Condition, or ``limit``/``offset`` are not ints.
+            ValueError: ``limit`` or ``offset`` is negative.
+            QueryError: ``order_by`` names an invalid field or direction.
+            WrongThreadError: called from a thread other than the store's
+                owner (ADR-001).
+            StoreClosedError: the store has already been closed.
         """
         self._enter()
         validate_window(limit, offset)
@@ -1474,6 +1631,12 @@ class Store:
         drops out; a deleted *target* keeps its postings, so ``incoming(dead)``
         names the now-dangling referrers — ADR-003). The same backlinks at a
         pinned watermark are :meth:`Snapshot.incoming`.
+
+        Raises:
+            NotAnEntityError: ``entity`` is not an ``@entity`` class instance.
+            WrongThreadError: called from a thread other than the store's
+                owner (ADR-001).
+            StoreClosedError: the store has already been closed.
         """
         self._enter()
         if not is_entity(entity):
@@ -1498,6 +1661,12 @@ class Store:
         whole store reads cleanly under this code. ``verify()`` itself never
         raises on a bad record — reporting it is the point — but the owner guard
         still applies. Run it before :meth:`migrate`.
+
+        Raises:
+            WrongThreadError: called from a thread other than the store's
+                owner (ADR-001) — the only thing that stops ``verify()``;
+                a bad record is reported, never raised.
+            StoreClosedError: the store has already been closed.
         """
         self._enter()
         failures: list[tuple[str, int]] = []
@@ -1529,6 +1698,18 @@ class Store:
         nothing. Commits in ``batch``-sized chunks, so peak memory is bounded by
         the batch, not the store. Returns the number of records rewritten; a type
         with no live class here is left untouched (``verify()`` names it).
+
+        Raises:
+            SchemaMismatchError: a record cannot be hydrated to its live
+                class's shape (a removed-then-re-added field with no default
+                or ``Glue``, or a damaged record) — run :meth:`verify` first
+                to surface these without mutating anything.
+            LeaseLostError: this process lost the single-writer lease while
+                migrating (invariant 10); a partial run just resumes on the
+                next call (it is TID-gapless and idempotent).
+            WrongThreadError: called from a thread other than the store's
+                owner (ADR-001).
+            StoreClosedError: the store has already been closed.
         """
         self._enter()
         migrated = 0
@@ -1568,6 +1749,15 @@ class Store:
         ``dc.Index``/``dc.Unique`` fields → bitmaps; everything else →
         residual. Read-only; builds the class indexes on first use (the
         same one-time O(extent) cost as a first query).
+
+        Raises:
+            NotAnEntityError: ``target`` is an entity class that is not an
+                ``@entity`` class.
+            TypeError: ``target`` is neither an ``@entity`` class nor a
+                Condition.
+            WrongThreadError: called from a thread other than the store's
+                owner (ADR-001).
+            StoreClosedError: the store has already been closed.
         """
         self._enter()
         cls, cond = query_target(target, "explain")
@@ -1590,6 +1780,15 @@ class Store:
         records are read and decoded but **no entity is constructed**.
         Reads committed state (like :meth:`snapshot`, unlike :meth:`query`,
         whose hydrated results show uncommitted in-memory changes).
+
+        Raises:
+            NotAnEntityError: ``target`` is an entity class that is not an
+                ``@entity`` class.
+            TypeError: ``target`` is neither an ``@entity`` class nor a
+                Condition.
+            WrongThreadError: called from a thread other than the store's
+                owner (ADR-001).
+            StoreClosedError: the store has already been closed.
         """
         self._enter()
         cls, cond = query_target(target, "count")
@@ -1634,6 +1833,19 @@ class Store:
         ascending-OID tiebreak; an indexed sort field is ordered from the index,
         an un-indexed one decodes that field for every match first). The sort
         field need not be among the projected ``fields``.
+
+        Raises:
+            NotAnEntityError: ``target`` is an entity class that is not an
+                ``@entity`` class.
+            QueryError: a projected field name is not a persisted field, or
+                ``order_by`` names an invalid field or direction.
+            TypeError: no field names were given, ``target`` is neither an
+                ``@entity`` class nor a Condition, or ``limit``/``offset``
+                are not ints.
+            ValueError: ``limit`` or ``offset`` is negative.
+            WrongThreadError: called from a thread other than the store's
+                owner (ADR-001).
+            StoreClosedError: the store has already been closed.
         """
         self._enter()
         validate_window(limit, offset)
@@ -1712,6 +1924,17 @@ class Store:
 
         Additive surface: ``query()``'s signature and list return type stay
         frozen.
+
+        Raises:
+            NotAnEntityError: ``target`` is an entity class that is not an
+                ``@entity`` class.
+            TypeError: ``target`` is neither an ``@entity`` class nor a
+                Condition.
+            WrongThreadError: called — or iterated — from a thread other than
+                the store's owner; the guard is re-asserted on every pull, so
+                this can stop the stream mid-flight (ADR-001).
+            StoreClosedError: the store is closed at the call, or closed
+                while the stream is being iterated.
         """
         self._enter()
         cls, cond = query_target(target, "query_iter")
