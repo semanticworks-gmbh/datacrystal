@@ -1,6 +1,6 @@
 # datacrystal user guide
 
-This guide documents what **exists today** (`0.3.0`, 2026-06). Everything that does not
+This guide documents what **exists today** (`0.6.0`, 2026-06). Everything that does not
 exist yet is explicitly marked **`[planned — …]`** with its place on the
 [roadmap](design/ROADMAP.md); nothing here describes vapor as if it were real. The public API
 freezes at the v0.1.0 tag.
@@ -719,8 +719,10 @@ await store.commit()                        # or commit explicitly outside scope
 store.close()
 ```
 
-- Every task on the owning loop may touch the graph (one thread by construction); foreign
-  threads still get `WrongThreadError`.
+- `dc.aopen(...)` returns a `dc.AsyncStore` — the awaitable facade over `dc.Store` (same
+  keywords, `await`-able `commit()`/`close()` plus the `transaction()` scope above). Every
+  task on the owning loop may touch the graph (one thread by construction); foreign threads
+  still get `WrongThreadError`.
 - `await store.commit()` captures **before its first await**, then applies off-loop while the
   loop keeps serving. A task that mutates an entity while a commit is in flight is safe by
   contract: the write re-dirties the entity and lands in the *next* commit. Concurrent
@@ -865,10 +867,12 @@ store.attach(consumer)                          # 2. ride the stream from there
   (`payload` nil, `prior` = the last payload) through the same channel.
 - A consumer that raises is **detached** with a `ConsumerDetachedWarning` — the commit
   stays durable, the store stays healthy, the sidecar rebuilds and re-attaches.
-- Writing a consumer? `datacrystal.testing.check_delta_consumer(factory, content=...)`
-  certifies it against every contract obligation (idempotency, ordering, gap/version
-  refusal, prior-based un-indexing); `datacrystal.testing.CountingConsumer` is the
-  minimal reference implementation, `datacrystal/contract/applier.py` the normative one.
+- Writing a consumer? Implement the `dc.DeltaConsumer` protocol (a `watermark` property plus
+  `apply(delta)`); `store.attach(consumer)` then rides it on the stream.
+  `datacrystal.testing.check_delta_consumer(factory, content=...)` certifies an implementation
+  against every contract obligation (idempotency, ordering, gap/version refusal, prior-based
+  un-indexing); `datacrystal.testing.CountingConsumer` is the minimal reference implementation,
+  `datacrystal/contract/applier.py` the normative one.
 
 ## The delta log: durable audit history
 
@@ -1141,7 +1145,6 @@ reserved).**
 | Feature | Where it lands |
 |---|---|
 | **object-store (S3) primary backend** — "the only infra is a blob store" | `[planned — item 16]`; feasibility spiked (manifest-LSM + conditional-PUT CAS), gated on the retained log + a scope ruling |
-| **GraphQL / FastAPI** — `datacrystal[web]` with strawberry integration | extension package, after the v1 core freeze |
 | vector search — `datacrystal[vector]`, usearch, ≥2 vector fields per entity | extension package, after v1 |
 | property-graph recipes, cross-mirror DuckDB recipes | v1 |
 | indexed-field renames, sets, custom scalar types, CJK-segmenting FTS tokenizer | demand-driven (offline `migrate`/`verify` and `dc.RenamedFrom`/`dc.Glue` already ship — see [Schema evolution](#schema-evolution)) |
