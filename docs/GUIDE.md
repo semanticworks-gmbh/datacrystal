@@ -8,6 +8,7 @@ freezes at the v0.1.0 tag.
 - [Open a store](#open-a-store)
 - [Define entities](#define-entities)
 - [The root](#the-root)
+  - [Self-referential adjacency (trees and graphs)](#self-referential-adjacency-trees-and-graphs)
 - [Writing: mutate, then commit](#writing-mutate-then-commit)
 - [Deleting](#deleting)
 - [Lists and dicts inside entities](#lists-and-dicts-inside-entities)
@@ -137,6 +138,8 @@ store.commit()
   handle, so a graph node can hold many edges that hydrate **on demand**, one `.get()` at a time
   (the model for adjacency / edge lists; a plain `list[T]` reloads its elements *eagerly*, so
   laziness follows the declared element type, not what you put in at write time).
+  **Self-reference is supported — this is how you model trees and graphs** (a node whose `T` is its
+  own type); see [Self-referential adjacency](#self-referential-adjacency-trees-and-graphs) below.
 - Assigning `store.root = value` captures the value immediately: new entities in it are
   registered, and lists/dicts come back from `store.root` as tracked containers.
 
@@ -160,6 +163,56 @@ store.root = Cabinet()
 
 Both are equivalent to the engine; pick by taste. And note that entities do **not** have to
 hang off the root at all — see the next-but-one section.
+
+### Self-referential adjacency (trees and graphs)
+
+The flagship object-graph shape is a **self-referential** entity: a node whose lazy edges point at
+its own type. A `list[dc.Lazy["Node"]]` of children plus a lazy `parent` backlink is exactly how
+you model a tree, a DAG, or an adjacency list — each edge stays off the RAM/read budget and
+hydrates one `.get()` at a time. Spell the self-reference as a **forward-ref string** under
+`from __future__ import annotations` (the entity's own name isn't bound yet while the class body
+runs; the string resolves lazily):
+
+```python
+from __future__ import annotations
+from dataclasses import field
+from typing import Annotated
+import datacrystal as dc
+
+@dc.entity
+class Region:                                       # a geographic containment tree
+    qid: Annotated[str, dc.Unique]
+    name: str
+    children: list[dc.Lazy["Region"]] = field(default_factory=list)   # self-referential edges
+    parent: dc.Lazy["Region"] | None = None                           # lazy backlink
+
+# write: continent -> country -> two regions
+africa = Region(qid="R-AF", name="Africa")
+namibia = Region(qid="R-NA", name="Namibia")
+erongo = Region(qid="R-ER", name="Erongo")
+namibia.parent = dc.Lazy.of(africa)
+africa.children = [dc.Lazy.of(namibia)]
+erongo.parent = dc.Lazy.of(namibia)
+namibia.children = [dc.Lazy.of(erongo)]
+store.root = africa
+store.commit()
+```
+
+After a reopen the tree is **cold** — children rehydrate as *unloaded* `dc.Lazy` handles, and you
+traverse on demand, identity preserved:
+
+```python
+root = store.root                          # Region "Africa", nothing below it loaded
+na = root.children[0]                       # an unloaded handle: na.loaded is False, na.oid is set
+namibia = na.get()                          # loads just this node (siblings untouched)
+er = namibia.children[0].get()
+assert er.parent.get() is namibia           # the parent backlink resolves to the SAME instance
+assert er.parent.get().parent.get() is root # ...all the way up — one live object per OID
+```
+
+The parent↔child cycle round-trips with no `RecursionError`, and identity is stable: every path to
+a node yields the same Python object (the registry contract — [Identity and memory](#identity-and-memory)).
+This is pinned by `tests/unit/test_selfref_adjacency.py` over both backends.
 
 ## Writing: mutate, then commit
 
