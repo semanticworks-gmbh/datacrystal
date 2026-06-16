@@ -2,10 +2,16 @@
 
 [![ci](https://github.com/themerius/datacrystal/actions/workflows/ci.yml/badge.svg)](https://github.com/themerius/datacrystal/actions/workflows/ci.yml)
 
-**Your live objects are the database.** Define plain typed dataclasses, mutate them, call
-`commit()` — datacrystal keeps the whole object graph durable, queryable and identical across
-restarts: same objects, same identities, same references. No ORM, no SQL, no schema files,
-no `save()`, no pickle.
+**Your live objects are the database.** Define typed dataclasses, mutate them, call `commit()`.
+datacrystal keeps the whole graph durable and queryable across restarts — same objects, same
+identities, same references.
+
+Every other path makes you *translate*: flatten your graph into tables (ORM), throw away your
+types (JSON), or trust arbitrary code on load (pickle). datacrystal doesn't translate — your
+data follows your code, no raindances.
+
+**No ORM. No schema files. No `save()`. No pickle** — a record decodes straight back into your
+objects, and decoding is structurally incapable of executing code.
 
 ```python
 from typing import Annotated
@@ -68,11 +74,9 @@ test gates this in CI). You get real transactional safety without ever leaving y
 
 ## How it works
 
-The workhorse trio — SQLite + ORM, JSON files, pickle — makes you either flatten a graph into
-tables, lose your types, or trust arbitrary code execution on load. datacrystal (inspired by
-[EclipseStore](https://eclipsestore.io)) takes the fourth path: slots-dataclasses as the
-canonical form, [msgspec](https://jcristharif.com/msgspec/) msgpack records (decoding is
-structurally incapable of executing code),
+datacrystal (inspired by [EclipseStore](https://eclipsestore.io)) is that fourth path:
+slots-dataclasses as the canonical form, [msgspec](https://jcristharif.com/msgspec/) msgpack
+records (no `__reduce__`, no opcode interpreter — decoding can't run code),
 [pyroaring](https://github.com/Ezibenroc/PyRoaringBitMap) bitmap indexes for queries, SQLite's
 journal for crash safety, and one live instance per object — `a.friend is b` survives a restart.
 
