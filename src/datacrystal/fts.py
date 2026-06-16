@@ -101,7 +101,8 @@ _PHRASE = re.compile(r'"([^"]*)"')
 
 class FtsConfigError(DataCrystalError):
     """The sidecar's configuration is unusable or contradicts what this
-    sidecar file was built with — rebuild rather than guess (invariant 11)."""
+    sidecar file was built with — rebuild rather than guess (invariant 11).
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,7 +113,8 @@ class SearchHit:
     normalize-stem-fold transform that indexed the text, so a stemmed match
     ("Kristall" finding "Kristalle") highlights correctly — which FTS5's
     own ``snippet()`` cannot do over a stem column. Phrase needles only
-    mark adjacent runs."""
+    mark adjacent runs.
+    """
 
     oid: int
     typename: str
@@ -122,7 +124,8 @@ class SearchHit:
     @property
     def snippet(self) -> str | None:
         """The first excerpt, or None when no indexed field of this hit has
-        text to excerpt."""
+        text to excerpt.
+        """
         for text in self.snippets.values():
             return text
         return None
@@ -131,7 +134,8 @@ class SearchHit:
 def _tokens(text: str) -> list[str]:
     """Lowercase NFC tokens, diacritics preserved — the stemmers' input
     shape (NFC first, so decomposed combining marks never split a token;
-    lowercase because Snowball is case-sensitive: "BERGE" does not stem)."""
+    lowercase because Snowball is case-sensitive: "BERGE" does not stem).
+    """
     return _TOKEN.findall(unicodedata.normalize("NFC", text).lower())
 
 
@@ -149,7 +153,8 @@ def _fold_token(token: str) -> str:
     millions of folds to the distinct vocabulary. The cache is keyed on the
     exact input token, so it can NEVER change the output bytes — fold/stem
     symmetry and BM25 relevance are untouched. Bounded so a giant vocabulary
-    cannot grow it without limit (it is an LRU, not a leak)."""
+    cannot grow it without limit (it is an LRU, not a leak).
+    """
     return "".join(
         ch for ch in unicodedata.normalize("NFKD", token)
         if not unicodedata.combining(ch)
@@ -179,7 +184,8 @@ def _resolve_language(language: str | None) -> str | None:
 def _registry_fulltext() -> dict[str, dict[str, str | None]]:
     """Derive typename → {field: language} from every registered ``@entity``
     class carrying ``dc.FullText`` markers — the declaration lives in code,
-    exactly like ``dc.Index`` (the engine records it, the extra acts on it)."""
+    exactly like ``dc.Index`` (the engine records it, the extra acts on it).
+    """
     out: dict[str, dict[str, str | None]] = {}
     for typename, ti in TYPES_BY_NAME.items():
         fields = {
@@ -280,7 +286,8 @@ class FullTextIndex:
     @property
     def watermark(self) -> int:
         """Highest TID fully applied — persisted in the sidecar file, in the
-        same transaction as each applied delta (§4.3)."""
+        same transaction as each applied delta (§4.3).
+        """
         return self._watermark
 
     def apply(self, delta: dict[str, Any]) -> bool:
@@ -339,7 +346,8 @@ class FullTextIndex:
         recipe for attaching to a store that already has history, and the
         rebuild path after a detach/staleness refusal. Any existing file at
         ``path`` is replaced: a sidecar that needed a rebuild is stale by
-        definition."""
+        definition.
+        """
         idx = cls(path, fulltext=fulltext, _wipe=True)
         idx._exec("BEGIN")
         try:
@@ -501,14 +509,16 @@ class FullTextIndex:
     def _stem_folded(self, tokens: list[str], language: str) -> list[str]:
         """Stem-first-fold-after: the stemmer sees lowercase NFC tokens with
         their diacritics (Russian й/ё steer its suffix tables), the index
-        and the query see the folded stems — identical on both sides."""
+        and the query see the folded stems — identical on both sides.
+        """
         return [_fold_token(stem) for stem in self._stem(tokens, language)]
 
     def _prose_values(self, cid: int, payload: bytes) -> tuple[str, dict[str, str]] | None:
         """Decode one record payload to its indexable ``{field: text}`` —
         by NAME through its persisted shape, missing fields filled from the
         live class's defaults exactly like snapshot materialization (so
-        incremental indexing ≡ bootstrap-from-snapshot, fitness #13)."""
+        incremental indexing ≡ bootstrap-from-snapshot, fitness #13).
+        """
         known = self._types.get(cid)
         if known is None:
             raise DeltaFormatError(
@@ -577,7 +587,8 @@ class FullTextIndex:
 
     def _query_units(self, query: str) -> list[list[str]]:
         """Quoted phrases as multi-token units, the rest as single tokens —
-        all in the stemmer's lowercase-NFC shape."""
+        all in the stemmer's lowercase-NFC shape.
+        """
         units = [_tokens(phrase) for phrase in _PHRASE.findall(query)]
         units += [[token] for token in _tokens(_PHRASE.sub(" ", query))]
         return [tokens for tokens in units if tokens]
@@ -585,7 +596,8 @@ class FullTextIndex:
     def _needles(self, query: str) -> _Needles:
         """What to highlight, per kind: the folded token sequences ("exact")
         plus the folded stem sequences per language in use — exactly the
-        transforms the index applied."""
+        transforms the index applied.
+        """
         units = self._query_units(query)
         needles: _Needles = {"exact": [
             [_fold_token(token) for token in unit] for unit in units
@@ -604,7 +616,8 @@ class FullTextIndex:
         matches marked ``[`` … ``]`` — or None when nothing in this text
         matches (the row matched via another field). Phrase needles mark
         only adjacent runs. The text is rendered in NFC so decomposed input
-        highlights exactly like the composed form it was indexed as."""
+        highlights exactly like the composed form it was indexed as.
+        """
         display = unicodedata.normalize("NFC", text)
         spans = [(m.start(), m.end()) for m in _TOKEN.finditer(display)]
         if not spans:
@@ -646,7 +659,8 @@ class FullTextIndex:
         then joins the terms: ``"any"`` with OR (ranked retrieval — BM25
         scores the union, missing terms down-rank not drop, #54), ``"all"``
         with AND (the precise-filter use case). Terms are quoted, so user
-        input can never inject FTS5 operators."""
+        input can never inject FTS5 operators.
+        """
         if match not in ("any", "all"):
             raise ValueError(
                 f"match must be 'any' (OR over terms) or 'all' (AND over "

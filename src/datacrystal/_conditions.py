@@ -198,7 +198,8 @@ class Not(Condition):
 
 def validate_window(limit: int | None, offset: int) -> None:
     """Validate the ``limit=``/``offset=`` window for query()/pluck() and the
-    snapshot reads (#14). ``type(...) is not int`` rejects ``bool`` too."""
+    snapshot reads (#14). ``type(...) is not int`` rejects ``bool`` too.
+    """
     if type(offset) is not int:
         raise TypeError(f"offset= must be an int, got {type(offset).__name__}")
     if offset < 0:
@@ -213,7 +214,8 @@ def validate_window(limit: int | None, offset: int) -> None:
 def apply_window(seq: list[_T], limit: int | None, offset: int) -> list[_T]:
     """Slice a result list to its ``(offset, limit)`` window. Result order is
     deterministic (ascending OID, preserved by ``get_many``), so a windowed read
-    equals the unwindowed read sliced the same way (#14)."""
+    equals the unwindowed read sliced the same way (#14).
+    """
     if offset:
         seq = seq[offset:]
     if limit is not None:
@@ -227,7 +229,8 @@ def window_iter(candidate: Iterable[_T], limit: int | None, offset: int) -> list
     set. Same result and order as ``apply_window(list(candidate), limit, offset)``
     because the roaring candidate iterates in ascending OID; the win is that a
     small ``limit`` over a huge extent stops after ``offset + limit`` instead of
-    listing every OID."""
+    listing every OID.
+    """
     stop = None if limit is None else offset + limit
     return list(islice(candidate, offset, stop))
 
@@ -236,7 +239,8 @@ def order_by_values(matched: Iterable[int], value_of: Any, descending: bool) -> 
     """``matched`` OIDs (in ascending-OID order) sorted by ``value_of(oid)`` for
     an order_by on a **non-indexed** field (#25): NULLs last, stable
     ascending-OID tiebreak. ``matched`` MUST already be ascending-OID so the
-    stable sort preserves OID order within equal values (deterministic paging)."""
+    stable sort preserves OID order within equal values (deterministic paging).
+    """
     present: list[int] = []
     absent: list[int] = []
     for oid in matched:
@@ -249,7 +253,8 @@ def parse_order_by(order_by: Any, ti: Any) -> tuple[str, bool]:
     """Resolve the frozen ``order_by`` contract (#25) to ``(field_name,
     descending)``. Accepts ``(field, direction)`` or a bare ``field`` (ascending),
     where ``field`` is a :class:`FieldExpr` (``EntityClass.f`` / ``dc.fields(C).f``)
-    or a field-name str and ``direction`` is ``'asc'``/``'desc'``."""
+    or a field-name str and ``direction`` is ``'asc'``/``'desc'``.
+    """
     field_ref: Any
     direction: Any
     if isinstance(order_by, tuple):
@@ -285,7 +290,8 @@ def parse_order_by(order_by: Any, ti: Any) -> tuple[str, bool]:
 
 def query_target(target: Any, method: str) -> tuple[type, Condition | None]:
     """``count()``/``pluck()``/snapshot reads accept an @entity class (the
-    whole extent) or a Condition — shared validation for both surfaces."""
+    whole extent) or a Condition — shared validation for both surfaces.
+    """
     if isinstance(target, Condition):
         return target.entity_class(), target
     if isinstance(target, type):
@@ -371,13 +377,15 @@ class FieldExpr:
 
     def contains(self, substring: str) -> Pred:
         """Substring match (exact, case-sensitive). On an indexed field the
-        planner iterates the index's distinct keys — never entities."""
+        planner iterates the index's distinct keys — never entities.
+        """
         _require_str(self.cls, self.name, "contains", substring)
         return Pred(self.cls, self.name, "contains", substring)
 
     def startswith(self, prefix: str) -> Pred:
         """Prefix match (exact, case-sensitive). On an indexed field the
-        planner iterates the index's distinct keys — never entities."""
+        planner iterates the index's distinct keys — never entities.
+        """
         _require_str(self.cls, self.name, "startswith", prefix)
         return Pred(self.cls, self.name, "startswith", prefix)
 

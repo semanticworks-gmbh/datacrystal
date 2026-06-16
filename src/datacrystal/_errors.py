@@ -39,7 +39,8 @@ class WrongThreadError(DataCrystalError):
 
 class EntityEscapeError(DataCrystalError):
     """A ``submit()`` result would have carried a live entity across the
-    owner boundary (ADR-001) — return plain data from submitted closures."""
+    owner boundary (ADR-001) — return plain data from submitted closures.
+    """
 
 
 class FrozenEntityError(DataCrystalError):
@@ -48,7 +49,8 @@ class FrozenEntityError(DataCrystalError):
 
 class NotAnEntityError(DataCrystalError):
     """An object that is not an ``@entity`` class instance was passed where
-    an entity is required."""
+    an entity is required.
+    """
 
 
 class UniqueViolationError(DataCrystalError):
@@ -69,12 +71,14 @@ class SchemaMismatchError(DataCrystalError):
 
 class UnregisteredTypeError(DataCrystalError):
     """The store contains records of a type whose ``@entity`` class has not
-    been imported/defined in this process."""
+    been imported/defined in this process.
+    """
 
 
 class NewerStoreError(DataCrystalError):
     """The store was written by a newer format version than this library
-    supports (DESIGN.md amendment 7: refuse loudly, never misread)."""
+    supports (DESIGN.md amendment 7: refuse loudly, never misread).
+    """
 
 
 class CorruptRecordError(DataCrystalError):
@@ -89,12 +93,14 @@ class MixedTemporalIndexError(DataCrystalError):
     Python refuses to compare the two, so a sorted run that mixed them would raise
     a bare ``TypeError`` deep in ``bisect``/``insort``. datacrystal rejects the mix
     loudly at insert/build instead — pick one convention per field (store every
-    timestamp aware, e.g. ``datetime.now(timezone.utc)``, is the recommendation)."""
+    timestamp aware, e.g. ``datetime.now(timezone.utc)``, is the recommendation).
+    """
 
 
 class QueryError(DataCrystalError):
     """A condition is malformed — e.g. it mixes fields of two entity classes
-    (cross-entity joins are a v1 feature on Arrow mirrors, not v0.x)."""
+    (cross-entity joins are a v1 feature on Arrow mirrors, not v0.x).
+    """
 
 
 class DeletedEntityError(DataCrystalError):
@@ -125,7 +131,8 @@ class ConsumerDetachedWarning(UserWarning):
     holds writes hostage. Its watermark now lags the store; ``attach()``
     refuses it until it rebuilds (e.g. from ``store.snapshot()``). See
     COMMIT-DELTA-v1 §5: deltas are not retained, missed history cannot be
-    re-fetched from the engine."""
+    re-fetched from the engine.
+    """
 
 
 class UnseenTypeWarning(UserWarning):
@@ -135,7 +142,8 @@ class UnseenTypeWarning(UserWarning):
     Legitimate on a first run (nothing committed yet); a footgun when you
     meant to open a different store file or forgot to ``commit()`` before
     reading back. ``get()`` deliberately stays silent — ``None`` is the
-    expected miss in the get-or-create idiom."""
+    expected miss in the get-or-create idiom.
+    """
 
 
 class UntrackedMutationWarning(UserWarning):
@@ -144,7 +152,8 @@ class UntrackedMutationWarning(UserWarning):
     going through the dirty-tracking hook (e.g. ``object.__setattr__`` or a
     mutable non-container object like a ``bytearray``). The safety net
     commits the entity anyway — fix the write path it names (KICKOFF risk 1:
-    silent lost writes were the #1 DX killer in both ancestor systems)."""
+    silent lost writes were the #1 DX killer in both ancestor systems).
+    """
 
 
 class DanglingDeleteWarning(UserWarning):
@@ -155,4 +164,5 @@ class DanglingDeleteWarning(UserWarning):
     found via the reverse-reference index (``incoming(dead)``, #110). The commit
     proceeds (unchecked deletes are uniform, ADR-003); ``strict_deletes=True``
     promotes this to a raised ``DanglingRefError`` instead. This is the dev-time
-    bridge until v1 checked-deletes/cascades land — NOT referential integrity."""
+    bridge until v1 checked-deletes/cascades land — NOT referential integrity.
+    """

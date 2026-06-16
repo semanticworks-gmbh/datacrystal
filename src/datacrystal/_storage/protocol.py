@@ -35,7 +35,8 @@ class StoredBlob:
     so the descriptor in the referring record carries everything the engine
     needs); ``tid`` is the commit that wrote it, ``size``/``hash`` (sha256)
     mirror the descriptor, ``data`` is the RAW bytes (never msgpack-framed, so
-    a future ``blobopen`` can range-read them)."""
+    a future ``blobopen`` can range-read them).
+    """
 
     oid: int
     tid: int
@@ -54,7 +55,8 @@ class StreamedBlob:
     ``hash`` (sha256) are already final (computed in the engine's pre-TID
     hashing pass); the backend recomputes only the ``crc`` as it fills. The
     in-memory fake, which has no ``blobopen``, materializes the chunks instead
-    (the one backend difference for streaming)."""
+    (the one backend difference for streaming).
+    """
 
     oid: int
     tid: int
@@ -125,7 +127,8 @@ class StorageReadView(Protocol):
         when the stream closes — the engine passes a dedicated read view's
         ``close`` so the pinned read transaction is released with the stream.
         Raises :class:`~datacrystal._errors.DanglingRefError` if the blob OID is
-        absent (deleted per ADR-003, or never committed)."""
+        absent (deleted per ADR-003, or never committed).
+        """
         ...
 
     def close(self) -> None: ...

@@ -28,7 +28,8 @@ class ObjectRegistry:
     def discard(self, oid: int) -> None:
         """Forget an OID (committed delete, ADR-003): the identity contract
         ends with the record — a later load of this OID must fail loudly,
-        never resurrect the detached instance."""
+        never resurrect the detached instance.
+        """
         self._by_oid.pop(oid, None)
 
     def items(self) -> list[tuple[int, Any]]:

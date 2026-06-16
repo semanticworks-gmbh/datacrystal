@@ -86,7 +86,8 @@ def _stream_create_update_delete() -> list[dict[str, Any]]:
 
 def _stream_direct(payload: bytes, length: int) -> list[dict[str, Any]]:
     """t1 creates X with ``payload`` directly; the rest are empty deltas, so
-    both equivalence streams end at the same watermark."""
+    both equivalence streams end at the same watermark.
+    """
     out = [_delta(1, [_upsert(_OID, payload, None)], types=[_TYPES_ROW])]
     out += [_delta(tid, []) for tid in range(2, length + 1)]
     return out
@@ -254,7 +255,8 @@ class CountingConsumer:
         type rows (spec §2) and are never retained (§5), so a sidecar
         attaching to a lived-in store takes its lineage, its initial
         derived state, and its watermark from one ``store.snapshot()`` —
-        this is the canonical sidecar bootstrap recipe."""
+        this is the canonical sidecar bootstrap recipe.
+        """
         consumer = cls()
         consumer.watermark = snapshot.tid
         for cid, typename, _fields in snapshot.types:

@@ -51,7 +51,8 @@ def _guard_temporal_comparable(field: str, new_key: Any, existing_key: Any) -> N
     Only ``datetime`` carries an offset; ``date``/``time``/``str``/numeric keys
     are uniformly comparable, so the guard is a no-op for them. Compares the
     incoming key against any one already-indexed key (all keys in a single sorted
-    run share one convention once this guard has held)."""
+    run share one convention once this guard has held).
+    """
     if (isinstance(new_key, _dt.datetime) and isinstance(existing_key, _dt.datetime)
             and (new_key.tzinfo is None) != (existing_key.tzinfo is None)):
         raise MixedTemporalIndexError(
@@ -67,7 +68,8 @@ def _sorted_run(field: str, keys: Iterable[Any]) -> list[Any]:
     bare ``TypeError`` a naive-vs-aware datetime mix raises in ``sorted()`` into a
     named :class:`MixedTemporalIndexError` (#106 / ADR-004 §4). Used by the bulk
     build's ``finalize_build`` and the cache ``load`` — the from-scan/from-cache
-    rebuild paths where the whole run is sorted at once."""
+    rebuild paths where the whole run is sorted at once.
+    """
     try:
         return sorted(keys)
     except TypeError as exc:
@@ -119,7 +121,8 @@ class QueryPlan:
 def explain_plan(typename: str, ci: "ClassIndexes",
                  cond: Condition | None) -> QueryPlan:
     """Build the :class:`QueryPlan` for one (class extent, condition) pair —
-    shared by the live store and snapshots (same two rules on both)."""
+    shared by the live store and snapshots (same two rules on both).
+    """
     extent = len(ci.extent)
     if cond is None:
         return QueryPlan(typename, None, False, None, extent, extent)
@@ -167,12 +170,14 @@ class ClassIndexes:
     def begin_bulk(self) -> None:
         """Enter bulk-build mode: ``insert()`` defers each sorted field's insort
         (it would be O(K^2) over the lineage) to a single sort in
-        :meth:`finalize_build`."""
+        :meth:`finalize_build`.
+        """
         self._building = True
 
     def finalize_build(self) -> None:
         """After a bulk build, derive each sorted field's sorted run from its eq
-        keys in one O(K log K) sort (incremental updates after this insort)."""
+        keys in one O(K log K) sort (incremental updates after this insort).
+        """
         for field in self.sorted_fields:
             self.sorted_keys[field] = _sorted_run(
                 field, (k for k in self.eq[field] if k is not None)
@@ -185,7 +190,8 @@ class ClassIndexes:
         a read-only reopen pays nothing. Rebuilds from the index (not the records),
         so additive schema evolution is already baked in and no fill logic is
         needed. From-records builds maintain the map incrementally and never call
-        this."""
+        this.
+        """
         last: dict[int, dict[str, Any]] = {}
         for field, col in self.eq.items():
             is_list = field in self.list_fields
@@ -275,7 +281,8 @@ class ClassIndexes:
 
     def remove(self, oid: int) -> None:
         """Un-index a committed delete (ADR-003) from the index's own
-        ``last_values`` memory — never a store read (invariant 11)."""
+        ``last_values`` memory — never a store read (invariant 11).
+        """
         if self._needs_lv_rebuild:  # first write after a cache load (#12)
             self._rebuild_last_values()
         old = self._last_values.pop(oid, None)
@@ -286,7 +293,8 @@ class ClassIndexes:
     def seal(self) -> None:
         """Drop the incremental-maintenance memory (oid → last-indexed
         values). For a consumer that will never fold in another commit —
-        the frozen snapshot views — that map is pure O(extent) waste."""
+        the frozen snapshot views — that map is pure O(extent) waste.
+        """
         self._last_values.clear()
         self._needs_lv_rebuild = False  # a sealed view never folds a commit
 
@@ -296,7 +304,8 @@ class ClassIndexes:
         keys) so any scalar key type round-trips. A pure-Unique field carries NO
         eq postings (#12) — only the flat ``unique`` value→oid map. ``sorted_keys``
         reconstruct from the postings on load; the ``_last_values`` memory is not
-        stored and is rebuilt lazily on the first write after a load."""
+        stored and is rebuilt lazily on the first write after a load.
+        """
         return {
             "extent": self.extent.serialize(),
             "eq": [[f, [[k, bm.serialize()] for k, bm in posts.items()]]
@@ -313,7 +322,8 @@ class ClassIndexes:
         caller rebuilds from records; the cache is never authoritative). The
         sorted runs reconstruct from the postings here; the ``_last_values``
         un-index memory is deferred to the first write (a read-only reopen never
-        pays for it), so a loaded index still supports further commits."""
+        pays for it), so a loaded index still supports further commits.
+        """
         eq_names = [f for f, _ in blob["eq"]]
         unique = [f for f, _ in blob["unique"]]
         list_fields = list(blob["list_fields"])
@@ -349,14 +359,16 @@ def _eq_index_fields(ti: TypeInfo) -> list[str]:
     pure-Unique field, whose ``==``/``in_`` answer from the value→oid unique map
     (#12). The SINGLE source of eq-membership; build, the cache marker-check, and
     plan()'s unique fallback all agree on it so a Unique-only field can't be in
-    ``eq`` on one path and absent on another."""
+    ``eq`` on one path and absent on another.
+    """
     return [s.name for s in ti.specs if s.indexed or s.sorted]
 
 
 def _maintained_fields(ti: TypeInfo) -> list[str]:
     """Every field the index touches — eq fields ∪ unique fields (#12). A pure-
     Unique field is maintained (it has a unique map and an un-index memory) but
-    carries no eq postings."""
+    carries no eq postings.
+    """
     return [s.name for s in ti.specs if s.indexed or s.sorted or s.unique]
 
 
@@ -371,7 +383,8 @@ def build_class_indexes(
     defaults. Each OID appears under exactly one cid (updates rewrite the
     row). ``scan_type`` is the seam: the live store scans its backend, a
     snapshot scans its pinned read view (ADR-002) — same rules, one code
-    path."""
+    path.
+    """
     specs = ti.specs
     eq_fields = _eq_index_fields(ti)
     unique = frozenset(s.name for s in specs if s.unique)
@@ -421,7 +434,8 @@ def harvest_ref_oids(values: list[Any]) -> set[int]:
     """Every entity-OID a decoded record references — direct refs and Lazy refs
     alike decode to ``RefToken``, in scalar fields and inside list/dict
     containers. The reverse-reference index's harvest (#20). Iterative (no
-    recursion) so a deeply-nested within-record structure can't blow the stack."""
+    recursion) so a deeply-nested within-record structure can't blow the stack.
+    """
     out: set[int] = set()
     stack: list[Any] = list(values)
     while stack:
@@ -437,7 +451,8 @@ def harvest_ref_oids(values: list[Any]) -> set[int]:
 
 class IndexManager:
     """Lazily builds and incrementally maintains per-class indexes (and the
-    global reverse-reference index, #20)."""
+    global reverse-reference index, #20).
+    """
 
     def __init__(self, backend: StorageBackend,
                  lineage_for: Callable[[TypeInfo], list[tuple[int, list[str]]]],
@@ -485,7 +500,8 @@ class IndexManager:
     def dump_for_cache(self) -> dict[str, Any]:
         """The built per-class indexes as ``{typename: blob}`` for the sidecar —
         the live store's forward indexes only (the reverse index is not cached
-        in this first cut)."""
+        in this first cut).
+        """
         from datacrystal._entity import type_info  # lazy: _entity imports us
 
         return {type_info(cls).typename: ci.dump() for cls, ci in self._by_cls.items()}
@@ -568,7 +584,8 @@ class IndexManager:
         the boot-loaded cache blob now predates the change (#71). Drop it — a
         later ``ensure()`` rebuilds from the now-current records rather than
         loading a stale blob (which would resurrect a deleted OID or miss a new
-        one). The cache is never authoritative (invariant 11)."""
+        one). The cache is never authoritative (invariant 11).
+        """
         if self._cache_blobs is not None:
             self._cache_blobs.pop(ti.typename, None)
 
@@ -587,7 +604,8 @@ class IndexManager:
 
     def apply_deletes(self, deletes: list[tuple[int, TypeInfo]]) -> None:
         """P3: drop committed deletions from every already-built index
-        (unbuilt indexes scan the post-delete records and never see them)."""
+        (unbuilt indexes scan the post-delete records and never see them).
+        """
         for oid, ti in deletes:
             ci = self._by_cls.get(ti.cls)
             if ci is None:
@@ -605,7 +623,8 @@ class IndexManager:
         rebuildable-derived-data contract as the forward indexes (invariant 11:
         never persisted, never in the commit txn). Unlike ``build_class_indexes``
         (per-class, indexed positions only) this is global and decodes every
-        field of every record."""
+        field of every record.
+        """
         if self._reverse is not None:
             return self._reverse
         if self._reverse_blob is not None:
@@ -635,7 +654,8 @@ class IndexManager:
         """The built reverse postings (target → referrers) for the sidecar (#63),
         or None if the reverse index was never built this session. Only this
         direction is cached — what ``incoming()`` reads; the referrer → targets
-        diff memory is rebuilt from it on the first fold (see ``__init__``)."""
+        diff memory is rebuilt from it on the first fold (see ``__init__``).
+        """
         if self._reverse is None:
             return None
         return {"rev": [[t, bm.serialize()] for t, bm in self._reverse.items()]}
@@ -643,7 +663,8 @@ class IndexManager:
     def _rebuild_reverse_refs(self) -> None:
         """Reconstruct the referrer → targets diff memory by inverting the loaded
         ``_reverse`` (target → referrers) — deferred from a cache load to the
-        first fold (#63), so a read-only reopen never pays it. No record decode."""
+        first fold (#63), so a read-only reopen never pays it. No record decode.
+        """
         refs: dict[int, BitMap64] = {}
         for target, referrers in (self._reverse or {}).items():
             for referrer in referrers:
@@ -655,7 +676,8 @@ class IndexManager:
         """P3: fold a committed batch's outgoing refs into the reverse postings,
         diffing old-vs-new per referrer (like the multi-valued index). Skips when
         the reverse index isn't built — a later ``ensure_reverse`` scans these
-        now-committed records (spec §5: an unwatched store pays nothing)."""
+        now-committed records (spec §5: an unwatched store pays nothing).
+        """
         rev = self._reverse
         if rev is None:
             return
@@ -680,7 +702,8 @@ class IndexManager:
         outgoing edges vanish from the postings — but KEEPS it as a *target*:
         entities still pointing at the dead OID are now dangling, and
         ``incoming(dead)`` names exactly them (the checked-delete enumeration
-        ADR-003 waited for). Skips when the reverse index isn't built."""
+        ADR-003 waited for). Skips when the reverse index isn't built.
+        """
         if deleted_oids and self._reverse is None and self._reverse_blob is not None:
             self._reverse_blob = None  # #63/#71: a delete before the reverse index
             #                            materializes makes the cached blob stale
@@ -702,7 +725,8 @@ def _range_slice(ci: ClassIndexes, field: str, op: str, value: Any) -> BitMap64:
     """The OIDs whose SortedIndex ``field`` key satisfies ``op value`` — bisect
     the sorted run for the matching key interval, union those eq postings
     (ADR-004 / #18). None is never in the run (SQL-NULL-like ordering), and a
-    None bound matches nothing — mirroring :meth:`Pred.evaluate`."""
+    None bound matches nothing — mirroring :meth:`Pred.evaluate`.
+    """
     acc = BitMap64()
     if value is None:
         return acc
@@ -842,7 +866,8 @@ def order_via_index(ci: ClassIndexes, matched: BitMap64, field: str,
 
     ``matched`` is the condition's candidate BitMap64; every matched OID appears
     under exactly one ``eq[field]`` key (None included), so the result is a pure
-    reordering of ``matched``."""
+    reordering of ``matched``.
+    """
     postings = ci.eq[field]
     if field in ci.sorted_fields:
         keys = list(ci.sorted_keys[field])
@@ -870,7 +895,8 @@ def windowed_index_order(ci: ClassIndexes, matched: BitMap64, field: str,
     NULLs (``eq[None]``) come last, reached only if the window isn't filled by
     non-None keys. Same order as :func:`order_via_index` then sliced — verified
     by the order_by oracle — but without touching the long tail of keys past the
-    window."""
+    window.
+    """
     if limit is None:  # no window to stop at → the full order, offset-sliced
         ordered = order_via_index(ci, matched, field, descending)
         return ordered[offset:] if offset else ordered

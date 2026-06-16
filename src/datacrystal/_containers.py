@@ -28,7 +28,8 @@ from datacrystal._state import touch
 def wrap_value(value: Any, owner: Any) -> Any:
     """Wrap lists/dicts (recursively) as persistent containers bound to
     ``owner``. Already-bound containers of the same owner pass through;
-    everything else is copied into a fresh bound wrapper."""
+    everything else is copied into a fresh bound wrapper.
+    """
     if isinstance(value, (PersistentList, PersistentDict)):
         # reportPrivateUsage: same-module wrap_value/owner cooperation
         if value._dc_owner is owner:  # pyright: ignore[reportPrivateUsage]

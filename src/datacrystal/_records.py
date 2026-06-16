@@ -86,7 +86,8 @@ class BlobToken:
     live engine maps it to a :class:`~datacrystal.Blob` handle, and decode-level
     reads (``count``/``pluck``) match/skip a blob field by descriptor without
     touching the ``blobs`` table. Equality is by ``blob_oid`` (a blob is
-    immutable: one OID, one content), mirroring ``RefToken``."""
+    immutable: one OID, one content), mirroring ``RefToken``.
+    """
 
     __slots__ = ("blob_oid", "size", "hash")
 
@@ -196,7 +197,8 @@ def encode_payload(
     ``dc.BlobSource`` for a streamed write), ``blob_sink`` allocates the blob OID
     and records the value for storage, returning ``(blob_oid, size, hash)``; we
     emit a tiny ``BLOB_EXT`` descriptor in the record instead of the bytes. A
-    None blob value encodes as msgpack None (the field is simply absent)."""
+    None blob value encodes as msgpack None (the field is simply absent).
+    """
     out: list[Any] = []
     for i, v in enumerate(values):
         if i in blob_positions and v is not None:
@@ -220,7 +222,8 @@ def fingerprint_payload(values: list[Any], oid_for: Callable[[Any], int]) -> byt
     """Encode a value list where any ``BlobToken`` is emitted as its descriptor
     ext (oid/size/hash) and everything else swizzles normally — the debug
     fingerprint path (ADR-007). A blob is presented as its already-known
-    descriptor so the net never fetches or re-stores its bytes."""
+    descriptor so the net never fetches or re-stores its bytes.
+    """
     out: list[Any] = []
     for v in values:
         if isinstance(v, BlobToken):
@@ -265,13 +268,15 @@ def encode_scalar_tree(tree: Any) -> bytes:
     SortedIndex run on reload). Used by the index cache (ADR-005), whose blob holds
     index keys that may now be datetimes; ``swizzle`` is the shared pre-pass (it
     converts the temporal leaves and rejects entities — none belong in a cache
-    blob)."""
+    blob).
+    """
     return _ENCODER.encode(swizzle(tree, _no_oid))
 
 
 def decode_scalar_tree(payload: bytes) -> Any:
     """Inverse of :func:`encode_scalar_tree` — the ext codes decode back to the
-    original datetime/date/time via the shared :func:`_ext_hook` (#106)."""
+    original datetime/date/time via the shared :func:`_ext_hook` (#106).
+    """
     return _DECODER.decode(payload)
 
 

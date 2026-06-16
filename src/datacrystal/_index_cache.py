@@ -41,7 +41,8 @@ class IndexCache:
         at ``watermark`` and the current format — else ``None`` (rebuild). Never
         raises on a missing, truncated, or foreign-format cache: it is never
         authoritative. ``reverse`` is optional (#63) — a pre-#63 sidecar simply
-        lacks it, so the reverse index rebuilds on demand as before."""
+        lacks it, so the reverse index rebuilds on demand as before.
+        """
         try:
             raw = self._path.read_bytes()
         except OSError:
@@ -64,7 +65,8 @@ class IndexCache:
               reverse: dict[str, Any] | None = None) -> None:
         """Stamp the built forward index blobs (and the reverse index, if built —
         #63) at ``watermark`` (temp file + atomic rename, so a crash mid-write
-        leaves the prior valid cache or none)."""
+        leaves the prior valid cache or none).
+        """
         payload = encode_scalar_tree(
             {"format": _CACHE_FORMAT, "watermark": watermark,
              "classes": blobs, "reverse": reverse}

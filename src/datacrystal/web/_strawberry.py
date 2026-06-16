@@ -155,7 +155,8 @@ def snapshot_context(snapshot: Snapshot) -> dict[str, Any]:
     is what scopes batching and caching to the request and pins every field to
     one watermark (ADR-002). The dict is the caller's to extend with other
     per-request values; the relation resolver only reads
-    :data:`LOADER_CONTEXT_KEY`."""
+    :data:`LOADER_CONTEXT_KEY`.
+    """
     return {LOADER_CONTEXT_KEY: SnapshotLoader(snapshot)}
 
 
@@ -176,7 +177,8 @@ def _make_relation_resolver(name: str) -> Any:
     one :meth:`~datacrystal._snapshot.Snapshot.get_many` (the N+1 killer). An
     absent edge (``None``) short-circuits without touching the loader; a
     dangling/deleted reference rides ``get_many``'s None-on-miss (ADR-003) and
-    resolves to GraphQL ``null`` — never a 500."""
+    resolves to GraphQL ``null`` — never a 500.
+    """
 
     async def resolve(root: Any, info: Info[Any, Any]) -> Any:
         ref = getattr(root, name)
@@ -198,7 +200,8 @@ def _relation_field(name: str) -> StrawberryField:
     The ``type_annotation`` is a placeholder (``object``) here; it is patched to
     the nullable target Strawberry type in
     :meth:`StrawberryReflector._resolve_pending` once every endpoint type is
-    cached (the cycle break)."""
+    cached (the cycle break).
+    """
     return StrawberryField(
         python_name=name,
         type_annotation=StrawberryAnnotation(object),
@@ -208,7 +211,8 @@ def _relation_field(name: str) -> StrawberryField:
 
 def _loader_from(info: Info[Any, Any]) -> SnapshotLoader:
     """Pull the per-request :class:`SnapshotLoader` off the GraphQL context, or
-    fail loudly if the request was not wired with :func:`snapshot_context`."""
+    fail loudly if the request was not wired with :func:`snapshot_context`.
+    """
     context: object = info.context
     if isinstance(context, Mapping):
         mapping = cast("Mapping[object, object]", context)
@@ -231,7 +235,8 @@ def _is_scalar_field(desc: FieldDescriptor) -> bool:
     Mirrors the engine's own indexable/list-of-scalar split
     (:func:`datacrystal._entity._is_indexable` / ``_is_list_of_scalar``) so the
     GraphQL scalar set is exactly the leaf set the engine treats as plain data —
-    no second definition of "scalar" to drift."""
+    no second definition of "scalar" to drift.
+    """
     from datacrystal._entity import (
         _is_indexable,  # pyright: ignore[reportPrivateUsage]  # engine leaf-set predicate, no second "scalar" definition
     )
@@ -311,7 +316,8 @@ class StrawberryReflector:
         reference field instead carries the **async relation resolver** (#100),
         which takes the view's :class:`~datacrystal._snapshot.Ref` token through
         the per-request DataLoader (the N+1 killer) rather than returning it
-        raw."""
+        raw.
+        """
         if _is_scalar_field(desc):
             return _plain_field(desc.name, desc.core_type)
         targets = referenced_entities(desc.core_type)
@@ -343,7 +349,8 @@ class StrawberryReflector:
         Strawberry resolves a field's type lazily at schema-conversion, so the
         annotation set here — after ``create_type`` — is the one the schema
         sees. Nullable so an absent reference (a ``None`` / missing edge)
-        validates without a non-null GraphQL violation."""
+        validates without a non-null GraphQL violation.
+        """
         still_pending: list[tuple[StrawberryField, str]] = []
         for field, typename in self._pending_refs:
             target = self._types.get(typename)
@@ -370,7 +377,8 @@ def _plain_field(name: str, core_type: Any) -> StrawberryField:
     With no ``base_resolver``, Strawberry uses the default resolver
     (``types/field.py:234``) — a ``getattr(source, name)`` against whatever the
     parent field returns, which on this surface is a frozen
-    :class:`~datacrystal._snapshot.EntityView` (``_snapshot.py:114``)."""
+    :class:`~datacrystal._snapshot.EntityView` (``_snapshot.py:114``).
+    """
     return StrawberryField(
         python_name=name,
         type_annotation=StrawberryAnnotation(core_type),

@@ -194,7 +194,8 @@ def to_pydantic(
     (#98): ``"plain"`` (default), the input-shaped ``"create"`` (same fields), or
     the output-shaped ``"public"`` — which carries the source's ``oid`` (``view.oid``
     for a snapshot view, the engine OID for a live entity) so a FastAPI route can
-    return it under ``response_model=EntityPublic``."""
+    return it under ``response_model=EntityPublic``.
+    """
     cls: type
     values: dict[str, Any]
     oid: int | None
@@ -257,7 +258,8 @@ def from_pydantic(model_instance: pydantic.BaseModel, cls: type, *, store: Any =
     a direct field assigned the entity): resolution goes through the public
     ``store.get_many`` on the **owner thread**, so the store's existing
     ``WrongThreadError`` guard (ADR-001) confines it — no new thread check is added
-    here."""
+    here.
+    """
     _, descriptors = reflect(cls)  # raises NotAnEntityError loudly for a non-@entity class
     field_values: dict[str, Any] = {}
     ref_oids: list[tuple[str, int, FieldDescriptor]] = []
@@ -292,7 +294,8 @@ def _type_info_for_view(view: EntityView) -> type:
 
     A view carries only its typename (it is store-free by design), so resolve it
     back to the live class to build the model. The class must be loaded in this
-    process — the same precondition every snapshot read that names fields has."""
+    process — the same precondition every snapshot read that names fields has.
+    """
     from datacrystal._entity import TYPES_BY_NAME
 
     ti = TYPES_BY_NAME.get(view.typename)
@@ -313,7 +316,8 @@ def _dto_value(value: Any, nested: int) -> Any:
     a container decays to a plain ``list`` / ``dict``, and a scalar / temporal
     passes through. ``nested`` bounds referent recursion (see :func:`to_pydantic`):
     a resident referent at depth > 0 becomes its own nested DTO; everything else
-    stays an OID. No branch ever forces a load."""
+    stays an OID. No branch ever forces a load.
+    """
     if isinstance(value, Ref):
         return value.oid
     if isinstance(value, RefToken):  # raw decoded token (defensive; views freeze)
@@ -356,7 +360,8 @@ def _dto_value(value: Any, nested: int) -> Any:
 def _has_nested_dto(data: dict[str, Any]) -> bool:
     """True if any projected value carries a nested DTO (a resident referent was
     recursed into), so :func:`to_pydantic` knows to ``model_construct`` rather
-    than ``model_validate`` (a DTO would not validate against an ``int`` slot)."""
+    than ``model_validate`` (a DTO would not validate against an ``int`` slot).
+    """
     return any(_contains_model(v) for v in data.values())
 
 
@@ -378,7 +383,8 @@ def _guard_owner(entity: Any) -> None:
     snapshot escape recipe) **before** any field is read, so ``to_pydantic`` can
     never tear a value out from under the owner. The owner store is reached via
     the entity's ``__dc_store__`` weakref; a never-stored or GC'd-store entity has
-    no owner to violate, so the guard is a no-op there."""
+    no owner to violate, so the guard is a no-op there.
+    """
     try:
         storeref = object.__getattribute__(entity, "__dc_store__")
     except AttributeError:

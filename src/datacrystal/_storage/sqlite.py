@@ -148,7 +148,8 @@ class _SqliteBlobReader(io.RawIOBase):
 
     If the connection is closed out from under the stream (a stream that outlived
     its snapshot), every op translates the raw ``sqlite3.ProgrammingError`` to
-    :class:`StoreClosedError` — the public surface stays DataCrystalError-only."""
+    :class:`StoreClosedError` — the public surface stays DataCrystalError-only.
+    """
 
     def __init__(self, blob: sqlite3.Blob, on_close: Callable[[], None] | None) -> None:
         self._blob = blob
@@ -351,7 +352,8 @@ class SqliteBackend:
     def _drop_types_unique_constraint(conn: sqlite3.Connection) -> None:
         """Stores created before additive schema evolution carry a UNIQUE
         constraint on types.name; the type lineage needs several rows per
-        name. One-time, idempotent table rebuild."""
+        name. One-time, idempotent table rebuild.
+        """
         row = conn.execute(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='types'"
         ).fetchone()
@@ -383,7 +385,8 @@ class SqliteBackend:
     def read_view(self) -> SqliteReadView:
         """A snapshot-isolated read view (own connection, pinned WAL read
         transaction). Safe to call from any thread — it never touches the
-        backend's shared connection (ADR-002)."""
+        backend's shared connection (ADR-002).
+        """
         return SqliteReadView(self._path)
 
     def apply(self, batch: CommitBatch) -> None:

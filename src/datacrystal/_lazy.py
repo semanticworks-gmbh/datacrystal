@@ -71,7 +71,8 @@ class Lazy[T]:
     @classmethod
     def _loaded(cls, obj: T, oid: int, store: Any) -> "Lazy[T]":
         """Engine path: a hydrated handle whose target is already live
-        (registry hit) — demotable, unlike a user-made ``Lazy.of``."""
+        (registry hit) — demotable, unlike a user-made ``Lazy.of``.
+        """
         self = cls.of(obj)
         self._oid = oid
         self._storeref = weakref.ref(store)
@@ -145,7 +146,8 @@ class BlobHandle:
     Note the write/read asymmetry (documented intentionally): you assign plain
     ``bytes`` to a ``dc.Blob`` field, and the *live* value stays ``bytes`` until
     commit; after a reopen (or a fresh hydration) the same field reads back as a
-    ``Blob`` handle. The bytes are identical either way."""
+    ``Blob`` handle. The bytes are identical either way.
+    """
 
     __slots__ = ("_obj", "_oid", "_size", "_hash", "_storeref",
                  "_atime", "_clock", "__weakref__")
@@ -166,7 +168,8 @@ class BlobHandle:
     @classmethod
     def _bind(cls, blob_oid: int, size: int, hash: bytes, store: Any) -> "BlobHandle":
         """Engine path: a handle for a decoded :class:`BlobToken`, bound to its
-        store but with the bytes still on disk (fetched on first ``.bytes()``)."""
+        store but with the bytes still on disk (fetched on first ``.bytes()``).
+        """
         self = object.__new__(cls)
         self._obj = None
         self._oid = blob_oid
@@ -192,7 +195,8 @@ class BlobHandle:
         """The blob's OID (its row in the ``blobs`` table). Lets the encode path
         re-emit a hydrated blob's existing descriptor unchanged — an immutable
         blob is never re-stored when a sibling field of its entity is edited
-        (ADR-007)."""
+        (ADR-007).
+        """
         return self._oid
 
     @property
@@ -203,7 +207,8 @@ class BlobHandle:
     def bytes(self) -> bytes:
         """The whole blob value (lazy, cached, demotable). The first call reads
         it from the store (CRC checked in the backend); later calls return the
-        cached bytes until the manager demotes the handle."""
+        cached bytes until the manager demotes the handle.
+        """
         obj = self._obj
         if obj is None:
             storeref = self._storeref
@@ -250,7 +255,8 @@ class BlobSource:
 
     After the commit the field reads back as a :class:`BlobHandle` (the source is
     a consumed, opaque write token, unlike a plain ``bytes`` value which stays
-    readable as itself — ADR-007 §3 asymmetry)."""
+    readable as itself — ADR-007 §3 asymmetry).
+    """
 
     __slots__ = ("size", "open_chunks")
 
@@ -271,7 +277,8 @@ def blob_from_path(path: str | Path, *, chunk_size: int = 1 << 20) -> BlobSource
     """A :class:`BlobSource` reading a file in ``chunk_size`` blocks (default
     1 MiB) — the invoice/PDF-archival recipe (ADR-007 §4). The size is the
     file's size at call time; the file is re-opened on each of the two read
-    passes, so it must stay unchanged across the commit."""
+    passes, so it must stay unchanged across the commit.
+    """
     p = Path(path)
     size = p.stat().st_size
 
@@ -326,7 +333,8 @@ class LazyReferenceManager:
     def sweep(self) -> int:
         """Demote every tracked handle idle past the timeout; returns the
         count. Callers are the owner by construction (API piggyback or the
-        owner-loop task) — recorded for the conformance suite."""
+        owner-loop task) — recorded for the conformance suite.
+        """
         now = self._clock()
         self._last_sweep = now
         demoted = 0

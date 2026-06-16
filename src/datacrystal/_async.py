@@ -54,7 +54,8 @@ async def aopen(path: str | Path, *, durability: str = "interval",
 class AsyncStore:
     """An open datacrystal store on an asyncio loop. Create via
     :func:`datacrystal.aopen` (or wrap a :class:`Store` you opened on the
-    loop's thread, e.g. over a test backend)."""
+    loop's thread, e.g. over a test backend).
+    """
 
     def __init__(self, store: Store) -> None:
         self._store = store
@@ -102,7 +103,8 @@ class AsyncStore:
 
     def delete(self, obj_or_cls: Any, /, **unique_key: Any) -> bool:
         """Buffer a deletion (ADR-003) — like ``store()``, this only touches
-        in-memory buffers; ``await commit()`` makes it durable."""
+        in-memory buffers; ``await commit()`` makes it durable.
+        """
         return self._store.delete(obj_or_cls, **unique_key)
 
     def upsert(self, obj: Any, /, key: str | None = None) -> Any:
@@ -129,7 +131,8 @@ class AsyncStore:
 
     def attach(self, consumer: DeltaConsumer) -> None:
         """Attach a COMMIT-DELTA-v1 consumer (delivered on the owner loop's
-        thread during P3 — after ``await commit()`` resumes)."""
+        thread during P3 — after ``await commit()`` resumes).
+        """
         self._store.attach(consumer)
 
     def detach(self, consumer: DeltaConsumer) -> None:
@@ -138,7 +141,8 @@ class AsyncStore:
     def snapshot(self) -> Snapshot:
         """A frozen read view at the durable watermark — like the sync
         store's, callable from any thread (e.g. inside
-        ``run_in_executor`` work that must not touch live entities)."""
+        ``run_in_executor`` work that must not touch live entities).
+        """
         return self._store.snapshot()
 
     # -- the awaitable commit ------------------------------------------------
@@ -176,14 +180,16 @@ class AsyncStore:
 
     def transaction(self) -> "_Transaction":
         """``async with store.transaction():`` — serialize this scope against
-        every other transaction/commit and commit on clean exit."""
+        every other transaction/commit and commit on clean exit.
+        """
         return _Transaction(self)
 
     # -- lifecycle -------------------------------------------------------------
 
     def close(self) -> None:
         """Close the store (drains the IO worker; uncommitted changes are
-        discarded — commit first)."""
+        discarded — commit first).
+        """
         if self._sweeper is not None:
             self._sweeper.cancel()
             self._sweeper = None

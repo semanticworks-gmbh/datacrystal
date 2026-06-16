@@ -76,7 +76,8 @@ __version__ = "0.6.0"
 
 def __getattr__(name: str):  # PEP 562
     """Load the asyncio facade on first use: plain ``import datacrystal``
-    must not pay the ``asyncio`` import (fitness #12, import-time budget)."""
+    must not pay the ``asyncio`` import (fitness #12, import-time budget).
+    """
     if name in ("aopen", "AsyncStore"):
         from datacrystal import _async
 

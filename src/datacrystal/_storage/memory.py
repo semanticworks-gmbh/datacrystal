@@ -26,7 +26,8 @@ class _MemoryBlobStream(io.BytesIO):
     """``io.BytesIO`` over a copy of one blob's bytes — the memory backend's
     streaming fallback (ADR-007 §3: it has no ``blobopen``, so it cannot be
     RSS-bounded; the bytes are already resident anyway). Closing runs the
-    view's ``on_close`` for symmetry with the sqlite reader."""
+    view's ``on_close`` for symmetry with the sqlite reader.
+    """
 
     def __init__(self, data: bytes, on_close: Callable[[], None] | None) -> None:
         super().__init__(data)
