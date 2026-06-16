@@ -677,6 +677,10 @@ class Store:
             if self._index.reverse_built else []
         )
         self._index.check_unique(index_entries, deleted=set(self._deleted))
+        # #106 / ADR-004 §4: reject a SortedIndex datetime field mixing naive +
+        # aware values BEFORE the TID is allocated (gapless sequence, invariant 5)
+        # — a mixed sorted run would raise a bare TypeError deep in bisect/insort.
+        self._index.check_sorted_temporal(index_entries)
         new_types: list[tuple[int, str, list[str]]] = []
         encoded: list[tuple[int, int, bytes]] = []
         # Out-of-line blob values this commit writes (ADR-007 / #82). Each
