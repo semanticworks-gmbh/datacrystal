@@ -56,6 +56,41 @@ testpaths = ["tests"]
 line-length = 100
 src = ["src", "tests"]
 
+[tool.ruff.lint]
+extend-select = ["D"]
+# Residual-docstring baseline: rules that still fire in src/ after the D205/D209
+# mechanical pass. The Google structural rules (D2xx layout, D4xx form) are
+# ENFORCED from here on; these few are baselined so `ruff check .` is 0 and CI
+# gates the rest immediately. Burn the nits down by deleting a line — never by
+# adding `# noqa` (src pragmas are reserved for the magic-query typing exception).
+extend-ignore = [
+    "D205", # blank-line-after-summary: OFF on purpose (a voice choice, not debt) — the
+            # descriptive house style runs the summary straight into a multi-line first
+            # paragraph; a mechanical blank line would split a sentence mid-thought.
+    "D102", # undocumented-public-method: a handful of self-evident methods
+            # (mostly protocol/dunder-adjacent) still lack a docstring.
+    "D105", # undocumented-magic-method: __repr__/__eq__/__iter__ etc. — obvious
+            # by signature; document only where the why is non-trivial.
+    "D107", # undocumented-public-init: __init__ intent lives on the class
+            # docstring in the house style; not every __init__ repeats it.
+    "D403", # first-word-uncapitalized: one summary keys off a lowercase field
+            # name ("name → factory"); capitalizing would misname it.
+    "D415", # missing-terminal-punctuation: a couple of summaries open a `::`
+            # literal block instead of ending in a period.
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+# Docstrings are a src/ library contract; don't require them outside src/.
+# evals/ are on-demand proving grounds (NOT unit tests, outside CI) — same
+# rationale as tests/examples/benchmarks.
+"tests/**" = ["D"]
+"examples/**" = ["D"]
+"benchmarks/**" = ["D"]
+"evals/**" = ["D"]
+
 [tool.pyright]
 venvPath = "."
 venv = ".venv"

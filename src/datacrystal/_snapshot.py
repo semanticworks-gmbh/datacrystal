@@ -64,7 +64,8 @@ _VIEW_CHUNK = 8192  # records per load_many in snapshot scans (peak-RAM bound)
 class Ref:
     """An entity reference inside a snapshot — resolve it via
     :meth:`Snapshot.get`. Snapshots never hand out live entities (ADR-001),
-    so references stay explicit OID tokens."""
+    so references stay explicit OID tokens.
+    """
 
     __slots__ = ("oid",)
 
@@ -162,7 +163,8 @@ def _view_value(value: Any) -> Any:
     Lazy handles become :class:`Ref` tokens, lists the tuples ``_freeze``
     makes of them — so conditions written against live objects evaluate
     against frozen views (the snapshot twin of the store's raw-read
-    transform)."""
+    transform).
+    """
     if is_entity(value):
         oid = oid_of(value)
         if oid is None:
@@ -191,7 +193,8 @@ def _order_views(views: list[EntityView], field: str,
                  descending: bool) -> list[EntityView]:
     """EntityViews ordered by ``field`` for the un-indexed / residual snapshot
     order_by path (#25): NULLs last, stable ascending-OID tiebreak (``views``
-    arrive ascending-OID from ``_views_for``)."""
+    arrive ascending-OID from ``_views_for``).
+    """
     present = [v for v in views if getattr(v, field) is not None]
     absent = [v for v in views if getattr(v, field) is None]
     present.sort(key=lambda v: getattr(v, field), reverse=descending)
@@ -299,13 +302,15 @@ class Snapshot:
     def types(self) -> tuple[tuple[int, str, tuple[str, ...]], ...]:
         """The full type lineage at this watermark — ``(cid, typename,
         field names)`` rows, exactly what a COMMIT-DELTA consumer needs to
-        bootstrap before applying deltas from ``tid`` onward."""
+        bootstrap before applying deltas from ``tid`` onward.
+        """
         return self._types
 
     @property
     def root(self) -> Any:
         """The committed root value (refs as :class:`Ref`, containers
-        frozen), or ``None`` if no root was ever assigned."""
+        frozen), or ``None`` if no root was ever assigned.
+        """
         if self._root_oid is None:
             return None
         return self.get(self._root_oid).value
@@ -342,7 +347,8 @@ class Snapshot:
 
         Cache-aware (OIDs already materialized in this snapshot cost no extra
         ``load_many``) and callable from any thread under the snapshot lock,
-        including on the mid-life bootstrap path (ADR-002 read views)."""
+        including on the mid-life bootstrap path (ADR-002 read views).
+        """
         oids = [r.oid if isinstance(r, (EntityView, Ref)) else r for r in refs]
         with self._lock:
             self._guard()
@@ -354,7 +360,8 @@ class Snapshot:
         snapshot's pinned read view, so it needs no owner thread and shares the
         snapshot's watermark; closing the stream does NOT close the snapshot
         (close the snapshot itself when done). A ``None`` blob raises
-        ``ValueError``; a non-blob field raises ``TypeError``."""
+        ``ValueError``; a non-blob field raises ``TypeError``.
+        """
         ev = view if isinstance(view, EntityView) else self.get(view)
         fields = ev.fields()
         if field not in fields:
@@ -387,7 +394,8 @@ class Snapshot:
         window (#25, the live store's contract): NULLs last, ascending-OID
         tiebreak. Ordering needs the live ``@entity`` class (a bare typename
         string with no class loaded can't name a field) and, being a total
-        sort, forgoes the stop-early materialization."""
+        sort, forgoes the stop-early materialization.
+        """
         validate_window(limit, offset)
         if isinstance(cls_or_typename, str):
             typename = cls_or_typename
@@ -438,7 +446,8 @@ class Snapshot:
         O(extent), the same documented cost as the live store's lazy index
         build), then cached for the snapshot's lifetime. Needs the live
         ``@entity`` class: which fields are indexed/unique is declared in
-        code (``dc.Index``/``dc.Unique``), not persisted."""
+        code (``dc.Index``/``dc.Unique``), not persisted.
+        """
         ti = type_info(cls)  # loud for non-entity classes
         if ti.typename not in self._cids_by_typename:
             self._warn_unseen(ti)
@@ -454,7 +463,8 @@ class Snapshot:
         """How many entities match at this watermark — ``count`` semantics
         of the live store, answered from the snapshot-local bitmaps (a
         residual predicate evaluates over cached :class:`EntityView` DTOs,
-        still never live entities)."""
+        still never live entities).
+        """
         cls, cond = query_target(target, "count")
         ti = type_info(cls)
         if ti.typename not in self._cids_by_typename:
@@ -490,7 +500,8 @@ class Snapshot:
         contract to the snapshot (#25): the whole match set is sorted before the
         window — NULLs last, ascending-OID tiebreak; an indexed sort field is
         ordered from the snapshot-local index, an un-indexed one from each
-        matched view's decoded value."""
+        matched view's decoded value.
+        """
         validate_window(limit, offset)
         cls, cond = query_target(target, "query")
         ti = type_info(cls)
@@ -533,7 +544,8 @@ class Snapshot:
     def explain(self, target: type | Condition) -> "QueryPlan":
         """The deterministic plan for ``target`` over this snapshot's
         indexes — the same two rules as :meth:`Store.explain`, against the
-        snapshot-local bitmaps."""
+        snapshot-local bitmaps.
+        """
         cls, cond = query_target(target, "explain")
         ti = type_info(cls)
         if ti.typename not in self._cids_by_typename:
@@ -562,7 +574,8 @@ class Snapshot:
 
         A ``target`` whose own record is gone at this watermark (deleted, ADR-003
         — unchecked) still names its now-dangling referrers (OIDs are never
-        reused): ``incoming(dead)`` is the checked-delete enumeration seam."""
+        reused): ``incoming(dead)`` is the checked-delete enumeration seam.
+        """
         oid = target.oid if isinstance(target, (EntityView, Ref)) else target
         with self._lock:
             self._guard()
@@ -597,7 +610,8 @@ class Snapshot:
 
     def _class_indexes(self, ti: Any) -> ClassIndexes:
         """The snapshot-local mutable indexes for one class (caller holds
-        the lock); the planner's working form behind the frozen views."""
+        the lock); the planner's working form behind the frozen views.
+        """
         ci = self._indexes.get(ti.cls)
         if ci is None:
             lineage = [
@@ -614,7 +628,8 @@ class Snapshot:
         lock): scan every committed record in this pinned view, harvest its
         outgoing refs, invert to target OID → referrer OIDs. The frozen-view
         analogue of ``IndexManager.ensure_reverse`` — global (every cid, every
-        field), rebuildable, never persisted (invariant 11)."""
+        field), rebuildable, never persisted (invariant 11).
+        """
         if self._reverse is not None:
             return self._reverse
         rev: dict[int, BitMap64] = {}
@@ -631,7 +646,8 @@ class Snapshot:
         OID. Intolerant (``tolerant=False``, the index-driven path): every OID
         is known-present (it came from a snapshot-local bitmap), so a missing
         record is internal corruption and raises. Tolerant: a missing OID is
-        simply left absent from the cache (deleted/never-committed, ADR-003)."""
+        simply left absent from the cache (deleted/never-committed, ADR-003).
+        """
         missing = [oid for oid in oids if oid not in self._cache]
         for start in range(0, len(missing), _VIEW_CHUNK):
             chunk = missing[start:start + _VIEW_CHUNK]
@@ -649,7 +665,8 @@ class Snapshot:
 
     def _views_for(self, oids: list[int]) -> list[EntityView]:
         """Batch-materialize EntityViews for known-present OIDs (caller holds
-        the lock); raises on any miss — the internal, index-driven path."""
+        the lock); raises on any miss — the internal, index-driven path.
+        """
         self._load_missing(oids, tolerant=False)
         return [self._cache[oid] for oid in oids]
 
@@ -657,7 +674,8 @@ class Snapshot:
         """The miss-tolerant sibling of :meth:`_views_for` (caller holds the
         lock): an absent/deleted OID yields ``None`` in its slot. The engine
         seam behind the public :meth:`get_many` (#94, the datacrystal[web]
-        DataLoader contract)."""
+        DataLoader contract).
+        """
         self._load_missing(oids, tolerant=True)
         return [self._cache.get(oid) for oid in oids]
 
@@ -676,7 +694,8 @@ class Snapshot:
         through its own persisted shape, missing live fields filled from
         dataclass defaults (the same additive-evolution rules as live
         hydration). Shared by :meth:`_materialize` (which caches a view) and
-        :meth:`_stream` (which constructs nothing)."""
+        :meth:`_stream` (which constructs nothing).
+        """
         typename = self._typename_by_cid.get(cid)
         persisted = self._fields_by_cid.get(cid)
         if typename is None or persisted is None:
@@ -721,7 +740,8 @@ class Snapshot:
         WITHOUT populating ``_cache`` or building a full list — the
         bounded-memory bootstrap scan (#16, the cache-bypassing sibling of
         :meth:`all`). ``scan_type`` is a cursor stream on sqlite, so peak
-        residency stays O(1) rows at the source too."""
+        residency stays O(1) rows at the source too.
+        """
         with self._lock:
             self._guard()
             for cid in self._cids_by_typename.get(typename, []):

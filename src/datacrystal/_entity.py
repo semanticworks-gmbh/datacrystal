@@ -231,7 +231,8 @@ class TypeInfo:
 
     def spec(self, name: str) -> FieldSpec | None:
         """O(1) FieldSpec lookup — ``get()``/``get_many()`` hit this on
-        every natural-key call (perf gate ``unique_key_lookup``)."""
+        every natural-key call (perf gate ``unique_key_lookup``).
+        """
         by_name = self._spec_by_name
         if by_name is None:
             by_name = self._spec_by_name = {s.name: s for s in self.specs}
@@ -263,7 +264,8 @@ class TypeInfo:
         """True if any field may hold an entity reference (direct, Lazy, or in a
         container). A type with none skips P1 graph discovery on commit (#52):
         :meth:`Store._register_graph` walks no fields for such an entity, since
-        :meth:`Store._walk_value` would only ever hit ref-free leaves."""
+        :meth:`Store._walk_value` would only ever hit ref-free leaves.
+        """
         cached = self._has_entity_refs
         if cached is None:
             cached = self._has_entity_refs = any(s.entity_ref for s in self.specs)
@@ -512,7 +514,8 @@ def _resolve_specs(cls: type, field_names: tuple[str, ...]) -> tuple[FieldSpec, 
 
 def _is_bytes_or_optional(hint: Any) -> bool:
     """``bytes`` or ``bytes | None`` — the only shape a ``dc.Blob`` field may
-    take (ADR-007: out-of-line raw bytes have no other representation)."""
+    take (ADR-007: out-of-line raw bytes have no other representation).
+    """
     if hint is bytes:
         return True
     if _is_union(hint):
@@ -554,7 +557,8 @@ def _is_indexable(hint: Any) -> bool:
     single scalar key. This must key off the Union origin, not args alone:
     ``get_args(list[str])`` is also ``(str,)``, so an args-only check would
     wrongly accept a list as a scalar (and then crash on the unhashable list
-    key at insert)."""
+    key at insert).
+    """
     if hint in _INDEXABLE_TYPES:
         return True
     if _is_union(hint):
@@ -578,7 +582,8 @@ def _may_hold_entity(hint: Any) -> bool:
 
     Mirrors :meth:`Store._walk_value`'s leaf set so the static per-type flag and
     the runtime graph walk agree by construction. Used only to *skip* work, so
-    it must never return False for a type that could carry an entity ref."""
+    it must never return False for a type that could carry an entity ref.
+    """
     if get_origin(hint) is Annotated:
         return _may_hold_entity(get_args(hint)[0])
     if hint in _REF_FREE_LEAVES:
@@ -597,7 +602,8 @@ def _may_hold_entity(hint: Any) -> bool:
 def _is_list_of_scalar(hint: Any) -> bool:
     """``list[scalar]`` or ``list[scalar] | None`` — an inverted (multi-valued)
     index over the list's elements (#13). Rejects bare ``list`` (no element
-    type), ``list[Ref]``, nested ``list[list[...]]``, and ``dict``."""
+    type), ``list[Ref]``, nested ``list[list[...]]``, and ``dict``.
+    """
     if _is_union(hint):
         args = [a for a in get_args(hint) if a is not type(None)]
         if len(args) != 1:

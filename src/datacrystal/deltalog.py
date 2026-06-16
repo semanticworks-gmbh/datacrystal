@@ -96,7 +96,8 @@ _VALID_OPS = ("upsert", "delete")
 class DeltaLogConfigError(DataCrystalError):
     """The log directory is not a datacrystal delta log, or was written by a
     newer log format than this build understands — refuse rather than
-    misread (the same format-honesty stance as ``NewerStoreError``)."""
+    misread (the same format-honesty stance as ``NewerStoreError``).
+    """
 
 
 def _fsync_path(path: Path) -> None:
@@ -179,21 +180,24 @@ class DeltaLog:
         """Highest TID handed to :meth:`apply` (what ``store.attach`` checks
         against ``store.last_tid``). With ``flush_every > 1`` this runs ahead
         of the *durable* watermark; reopening resumes from
-        :attr:`durable_watermark`."""
+        :attr:`durable_watermark`.
+        """
         return self._applied
 
     @property
     def durable_watermark(self) -> int:
         """Highest TID committed to ``manifest.json`` — what a reopen
         resumes from. Equals :attr:`watermark` whenever the buffer is empty
-        (always, at ``flush_every=1``)."""
+        (always, at ``flush_every=1``).
+        """
         return self._watermark
 
     @property
     def genesis_tid(self) -> int:
         """The watermark this log started recording *after* (0 for a log that
         recorded from a fresh store; the snapshot's tid for a
-        :meth:`bootstrap`-attached one)."""
+        :meth:`bootstrap`-attached one).
+        """
         return self._genesis_tid
 
     @property
@@ -201,7 +205,8 @@ class DeltaLog:
         """The type lineage known at the join point — empty for a from-zero
         log (its deltas carry their own type rows), the snapshot's lineage
         for a bootstrapped one (so a replay consumer can seed pre-join
-        types)."""
+        types).
+        """
         return tuple(
             (cid, typename, tuple(fields)) for cid, typename, fields in self._genesis_types
         )
@@ -210,7 +215,8 @@ class DeltaLog:
         """Record one delta. Returns True when it advanced the watermark,
         False on an idempotent skip (§4.2). Validates the §4 obligations and
         rejects malformed/unknown-op deltas *before* buffering anything — a
-        refused delta leaves no trace (§4.4 shape)."""
+        refused delta leaves no trace (§4.4 shape).
+        """
         if delta.get("f") != FORMAT_MARKER:
             raise DeltaFormatError(f"not a datacrystal delta: f={delta.get('f')!r}")
         if delta["v"] > CONTRACT_VERSION:
@@ -251,7 +257,8 @@ class DeltaLog:
         only what happens *after* — but it pins its watermark to the snapshot
         (so ``store.attach()`` accepts it without a gap) and keeps the
         snapshot's type lineage (so a replay consumer can seed the pre-join
-        types). Any existing log at ``path`` is replaced."""
+        types). Any existing log at ``path`` is replaced.
+        """
         target = Path(path)
         if target.exists():
             shutil.rmtree(target)
@@ -273,7 +280,8 @@ class DeltaLog:
         yet flushed) deltas. Pure read: it does not flush. The deltas are
         exactly the COMMIT-DELTA-v1 maps the store emitted; feed them to a
         :class:`~datacrystal.contract.ReferenceApplier`, a fresh store, or a
-        follower."""
+        follower.
+        """
         for seg in self._segments:
             if seg.last_tid <= after_tid:
                 continue  # whole segment is behind the cursor
@@ -293,7 +301,8 @@ class DeltaLog:
         Faithful for a from-zero log (it holds the complete history). For a
         :meth:`bootstrap`-attached log it reflects post-join changes seeded at
         the genesis watermark, not necessarily a full fold (pre-join state was
-        never retained)."""
+        never retained).
+        """
         applier = ReferenceApplier()
         applier.watermark = self._genesis_tid
         for cid, typename, fields in self._genesis_types:
@@ -308,7 +317,8 @@ class DeltaLog:
         """Append the buffered deltas as frames to the current segment (fsync),
         then commit the manifest (the durable watermark moves here, atomically
         via temp-file + rename). The segment bytes are fsynced *before* the
-        manifest names them, so the watermark never lies (§4.3)."""
+        manifest names them, so the watermark never lies (§4.3).
+        """
         self.bytes_flushed = 0
         if not self._buffer:
             return
@@ -352,7 +362,8 @@ class DeltaLog:
     def _ensure_current_segment(self) -> bool:
         """Ensure there is a current segment with room; roll to a fresh
         segment if there is none or the current one has passed
-        ``max_segment_bytes``. Returns True when a new segment was created."""
+        ``max_segment_bytes``. Returns True when a new segment was created.
+        """
         if self._segments and self._segments[-1].nbytes < self._max_segment_bytes:
             return False
         name = f"seg-{self._next_segment:06d}.dlog"
@@ -362,7 +373,8 @@ class DeltaLog:
 
     def _iter_segment(self, seg: _Segment) -> Iterator[dict[str, Any]]:
         """Decode the frames of one segment, reading only up to its committed
-        length (bytes past it are crash debris)."""
+        length (bytes past it are crash debris).
+        """
         path = self._dir / "data" / seg.name
         remaining = seg.nbytes
         with open(path, "rb") as f:
@@ -441,7 +453,8 @@ class DeltaLog:
         possible crash: truncate any named segment to its committed length
         (debris of an append the manifest never recorded) and delete any
         segment file the manifest does not name (debris of a roll it never
-        recorded)."""
+        recorded).
+        """
         data = self._dir / "data"
         named = {seg.name for seg in self._segments}
         for seg in self._segments:

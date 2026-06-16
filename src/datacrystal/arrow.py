@@ -111,7 +111,8 @@ _TOMBSTONE: Any = object()  # pending-row sentinel: this OID is deleted
 class MirrorConfigError(DataCrystalError):
     """The mirror directory contradicts this configuration — its content
     would be stale for the new settings; rebuild rather than guess
-    (invariant 11: sidecars are rebuildable derived data)."""
+    (invariant 11: sidecars are rebuildable derived data).
+    """
 
 
 # -- value lattice -------------------------------------------------------------
@@ -269,7 +270,8 @@ def _encode_fallback(value: Any) -> bytes:
 
 def decode_fallback(buf: bytes) -> Any:
     """Decode one msgpack-fallback cell back to its value (refs come back
-    as ``RefToken``s, temporals as their datetime types)."""
+    as ``RefToken``s, temporals as their datetime types).
+    """
     return _FALLBACK_DECODER.decode(buf)
 
 
@@ -379,7 +381,8 @@ class ArrowMirror:
     def watermark(self) -> int:
         """Highest TID fully applied. With ``flush_every > 1`` this can run
         ahead of the *durable* watermark in ``manifest.json`` — reopening
-        resumes from the manifest."""
+        resumes from the manifest.
+        """
         return self._watermark
 
     def apply(self, delta: dict[str, Any]) -> bool:
@@ -459,7 +462,8 @@ class ArrowMirror:
         leaves the manifest watermark at 0 (≠ ``snapshot.tid``) and reopen
         forces a clean re-bootstrap rather than trusting a partial extent.
         Compaction is suppressed during the stream (≤1 per type, no O(M²)
-        thrash)."""
+        thrash).
+        """
         if batch < 1:
             raise MirrorConfigError("batch must be >= 1")
         mirror = cls(path, only=only, flush_every=flush_every,
@@ -493,7 +497,8 @@ class ArrowMirror:
         """The current mirror of one type as an immutable ``pyarrow.Table``:
         one row per live entity (``__oid__`` int64 first, then the fields,
         sorted by name), at this mirror's ``watermark`` — unflushed rows
-        included. Hand the table to DuckDB/polars/pandas zero-copy."""
+        included. Hand the table to DuckDB/polars/pandas zero-copy.
+        """
         typename = (
             cls_or_typename if isinstance(cls_or_typename, str)
             else type_info(cls_or_typename).typename
@@ -520,7 +525,8 @@ class ArrowMirror:
     def compact(self) -> None:
         """Collapse every mirrored type to one fold-free segment (and drop
         tombstones for good). The ``data/`` directory is afterwards directly
-        readable as plain parquet — one file per type, current state only."""
+        readable as plain parquet — one file per type, current state only.
+        """
         self.flush()
         doomed: list[Path] = []
         for typename, state in self._tables.items():
@@ -543,7 +549,8 @@ class ArrowMirror:
         wins folding per ``OID_COLUMN`` and tombstone filtering, so a raw
         multi-segment read can show superseded/deleted rows; ``compact()``
         first (or read :meth:`table`) when you need the exact live set. The
-        directory exists once the type has been flushed at least once."""
+        directory exists once the type has been flushed at least once.
+        """
         typename = (
             cls_or_typename if isinstance(cls_or_typename, str)
             else type_info(cls_or_typename).typename
@@ -555,7 +562,8 @@ class ArrowMirror:
     def flush(self) -> None:
         """Persist pending rows as one new segment per touched type and
         commit the manifest (the durable watermark moves here — atomically,
-        via temp-file + rename)."""
+        via temp-file + rename).
+        """
         doomed: list[Path] = []
         self.rows_flushed = 0
         for typename, rows in sorted(self._pending.items()):
@@ -612,7 +620,8 @@ class ArrowMirror:
         """Decode one payload to ``{field: value}`` — by NAME through its
         persisted shape, missing fields filled from the live class's
         defaults exactly like snapshot materialization (fitness #13:
-        incremental ≡ bootstrap), or left absent (→ null) without one."""
+        incremental ≡ bootstrap), or left absent (→ null) without one.
+        """
         by_name = dict(zip(persisted, decode_payload(payload)))
         ti = TYPES_BY_NAME.get(typename)
         if ti is None:
@@ -699,7 +708,8 @@ class ArrowMirror:
 
     def _fold(self, parts: list[pa.Table], columns: dict[str, str]) -> pa.Table:
         """Newest-wins per OID across segments (and pending), oldest →
-        newest in ``parts``; the result still carries tombstone rows."""
+        newest in ``parts``; the result still carries tombstone rows.
+        """
         if not parts:
             fields = [pa.field(_OID_COL, pa.int64()),
                       pa.field(_DELETED_COL, pa.bool_())]
@@ -722,7 +732,8 @@ class ArrowMirror:
     def _compact_type(self, typename: str, state: _TableState) -> list[Path]:
         """Fold a type's segments into one, dropping tombstones (nothing
         older remains for them to shadow). Returns the obsolete files —
-        the caller unlinks them AFTER the manifest stops naming them."""
+        the caller unlinks them AFTER the manifest stops naming them.
+        """
         parts = [
             self._read_segment(typename, segment, state.columns)
             for segment in state.segments
@@ -814,7 +825,8 @@ class ArrowMirror:
     def _sweep_orphans(self) -> None:
         """Delete segment files the manifest does not name — debris of a
         crash between segment write and manifest commit. Their numbers will
-        be reused; sweeping prevents a stale file from masquerading later."""
+        be reused; sweeping prevents a stale file from masquerading later.
+        """
         live = {
             (_safe_dirname(typename), segment)
             for typename, state in self._tables.items()

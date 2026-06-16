@@ -44,12 +44,14 @@ _REQUIRED_OP_KEYS = ("op", "oid", "cid", "payload", "prior")
 
 class DeltaFormatError(_Base):
     """A delta violates the COMMIT-DELTA-v1 shape, carries an unsupported
-    version, or contradicts the consumer's state (a producer bug)."""
+    version, or contradicts the consumer's state (a producer bug).
+    """
 
 
 class DeltaGapError(_Base):
     """A delta skipped past the consumer's watermark — history is missing
-    and the consumer must resync; guessing is forbidden (spec §4.4)."""
+    and the consumer must resync; guessing is forbidden (spec §4.4).
+    """
 
 
 _encoder = msgspec.msgpack.Encoder()
@@ -63,7 +65,8 @@ def encode_delta(delta: dict[str, Any]) -> bytes:
 
 def decode_delta(raw: bytes) -> dict[str, Any]:
     """Decode a wire-form delta back to a map (no validation — apply()
-    validates)."""
+    validates).
+    """
     return _decoder.decode(raw)
 
 
@@ -85,7 +88,8 @@ class ReferenceApplier:
 
     def apply(self, delta: dict[str, Any] | bytes) -> bool:
         """Apply one delta; returns False when it was already applied
-        (idempotent skip), True when it advanced the watermark."""
+        (idempotent skip), True when it advanced the watermark.
+        """
         if isinstance(delta, (bytes, bytearray, memoryview)):
             delta = decode_delta(bytes(delta))
         for key in _REQUIRED_KEYS:

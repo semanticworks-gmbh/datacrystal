@@ -71,7 +71,8 @@ def referenced_entities(core_type: Any) -> tuple[type, ...]:
     object field in :mod:`._strawberry`, a nested DTO on the REST side), so both
     need to name the referent class from the same stripped annotation the engine
     persists — keeping the two surfaces' relation shapes identical by
-    construction (the module's mirror-the-engine rule)."""
+    construction (the module's mirror-the-engine rule).
+    """
     seen: dict[int, type] = {}
     _collect_entities(core_type, seen)
     return tuple(seen.values())

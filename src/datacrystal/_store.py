@@ -420,7 +420,8 @@ class Store:
         """Assigning the root captures it immediately: lists/dicts come back
         from ``store.root`` as tracked persistent containers (mutate them in
         place — ``commit()`` sees it), and new entities in the value are
-        registered for the next commit."""
+        registered for the next commit.
+        """
         self._enter()
         if self._root_oid is None:
             holder = _Root(value=value)
@@ -450,7 +451,8 @@ class Store:
 
     def store(self, obj: Any) -> int:
         """Register ``obj`` (and every new entity reachable from it) for the
-        next commit; returns its OID."""
+        next commit; returns its OID.
+        """
         self._enter()
         if not is_entity(obj):
             raise NotAnEntityError(
@@ -461,7 +463,8 @@ class Store:
     def mark_dirty(self, obj: Any) -> None:
         """Explicitly buffer an entity for the next commit. Rarely needed —
         attribute writes and in-place container mutation are tracked
-        automatically; this is the escape hatch for anything exotic."""
+        automatically; this is the escape hatch for anything exotic.
+        """
         self._enter()
         if not is_entity(obj):
             raise NotAnEntityError(
@@ -633,7 +636,8 @@ class Store:
     def _find_by_key(self, ti: TypeInfo, field: str, value: Any) -> Any | None:
         """The upsert lookup: committed unique map (a key freed by a
         buffered delete is reusable, ADR-003), then earlier upserts of this
-        batch — self-healing against mid-batch key mutation or deletion."""
+        batch — self-healing against mid-batch key mutation or deletion.
+        """
         if self._cid_by_typename.get(ti.typename) is not None:
             ci = self._index.ensure(ti)
             oid = ci.unique[field].get(value)
@@ -649,7 +653,8 @@ class Store:
 
     def commit(self) -> int | None:
         """Atomically persist all buffered changes; returns the new commit
-        TID, or ``None`` if there was nothing to commit."""
+        TID, or ``None`` if there was nothing to commit.
+        """
         self._enter()
         capture = self._p1_capture()
         if capture is None:
@@ -668,7 +673,8 @@ class Store:
         captured set CLEAN and re-arm the hooks. The flip happens BEFORE P2
         so a write racing P2 re-dirties through the normal hook path and
         lands in the *next* commit; a failed P2 compensates via
-        :meth:`_p2_rollback`."""
+        :meth:`_p2_rollback`.
+        """
         if self._lock is not None and self._lock.lost:
             raise LeaseLostError(
                 "this process lost the single-writer lease (paused too long?); "
@@ -891,7 +897,8 @@ class Store:
     def _p2_rollback(self, capture: _Capture) -> None:
         """A failed P2 was never durable: re-buffer the captured set (unless
         a racing write already re-buffered an entity) and reuse the TID —
-        the sequence stays gapless (invariant 5)."""
+        the sequence stays gapless (invariant 5).
+        """
         self._alloc._next_tid = capture.tid  # pyright: ignore[reportPrivateUsage]  # gapless TID reuse, invariant 5
         for oid, obj, prior in capture.flipped:
             if prior == STATE_NEW:
@@ -957,7 +964,8 @@ class Store:
         in TID order, on the owner thread. A consumer that raises (or that
         fails to advance its watermark) is detached with a loud warning —
         sidecars are rebuildable derived data (invariant 11); the store
-        never holds writes hostage to one."""
+        never holds writes hostage to one.
+        """
         tid = delta["tid"]
         for consumer in list(self._consumers):
             try:
@@ -1000,7 +1008,8 @@ class Store:
         outgoing refs (a NEW/DIRTY referrer that now points at the dead OID is
         added; a DIRTY referrer that dropped the ref is removed), minus the
         co-deleted set (a referrer also deleted here drops out — ADR-003: its
-        outgoing edges vanish). The seam is ``incoming(dead)`` (ADR-003, line 108)."""
+        outgoing edges vanish). The seam is ``incoming(dead)`` (ADR-003, line 108).
+        """
         deleted_oids = {oid for oid, _, _ in deletes}
         rev = self._index.ensure_reverse()  # pre-commit map (forced built by P1)
         pending_targets = dict(ref_entries)  # referrer oid → its targets THIS commit
@@ -1045,7 +1054,8 @@ class Store:
         A same-commit NEW/DIRTY referrer is not yet in the registry or on disk,
         so consult the live commit buffers first, then a registry instance, then
         one ``load_many`` via the persisted cid lineage. Best-effort — an OID
-        with no record (race) is simply absent (the message shows '?')."""
+        with no record (race) is simply absent (the message shows '?').
+        """
         out: dict[int, str] = {}
         unresolved: list[int] = []
         for oid in oids:
@@ -1064,7 +1074,8 @@ class Store:
     def _sweep_untracked(self) -> None:
         """debug=True: warn about (and rescue) CLEAN entities whose
         re-encoded record no longer matches their last known fingerprint —
-        a mutation slipped past the hooks (KICKOFF risk 1)."""
+        a mutation slipped past the hooks (KICKOFF risk 1).
+        """
         for oid, obj in self._registry.items():
             if oid in self._new or oid in self._dirty:
                 continue
@@ -1128,7 +1139,8 @@ class Store:
 
     def run_pending(self) -> int:
         """Execute all queued :meth:`submit` work now (owner thread only);
-        returns the number of submissions run."""
+        returns the number of submissions run.
+        """
         self._guard()
         count = self._pump()
         if self._lazyman is not None:  # an explicit boundary sweeps too
@@ -1137,7 +1149,8 @@ class Store:
 
     def _pump(self) -> int:
         """Drain the submit() queue on the owner. Called from the public API
-        boundaries; reentrant calls (a submission touching the store) no-op."""
+        boundaries; reentrant calls (a submission touching the store) no-op.
+        """
         if self._pumping or not self._submitted:
             return 0
         self._pumping = True
@@ -1249,7 +1262,8 @@ class Store:
         raises ``ValueError``. An uncommitted raw-bytes value streams from an
         in-memory ``BytesIO`` (nothing is saved by it yet); an uncommitted
         ``dc.BlobSource`` raises ``ValueError`` — ``commit()`` it first, since its
-        bytes are not resident."""
+        bytes are not resident.
+        """
         self._enter()
         ti = type_info(entity)
         spec = ti.spec(field)
@@ -1282,7 +1296,8 @@ class Store:
     def get(self, cls: type, **unique_key: Any) -> Any | None:
         """Look up one entity by a unique secondary key, e.g.
         ``store.get(Mineral, qid="Q43010")``. Returns ``None`` if absent.
-        Reflects committed state."""
+        Reflects committed state.
+        """
         self._enter()
         if len(unique_key) != 1:
             raise TypeError("get() takes exactly one unique-field keyword argument")
@@ -1306,7 +1321,8 @@ class Store:
 
         The unique-key form returns a list aligned with the given values,
         ``None`` where a key is absent — the bulk twin of :meth:`get`, for
-        ETL upserts that fetch thousands of natural keys at once."""
+        ETL upserts that fetch thousands of natural keys at once.
+        """
         self._enter()
         if unique_key:
             if not isinstance(refs, type):
@@ -1400,7 +1416,8 @@ class Store:
         sort field the order comes straight from the index — a ``SortedIndex``
         field (ADR-004) is effectively free; an un-indexed sort field must
         decode that field for every match first (an honest O(matches) cost, the
-        same scan a non-indexed predicate pays)."""
+        same scan a non-indexed predicate pays).
+        """
         self._enter()
         validate_window(limit, offset)
         cls, cond = query_target(target, "query")
@@ -1437,7 +1454,8 @@ class Store:
         short-circuiting to O(offset+limit) when ``limit`` is set (#66); an
         **un-indexed** field decodes that one field for every matched OID (the
         honest O(matches) ceiling), then sorts (NULLs last, ascending-OID
-        tiebreak) and slices."""
+        tiebreak) and slices.
+        """
         if field in ci.eq:
             return windowed_index_order(ci, matched, field, descending, limit, offset)
         values = {oid: row[field] for oid, row in self._iter_raw(ti, list(matched))}
@@ -1455,7 +1473,8 @@ class Store:
         list/dict containers. Deletes fold incrementally (a deleted referrer
         drops out; a deleted *target* keeps its postings, so ``incoming(dead)``
         names the now-dangling referrers — ADR-003). The same backlinks at a
-        pinned watermark are :meth:`Snapshot.incoming`."""
+        pinned watermark are :meth:`Snapshot.incoming`.
+        """
         self._enter()
         if not is_entity(entity):
             raise NotAnEntityError(
@@ -1478,7 +1497,8 @@ class Store:
         ``Glue`` function raises, or a corrupt record. An empty list means the
         whole store reads cleanly under this code. ``verify()`` itself never
         raises on a bad record — reporting it is the point — but the owner guard
-        still applies. Run it before :meth:`migrate`."""
+        still applies. Run it before :meth:`migrate`.
+        """
         self._enter()
         failures: list[tuple[str, int]] = []
         for typename in list(self._cids_by_typename):
@@ -1508,7 +1528,8 @@ class Store:
         resumes). **Idempotent**: a second run finds nothing stale and rewrites
         nothing. Commits in ``batch``-sized chunks, so peak memory is bounded by
         the batch, not the store. Returns the number of records rewritten; a type
-        with no live class here is left untouched (``verify()`` names it)."""
+        with no live class here is left untouched (``verify()`` names it).
+        """
         self._enter()
         migrated = 0
         for typename in list(self._cids_by_typename):
@@ -1546,7 +1567,8 @@ class Store:
         DuckDB over the ``[arrow]`` mirror): ``==``/``.in_()`` on
         ``dc.Index``/``dc.Unique`` fields → bitmaps; everything else →
         residual. Read-only; builds the class indexes on first use (the
-        same one-time O(extent) cost as a first query)."""
+        same one-time O(extent) cost as a first query).
+        """
         self._enter()
         cls, cond = query_target(target, "explain")
         ti = type_info(cls)
@@ -1567,7 +1589,8 @@ class Store:
         predicate falls back to a decode-level scan of the candidates:
         records are read and decoded but **no entity is constructed**.
         Reads committed state (like :meth:`snapshot`, unlike :meth:`query`,
-        whose hydrated results show uncommitted in-memory changes)."""
+        whose hydrated results show uncommitted in-memory changes).
+        """
         self._enter()
         cls, cond = query_target(target, "count")
         ti = type_info(cls)
@@ -1610,7 +1633,8 @@ class Store:
         the window, with the same contract as :meth:`query` (NULLs last,
         ascending-OID tiebreak; an indexed sort field is ordered from the index,
         an un-indexed one decodes that field for every match first). The sort
-        field need not be among the projected ``fields``."""
+        field need not be among the projected ``fields``.
+        """
         self._enter()
         validate_window(limit, offset)
         if not fields:
@@ -1687,7 +1711,8 @@ class Store:
         O(chunk), never O(extent) — walk millions of matches in bounded RAM.
 
         Additive surface: ``query()``'s signature and list return type stay
-        frozen."""
+        frozen.
+        """
         self._enter()
         cls, cond = query_target(target, "query_iter")
         ti = type_info(cls)
@@ -1730,7 +1755,8 @@ class Store:
         """Decode-level row scan: committed records → field-value dicts via
         the per-cid hydration plan (additive evolution honored). Loads in
         chunks to bound peak memory; constructs no entities, touches no
-        registry — the machinery behind count()/pluck() and gate #19."""
+        registry — the machinery behind count()/pluck() and gate #19.
+        """
         for start in range(0, len(oids), _RAW_CHUNK):
             chunk = oids[start:start + _RAW_CHUNK]
             records = self._backend.load_many(chunk)
@@ -1765,7 +1791,8 @@ class Store:
     def _enter(self) -> None:
         """Public API boundary: guard, then piggyback the work the owner
         owes — the submit() queue and the lazy-demotion sweep (ADR-001
-        daemon principle: both only ever run on the owner)."""
+        daemon principle: both only ever run on the owner).
+        """
         self._guard()
         self._pump()
         if self._lazyman is not None:
@@ -1773,7 +1800,8 @@ class Store:
 
     def _on_first_write(self, obj: Any) -> None:
         """First write to a CLEAN entity (called by the one-shot hook,
-        BEFORE the mutation lands)."""
+        BEFORE the mutation lands).
+        """
         if threading.get_ident() != self._owner:
             raise WrongThreadError(_THREAD_RECIPE)
         if self._closed:
@@ -1843,7 +1871,8 @@ class Store:
         """The OIDs ``obj`` references — direct entity refs and Lazy refs, in
         scalar fields and inside list/dict containers (#20). The live-object
         twin of ``_indexes.harvest_ref_oids``; both yield the same OIDs (a ref
-        and a ``Lazy`` to the same entity persist as the same OID)."""
+        and a ``Lazy`` to the same entity persist as the same OID).
+        """
         out: set[int] = set()
         stack: list[Any] = [getattr(obj, n) for n in type_info(obj).field_names]
         while stack:
@@ -1883,7 +1912,8 @@ class Store:
         """The indices (in ``ti.field_names`` order) of ``dc.Blob`` fields —
         the spec-driven split signal ``encode_payload`` needs (ADR-007 §2: a
         bytes value alone can't be told apart from an inline ``bytes`` scalar).
-        Cached on the TypeInfo's specs, so this is a cheap per-record lookup."""
+        Cached on the TypeInfo's specs, so this is a cheap per-record lookup.
+        """
         return frozenset(
             i for i, spec in enumerate(ti.specs) if spec.blob
         )
@@ -1898,7 +1928,8 @@ class Store:
         touched. ``oid`` is pinned to 0: a fingerprint is only ever compared to
         another taken in the SAME representation epoch (re-stamped on every
         hydrate/commit), so the real blob OID is irrelevant to mismatch
-        detection."""
+        detection.
+        """
         values = [getattr(obj, name) for name in ti.field_names]
         positions = self._blob_positions(ti)
         if not positions:
@@ -1926,7 +1957,8 @@ class Store:
         """Fetch one whole blob value for a :class:`~datacrystal.Blob` handle
         (ADR-007). Re-asserts the ADR-001 owner-thread contract before any I/O —
         the same confinement the live read path enforces — then returns the raw
-        bytes (the backend has already CRC-checked them)."""
+        bytes (the backend has already CRC-checked them).
+        """
         self._guard()
         stored = self._backend.load_blob(blob_oid)
         if stored is None:
@@ -1983,7 +2015,8 @@ class Store:
     def _hydration_plan(self, cid: int, ti: TypeInfo) -> list[tuple[Any, int | None, Any]]:
         """Per-(cid → live class) decode plan: for every live field, where its
         value comes from — a position in the persisted record, or a default
-        factory (additive evolution). Removed persisted fields are ignored."""
+        factory (additive evolution). Removed persisted fields are ignored.
+        """
         plan = self._plan_by_cid.get(cid)
         if plan is None:
             persisted = self._persisted_fields.get(cid, [])
@@ -2023,7 +2056,8 @@ class Store:
         entity — raises if it cannot (the :meth:`verify` probe). The hydration
         plan must bind every live field (else ``SchemaMismatchError``), the
         payload width must match, and every ``Glue`` function must run on this
-        record's old values (a glue that raises is a real, reportable failure)."""
+        record's old values (a glue that raises is a real, reportable failure).
+        """
         hplan = self._hydration_plan(rec.cid, ti)
         values = decode_payload(rec.payload)
         persisted = self._persisted_fields.get(rec.cid, [])
@@ -2060,7 +2094,8 @@ class Store:
         recursing (the registry is the read path's ``walked`` set). Atomicity:
         if any fill fails (a dangling eager ref, a schema mismatch), every shell
         THIS call registered is discarded — a partial load never leaves a
-        half-built corpse behind the one-instance-per-OID contract."""
+        half-built corpse behind the one-instance-per-OID contract.
+        """
         registered: list[int] = []
         fill_queue: deque[tuple[Any, StoredRecord]] = deque()
 
@@ -2186,7 +2221,8 @@ _RAW_CHUNK = 8192  # records per load_many in decode-level scans (peak-RAM bound
 
 class _RawView:
     """A decoded record posing as an entity for ``Condition.evaluate`` —
-    attribute reads come from the row dict, nothing else exists."""
+    attribute reads come from the row dict, nothing else exists.
+    """
 
     __slots__ = ("_row",)
 
@@ -2202,7 +2238,8 @@ class _RawView:
 
 def _ref_target_oid(value: Any) -> int | None:
     """The OID a reference-shaped value points at (entity or Lazy handle),
-    or None for plain values and not-yet-stored targets."""
+    or None for plain values and not-yet-stored targets.
+    """
     if is_entity(value):
         return oid_of(value)
     if isinstance(value, Lazy):
@@ -2218,7 +2255,8 @@ def _blob_hash(value: Any) -> bytes | None:
     hydrated ``BlobHandle`` carries it free; a raw ``bytes``/``bytearray`` value
     is hashed (the write path accepts both, so equivalence must too — else an
     identical ``bytearray`` upsert spuriously re-stores); anything else (e.g.
-    None, or a streamed ``BlobSource`` with no resident hash) is not a blob."""
+    None, or a streamed ``BlobSource`` with no resident hash) is not a blob.
+    """
     if isinstance(value, BlobHandle):
         return value.hash
     if isinstance(value, (bytes, bytearray)):
@@ -2232,7 +2270,8 @@ def _equivalent(cur: Any, new: Any) -> bool:
     target OID (a Lazy handle and a direct reference encode identically);
     a type change (e.g. ``1`` → ``True``) re-writes even when ``==`` says
     equal, because msgpack bytes differ; wrapped containers compare to the
-    plain ones they came from."""
+    plain ones they came from.
+    """
     if cur is new:
         return True
     # Blob fields compare by content hash (a hydrated BlobHandle carries the
@@ -2258,7 +2297,8 @@ def _equivalent(cur: Any, new: Any) -> bool:
 
 def _raw_value(value: Any) -> Any:
     """Map entity/Lazy predicate values onto the decoded representation
-    (RefTokens compare by OID), so residuals evaluate without hydration."""
+    (RefTokens compare by OID), so residuals evaluate without hydration.
+    """
     if is_entity(value):
         oid = oid_of(value)
         if oid is None:
@@ -2279,7 +2319,8 @@ def _raw_value(value: Any) -> Any:
 def _order_by_attr(objs: list[Any], field: str, descending: bool) -> list[Any]:
     """Hydrated entities ordered by a field for the residual order_by path (#25):
     NULLs last, stable ascending-OID tiebreak (``objs`` arrive ascending-OID from
-    ``get_many``, and a stable sort preserves that within equal values)."""
+    ``get_many``, and a stable sort preserves that within equal values).
+    """
     present = [o for o in objs if getattr(o, field) is not None]
     absent = [o for o in objs if getattr(o, field) is None]
     present.sort(key=lambda o: getattr(o, field), reverse=descending)
@@ -2290,7 +2331,8 @@ def _order_rows(rows: list[tuple[int, dict[str, Any]]], field: str,
                 descending: bool) -> list[tuple[int, dict[str, Any]]]:
     """Decoded ``(oid, row)`` pairs ordered by ``row[field]`` for the residual /
     un-indexed pluck order_by path (#25): NULLs last, stable ascending-OID
-    tiebreak (``rows`` arrive ascending-OID from the candidate scan)."""
+    tiebreak (``rows`` arrive ascending-OID from the candidate scan).
+    """
     present = [r for r in rows if r[1][field] is not None]
     absent = [r for r in rows if r[1][field] is None]
     present.sort(key=lambda r: r[1][field], reverse=descending)
@@ -2319,7 +2361,8 @@ def _publish(value: Any) -> Any:
     A blob field plucks as its inert :class:`~datacrystal._records.BlobToken`
     descriptor (``.blob_oid``/``.size``/``.hash``) — the bytes are NEVER read by
     a decode-level scan (ADR-007): pluck/count/query around a blob-bearing type
-    touch only the 48-byte descriptor, not the blobs table."""
+    touch only the 48-byte descriptor, not the blobs table.
+    """
     if isinstance(value, BlobToken):
         return value
     if isinstance(value, RefToken):
@@ -2334,7 +2377,8 @@ def _publish(value: Any) -> Any:
 
 def _find_escapee(value: Any) -> str | None:
     """Name the first live entity (or handle to one) inside a submit()
-    result, or None if the value is plain data (ADR-001: EntityEscapeError)."""
+    result, or None if the value is plain data (ADR-001: EntityEscapeError).
+    """
     if is_entity(value):
         return type(value).__name__
     if isinstance(value, Lazy):
