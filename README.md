@@ -62,6 +62,10 @@ of any size and only the nodes on the path you follow hydrate (in the GLEIF prov
 deepest-path walk over a 180,000-node ownership graph loads **10** of them). Cold data lives in
 SQLite and faults in on first `.get()`; entities you drop are garbage-collected.
 
+**4. A real database, not a pickle file.** Every commit is one atomic transaction —
+all-or-nothing, durable, an exact prefix after any crash, never a torn write (a real `kill -9`
+test gates this in CI). You get real transactional safety without ever leaving your objects.
+
 ## How it works
 
 The workhorse trio — SQLite + ORM, JSON files, pickle — makes you either flatten a graph into
@@ -93,10 +97,11 @@ journal for crash safety, and one live instance per object — `a.friend is b` s
 - Out-of-line binary blobs (`dc.Blob`) — read or written whole or streamed.
 - Frozen (append-only) entities; unchecked `delete()`.
 
-**Durability & concurrency**
-- SQLite-blob durability; SIGKILL crash safety; single-writer lease lock.
-- Async stores (`aopen`); thread-safe `snapshot()` (bitmap queries included).
-- The COMMIT-DELTA-v1 watermark pipeline — locked contract + public conformance kit.
+**Durability & crash safety**
+- **Every commit is one atomic transaction** — all-or-nothing, never a torn write: after any crash you reopen to an *exact committed prefix*. A real `kill -9` test gates this in CI.
+- **Durability is a policy you pick:** `commit` (fsync every commit — survives power loss) · `interval` (default — a process crash loses nothing; an OS crash may trim the last commits, never corrupts) · `never` (scratch/benchmarks).
+- **Single-writer** (owner-confined + a process lease lock); readers get point-in-time **snapshot isolation** from any thread (bitmap queries included).
+- Async stores (`aopen`); the COMMIT-DELTA-v1 watermark pipeline — locked contract + public conformance kit.
 
 **Three extras ride the pipeline**
 - **`datacrystal[fts]`** — FTS5 full-text search, per-language Snowball stemming + BM25 over `dc.FullText` fields.
