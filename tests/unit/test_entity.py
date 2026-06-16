@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import weakref
 from dataclasses import field
-from datetime import datetime
+from datetime import date, datetime
 from typing import Annotated, Any
 
 import pytest
@@ -221,12 +221,20 @@ def test_forward_ref_entities_decorate_then_resolve():
     assert down_specs["up"].lazy_refs
 
 
-def test_index_on_datetime_rejected_at_decoration():
-    # The original report (timeseries probe): Annotated[datetime, Index] was
-    # accepted at @entity and only failed at first commit(). Now it fails at the
-    # definition site.
+def test_datetime_date_accepted_as_index_keys_at_decoration():
+    # #106 (inverts the old test_index_on_datetime_rejected_at_decoration): the
+    # eval found datetime to be the most common sort/range key, so it (and date)
+    # now join the indexable-scalar type gate (_INDEXABLE_TYPES). They are
+    # accepted at @entity for the whole marker family — SortedIndex here (the
+    # range + order_by key #106 ships) and Index/Unique (the ==/.in_ query path
+    # rides on top in #106B). Decoration is the gate; this asserts it admits both.
+    @dc.entity
     class Reading:
-        ts: Annotated[datetime, dc.Index]
+        label: Annotated[str, dc.Unique]
+        ts: Annotated[datetime, dc.SortedIndex] = datetime(2000, 1, 1)
+        day: Annotated[date | None, dc.SortedIndex] = None
+        seen: Annotated[datetime | None, dc.Index] = None  # admitted (#106B owns ==/.in_)
 
-    with pytest.raises(TypeError, match="must be scalar"):
-        dc.entity(Reading)
+    specs = {s.name: s for s in type_info(Reading).specs}
+    assert specs["ts"].sorted and specs["day"].sorted
+    assert specs["seen"].indexed

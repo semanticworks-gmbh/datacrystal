@@ -14,6 +14,7 @@ relation resolver is #100).
 from __future__ import annotations
 
 from dataclasses import field
+from datetime import datetime, timezone
 from typing import Annotated, Any
 
 import pytest
@@ -256,3 +257,50 @@ def test_reference_field_yields_the_raw_ref_token_pre_resolver(store_factory) ->
         assert isinstance(view.type_locality, Ref)
     finally:
         store.close()
+
+
+# --- datetime SortedIndex field reflected via GraphQL (#106) ------------------
+
+
+@dc.entity(frozen=True)
+class CatalogEvent:
+    """A mineral-cabinet acquisition event with a SortedIndex datetime key.
+    Admitting datetime to the engine's indexable-scalar gate (#106) makes
+    ``_is_scalar_field`` return True for ``at`` — so it is now reflected (it was
+    previously dropped as an unmappable ``None``)."""
+
+    seq: Annotated[int, dc.Unique]
+    kind: Annotated[str, dc.Index] = "acquire"
+    at: Annotated[datetime | None, dc.SortedIndex] = None
+
+
+def test_datetime_sorted_index_field_is_reflected_and_serializes() -> None:
+    """#106: admitting datetime to ``_is_indexable`` makes ``_is_scalar_field``
+    True, so a SortedIndex datetime field now lands on the GraphQL type as a
+    DateTime scalar (previously dropped). The reference/scalar fields around it
+    are unaffected — no regression."""
+    gql = reflect_strawberry_type(CatalogEvent)
+    assert _field_names(gql) == {"seq", "kind", "at"}  # 'at' present, not dropped
+
+    at = datetime(2021, 6, 1, 12, 0, tzinfo=timezone.utc)
+    sdl = _schema_exposing(gql, EntityView(0, "x:CatalogEvent", {})).as_str()
+    assert "at: DateTime" in sdl  # datetime | None → nullable DateTime scalar
+    assert "seq: Int!" in sdl  # the int Unique key still reflects unchanged
+    assert "kind: String!" in sdl  # the str Index field still reflects unchanged
+
+    view = EntityView(0, "x:CatalogEvent", {"seq": 7, "kind": "acquire", "at": at})
+    result = _schema_exposing(gql, view).execute_sync("{ root { seq kind at } }")
+    assert result.errors is None
+    assert result.data == {
+        "root": {"seq": 7, "kind": "acquire", "at": "2021-06-01T12:00:00+00:00"}
+    }
+
+
+def test_datetime_field_resolves_none_off_the_view() -> None:
+    """A nullable datetime field with no value serializes to GraphQL null —
+    the NULLs path the engine keeps SQL-NULL-like also holds at the edge."""
+    gql = reflect_strawberry_type(CatalogEvent)
+    view = EntityView(0, "x:CatalogEvent", {"seq": 1, "kind": "acquire", "at": None})
+    result = _schema_exposing(gql, view).execute_sync("{ root { at } }")
+    assert result.errors is None
+    assert result.data == {"root": {"at": None}}

@@ -28,9 +28,20 @@ predicates from the index — a third deterministic planning rule, not an optimi
 1. **Marker — `dc.SortedIndex`.** A bare field marker (like `dc.Index`/`dc.Unique`), declared
    `Annotated[T, dc.SortedIndex]`. **Opt-in per field**: the application decides which fields need
    range queries, exactly as it decides `dc.Index` — so an app pays the sorted-index cost only where
-   its access pattern needs it. Valid on orderable scalar shapes (`int`, `float`, `str`, naive
-   date/time, optionally `| None`); a list / `Lazy` / entity-ref field **rejects it loudly at
-   `@entity`** (eager validation, like the other markers).
+   its access pattern needs it. Valid on orderable scalar shapes (`int`, `float`, `str`, `bool`,
+   `datetime`, `date`, optionally `| None`); a list / `Lazy` / entity-ref field **rejects it loudly
+   at `@entity`** (eager validation, like the other markers).
+
+   *Amendment (#106, 2026-06-16): `datetime`/`date` admitted.* The eval found `datetime` to be the
+   single most common sort/range key (created/published/updated timestamps), and the engine already
+   persists both faithfully (`_records.py` — aware datetimes ride msgspec's timestamp ext, naive ones
+   an ISO-text ext). This was always pre-authorized here ("naive date/time"); the amendment widens it
+   to **aware datetimes too**, ordered by their UTC instant (see §4). One shared type gate
+   (`_entity._INDEXABLE_TYPES`) feeds `Index`/`Unique`/`SortedIndex` and the `[web]` extra's
+   GraphQL-scalar set, so admitting the types relaxes all of them at the `@entity` site; the `==`/
+   `.in_()` query path for `Index`/`Unique` on a datetime rides on top (#106B). The index cache codec
+   (ADR-005) routes datetime keys through the record ext codes so a **naive** key is not silently
+   round-tripped to a bare `str` (cache format bumped 1 → 2; old sidecars rebuild, never authoritative).
 
 2. **The third planning rule.** An ordering comparison (`>=`, `>`, `<`, `<=`; `between` is their
    conjunction) on a `dc.SortedIndex` field is answered from the sorted index as a **range slice** —
@@ -50,6 +61,16 @@ predicates from the index — a third deterministic planning rule, not an optimi
    residual). String ordering is Unicode codepoint order (documented; linguistic collation stays out
    of scope, like FTS). Mixed-type comparisons never match. Order is otherwise the field's natural
    order; ties break on ascending OID (deterministic, matching `limit`/`offset`).
+
+   *Datetime total order (#106).* Timezone-**aware** datetimes order by their UTC instant — the
+   offset's identity is not preserved, the instant is (the codec already normalizes aware → UTC), so
+   ordering is DST/offset-irrelevant. Timezone-**naive** datetimes carry no offset and order among
+   themselves. Python cannot compare a naive against an aware `datetime`, so a single `SortedIndex`
+   field that mixes the two conventions **raises a loud, deterministic `MixedTemporalIndexError` at
+   insert/commit/build** (never a bare comparison `TypeError` leaking from `bisect`/`insort`) — an
+   instance of the "mixed-type comparisons never match" rule, surfaced eagerly because the sorted run
+   needs a total order. Pick one convention per field (storing every timestamp aware,
+   e.g. `datetime.now(timezone.utc)`, is recommended).
 
 5. **`order_by` is a follow-on, not this ADR.** A sorted index trivially yields ordered iteration,
    so `order_by=` over a `dc.SortedIndex` field (ROADMAP #25) becomes a natural additive story; this
