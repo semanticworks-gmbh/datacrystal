@@ -16,9 +16,16 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, cast
 
-import msgspec.msgpack
+import msgspec
 
-_CACHE_FORMAT = 1
+from datacrystal._records import decode_scalar_tree, encode_scalar_tree
+
+# Bumped when admitting datetime/date keys: the codec now routes temporal leaves
+# through the record ext codes (#106) rather than msgspec's default datetime
+# handling, which lossily encoded a naive datetime as a bare str. A pre-#106
+# sidecar (format 1) is silently ignored and the index rebuilds — never
+# authoritative (invariant 11), so a format bump is just a one-time rebuild.
+_CACHE_FORMAT = 2
 
 
 class IndexCache:
@@ -40,7 +47,7 @@ class IndexCache:
         except OSError:
             return None
         try:
-            decoded = msgspec.msgpack.decode(raw)
+            decoded = decode_scalar_tree(raw)
         except (msgspec.DecodeError, ValueError, EOFError):
             return None
         if not isinstance(decoded, dict):
@@ -58,7 +65,7 @@ class IndexCache:
         """Stamp the built forward index blobs (and the reverse index, if built —
         #63) at ``watermark`` (temp file + atomic rename, so a crash mid-write
         leaves the prior valid cache or none)."""
-        payload = msgspec.msgpack.encode(
+        payload = encode_scalar_tree(
             {"format": _CACHE_FORMAT, "watermark": watermark,
              "classes": blobs, "reverse": reverse}
         )

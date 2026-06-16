@@ -253,5 +253,27 @@ def decode_payload(payload: bytes) -> list[Any]:
     return _DECODER.decode(payload)
 
 
+def _no_oid(_value: Any) -> int:  # pragma: no cover - never reached on a ref-free tree
+    raise TypeError("an entity reference cannot appear in an index-cache blob")
+
+
+def encode_scalar_tree(tree: Any) -> bytes:
+    """Encode a ref-free value tree (dicts/lists of scalars) the SAME way record
+    payloads encode their temporal leaves — datetime/date/time ride the ext codes
+    (#106), not msgspec's default datetime handling, which silently round-trips a
+    **naive** datetime as a bare ISO ``str`` (losing the type and breaking the
+    SortedIndex run on reload). Used by the index cache (ADR-005), whose blob holds
+    index keys that may now be datetimes; ``swizzle`` is the shared pre-pass (it
+    converts the temporal leaves and rejects entities — none belong in a cache
+    blob)."""
+    return _ENCODER.encode(swizzle(tree, _no_oid))
+
+
+def decode_scalar_tree(payload: bytes) -> Any:
+    """Inverse of :func:`encode_scalar_tree` — the ext codes decode back to the
+    original datetime/date/time via the shared :func:`_ext_hook` (#106)."""
+    return _DECODER.decode(payload)
+
+
 def crc(payload: bytes) -> int:
     return zlib.crc32(payload) & 0xFFFFFFFF
