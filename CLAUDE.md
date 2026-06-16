@@ -162,8 +162,15 @@ stale venv shebangs — `rm -rf .venv && uv sync`.
 
 - Engine tests parametrize over both backends via the `store_factory` fixture (`tests/conftest.py`);
   memory and sqlite must behave identically.
-- `tests/fitness/` are CI gates (pickle-free AST walk, dep budget, memory boundedness).
-- The README quickstart must run verbatim, twice, from a clean directory.
+- `tests/fitness/` are CI gates (pickle-free AST walk, dep budget, memory boundedness, plus the
+  docs guardrails: GUIDE↔`__all__` drift, README-quickstart-runs-twice, internal-doc-links).
+- The README quickstart must run verbatim, twice, from a clean directory (enforced by
+  `tests/fitness/test_readme_quickstart.py`).
+- **Definition of Done — public surface ships with its docs:** any PR adding public surface (a new
+  `datacrystal.__all__` name) documents it in the GUIDE in the SAME PR — a runnable/inline-code
+  mention for API symbols, or a row in the `## Errors` reference table for exception/warning classes.
+  Enforced by `tests/fitness/test_guide_drift.py` (core `__all__` today; `datacrystal.web` is gated
+  on #129). The GUIDE's "Planned features" section must never list an already-exported symbol.
 - Schema-evolution tests fabricate classes dynamically with the same typename to simulate
   code changes between runs; their per-file pyright pragmas exist only for that.
 - The test/demo domain is always the mineral cabinet — do not invent a second domain.
