@@ -275,8 +275,8 @@ class DeltaLog:
 
         Raises:
             DeltaLogConfigError: ``flush_every`` or ``max_segment_bytes`` is
-                below its minimum, or ``path`` holds a directory that is not
-                a datacrystal delta log or was written by a newer log format.
+                below its minimum. (Any existing directory at ``path`` is
+                replaced, so its prior contents are never validated here.)
         """
         target = Path(path)
         if target.exists():

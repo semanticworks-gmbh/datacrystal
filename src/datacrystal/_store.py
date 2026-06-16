@@ -431,6 +431,9 @@ class Store:
         registered for the next commit.
 
         Raises:
+            DeletedEntityError: the assigned value is (or contains) an entity
+                that was ``store.delete()``-d — it is detached; assign a fresh
+                instance instead.
             WrongThreadError: called from a thread other than the one that
                 opened the store (owner confinement, ADR-001).
             StoreClosedError: the store has already been closed.
@@ -730,11 +733,13 @@ class Store:
             DanglingRefError: only under ``strict_deletes=True`` — this commit
                 deletes a record another surviving record still points at
                 (the eager ADR-003 dangling-ref check).
+            OverflowError: an integer field value is outside msgpack's
+                signed/unsigned 64-bit range.
             ValueError: a ``dc.BlobSource`` declared a size its bytes do not
-                total, or a value cannot be encoded (e.g. an int beyond
-                msgpack's 64-bit range).
+                total.
             TypeError: a ``dc.Blob`` field holds neither ``bytes`` nor a
-                ``dc.BlobSource``.
+                ``dc.BlobSource``, or a field holds a value msgpack cannot
+                encode (an unsupported type).
             WrongThreadError: called from a thread other than the store's
                 owner (ADR-001).
             StoreClosedError: the store has already been closed.
