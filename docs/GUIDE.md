@@ -21,7 +21,9 @@ freezes at the v0.1.0 tag.
 - [Snapshots and the commit-delta pipeline](#snapshots-and-the-commit-delta-pipeline)
 - [Full-text search: datacrystal[fts]](#full-text-search-datacrystalfts)
 - [Arrow mirrors: datacrystal[arrow]](#arrow-mirrors-datacrystalarrow)
+- [Transactional guarantees (A/C/I/D)](#transactional-guarantees-acid)
 - [Durability and crash safety](#durability-and-crash-safety)
+- [Typing](#typing)
 - [Errors](#errors)
 - [Planned features and when they land](#planned-features-and-when-they-land)
 
@@ -1096,6 +1098,99 @@ After `compact()` that directory is the live set exactly (tombstones dropped); *
 `table()` (or compact first) when you need precise results. `duckdb` is not a datacrystal
 dependency — `pip install duckdb` alongside `datacrystal[arrow]`; `polars`/`pandas` read the
 same `mirror.table(...)` if you prefer them.
+
+## Transactional guarantees (A/C/I/D)
+
+`store.commit()` is **one transaction**. This section is the per-letter account of what that
+buys you — what each of atomicity, consistency, isolation, and durability guarantees, which
+in-repo test proves it, and (just as important) what datacrystal **does not** claim. It is the
+authoritative companion to [Durability and crash safety](#durability-and-crash-safety) (the loss
+windows) and [Deleting](#deleting) (the referential-integrity caveat); where they overlap, they
+agree.
+
+### Atomicity — all of a commit, or none of it
+
+A commit's records, out-of-line blobs, deletes, and metadata are written inside a single SQLite
+`BEGIN IMMEDIATE … COMMIT`; any error rolls the whole batch back (`except: ROLLBACK; raise`) and
+nothing lands. After a crash you see an **exact prefix** of your acked commits — never a torn one,
+never half a commit.
+
+- **Proven by** the CI-gated `kill -9` torture test (`tests/integration/test_crash.py`): a writer
+  SIGKILL'd mid-commit reopens to exactly its last acked commit.
+- **And** the SQL-layer rollback test (`tests/integration/test_sql_rollback.py`): a fault injected
+  *after* the records-and-blob inserts but *before* `COMMIT` leaves **zero** rows on disk and the
+  watermark unmoved — SQLite itself undoes the half-written batch, so atomicity is proven at the
+  storage layer, not merely asserted by construction.
+
+### Consistency — invariants checked before the commit is taken
+
+Uniqueness (`dc.Unique` → `UniqueViolationError`), schema validity (additive type lineage →
+`SchemaMismatchError`), frozen-entity immutability (`FrozenEntityError`), and the temporal-index
+comparability rule (`MixedTemporalIndexError`) are all enforced **before the TID is allocated**, in
+P1. A rejected commit therefore consumes no TID and leaves the sequence **gapless and retryable**
+(invariant 5 — replay determinism is a public contract). The buffers stay intact, so you can fix
+and re-commit.
+
+What datacrystal does **not** enforce here:
+
+- **Referential integrity is not enforced.** `store.delete()` is *unchecked* in v0.x
+  ([ADR-003](design/ADR-003-delete-semantics.md)): a delete can leave other records pointing at the
+  gone OID, and *following* such a stale reference raises `DanglingRefError` only at follow time —
+  never silently. The dev-time bridge is `Store.open(strict_deletes=True)` (raises at the offending
+  `commit()`, naming the referrers, still before the TID so the sequence stays gapless) or
+  `Store.open(debug=True)` (warns with `DanglingDeleteWarning` and commits anyway). See
+  [Deleting](#deleting). Checked delete (refuse-if-referenced, cascades) lands with the v1
+  reverse-reference index `[planned — v1]`.
+- **Live objects have no rollback.** A rejected `commit()` reverts nothing in memory — your
+  in-RAM mutations stay buffered (that is what makes the commit retryable). Decide explicitly: fix
+  and re-commit, or `close()` to discard the uncommitted changes.
+
+### Isolation — single-writer serialization, WAL snapshot reads
+
+Writes never interleave because there is exactly **one writer**: the store and its live graph are
+owner-confined (a foreign thread raises `WrongThreadError`, [ADR-001](design/ADR-001-concurrency-contract.md))
+and a second *process* opening the directory is refused by the lease lock (`StoreLockedError`). So
+all writes serialize through the owner — no write-write conflicts to resolve.
+
+Readers get **snapshot isolation** through SQLite WAL: each `store.snapshot()` (and each streamed
+`open_blob()`) reads from its own connection pinned to one commit watermark
+([ADR-002](design/ADR-002-storage-read-views.md)), so a reader on another thread sees a stable,
+never-torn view while the owner keeps committing.
+
+What datacrystal does **not** claim: there is **no configurable SQL isolation level** (no
+`READ COMMITTED`/`SERIALIZABLE` knob) and **no multi-writer MVCC**. Isolation comes from the
+single-writer contract plus WAL read views, not from concurrency control over competing writers.
+
+### Durability — the configurable triad
+
+Durability is the `durability=` triad chosen at `Store.open`, each with an explicit loss window
+(the full account is in [Durability and crash safety](#durability-and-crash-safety) and
+[Open a store](#open-a-store)):
+
+- **`"commit"`** — `synchronous=FULL` (plus `F_FULLFSYNC` on macOS): every acked commit is fsync-
+  durable, surviving even OS crash / power loss (cost: ~4 ms/commit on macOS, honestly).
+- **`"interval"`** (default) — `synchronous=NORMAL`, WAL group-commit: a **process** crash
+  (`kill -9`) loses nothing; an OS crash or power loss may trim the last few commits, but the file
+  is never corrupted.
+- **`"never"`** — `synchronous=OFF`: no fsync, an OS crash can corrupt the file. Benchmarks and
+  throwaway scratch stores only.
+
+Honesty note: process-crash durability **is** in-process testable and CI-gated (the `kill -9`
+test runs under `"commit"`). True power-loss durability rests on SQLite's `synchronous=FULL`/
+`F_FULLFSYNC` settings — it cannot be exercised from within a process, so it is **settings-backed,
+not in-process tested**.
+
+### What we do *not* claim
+
+datacrystal deliberately does **not** wear a blanket **"ACID compliant"** badge. Concretely:
+
+- no blanket ACID claim — read the per-letter guarantees above instead;
+- no configurable **SQL isolation level** and no multi-writer MVCC (isolation = single-writer +
+  WAL snapshots);
+- no **referential integrity** in v0.x (`store.delete()` is unchecked; `DanglingRefError` is the
+  loud follow-time signal, not a commit-time guard).
+
+Each guarantee above is exactly as strong as its cited test or setting — no more, no less.
 
 ## Durability and crash safety
 
