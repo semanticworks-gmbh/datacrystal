@@ -15,6 +15,7 @@ freezes at the v0.1.0 tag.
 - [Reading: get, query, lazy references](#reading-get-query-lazy-references)
 - [Identity and memory](#identity-and-memory)
 - [Big data: keeping memory bounded](#big-data-keeping-memory-bounded)
+  - [Recipe: parallel ingest (parse in a pool → single writer)](#recipe-parallel-ingest-parse-in-a-pool--single-writer)
 - [Schema evolution](#schema-evolution)
 - [Frozen entities](#frozen-entities)
 - [Concurrency and deployment](#concurrency-and-deployment)
@@ -640,6 +641,63 @@ piggyback on your own store calls (sync), or as an owner-loop task (`aopen`). Ti
 v0.1; an RSS-quota variant is deferred (psutil stays out of core), and a hard per-store memory
 cap does not exist. For analytics-style scans, the honest answer is the
 [Arrow mirror tier](#arrow-mirrors-datacrystalarrow), not the object graph.
+
+### Recipe: parallel ingest (parse in a pool → single writer)
+
+Bulk-importing many files (the classic shape: dozens of XML/CSV files into millions of records)?
+The right way under owner confinement ([ADR-001](design/ADR-001-concurrency-contract.md)) is to
+**parse in a process pool, but build and write only in the owner process**. It needs no new
+API — just `store.store()` / `store.commit()` and stdlib `multiprocessing`:
+
+```python
+import multiprocessing as mp
+import datacrystal as dc
+
+def parse_file(path: str) -> list[dict]:   # WORKER: returns plain data — never @entity instances
+    return list(parse(path))               # dicts/tuples only
+
+if __name__ == "__main__":
+    with dc.Store.open("cabinet.store") as store:
+        if store.root is None:
+            store.root = {}
+        with mp.Pool() as pool:
+            for recs in pool.imap_unordered(parse_file, files):   # parse fans out across cores
+                for d in recs:
+                    store.store(Mineral(**d))                     # build + write: OWNER ONLY
+                store.commit()                                    # one commit per file
+```
+
+**The one rule to hold:** workers return **plain data** (dicts/tuples); `@entity` instances are
+constructed **only in the owner process**. Why this matters, honestly — across a *process* boundary
+an `@entity` does **not** raise a loud error. An `@entity` is an ordinary `slots=True` dataclass
+(datacrystal defines no custom pickle hook), so it pickles cleanly via the stdlib default and
+arrives in the owner as an un-stamped detached copy that `store.store()` re-registers with a
+**fresh OID** — building entities in workers silently double-serializes and breaks identity-by-OID
+rather than failing fast. (The loud guards cover *thread* mistakes, not this one: `EntityEscapeError`
+is the cross-**thread** `submit()`-result guard; `WrongThreadError` fires on foreign-thread access;
+`StoreLockedError` refuses a second writer **process**.)
+
+**Set the performance expectation correctly:** parallelism speeds the **parse**, not the **write**
+— the single writer is the serial wall (`store()` + `commit()` run on the owner). So reach for this
+only when parsing is a real fraction of import time. Illustrative ratios from one app's
+parallel-ingest probe (8 files, 800k records, 8 cores) — **not** a datacrystal benchmark, shown only
+to set the shape of the trade-off:
+
+```
+parse only:   7.1s -> 1.9s   (~3.8x)    # the parse parallelizes
+full import: 22.0s -> 17.7s  (~1.2x)    # the write stays serial — the wall
+```
+
+For more throughput, tune the **write** side instead: `durability="never"` for a one-shot bulk load
+(see [Open a store](#open-a-store)), `@dc.entity(frozen=True)` records (cheapest to commit —
+[Frozen entities](#frozen-entities)), fewer `dc.Index`/`dc.Unique` fields, and bigger commit
+batches. The scale model stays **1 writer + N readers**; write-sharding is out of core —
+[SCALING.md](design/SCALING.md).
+
+Deliberately no `store.writer()` / `bulk_load()` / `parallel_map()` helper: a batching write-sink
+would reintroduce the session object the design rejects ("no session, no `save()` — mutate, then
+`commit()`"), and a process-pool wrapper is not a database concern. The primitives already suffice;
+this is a discoverability recipe, not a missing feature.
 
 ## Schema evolution
 
