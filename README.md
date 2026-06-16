@@ -1,6 +1,9 @@
 # datacrystal
 
 [![ci](https://github.com/themerius/datacrystal/actions/workflows/ci.yml/badge.svg)](https://github.com/themerius/datacrystal/actions/workflows/ci.yml)
+[![version](https://img.shields.io/badge/version-0.6.0-blue)](CHANGELOG.md)
+[![python](https://img.shields.io/badge/python-3.14-blue)](.python-version)
+[![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 **Your live objects are the database.** Define typed dataclasses, mutate them, call `commit()`.
 datacrystal keeps the whole graph durable and queryable across restarts — same objects, same
@@ -156,6 +159,13 @@ uv run pytest
   adversarial reviews.
 - [docs/research/](docs/research/) — per-topic evidence (EclipseStore internals, ZODB prior
   art, CPython mechanics with benchmarks, engine surveys).
+
+## Contributing
+
+datacrystal is maintained solo by Sven Hodapp; issues and small focused PRs are welcome. See
+[CONTRIBUTING.md](CONTRIBUTING.md) for dev setup and the house rules, and
+[docs/design/ROADMAP.md](docs/design/ROADMAP.md) for what is in and out of scope (the *Punted*
+and *Never* lists). Per-release changes live in the [CHANGELOG](CHANGELOG.md).
 
 Status: **0.6.0** — the API froze at the v0.1.0 baseline; v0.2–0.6 are purely additive.
 PyPI publication deferred (names reserved). License: [MIT](LICENSE).
