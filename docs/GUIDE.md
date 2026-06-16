@@ -8,6 +8,7 @@ freezes at the v0.1.0 tag.
 - [Open a store](#open-a-store)
 - [Define entities](#define-entities)
 - [The root](#the-root)
+  - [Self-referential adjacency (trees and graphs)](#self-referential-adjacency-trees-and-graphs)
 - [Writing: mutate, then commit](#writing-mutate-then-commit)
 - [Deleting](#deleting)
 - [Lists and dicts inside entities](#lists-and-dicts-inside-entities)
@@ -15,13 +16,16 @@ freezes at the v0.1.0 tag.
 - [Reading: get, query, lazy references](#reading-get-query-lazy-references)
 - [Identity and memory](#identity-and-memory)
 - [Big data: keeping memory bounded](#big-data-keeping-memory-bounded)
+  - [Recipe: parallel ingest (parse in a pool → single writer)](#recipe-parallel-ingest-parse-in-a-pool--single-writer)
 - [Schema evolution](#schema-evolution)
 - [Frozen entities](#frozen-entities)
 - [Concurrency and deployment](#concurrency-and-deployment)
 - [Snapshots and the commit-delta pipeline](#snapshots-and-the-commit-delta-pipeline)
 - [Full-text search: datacrystal[fts]](#full-text-search-datacrystalfts)
 - [Arrow mirrors: datacrystal[arrow]](#arrow-mirrors-datacrystalarrow)
+- [Transactional guarantees (A/C/I/D)](#transactional-guarantees-acid)
 - [Durability and crash safety](#durability-and-crash-safety)
+- [Typing](#typing)
 - [Errors](#errors)
 - [Planned features and when they land](#planned-features-and-when-they-land)
 
@@ -134,6 +138,8 @@ store.commit()
   handle, so a graph node can hold many edges that hydrate **on demand**, one `.get()` at a time
   (the model for adjacency / edge lists; a plain `list[T]` reloads its elements *eagerly*, so
   laziness follows the declared element type, not what you put in at write time).
+  **Self-reference is supported — this is how you model trees and graphs** (a node whose `T` is its
+  own type); see [Self-referential adjacency](#self-referential-adjacency-trees-and-graphs) below.
 - Assigning `store.root = value` captures the value immediately: new entities in it are
   registered, and lists/dicts come back from `store.root` as tracked containers.
 
@@ -157,6 +163,56 @@ store.root = Cabinet()
 
 Both are equivalent to the engine; pick by taste. And note that entities do **not** have to
 hang off the root at all — see the next-but-one section.
+
+### Self-referential adjacency (trees and graphs)
+
+The flagship object-graph shape is a **self-referential** entity: a node whose lazy edges point at
+its own type. A `list[dc.Lazy["Node"]]` of children plus a lazy `parent` backlink is exactly how
+you model a tree, a DAG, or an adjacency list — each edge stays off the RAM/read budget and
+hydrates one `.get()` at a time. Spell the self-reference as a **forward-ref string** under
+`from __future__ import annotations` (the entity's own name isn't bound yet while the class body
+runs; the string resolves lazily):
+
+```python
+from __future__ import annotations
+from dataclasses import field
+from typing import Annotated
+import datacrystal as dc
+
+@dc.entity
+class Region:                                       # a geographic containment tree
+    qid: Annotated[str, dc.Unique]
+    name: str
+    children: list[dc.Lazy["Region"]] = field(default_factory=list)   # self-referential edges
+    parent: dc.Lazy["Region"] | None = None                           # lazy backlink
+
+# write: continent -> country -> two regions
+africa = Region(qid="R-AF", name="Africa")
+namibia = Region(qid="R-NA", name="Namibia")
+erongo = Region(qid="R-ER", name="Erongo")
+namibia.parent = dc.Lazy.of(africa)
+africa.children = [dc.Lazy.of(namibia)]
+erongo.parent = dc.Lazy.of(namibia)
+namibia.children = [dc.Lazy.of(erongo)]
+store.root = africa
+store.commit()
+```
+
+After a reopen the tree is **cold** — children rehydrate as *unloaded* `dc.Lazy` handles, and you
+traverse on demand, identity preserved:
+
+```python
+root = store.root                          # Region "Africa", nothing below it loaded
+na = root.children[0]                       # an unloaded handle: na.loaded is False, na.oid is set
+namibia = na.get()                          # loads just this node (siblings untouched)
+er = namibia.children[0].get()
+assert er.parent.get() is namibia           # the parent backlink resolves to the SAME instance
+assert er.parent.get().parent.get() is root # ...all the way up — one live object per OID
+```
+
+The parent↔child cycle round-trips with no `RecursionError`, and identity is stable: every path to
+a node yields the same Python object (the registry contract — [Identity and memory](#identity-and-memory)).
+This is pinned by `tests/unit/test_selfref_adjacency.py` over both backends.
 
 ## Writing: mutate, then commit
 
@@ -349,7 +405,8 @@ never truncates).
 > same kind of write-asymmetry as assigning `bytes` and reading back a `BlobHandle` — a type
 > checker sees `bytes` and flags the `BlobSource`. Add a `# type: ignore[assignment]` at that line
 > (or a per-file `# pyright: reportArgumentType=false` in code that writes many). The runtime is
-> exact; only the static type is approximate, by design.
+> exact; only the static type is approximate, by design. This and the other checker quirks are
+> collected in one place — see [Typing](#typing).
 
 ### When to reach for a `Blob` entity + `dc.Lazy` instead
 
@@ -483,6 +540,63 @@ Query semantics:
   hits = store.query((M.crystal_system == "cubic") & (M.mohs >= 6.0))
   ```
 
+  This is the first of the type-checker quirks; the full set lives in one place — see
+  [Typing](#typing).
+
+### Recipe: paging the newest/top-N by an indexed field
+
+For "the N newest" (or hardest, heaviest, …) by an indexed field, reach for a bare
+`order_by` + `limit` — **not** a `>= sentinel` predicate. Both are correct and return the same
+rows; one stays flat as the dataset grows and the other does not.
+
+```python
+@dc.entity
+class CatalogEvent:
+    seq: Annotated[int, dc.Unique]
+    at: Annotated[datetime | None, dc.SortedIndex] = None   # None = unrecorded time
+
+F = dc.fields(CatalogEvent)
+
+# FAST — streams the newest 100 straight off the SortedIndex head, O(limit).
+newest = store.query(CatalogEvent, order_by=(F.at, "desc"), limit=100)
+
+# SLOWER — same answer, but considers every matching candidate before windowing.
+sentinel = datetime(1970, 1, 1, tzinfo=timezone.utc)
+newest = store.query(F.at >= sentinel, order_by=(F.at, "desc"), limit=100)
+```
+
+Why the bare-`order_by` form wins:
+
+- It orders **straight from the `SortedIndex` run** and windows **lazily** — it materializes only
+  about `offset + limit` rows, so its cost is O(limit), flat no matter how big the class grows.
+- Because **NULLs sort last** (in *both* directions), rows with `at=None` (unrecorded /
+  unpublished) land in the tail and are skipped for free once the window fills — you don't need a
+  predicate to exclude them.
+- The `>= sentinel` form narrows the **candidate set** to every match first (it then windows the
+  *same* lazy way), so its cost grows with the number of matches. It is **not** slower because it
+  "scans records" or sorts everything — both forms stream from the index with **no** Python
+  residual; the difference is purely the candidate-set *size*. (A `>= sentinel` predicate also
+  drops `None`, since ordering comparisons never match `None` — so the two forms agree on which
+  rows they return.)
+
+`explain()` shows the tell — the `candidates: K of extent` line:
+
+```python
+store.explain(CatalogEvent)
+# CatalogEvent: full extent — query() hydrates all <extent> entities ...
+#   (the order_by form windows this lazily to ~offset+limit; it does NOT hydrate the extent)
+
+store.explain(F.at >= sentinel)
+# CatalogEvent: (CatalogEvent.at >= ...)
+#   candidates via bitmaps: <matches> of <extent>     # grows with the match count
+```
+
+This works directly on a `datetime` `SortedIndex` field (a timestamp answers range, `order_by`,
+**and** `==`/`.in_()` from the one index) — the newest-by-timestamp shape this recipe is for. It is
+the rule-based planner's **third** deterministic rule (the `SortedIndex` range slice), not an
+optimizer: `explain()` always shows exactly what answers from the index and what (if anything)
+falls to a residual.
+
 ### Backlinks: who references this? — `incoming()`
 
 `store.incoming(entity)` returns every committed entity that **references** `entity` — the
@@ -580,6 +694,63 @@ piggyback on your own store calls (sync), or as an owner-loop task (`aopen`). Ti
 v0.1; an RSS-quota variant is deferred (psutil stays out of core), and a hard per-store memory
 cap does not exist. For analytics-style scans, the honest answer is the
 [Arrow mirror tier](#arrow-mirrors-datacrystalarrow), not the object graph.
+
+### Recipe: parallel ingest (parse in a pool → single writer)
+
+Bulk-importing many files (the classic shape: dozens of XML/CSV files into millions of records)?
+The right way under owner confinement ([ADR-001](design/ADR-001-concurrency-contract.md)) is to
+**parse in a process pool, but build and write only in the owner process**. It needs no new
+API — just `store.store()` / `store.commit()` and stdlib `multiprocessing`:
+
+```python
+import multiprocessing as mp
+import datacrystal as dc
+
+def parse_file(path: str) -> list[dict]:   # WORKER: returns plain data — never @entity instances
+    return list(parse(path))               # dicts/tuples only
+
+if __name__ == "__main__":
+    with dc.Store.open("cabinet.store") as store:
+        if store.root is None:
+            store.root = {}
+        with mp.Pool() as pool:
+            for recs in pool.imap_unordered(parse_file, files):   # parse fans out across cores
+                for d in recs:
+                    store.store(Mineral(**d))                     # build + write: OWNER ONLY
+                store.commit()                                    # one commit per file
+```
+
+**The one rule to hold:** workers return **plain data** (dicts/tuples); `@entity` instances are
+constructed **only in the owner process**. Why this matters, honestly — across a *process* boundary
+an `@entity` does **not** raise a loud error. An `@entity` is an ordinary `slots=True` dataclass
+(datacrystal defines no custom pickle hook), so it pickles cleanly via the stdlib default and
+arrives in the owner as an un-stamped detached copy that `store.store()` re-registers with a
+**fresh OID** — building entities in workers silently double-serializes and breaks identity-by-OID
+rather than failing fast. (The loud guards cover *thread* mistakes, not this one: `EntityEscapeError`
+is the cross-**thread** `submit()`-result guard; `WrongThreadError` fires on foreign-thread access;
+`StoreLockedError` refuses a second writer **process**.)
+
+**Set the performance expectation correctly:** parallelism speeds the **parse**, not the **write**
+— the single writer is the serial wall (`store()` + `commit()` run on the owner). So reach for this
+only when parsing is a real fraction of import time. Illustrative ratios from one app's
+parallel-ingest probe (8 files, 800k records, 8 cores) — **not** a datacrystal benchmark, shown only
+to set the shape of the trade-off:
+
+```
+parse only:   7.1s -> 1.9s   (~3.8x)    # the parse parallelizes
+full import: 22.0s -> 17.7s  (~1.2x)    # the write stays serial — the wall
+```
+
+For more throughput, tune the **write** side instead: `durability="never"` for a one-shot bulk load
+(see [Open a store](#open-a-store)), `@dc.entity(frozen=True)` records (cheapest to commit —
+[Frozen entities](#frozen-entities)), fewer `dc.Index`/`dc.Unique` fields, and bigger commit
+batches. The scale model stays **1 writer + N readers**; write-sharding is out of core —
+[SCALING.md](design/SCALING.md).
+
+Deliberately no `store.writer()` / `bulk_load()` / `parallel_map()` helper: a batching write-sink
+would reintroduce the session object the design rejects ("no session, no `save()` — mutate, then
+`commit()`"), and a process-pool wrapper is not a database concern. The primitives already suffice;
+this is a discoverability recipe, not a missing feature.
 
 ## Schema evolution
 
@@ -1097,6 +1268,99 @@ After `compact()` that directory is the live set exactly (tombstones dropped); *
 dependency — `pip install duckdb` alongside `datacrystal[arrow]`; `polars`/`pandas` read the
 same `mirror.table(...)` if you prefer them.
 
+## Transactional guarantees (A/C/I/D)
+
+`store.commit()` is **one transaction**. This section is the per-letter account of what that
+buys you — what each of atomicity, consistency, isolation, and durability guarantees, which
+in-repo test proves it, and (just as important) what datacrystal **does not** claim. It is the
+authoritative companion to [Durability and crash safety](#durability-and-crash-safety) (the loss
+windows) and [Deleting](#deleting) (the referential-integrity caveat); where they overlap, they
+agree.
+
+### Atomicity — all of a commit, or none of it
+
+A commit's records, out-of-line blobs, deletes, and metadata are written inside a single SQLite
+`BEGIN IMMEDIATE … COMMIT`; any error rolls the whole batch back (`except: ROLLBACK; raise`) and
+nothing lands. After a crash you see an **exact prefix** of your acked commits — never a torn one,
+never half a commit.
+
+- **Proven by** the CI-gated `kill -9` torture test (`tests/integration/test_crash.py`): a writer
+  SIGKILL'd mid-commit reopens to exactly its last acked commit.
+- **And** the SQL-layer rollback test (`tests/integration/test_sql_rollback.py`): a fault injected
+  *after* the records-and-blob inserts but *before* `COMMIT` leaves **zero** rows on disk and the
+  watermark unmoved — SQLite itself undoes the half-written batch, so atomicity is proven at the
+  storage layer, not merely asserted by construction.
+
+### Consistency — invariants checked before the commit is taken
+
+Uniqueness (`dc.Unique` → `UniqueViolationError`), schema validity (additive type lineage →
+`SchemaMismatchError`), frozen-entity immutability (`FrozenEntityError`), and the temporal-index
+comparability rule (`MixedTemporalIndexError`) are all enforced **before the TID is allocated**, in
+P1. A rejected commit therefore consumes no TID and leaves the sequence **gapless and retryable**
+(invariant 5 — replay determinism is a public contract). The buffers stay intact, so you can fix
+and re-commit.
+
+What datacrystal does **not** enforce here:
+
+- **Referential integrity is not enforced.** `store.delete()` is *unchecked* in v0.x
+  ([ADR-003](design/ADR-003-delete-semantics.md)): a delete can leave other records pointing at the
+  gone OID, and *following* such a stale reference raises `DanglingRefError` only at follow time —
+  never silently. The dev-time bridge is `Store.open(strict_deletes=True)` (raises at the offending
+  `commit()`, naming the referrers, still before the TID so the sequence stays gapless) or
+  `Store.open(debug=True)` (warns with `DanglingDeleteWarning` and commits anyway). See
+  [Deleting](#deleting). Checked delete (refuse-if-referenced, cascades) lands with the v1
+  reverse-reference index `[planned — v1]`.
+- **Live objects have no rollback.** A rejected `commit()` reverts nothing in memory — your
+  in-RAM mutations stay buffered (that is what makes the commit retryable). Decide explicitly: fix
+  and re-commit, or `close()` to discard the uncommitted changes.
+
+### Isolation — single-writer serialization, WAL snapshot reads
+
+Writes never interleave because there is exactly **one writer**: the store and its live graph are
+owner-confined (a foreign thread raises `WrongThreadError`, [ADR-001](design/ADR-001-concurrency-contract.md))
+and a second *process* opening the directory is refused by the lease lock (`StoreLockedError`). So
+all writes serialize through the owner — no write-write conflicts to resolve.
+
+Readers get **snapshot isolation** through SQLite WAL: each `store.snapshot()` (and each streamed
+`open_blob()`) reads from its own connection pinned to one commit watermark
+([ADR-002](design/ADR-002-storage-read-views.md)), so a reader on another thread sees a stable,
+never-torn view while the owner keeps committing.
+
+What datacrystal does **not** claim: there is **no configurable SQL isolation level** (no
+`READ COMMITTED`/`SERIALIZABLE` knob) and **no multi-writer MVCC**. Isolation comes from the
+single-writer contract plus WAL read views, not from concurrency control over competing writers.
+
+### Durability — the configurable triad
+
+Durability is the `durability=` triad chosen at `Store.open`, each with an explicit loss window
+(the full account is in [Durability and crash safety](#durability-and-crash-safety) and
+[Open a store](#open-a-store)):
+
+- **`"commit"`** — `synchronous=FULL` (plus `F_FULLFSYNC` on macOS): every acked commit is fsync-
+  durable, surviving even OS crash / power loss (cost: ~4 ms/commit on macOS, honestly).
+- **`"interval"`** (default) — `synchronous=NORMAL`, WAL group-commit: a **process** crash
+  (`kill -9`) loses nothing; an OS crash or power loss may trim the last few commits, but the file
+  is never corrupted.
+- **`"never"`** — `synchronous=OFF`: no fsync, an OS crash can corrupt the file. Benchmarks and
+  throwaway scratch stores only.
+
+Honesty note: process-crash durability **is** in-process testable and CI-gated (the `kill -9`
+test runs under `"commit"`). True power-loss durability rests on SQLite's `synchronous=FULL`/
+`F_FULLFSYNC` settings — it cannot be exercised from within a process, so it is **settings-backed,
+not in-process tested**.
+
+### What we do *not* claim
+
+datacrystal deliberately does **not** wear a blanket **"ACID compliant"** badge. Concretely:
+
+- no blanket ACID claim — read the per-letter guarantees above instead;
+- no configurable **SQL isolation level** and no multi-writer MVCC (isolation = single-writer +
+  WAL snapshots);
+- no **referential integrity** in v0.x (`store.delete()` is unchecked; `DanglingRefError` is the
+  loud follow-time signal, not a commit-time guard).
+
+Each guarantee above is exactly as strong as its cited test or setting — no more, no less.
+
 ## Durability and crash safety
 
 - A commit is one SQLite transaction; `durability="commit"` makes it fsync-durable per commit,
@@ -1110,6 +1374,68 @@ same `mirror.table(...)` if you prefer them.
   `sqlite3.backup`/Litestream PITR recipes are `[planned — docs, v0.x]`.
 - Opening a store written by a **newer** library version raises `NewerStoreError` naming both
   versions — never a misread.
+
+## Typing
+
+datacrystal is typed-Python-first, and the **runtime is always exact**. But three spots use Python
+in ways a static checker (pyright/basedpyright/mypy) cannot follow, so they flag a false positive.
+This section is the single, authoritative list — meet them once here, apply the blessed workaround,
+and your checker is clean with **zero** behavior change. (A pyright/mypy plugin that would erase
+these is `[planned]`; see *Deferred* below.)
+
+### 1. Class-attribute conditions read as the field's value type
+
+`Mineral.mohs >= 6.0` is the documented primary query form, but a checker sees `Mineral.mohs` as
+`float | None` and reads the whole thing as `float >= float -> bool`, not a `Condition`. The
+**workaround** is the typed field proxy `dc.fields(C)` — it returns a `FieldProxy` whose attributes
+are `FieldExpr`s, so the comparison types as a `Condition`:
+
+```python
+M = dc.fields(Mineral)
+hits = store.query((M.crystal_system == "cubic") & (M.mohs >= 6.0))   # checker-clean
+```
+
+Both forms are identical at runtime; `dc.fields(C)` is purely for the checker. (Also covered inline
+in [Reading](#reading-get-query-lazy-references).)
+
+### 2. A `dc.Blob` field reads back as `dc.BlobHandle`, not `bytes`
+
+A field declared `Annotated[bytes, dc.Blob]` hydrates to a `dc.BlobHandle` (lazy — `.size`/`.hash`
+are free, `.bytes()` fetches once). `BlobHandle` is **not** a `bytes` subclass, so a checker that
+trusts the `bytes` declaration flags `.bytes()`/`.size` on the field. There is no pragma that fixes
+this cleanly — treat the handle as the real shape (the declared `bytes` is the *write*-side type),
+and reach for `.bytes()` / streamed `store.open_blob()` as documented in
+[Storing binary blobs](#storing-binary-blobs-pdfs-scans-invoices).
+
+### 3. Assigning a `dc.BlobSource` to a `bytes`-typed `dc.Blob` field
+
+The streamed-write form assigns a `dc.BlobSource` (or `dc.blob_from_path(...)`) to a field typed
+`bytes`, which a checker flags `[assignment]`. The **workaround** is a `# type: ignore[assignment]`
+on that line (or a per-file `# pyright: reportArgumentType=false` in code that writes many):
+
+```python
+inv.pdf = dc.blob_from_path("/tmp/2026-0042.pdf")   # type: ignore[assignment]
+store.commit()
+```
+
+This is the same write/read asymmetry as #2, from the write side. (Also noted inline in
+[Writing a big blob](#writing-a-big-blob-without-holding-it-whole-in-ram).)
+
+### Not a false positive: `list`/`dict` read back as persistent containers
+
+For completeness — a field declared `list[str]` (or `dict[...]`) reads back as a
+`dc.PersistentList` / `dc.PersistentDict`. This is **not** a checker quirk and needs **no
+workaround**: `PersistentList` subclasses `list` and `PersistentDict` subclasses `dict`, so the
+read-back value stays assignable to the declared type and the checker is happy. The only semantic to
+remember is the runtime one, not a typing one: **assignment copies** (mutate *through* the field —
+see [Lists and dicts](#lists-and-dicts-inside-entities)).
+
+### Deferred
+
+A pyright/mypy plugin (or `.pyi` overloads) that would type `EntityClass.field <op> value` as a
+`Condition` and reflect the real read-back types (`BlobHandle`, `PersistentList[T]`) — erasing
+quirks 1–3 without any pragma — is **out of scope here and deferred** to its own backlog issue. The
+runtime exactness above is unaffected by whether it ever ships.
 
 ## Errors
 
