@@ -225,7 +225,13 @@ store.commit()
   still reference; *following* such a stale reference (eager hydration, `Lazy.get()`,
   `get_many`, snapshot `get`) raises `DanglingRefError` — loudly, never a silent `None`.
   Checked deletes (refuse-if-referenced, cascades) arrive with the v1 reverse-reference
-  index. If the *root graph* ends up referencing a deleted entity, reading `store.root`
+  index. **Dev-time bridge until then:** `Store.open(strict_deletes=True)` **raises**
+  `DanglingRefError` at the offending `commit()`, naming the referrers — turning a deferred,
+  spooky failure into an at-the-delete one; `Store.open(debug=True)` runs the same check but
+  only **warns** (`DanglingDeleteWarning`) and commits anyway, so a bulk re-import isn't
+  bricked. The check runs in P1 before the TID is allocated (a rejected strict commit stays
+  gapless and retryable); unarmed — the default — pays nothing. It is a *diagnostic*, not
+  referential integrity. If the *root graph* ends up referencing a deleted entity, reading `store.root`
   raises after a reopen — assigning `store.root` replaces the root and recovers the store.
 - Disk space: the SQLite pages are freed for reuse immediately; the file itself shrinks
   only on `VACUUM` (run it offline if you need the bytes back).
@@ -1135,9 +1141,11 @@ add `datacrystal.fts.FtsConfigError` and `datacrystal.arrow.MirrorConfigError` (
 `DataCrystalError`s): the sidecar file/directory contradicts the requested configuration
 or is newer than the installed extra — rebuild rather than guess.
 
-Three warnings live outside the exception family (all `UserWarning`s):
+Four warnings live outside the exception family (all `UserWarning`s):
 `UntrackedMutationWarning`, emitted by the `debug=True` safety net when a mutation slipped
 past the dirty tracking — the entity is committed anyway; fix the write path it names;
+`DanglingDeleteWarning`, emitted under `debug=True` when a `commit()` deletes an entity another
+record still references — the commit proceeds (use `strict_deletes=True` to raise instead);
 `ConsumerDetachedWarning`, emitted when an attached delta consumer raised during
 delivery and was detached (the commit is durable; rebuild the sidecar and re-attach);
 and `UnseenTypeWarning`, emitted when `query()`/`count()`/`pluck()` run against a class
