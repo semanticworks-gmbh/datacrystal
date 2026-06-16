@@ -111,9 +111,29 @@ journal for crash safety, and one live instance per object — `a.friend is b` s
 **Not yet** (see the [roadmap](docs/design/ROADMAP.md)): vector search, an S3/object-store
 backend, cross-mirror join recipes.
 
-## Try it
+## Quick start
 
+Not on PyPI yet — the name is reserved; publication follows the v0.1.0 line. Install straight
+from GitHub:
+
+```bash
+# add it to your project (uv) — pin a release tag…
+uv add "datacrystal @ git+https://github.com/themerius/datacrystal@v0.6.0"
+# …or track main
+uv add "datacrystal @ git+https://github.com/themerius/datacrystal@main"
+
+# pip works the same way
+pip install "datacrystal @ git+https://github.com/themerius/datacrystal@v0.6.0"
+
+# need an extra? name it in the brackets
+uv add "datacrystal[web] @ git+https://github.com/themerius/datacrystal@v0.6.0"
 ```
+
+The example at the top is a complete program — run it twice and the data is still there.
+
+**Or kick the tires in this repo:**
+
+```bash
 uv sync --all-extras
 uv run python examples/minerals/demo.py   # run it twice — the data is still there
 uv run pytest
