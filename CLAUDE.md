@@ -72,8 +72,11 @@ stale venv shebangs — `rm -rf .venv && uv sync`.
   (size-known, ~954 MiB ceiling), chunked layout = #76 (single-cell→chunked migration, never both).
   Lazy-whole landed in #88 (#81-83); streamed read/write in #90 (#84/#85). The `BLOB_EXT`/`StreamedBlob`
   byte format is LOCKED — a change means a NEW contract version, never an edit.
-- `docs/GUIDE.md` — user-facing semantics. Documentation honesty rule: features that do not
-  exist are marked `[planned — milestone]`, never described as if real.
+- `docs/` — user-facing semantics, a **Diátaxis split** (#128): `docs/GUIDE.md` is the thin index
+  (README/design docs link to it), `docs/tutorial.md` the first session, `docs/how-to/*.md` the
+  goal recipes, `docs/reference.md` the dry complete API (the drift-guard's target), and
+  `docs/explanation.md` the "why". Documentation honesty rule: features that do not exist are
+  marked `[planned — milestone]`, never described as if real.
 - `docs/design/EVAL-STRATEGY.md` — the **eval feedback loop + the curated real-dataset portfolio**
   (the frontier sensor: sense → triage → refine → build → ratchet). The proving grounds in `evals/`
   are run on demand against real data; the loop is what keeps the lib blazing-fast AND correct
@@ -163,14 +166,16 @@ stale venv shebangs — `rm -rf .venv && uv sync`.
 - Engine tests parametrize over both backends via the `store_factory` fixture (`tests/conftest.py`);
   memory and sqlite must behave identically.
 - `tests/fitness/` are CI gates (pickle-free AST walk, dep budget, memory boundedness, plus the
-  docs guardrails: GUIDE↔`__all__` drift, README-quickstart-runs-twice, internal-doc-links).
+  docs guardrails: reference↔`__all__` drift, README-quickstart-runs-twice, internal-doc-links
+  incl. cross-file `#fragment` anchors).
 - The README quickstart must run verbatim, twice, from a clean directory (enforced by
   `tests/fitness/test_readme_quickstart.py`).
 - **Definition of Done — public surface ships with its docs:** any PR adding public surface (a new
-  `datacrystal.__all__` name) documents it in the GUIDE in the SAME PR — a runnable/inline-code
-  mention for API symbols, or a row in the `## Errors` reference table for exception/warning classes.
-  Enforced by `tests/fitness/test_guide_drift.py` (core `__all__` today; `datacrystal.web` is gated
-  on #129). The GUIDE's "Planned features" section must never list an already-exported symbol.
+  `datacrystal.__all__` name) documents it in `docs/reference.md` in the SAME PR — a
+  runnable/inline-code mention for API symbols, or a row in the `## Errors` reference table for
+  exception/warning classes. Enforced by `tests/fitness/test_guide_drift.py` (core `__all__` and
+  `datacrystal.web.__all__`). The reference's "Planned features" section must never list an
+  already-exported symbol.
 - Schema-evolution tests fabricate classes dynamically with the same typename to simulate
   code changes between runs; their per-file pyright pragmas exist only for that.
 - The test/demo domain is always the mineral cabinet — do not invent a second domain.
