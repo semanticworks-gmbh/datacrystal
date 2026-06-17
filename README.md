@@ -148,8 +148,12 @@ uv run pytest
 
 ## Learn it
 
-- **[docs/GUIDE.md](docs/GUIDE.md) — the user guide**: every feature that exists, every
-  planned feature clearly marked as planned.
+- **[docs/GUIDE.md](docs/GUIDE.md) — the documentation**: the index into a
+  [Diátaxis](https://diataxis.fr) split — a hand-held [Tutorial](docs/tutorial.md) (learn by
+  doing), goal-oriented [How-to guides](docs/how-to/) (querying & paging, ingest & memory, schema
+  evolution, blobs, web deployment, search, analytics, snapshots & the delta log), a dry complete
+  [Reference](docs/reference.md) (every method, option, guarantee, and error — with planned
+  features clearly marked), and an [Explanation](docs/explanation.md) of the design *why*.
 - [docs/design/](docs/design/) — design documents: [VISION.md](docs/design/VISION.md) (the
   "why"), [DESIGN.md](docs/design/DESIGN.md) (architecture),
   [ROADMAP.md](docs/design/ROADMAP.md) (scope authority),

@@ -1,0 +1,53 @@
+# datacrystal
+
+> An embedded object-graph database for Python (EclipseStore-inspired): your typed live objects ARE
+> the database. Define dataclasses, mutate them, call `commit()`; datacrystal keeps the whole graph
+> durable and queryable across restarts — same objects, same identities, same references. No ORM,
+> no schema files, no `save()`, no pickle (records are msgspec msgpack; decoding cannot execute
+> code). Roaring-bitmap queries through a rule-based planner you can `explain()`, SQLite-blob
+> durability with atomic commits, explicit `Lazy[T]` cut points for bounded memory, and three
+> extras that ride a locked commit-delta pipeline: `datacrystal[fts]` (FTS5 + Snowball),
+> `datacrystal[arrow]` (parquet mirrors → DuckDB), `datacrystal[web]` (FastAPI/Pydantic + Strawberry
+> GraphQL). Version 0.6.0; the public API froze at the v0.1.0 baseline (everything since is purely
+> additive); PyPI publication is deferred (the name is reserved). Single-writer by design.
+
+## Docs
+
+The documentation follows the Diátaxis split (tutorial / how-to / reference / explanation).
+
+- [Documentation index](docs/GUIDE.md): the landing page linking all four doc modes and the design docs.
+- [Tutorial](docs/tutorial.md): a hand-held, decision-free first session on the mineral cabinet — define a model, open a store, add data, commit, reopen and see it persisted, query, follow a lazy reference.
+- [Reference](docs/reference.md): the dry, complete, accurate API — open/define/root, writing & upsert, deleting, lists/dicts, what-can-be-persisted, blobs, the reading API, frozen entities, concurrency, snapshots, the commit-delta pipeline, the datacrystal[web] reflection API, A/C/I/D guarantees, durability, typing quirks, glossary, errors, and planned features.
+- [Explanation](docs/explanation.md): the design *why* — identity and memory, the query-semantics theory (planner/residual/candidate set), why deletes are unchecked, and the design philosophy.
+
+## How-to guides
+
+- [Query and page results](docs/how-to/querying-and-paging.md): limit/offset, `order_by`, the top-N-by-indexed-field recipe, and backlinks via `incoming()`.
+- [Ingest big data and keep memory bounded](docs/how-to/ingest-and-memory.md): free-floating entities, `dc.Lazy` cut points, decode-level reads, `query_iter`, idle-handle demotion, and the parse-in-a-pool parallel-ingest recipe.
+- [Evolve your schema](docs/how-to/schema-evolution.md): the safe-change table, `dc.RenamedFrom`, `dc.Glue`, offline `migrate`/`verify`, and deriving an indexed field.
+- [Store binary blobs](docs/how-to/blobs.md): the three blob tiers, `dc.Blob` out-of-line bytes, streamed read (`open_blob`) and streamed write (`dc.BlobSource`/`blob_from_path`), and when to use a `Blob` entity.
+- [Deploy behind FastAPI and GraphQL](docs/how-to/web-deployment.md): the `datacrystal[web]` minimal app, the deployment doctrine (workers=1, snapshots for reads, submit for writes, per-request DataLoader), and reflecting `@entity` into Pydantic/Strawberry.
+- [Full-text search](docs/how-to/search.md): the `datacrystal[fts]` FTS5 + per-language Snowball stemming + BM25 sidecar over `dc.FullText` fields.
+- [Analytics with Arrow mirrors](docs/how-to/analytics.md): the `datacrystal[arrow]` parquet mirror, zero-copy Arrow tables, and the filter-here-aggregate-in-DuckDB recipes.
+- [Snapshots, the commit stream, and the delta log](docs/how-to/snapshots-and-delta-log.md): reading from any thread, attaching a `DeltaConsumer`, and the core `datacrystal.deltalog` audit history.
+
+## Design documents
+
+- [VISION.md](docs/design/VISION.md): the product "why" — your live objects are the database; the data follows your code, no raindances.
+- [ROADMAP.md](docs/design/ROADMAP.md): scope authority, including the Punted and Never lists.
+- [DESIGN.md](docs/design/DESIGN.md): the architecture.
+- [KICKOFF.md](docs/design/KICKOFF.md): the engineering standards (fitness functions, perf gates) and the v0.1 execution record.
+- [COMMIT-DELTA-v1.md](docs/design/COMMIT-DELTA-v1.md): the locked public commit-delta contract the extras ride.
+- [ADR-001 concurrency contract](docs/design/ADR-001-concurrency-contract.md): owner confinement.
+- [ADR-002 storage read views](docs/design/ADR-002-storage-read-views.md): snapshot isolation.
+- [ADR-003 delete semantics](docs/design/ADR-003-delete-semantics.md): the unchecked-delete contract.
+- [ADR-004 sorted-range index](docs/design/ADR-004-sorted-range-index.md): the `dc.SortedIndex` third planning rule.
+- [ADR-005 index cache](docs/design/ADR-005-index-cache.md): the watermark-validated on-disk index cache.
+- [ADR-007 blob fields](docs/design/ADR-007-blob-fields.md): out-of-line `dc.Blob` bytes.
+- [SCALING.md](docs/design/SCALING.md): the single-writer-plus-N-readers scale model.
+
+## Project
+
+- [README](README.md): the pitch, the runnable quick-start, and what works today.
+- [CHANGELOG](CHANGELOG.md): per-release changes.
+- [CONTRIBUTING](CONTRIBUTING.md): dev setup and house rules.
