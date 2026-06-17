@@ -6,11 +6,18 @@ Over README.md, CLAUDE.md, and docs/**/*.md:
   heading is reduced to its GitHub slug (lowercase, drop punctuation, spaces -> hyphens,
   GitHub's ``-1``/``-2`` de-duplication of repeated headings);
 * every ``](relative/path)`` link (optionally with a ``#fragment``) must point at a path
-  that exists on disk, resolved relative to the linking file.
+  that exists on disk, resolved relative to the linking file;
+* and, since the Diátaxis split (#128) made cross-file fragments pervasive, every
+  ``](relative/path#fragment)`` link whose target is one of our in-scope markdown files must
+  additionally have the ``#fragment`` match a heading slug **in that target file** — not just
+  resolve the path. A cross-file link to a moved or renamed section is exactly as broken as a
+  dangling same-file anchor, so it is guarded the same way.
 
 This catches the dangling-anchor class that slipped before (the old ``#querying``, fixed in
-#131) and broken relative paths. External (``scheme://`` / ``mailto:``) links are out of
-scope — they need the network and are not a documentation-honesty contract.
+#131), broken relative paths, and cross-file fragments pointing at a section that no longer
+exists under that slug. External (``scheme://`` / ``mailto:``) links are out of scope — they
+need the network and are not a documentation-honesty contract; a fragment into a non-markdown
+target (or a markdown file outside our scope, e.g. a directory link) is left to the path check.
 """
 
 from __future__ import annotations
@@ -72,7 +79,10 @@ def _file_slugs(text: str) -> set[str]:
 
 def test_internal_doc_links_resolve():
     files = _doc_files()
+    # Slugs cached by RESOLVED path so a cross-file link's #fragment can be checked against the
+    # heading slugs of the file it actually points at (not just the linking file's own slugs).
     slug_cache = {f: _file_slugs(f.read_text()) for f in files}
+    slug_by_resolved = {f.resolve(): slugs for f, slugs in slug_cache.items()}
 
     problems: list[str] = []
     for f in files:
@@ -88,11 +98,20 @@ def test_internal_doc_links_resolve():
                     problems.append(f"{f.relative_to(ROOT)}: dangling anchor '{target}'")
                 continue
             # relative path, optionally with its own #fragment
-            path_part, _, _frag = target.partition("#")
+            path_part, _, frag = target.partition("#")
             if path_part == "":  # pure fragment handled above; empty means nothing to check
                 continue
             resolved = (f.parent / path_part).resolve()
             if not resolved.exists():
                 problems.append(f"{f.relative_to(ROOT)}: missing path target '{target}'")
+                continue
+            # Cross-file fragment: if the target is an in-scope markdown file, the #fragment
+            # must match a heading slug in THAT file (a moved/renamed section is a broken link).
+            if frag and resolved in slug_by_resolved:
+                if frag not in slug_by_resolved[resolved]:
+                    problems.append(
+                        f"{f.relative_to(ROOT)}: cross-file link '{target}' resolves, but "
+                        f"'#{frag}' is not a heading in {resolved.relative_to(ROOT)}"
+                    )
 
     assert not problems, "internal documentation links do not resolve:\n  " + "\n  ".join(problems)
