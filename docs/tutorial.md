@@ -16,7 +16,7 @@ datacrystal is not on PyPI yet (the name is reserved); install it straight from 
 `uv`:
 
 ```bash
-uv add "datacrystal @ git+https://github.com/themerius/datacrystal@v0.6.0"
+uv add "datacrystal @ git+https://github.com/semanticworks-gmbh/datacrystal@v0.6.0"
 ```
 
 You need Python 3.14. Nothing else — the core has just two dependencies and no database server
