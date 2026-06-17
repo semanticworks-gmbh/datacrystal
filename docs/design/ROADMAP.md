@@ -56,7 +56,7 @@ No item moves on this note alone; it records the lens.
 
 ## How this roadmap works
 
-**The live backlog lives in [GitHub Issues + Milestones](https://github.com/themerius/datacrystal/issues)**
+**The live backlog lives in [GitHub Issues + Milestones](https://github.com/semanticworks-gmbh/datacrystal/issues)**
 — status, ordering, assignment, PR links. This file is the **scope charter**: it records what
 shipped, what we will **not** build (Punted / Never, below) and *why*, and the ratified decision log
 above. Single source of truth: **GitHub owns "what we're building & when"; this file owns "what we

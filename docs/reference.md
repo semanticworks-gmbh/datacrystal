@@ -979,7 +979,7 @@ the store has no committed records of (the result is empty — first run, or a f
 ## Planned features and when they land
 
 Sequencing follows the ratified [roadmap](design/ROADMAP.md); the live backlog (in/order)
-is on [GitHub Issues](https://github.com/themerius/datacrystal/issues). **v0.1.0 (the API-freeze
+is on [GitHub Issues](https://github.com/semanticworks-gmbh/datacrystal/issues). **v0.1.0 (the API-freeze
 baseline) and the purely additive surface through v0.6.0 are all tagged (the v0.1.0 freeze is
 never broken); PyPI publication is still deferred (names reserved).**
 
