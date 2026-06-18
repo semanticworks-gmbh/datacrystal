@@ -105,14 +105,17 @@ class Mineral:
   is **identity** — there is exactly one live instance per stored object.
 - Field markers go inside `typing.Annotated`:
   - `dc.Index` — adds the field to the roaring-bitmap indexes; `==` and `.in_()` queries on it
-    answer from bitmaps. Index/Unique fields must be scalar (`str | int | float | bool`,
-    optionally `| None`; `datetime`/`date` are supported as `dc.SortedIndex` keys — see the
-    `dc.SortedIndex` notes below) — or a **`list` of scalars** for a multi-valued (inverted) index
-    (`Annotated[list[str], dc.Index]`), queried with `.contains(elem)` for exact element
-    membership. A bad index type is rejected at `@dc.entity` definition, not first `commit()`.
-  - `dc.Unique` — unique secondary key (e.g. URIs, slugs, external ids). Duplicates are
-    rejected at commit (`UniqueViolationError`); `None` never collides (SQL-NULL-style). A
-    `Unique` field cannot be a list (a multi-valued field has no single key).
+    answer from bitmaps. Index/Unique fields must be scalar (`str | int | float | bool` or
+    `datetime`/`date`, optionally `| None`) — or a **`list` of scalars** for a multi-valued
+    (inverted) index (`Annotated[list[str], dc.Index]`), queried with `.contains(elem)` for exact
+    element membership. A `datetime`/`date` indexes by value; a timezone-aware `datetime` keys by
+    its UTC instant, so two clocks spelling the same instant collapse to one bitmap key. A bad
+    index type is rejected at `@dc.entity` definition, not first `commit()`.
+  - `dc.Unique` — unique secondary key (e.g. URIs, slugs, external ids, acquisition timestamps).
+    Duplicates are rejected at commit (`UniqueViolationError`); `None` never collides
+    (SQL-NULL-style). A `datetime`/`date` is a valid unique key — `store.get(cls, ts=…)` looks it
+    up by value (aware datetimes by UTC instant). A `Unique` field cannot be a list (a multi-valued
+    field has no single key).
   - `dc.SortedIndex` — a scalar field that answers **range** queries (`>=`, `>`, `<=`, `<`,
     `between`) and `order_by` from a sorted index, plus `==`/`.in_()` (it is an index). See
     [Reading API](#reading-api).
