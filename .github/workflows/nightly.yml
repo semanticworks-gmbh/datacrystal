@@ -1,0 +1,50 @@
+# Nightly lane (#27 epic, slice A — #140): the EXISTING warn-stage perf gates
+# at 1M scale, off the PR critical path. This is the "nightly @1M / @100k"
+# cadence column of the KICKOFF §6 benchmark table — the same same-run ratio /
+# op-count / byte-count gates ci.yml runs at PR scale, just at the larger
+# extents (DC_BENCH_SPECIMENS=1000000; commit_tput_large at 10k→100k via
+# DC_BENCH_LARGE_EXTENTS). Gates STAY warn-stage: DC_BENCH_STRICT is NOT set,
+# so a breach warns and only a 3× egregious breach fails — no warn→hard flip
+# until 14 green nights (KICKOFF §6). Deferred to later slices of #27: the
+# cold-I/O / boot harness, the crash-torture lane, and the trend dashboard +
+# release baselines + the eventual flip.
+name: nightly
+
+on:
+  schedule:
+    # 03:17 UTC daily — odd minute to dodge the top-of-hour Actions rush.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+jobs:
+  perf-1m:
+    runs-on: ubuntu-latest
+    # 1M build + the full gate matrix is heavy; give it room (PR lane is fast).
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Sync environment (Python pinned via .python-version; extras for their tests)
+        run: uv sync --all-extras
+
+      - name: Perf gates at 1M (warn-stage — same-run ratios, KICKOFF §6 nightly cadence)
+        # DC_BENCH_SPECIMENS=1000000 scales the big_store corpus → query_bitmap_vs_scan@1M,
+        # unique_key_lookup@1M, snapshot_cost (snapshot_open_read), watermark_apply_fixed_delta@1M.
+        # DC_BENCH_LARGE_EXTENTS=10000,100000 measures commit_tput_large's t(10N)/t(N) at @100k.
+        # NO DC_BENCH_STRICT: gates stay warn-stage (no warn→hard flip — that is a later slice).
+        env:
+          DC_BENCH_SPECIMENS: "1000000"
+          DC_BENCH_LARGE_EXTENTS: "10000,100000"
+        run: uv run pytest benchmarks -q -s | tee nightly-perf-1m.log
+
+      - name: Upload perf-gate results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-perf-1m
+          path: nightly-perf-1m.log
+          retention-days: 30

@@ -105,14 +105,17 @@ class Mineral:
   is **identity** — there is exactly one live instance per stored object.
 - Field markers go inside `typing.Annotated`:
   - `dc.Index` — adds the field to the roaring-bitmap indexes; `==` and `.in_()` queries on it
-    answer from bitmaps. Index/Unique fields must be scalar (`str | int | float | bool`,
-    optionally `| None`; `datetime`/`date` are supported as `dc.SortedIndex` keys — see the
-    `dc.SortedIndex` notes below) — or a **`list` of scalars** for a multi-valued (inverted) index
-    (`Annotated[list[str], dc.Index]`), queried with `.contains(elem)` for exact element
-    membership. A bad index type is rejected at `@dc.entity` definition, not first `commit()`.
-  - `dc.Unique` — unique secondary key (e.g. URIs, slugs, external ids). Duplicates are
-    rejected at commit (`UniqueViolationError`); `None` never collides (SQL-NULL-style). A
-    `Unique` field cannot be a list (a multi-valued field has no single key).
+    answer from bitmaps. Index/Unique fields must be scalar (`str | int | float | bool` or
+    `datetime`/`date`, optionally `| None`) — or a **`list` of scalars** for a multi-valued
+    (inverted) index (`Annotated[list[str], dc.Index]`), queried with `.contains(elem)` for exact
+    element membership. A `datetime`/`date` indexes by value; a timezone-aware `datetime` keys by
+    its UTC instant, so two clocks spelling the same instant collapse to one bitmap key. A bad
+    index type is rejected at `@dc.entity` definition, not first `commit()`.
+  - `dc.Unique` — unique secondary key (e.g. URIs, slugs, external ids, acquisition timestamps).
+    Duplicates are rejected at commit (`UniqueViolationError`); `None` never collides
+    (SQL-NULL-style). A `datetime`/`date` is a valid unique key — `store.get(cls, ts=…)` looks it
+    up by value (aware datetimes by UTC instant). A `Unique` field cannot be a list (a multi-valued
+    field has no single key).
   - `dc.SortedIndex` — a scalar field that answers **range** queries (`>=`, `>`, `<=`, `<`,
     `between`) and `order_by` from a sorted index, plus `==`/`.in_()` (it is an index). See
     [Reading API](#reading-api).
@@ -716,11 +719,15 @@ from datacrystal.web import (
   marker flags ride along as OpenAPI `json_schema_extra` (`unique`→`candidate_key`,
   `indexed`→`queryable`, `fulltext`→`searchable`). The result is cached per `(class, face)` — a pure
   function of its inputs. A reference field crosses the edge as its OID (an int), a defaulted field
-  becomes optional, a frozen `@entity` becomes a frozen DTO.
+  becomes optional, a frozen `@entity` becomes a frozen DTO. A **list-valued** reference (a
+  `list[dc.Lazy[T]]` adjacency or a `list[T]` of `@entity` — the multi-valued edge) crosses as
+  `list[int]` (a list of edge OIDs), not a collapsed single `int`.
 - **`to_pydantic(source, face=...)`** — projects a live entity *or* an `EntityView` into a detached,
-  validated DTO.
+  validated DTO. A list-valued reference projects as a `list[int]` of edge OIDs.
 - **`from_pydantic(dto, cls, store=...)`** — rebuilds a live `@entity` through the public
-  constructor (`STATE_NEW`, never poking the engine slots).
+  constructor (`STATE_NEW`, never poking the engine slots). A `list[int]` edge stays a list of raw
+  OIDs without a `store`; with `store=` every OID is resolved in one `store.get_many` and each
+  rewrapped as `Lazy.of`.
 
 **GraphQL (Strawberry):**
 
@@ -730,7 +737,10 @@ from datacrystal.web import (
   schema (one GraphQL type per entity, cached by typename, cycles broken by patching
   reference-field targets in after both endpoint types exist). Scalar fields resolve straight off
   the frozen `EntityView`; reference fields carry the per-request DataLoader resolver (the N+1
-  killer).
+  killer). A **list-valued** reference reflects as a `list[Target]` of edges (the one-to-many
+  relation) — every element OID batches through the same loader, so a level's lists coalesce into
+  one `Snapshot.get_many` (O(depth), not O(nodes)); an empty list resolves to `[]`, a dangling
+  element to `null`.
 - **`SnapshotLoader`** — the per-request DataLoader over a pinned snapshot; sibling reference edges
   batch into one `Snapshot.get_many` (no N+1).
 - **`snapshot_context(snapshot)`** — builds a GraphQL `context` carrying a fresh per-request

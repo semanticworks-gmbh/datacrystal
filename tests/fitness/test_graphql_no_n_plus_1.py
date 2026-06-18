@@ -30,6 +30,7 @@ being installed (``strawberry``).
 from __future__ import annotations
 
 import asyncio
+from dataclasses import field
 from typing import Annotated, Any, Callable, Iterator
 
 import pytest
@@ -59,6 +60,10 @@ class Mineral:
     qid: Annotated[str, dc.Unique]
     name: str
     weathers_to: dc.Lazy["Mineral"] | None = None
+    # The #103 list edge: a node alters to MANY products (a fan-out tree). The
+    # list-edge gate below proves that following a level's lists costs ONE
+    # get_many — O(depth), never O(nodes) — exactly like the scalar edge.
+    alters_to: list[dc.Lazy["Mineral"]] = field(default_factory=list)
 
 
 # --- the counting storage harness (KICKOFF pattern, test_scale_shape.py) ------
@@ -270,3 +275,93 @@ def test_n_plus_1_batching_holds_as_fanout_grows() -> None:
         f"batch count must stay {depth} (one per level) as fanout grows 4×, "
         f"got {counts} — the DataLoader batched per node, not per level (N+1)"
     )
+
+
+# --- the list-edge gate (#103) ------------------------------------------------
+#
+# The scalar gate above proves O(depth) for a single-ref edge; this one proves
+# the SAME property for a list-valued ``alters_to`` edge. A node alters to
+# ``fanout`` children, so level L holds ``fanout**L`` nodes — a fan-out TREE, not
+# parallel chains. Following the ``alters_to`` list ``depth`` levels deep, every
+# node at a level resolves its child list in the SAME resolver tick: the loader
+# coalesces all of a level's lists into ONE get_many. So D batch reads serve a
+# tree of ``fanout + fanout**2 + …`` followed edges — O(depth), never O(nodes),
+# at the list level. A regression to per-list batching would make load_calls
+# scale with the node count and fail this PR.
+
+
+def _build_alteration_tree(store: dc.Store, depth: int, fanout: int) -> int:
+    """Store a fan-out ``alters_to`` tree ``depth`` levels deep where every node
+    has ``fanout`` children, and return the root OID. Built leaves-first so each
+    parent can reference its already-stored children as ``Lazy`` adjacency."""
+    from datacrystal._entity import oid_of
+
+    counter = [0]
+
+    def build(level: int) -> Mineral:
+        i = counter[0]
+        counter[0] += 1
+        children: list[dc.Lazy[Mineral]] = []
+        if level < depth:
+            children = [dc.Lazy.of(build(level + 1)) for _ in range(fanout)]
+        node = Mineral(qid=f"Q{i}", name=f"alt-{level}-{i}", alters_to=children)
+        store.store(node)
+        return node
+
+    root = build(0)
+    store.commit()
+    root_oid = oid_of(root)
+    assert root_oid is not None
+    return root_oid
+
+
+def _list_nested_selection(depth: int) -> str:
+    """A GraphQL selection following the ``alters_to`` LIST edge ``depth`` deep."""
+    inner = "qid name"
+    for _ in range(depth):
+        inner = f"qid name altersTo {{ {inner} }}"
+    return f"{{ root {{ {inner} }} }}"
+
+
+def test_list_edge_nesting_is_o_depth_not_o_nodes() -> None:
+    """The #103 list-edge N+1 gate: a depth-``D`` query following a LIST-valued
+    ``alters_to`` edge over a fan-out tree issues exactly ``D`` batch reads — one
+    ``get_many`` per relation LEVEL — while ``fanout**1 + … + fanout**D`` edges
+    are followed. The per-request DataLoader coalesces every list at a level into
+    one batch; per-list batching would scale reads with NODE COUNT (N+1)."""
+    depth, fanout = 3, 3  # 3 + 9 + 27 = 39 followed edges across 3 levels
+    backend = CountingBackend(MemoryBackend())
+    store = dc.Store._from_backend(backend)
+    try:
+        root_oid = _build_alteration_tree(store, depth=depth, fanout=fanout)
+
+        gql = StrawberryReflector().reflect(Mineral)
+        with store.snapshot() as snap:
+            root_view = snap.get(root_oid)  # materialize level 0
+            backend.reset()  # isolate the reference-following reads
+
+            schema = _schema_exposing_list(gql, [root_view])
+            result = asyncio.run(
+                schema.execute(
+                    _list_nested_selection(depth),
+                    context_value=snapshot_context(snap),
+                )
+            )
+
+        assert result.errors is None, result.errors
+
+        followed_edges = sum(fanout**level for level in range(1, depth + 1))  # 39
+        assert backend.load_calls == depth, (
+            f"LIST-EDGE N+1 REGRESSION: a depth-{depth} query following a "
+            f"list-valued edge over a fan-out-{fanout} tree ({followed_edges} "
+            f"edges) issued {backend.load_calls} get_many batches — expected "
+            f"exactly {depth} (one per relation LEVEL). The per-request "
+            "DataLoader is no longer coalescing a level's lists into one "
+            "Snapshot.get_many; reads scale with NODE COUNT, not depth."
+        )
+        # O(depth): the batch count is far below the followed-edge count.
+        assert backend.load_calls < followed_edges
+        # Every followed edge was served by those D batches.
+        assert backend.records_loaded == followed_edges
+    finally:
+        store.close()

@@ -61,7 +61,7 @@ from datacrystal._entity import EntityMeta, is_entity, oid_of, type_info
 from datacrystal._lazy import BlobHandle, Lazy
 from datacrystal._records import BlobToken, RefToken
 from datacrystal._snapshot import EntityView, Ref
-from datacrystal.web._reflect import FieldDescriptor, reflect
+from datacrystal.web._reflect import FieldDescriptor, list_ref_target, reflect
 
 __all__ = ["entity_model", "from_pydantic", "to_pydantic"]
 
@@ -262,29 +262,53 @@ def from_pydantic(model_instance: pydantic.BaseModel, cls: type, *, store: Any =
     """
     _, descriptors = reflect(cls)  # raises NotAnEntityError loudly for a non-@entity class
     field_values: dict[str, Any] = {}
-    ref_oids: list[tuple[str, int, FieldDescriptor]] = []
+    # A ref field to resolve via the store: its name, the FieldDescriptor, whether
+    # it is a list-of-ref edge (#103), and the OIDs (one for a scalar ref, many
+    # for a list edge). All OIDs across all ref fields flatten into ONE get_many.
+    ref_plan: list[tuple[str, FieldDescriptor, bool, list[int]]] = []
     for d in descriptors:
         if not hasattr(model_instance, d.name):
             continue  # absent on this face/DTO → fall to the dataclass default
         value = getattr(model_instance, d.name)
         is_ref = d.spec.lazy_refs or _contains_entity(d.core_type)
-        if is_ref and store is not None and isinstance(value, int):
-            ref_oids.append((d.name, value, d))  # resolve in one round-trip below
-            continue
+        if is_ref and store is not None:
+            if list_ref_target(d.core_type) is not None and isinstance(value, list):
+                # A list-valued edge crosses as list[int] (#103): resolve every
+                # OID and rewrap each below. An empty list resolves to an empty
+                # list (no edges to follow).
+                oids = [int(o) for o in cast("list[Any]", value)]
+                ref_plan.append((d.name, d, True, oids))
+                continue
+            if isinstance(value, int):
+                ref_plan.append((d.name, d, False, [value]))  # one round-trip below
+                continue
         field_values[d.name] = value  # scalar / container / OID-as-is (no store)
 
-    if ref_oids:
-        # ref_oids is only populated when a store was passed (the branch above), so
+    if ref_plan:
+        # ref_plan is only populated when a store was passed (the branch above), so
         # store is non-None here — assert it to re-narrow for the type checker.
         assert store is not None
-        # One owner-thread round-trip (store.get_many guards the thread, ADR-001).
-        resolved: list[Any] = store.get_many([oid for _, oid, _ in ref_oids])
-        for (name, _, d), target in zip(ref_oids, resolved, strict=True):
+        # One owner-thread round-trip for EVERY ref OID across every field
+        # (store.get_many guards the thread, ADR-001 — no N+1, even across edges).
+        flat_oids = [oid for _, _, _, oids in ref_plan for oid in oids]
+        resolved: list[Any] = store.get_many(flat_oids) if flat_oids else []
+        cursor = 0
+        for name, d, is_list, oids in ref_plan:
+            targets = resolved[cursor : cursor + len(oids)]
+            cursor += len(oids)
             # A Lazy field carries a handle; a directly-typed @entity field the
             # entity itself — mirror the engine's two ref shapes. ``Lazy[Any].of``
             # binds T explicitly (the engine's idiom in _store.py for a loosely
             # typed store path) — a bare ``Lazy.of`` would infer ``Lazy[Unknown]``.
-            field_values[name] = Lazy[Any].of(target) if d.spec.lazy_refs else target
+            if is_list:
+                field_values[name] = (
+                    [Lazy[Any].of(t) for t in targets] if d.spec.lazy_refs else targets
+                )
+            else:
+                target = targets[0]
+                field_values[name] = (
+                    Lazy[Any].of(target) if d.spec.lazy_refs else target
+                )
 
     return cls(**field_values)  # public constructor → STATE_NEW; never pokes __dc_* slots
 
@@ -402,11 +426,21 @@ def _boundary_annotation(d: FieldDescriptor) -> Any:
     DTO transports an identifier, not a live engine object (the request edge must
     not carry an engine instance, and a detached DTO has no store to hydrate
     against). Optionality is preserved: an optional ref becomes ``int | None``.
-    A ``list`` / ``dict`` field keeps its core type as-is (``list[scalar]`` / a
-    mapping is already transport-shaped). Everything else keeps its scalar core
-    type verbatim.
+
+    A **list-valued** reference (the #30 multi-valued edge — ``list[Lazy[T]]``
+    adjacency, or a ``list[T]`` of ``@entity``) crosses as ``list[int]`` — a list
+    of edge OIDs, not a single collapsed ``int`` (story #103). Detected via the
+    container origin (``list_ref_target``), since ``lazy_refs`` /
+    ``_contains_entity`` are true for a scalar ref and a list edge alike; an
+    optional list edge becomes ``list[int] | None``.
+
+    A non-reference ``list`` / ``dict`` field keeps its core type as-is
+    (``list[scalar]`` / a mapping is already transport-shaped). Everything else
+    keeps its scalar core type verbatim.
     """
     core = d.core_type
+    if list_ref_target(core) is not None:
+        return list[int] | None if _is_optional(core) else list[int]
     if d.spec.lazy_refs or _contains_entity(core):
         return int | None if _is_optional(core) else int
     return core

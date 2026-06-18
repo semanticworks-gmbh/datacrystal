@@ -16,7 +16,13 @@ import pytest
 
 import datacrystal as dc
 from benchmarks import _gen
-from benchmarks.conftest import SMALL_SPECIMENS, SPECIMENS, gate, time_it
+from benchmarks.conftest import (
+    LARGE_SHAPE_EXTENTS,
+    SMALL_SPECIMENS,
+    SPECIMENS,
+    gate,
+    time_it,
+)
 from datacrystal._records import decode_payload
 
 
@@ -81,7 +87,7 @@ def test_commit_tput_large_shape(tmp_path) -> None:
     """KICKOFF ``commit_tput_large``: P1 never quadratic —
     t(10·N)/t(N) ≤ 12."""
     times = []
-    for n in (2_000, 20_000):
+    for n in LARGE_SHAPE_EXTENTS:
         store = dc.Store.open(tmp_path / f"large-{n}.store")
 
         def run(store: dc.Store = store, n: int = n) -> None:

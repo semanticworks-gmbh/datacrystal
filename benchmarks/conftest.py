@@ -27,6 +27,16 @@ from benchmarks import _gen
 SPECIMENS = int(os.environ.get("DC_BENCH_SPECIMENS", "60000"))
 SMALL_SPECIMENS = max(1000, SPECIMENS // 10)
 
+# The two extents the commit_tput_large *shape* gate builds (KICKOFF §6:
+# "PR @10k; nightly @100k"). Kept a same-run pair so the gate stays a ratio
+# (invariant 12), never a wall-clock absolute. The default is the PR pair;
+# the nightly lane (nightly.yml) overrides it to "10000,100000" via
+# DC_BENCH_LARGE_EXTENTS so the t(10N)/t(N) ratio is measured at the @100k
+# cadence the table prescribes — additive, never a new gate (#140, #27).
+LARGE_SHAPE_EXTENTS = tuple(
+    int(n) for n in os.environ.get("DC_BENCH_LARGE_EXTENTS", "2000,20000").split(",")
+)
+
 
 class BenchGateWarning(UserWarning):
     """A perf gate breached its threshold (warning stage — KICKOFF §6)."""
