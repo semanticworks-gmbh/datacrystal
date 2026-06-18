@@ -1,6 +1,15 @@
 # datacrystal — hero image
 
-The project hero (`hero.png`), shown at the top of the README.
+The project hero, shown at the top of the README (and in `docs/design/NAME.md`) via a `<picture>`
+element that serves the small AVIF with a PNG fallback.
+
+## Files
+
+- **`hero.avif`** — web-delivery version (~143 KB, AVIF q65). Served first via `<picture>`/`<source>`
+  so READMEs and docs load fast and cheap. ~18× smaller than the PNG, visually indistinguishable.
+- **`hero.png`** — the lossless master and the `<img>` fallback (for the rare browser without AVIF).
+  This is the file to **edit** for the brand hex pass below; re-export the AVIF afterwards with:
+  `avifenc -q 65 -s 4 --jobs all hero.png hero.avif`
 
 **The idea** is documented beside the name, in
 [`docs/design/NAME.md` → The hero image](../docs/design/NAME.md#the-hero-image): the picture

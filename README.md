@@ -6,7 +6,10 @@
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 <p align="center">
-  <img src="assets/hero.png" alt="datacrystal hero — unstructured documents on the left flow rightward and crystallize into an ordered, faceted data crystal in the brand's navy, blue and teal" width="100%">
+  <picture>
+    <source srcset="assets/hero.avif" type="image/avif">
+    <img src="assets/hero.png" alt="datacrystal hero — unstructured documents on the left flow rightward and crystallize into an ordered, faceted data crystal in the brand's navy, blue and teal" width="100%">
+  </picture>
 </p>
 
 **Your live objects are the database.** Define typed dataclasses, mutate them, call `commit()`.
