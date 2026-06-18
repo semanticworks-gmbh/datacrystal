@@ -35,7 +35,10 @@ promise of the product, pre-installed in the audience's imagination.
 
 ## The hero image
 
-![datacrystal hero](../../assets/hero.png)
+<picture>
+  <source srcset="../../assets/hero.avif" type="image/avif">
+  <img src="../../assets/hero.png" alt="datacrystal hero — unstructured data on the left crystallizing into an ordered, faceted data crystal">
+</picture>
 
 The project's hero image *is* this metaphor, drawn. On the left, unstructured business documents —
 invoices, notes, fragments — flow rightward and **crystallize** into an ordered, faceted data
