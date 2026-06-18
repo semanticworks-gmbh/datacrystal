@@ -33,6 +33,27 @@ Free cultural resonance: "data crystal" is an established sci-fi trope for *perf
 knowledge storage* (Babylon 5 data crystals, holocrons, Superman's memory crystals) — exactly the
 promise of the product, pre-installed in the audience's imagination.
 
+## The hero image
+
+![datacrystal hero](../../assets/hero.png)
+
+The project's hero image *is* this metaphor, drawn. On the left, unstructured business documents —
+invoices, notes, fragments — flow rightward and **crystallize** into an ordered, faceted data
+crystal. That is the exact moment the *crystallize* and *lattice* rows of the table above describe:
+a fluid, living object graph solidifying (`commit()`) into a durable, queryable structure, kept
+intact rather than flattened or translated.
+
+The facets are not decoration — they are SemanticWorks' **Information Tetrahedron** (navy, blue,
+teal). A crystal is a lattice of one repeating unit cell, and datacrystal's unit cell is that
+tetrahedron of meaning: its four faces are the four semiotic dimensions of the **Semantic Digital
+Asset (SDA)** model — *syntax, semantics, pragmatics, sigmatics* — the hidden fourth face
+(sigmatics, the bond to reality) being the foundation the others rest on. datacrystal is that
+foundation: the durable, queryable substrate the semantic and agent layers are built on, which is
+why the company icon and the library share one shape.
+
+Generated with the SemanticWorks brand illustration pipeline; the concept, exact prompt, seed and
+the required brand post-processing checklist are recorded in [`assets/hero.md`](../../assets/hero.md).
+
 ## Availability audit (2026-06-10)
 
 | Check | Result |
