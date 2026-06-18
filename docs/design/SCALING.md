@@ -23,6 +23,19 @@ bitmap indexes lazy-build by an O(extent) scan per process start. Multi-GB→TB 
 mirror tier's job (partitioned parquet + DuckDB is TB-class). A pipeline-fed persistent-index
 sidecar could raise the live ceiling later — demand-driven, deliberately not a roadmap item.
 
+A concrete eval datapoint for that index tier (2026-06-18): the **full MaStR corpus** —
+6,200,022 real solar units, ingested via
+[../../evals/proving_grounds/mastr.py](../../evals/proving_grounds/mastr.py) — peaked at
+**3.886 GB ingest RSS**. That RAM is the in-memory index tier itself: the unique map of 6.2M
+`mastr_nr` keys plus the bitmap postings for the indexed fields (Bundesland / PLZ /
+Betriebsstatus). Ingest ran at 15,611 u/s, and a cold reopen took 31.9 s — an O(corpus) index
+rebuild from the records, which are rebuildable derived data never persisted inside the commit
+txn ([invariant 11](../../CLAUDE.md), ratified in [ADR-005](ADR-005-index-cache.md)). The map
+size is an **inherent property of a Unique index**, not a regression: to catch a duplicate you
+must remember every key, so a unique constraint over N keys costs Θ(N) live memory by
+construction. It is a cost to manage (drop the constraint, or move the corpus to the mirror
+tier for query), not a bug to fix.
+
 ## Tier 1 — multiple processes, one machine (`uvicorn --workers N`)
 
 - **Default: workers=1 + asyncio.** The v0.x lease lock file turns the misconfiguration into a
