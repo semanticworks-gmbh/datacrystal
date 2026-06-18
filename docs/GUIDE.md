@@ -29,6 +29,8 @@ Goal-oriented recipes with runnable snippets:
 - [Deploy behind FastAPI and GraphQL](how-to/web-deployment.md) — `datacrystal[web]` reflection +
   deployment doctrine.
 - [Full-text search](how-to/search.md) — `datacrystal[fts]`, FTS5 + Snowball stemming.
+- [Vector and hybrid search](how-to/vector-search.md) — bring-your-own embeddings, exact top-k,
+  RRF fusion with `datacrystal[fts]`.
 - [Analytics with Arrow mirrors](how-to/analytics.md) — `datacrystal[arrow]` + DuckDB.
 - [Snapshots, the commit stream, and the delta log](how-to/snapshots-and-delta-log.md).
 

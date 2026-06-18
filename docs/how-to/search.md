@@ -47,3 +47,6 @@ minerals = store.get_many([hit.oid for hit in idx.search("Tsumeb", cls=Mineral)]
   findable only as that whole run) `[planned — segmenting tokenizer, demand-driven]`;
   abugida-script languages (hi/ne/ta) are refused loudly rather than silently broken.
   Like the store, an index is used from the thread that opened it.
+- For semantic / RAG retrieval, combine this BM25 index with embeddings you compute — see
+  [Vector and hybrid search](vector-search.md), which fuses `idx.search(...)` and dense vectors
+  with Reciprocal Rank Fusion over the same store.
