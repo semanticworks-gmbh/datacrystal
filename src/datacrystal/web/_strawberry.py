@@ -65,6 +65,7 @@ never from :mod:`._reflect` — so plain ``import datacrystal`` stays inside the
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Mapping
 from typing import Any, cast
 
@@ -80,7 +81,12 @@ from datacrystal._entity import (
     _is_list_of_scalar,  # pyright: ignore[reportPrivateUsage]  # engine leaf-set predicate, no second "scalar" definition
 )
 from datacrystal._snapshot import EntityView, Ref, Snapshot
-from datacrystal.web._reflect import FieldDescriptor, referenced_entities, reflect
+from datacrystal.web._reflect import (
+    FieldDescriptor,
+    list_ref_target,
+    referenced_entities,
+    reflect,
+)
 
 __all__ = [
     "LOADER_CONTEXT_KEY",
@@ -160,7 +166,7 @@ def snapshot_context(snapshot: Snapshot) -> dict[str, Any]:
     return {LOADER_CONTEXT_KEY: SnapshotLoader(snapshot)}
 
 
-def _make_relation_resolver(name: str) -> Any:
+def _make_relation_resolver(name: str, *, list_edge: bool) -> Any:
     """Build the async relation resolver for the reference field ``name`` (#100).
 
     Returned as a closure (the field name captured, never a GraphQL argument) so
@@ -178,7 +184,36 @@ def _make_relation_resolver(name: str) -> Any:
     absent edge (``None``) short-circuits without touching the loader; a
     dangling/deleted reference rides ``get_many``'s None-on-miss (ADR-003) and
     resolves to GraphQL ``null`` — never a 500.
+
+    ``list_edge`` switches on the #30 multi-valued adjacency shape (story #103):
+    the view holds a **tuple** of :class:`~datacrystal._snapshot.Ref` tokens, so
+    every element's OID is dispatched to the loader and the per-element awaits are
+    gathered in the SAME tick — Strawberry's ``call_soon`` coalescing then folds
+    them (and every sibling list/scalar edge in the tick) into ONE
+    :meth:`~datacrystal._snapshot.Snapshot.get_many`, never one batch per list.
+    An empty list resolves to ``[]`` (no loader round-trip); a dangling element
+    becomes ``null`` in its slot, the list itself non-null.
     """
+    if list_edge:
+
+        async def resolve_list(root: Any, info: Info[Any, Any]) -> Any:
+            edges = getattr(root, name)
+            if edges is None:
+                return []
+            loader = _loader_from(info)
+            # The view freezes a list edge to a tuple of Ref tokens; tolerate a
+            # bare OID defensively. Gather in one tick so the loads coalesce into
+            # a single get_many — across this list AND every sibling edge.
+            return await asyncio.gather(
+                *(
+                    loader.load(edge.oid if isinstance(edge, Ref) else edge)
+                    for edge in edges
+                )
+            )
+
+        resolve_list.__name__ = f"resolve_{name}"
+        resolve_list.__qualname__ = f"_make_relation_resolver.resolve_{name}"
+        return resolve_list
 
     async def resolve(root: Any, info: Info[Any, Any]) -> Any:
         ref = getattr(root, name)
@@ -194,18 +229,21 @@ def _make_relation_resolver(name: str) -> Any:
     return resolve
 
 
-def _relation_field(name: str) -> StrawberryField:
+def _relation_field(name: str, *, list_edge: bool) -> StrawberryField:
     """A reference field named ``name`` carrying the async relation resolver.
 
     The ``type_annotation`` is a placeholder (``object``) here; it is patched to
-    the nullable target Strawberry type in
+    the (nullable, or ``list[...]``) target Strawberry type in
     :meth:`StrawberryReflector._resolve_pending` once every endpoint type is
-    cached (the cycle break).
+    cached (the cycle break). ``list_edge`` selects the multi-valued resolver +
+    the ``list[Target | None]`` annotation (story #103).
     """
     return StrawberryField(
         python_name=name,
         type_annotation=StrawberryAnnotation(object),
-        base_resolver=StrawberryResolver(_make_relation_resolver(name)),
+        base_resolver=StrawberryResolver(
+            _make_relation_resolver(name, list_edge=list_edge)
+        ),
     )
 
 
@@ -257,8 +295,10 @@ class StrawberryReflector:
     def __init__(self) -> None:
         self._types: dict[str, type] = {}
         # Reference fields whose target type is patched in once both ends exist
-        # (the cycle break): (field, referenced typename) deferred until resolve().
-        self._pending_refs: list[tuple[StrawberryField, str]] = []
+        # (the cycle break): (field, referenced typename, is_list_edge) deferred
+        # until resolve(). The list flag (#103) selects ``list[Target | None]``
+        # over a plain nullable ``Target`` for a multi-valued adjacency field.
+        self._pending_refs: list[tuple[StrawberryField, str, bool]] = []
 
     def reflect(self, cls: type) -> type:
         """Reflect ``cls`` (and every entity it references) into a Strawberry type.
@@ -315,11 +355,24 @@ class StrawberryReflector:
         them straight off the :class:`~datacrystal._snapshot.EntityView`. A
         reference field instead carries the **async relation resolver** (#100),
         which takes the view's :class:`~datacrystal._snapshot.Ref` token through
-        the per-request DataLoader (the N+1 killer) rather than returning it
-        raw.
+        the per-request DataLoader (the N+1 killer) rather than returning it raw.
+        A **list-valued** reference (the #30 multi-valued edge) reflects as a
+        ``list[Target | None]`` of edges resolved through the same loader (#103) —
+        detected via the container origin (``list_ref_target``), since
+        ``referenced_entities`` flattens a list edge and a scalar ref to the same
+        referent tuple.
         """
         if _is_scalar_field(desc):
             return _plain_field(desc.name, desc.core_type)
+        list_target = list_ref_target(desc.core_type)
+        if list_target is not None:
+            # A list-of-ref adjacency edge (#103): reflect ``list[Target | None]``
+            # and resolve every element OID through the per-request DataLoader.
+            target_info, _ = reflect(list_target)
+            field = _relation_field(desc.name, list_edge=True)
+            self._pending_refs.append((field, target_info.typename, True))
+            referents.append(list_target)
+            return field
         targets = referenced_entities(desc.core_type)
         if not targets:
             # Neither a scalar nor an entity reference (bare ``list``, ``dict``,
@@ -337,27 +390,30 @@ class StrawberryReflector:
         # The type annotation is a placeholder here (the target's Strawberry type
         # may not exist yet on a cycle) — patched in ``_resolve_pending`` once
         # every endpoint is cached. The relation resolver (#100) is bound now.
-        field = _relation_field(desc.name)
-        self._pending_refs.append((field, target_info.typename))
+        field = _relation_field(desc.name, list_edge=False)
+        self._pending_refs.append((field, target_info.typename, False))
         referents.append(target)
         return field
 
     def _resolve_pending(self) -> None:
-        """Patch each deferred reference field's annotation to its (nullable)
-        target Strawberry type, now that every endpoint type is in the cache.
+        """Patch each deferred reference field's annotation to its target
+        Strawberry type, now that every endpoint type is in the cache.
 
         Strawberry resolves a field's type lazily at schema-conversion, so the
         annotation set here — after ``create_type`` — is the one the schema
-        sees. Nullable so an absent reference (a ``None`` / missing edge)
-        validates without a non-null GraphQL violation.
+        sees. A scalar edge becomes ``Target | None`` (nullable, so an absent
+        reference validates without a non-null violation); a list edge (#103)
+        becomes ``list[Target | None]`` — a non-null list (empty → ``[]``) of
+        nullable elements (a dangling element resolves to ``null``, ADR-003).
         """
-        still_pending: list[tuple[StrawberryField, str]] = []
-        for field, typename in self._pending_refs:
+        still_pending: list[tuple[StrawberryField, str, bool]] = []
+        for field, typename, is_list in self._pending_refs:
             target = self._types.get(typename)
             if target is None:
-                still_pending.append((field, typename))
+                still_pending.append((field, typename, is_list))
                 continue
-            field.type_annotation = StrawberryAnnotation(target | None)
+            annotation = list[target | None] if is_list else target | None
+            field.type_annotation = StrawberryAnnotation(annotation)
         self._pending_refs = still_pending
 
 

@@ -78,6 +78,31 @@ def referenced_entities(core_type: Any) -> tuple[type, ...]:
     return tuple(seen.values())
 
 
+def list_ref_target(core_type: Any) -> type | None:
+    """The single ``@entity`` referent of a **list-valued** reference field, or ``None``.
+
+    The #30 multi-valued edge — ``list[Lazy[T]]`` adjacency, or a plain
+    ``list[T]`` / ``tuple[T, ...]`` of ``@entity`` — is the one shape both web
+    targets must reflect as a *list of edges* rather than a single scalar edge
+    (story #103). :func:`referenced_entities` cannot tell a list edge from a
+    scalar ref because it flattens through containers (``list[Lazy[Mineral]]``
+    and ``Lazy[Mineral] | None`` both yield ``(Mineral,)``); the list-ness lives
+    in the container origin, so detection tests ``get_origin(core_type)`` here
+    instead — the deliberate split called out in the story.
+
+    Returns the lone referent class when ``core_type`` is a ``list``/``tuple``
+    whose element type bottoms out on exactly one ``@entity`` (homogeneous
+    one-to-many adjacency); ``None`` for a list of scalars (no referent) or a
+    list whose elements are a union of several entities (out of scope for v1's
+    single-target reflection, mirroring the scalar reference rule).
+    """
+    inner = _strip_annotated(core_type)
+    if get_origin(inner) not in (list, tuple):
+        return None
+    targets = referenced_entities(inner)
+    return targets[0] if len(targets) == 1 else None
+
+
 def _collect_entities(hint: Any, seen: dict[int, type]) -> None:
     while get_origin(hint) is Annotated:
         hint = get_args(hint)[0]
