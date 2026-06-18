@@ -1,9 +1,13 @@
 # datacrystal
 
 [![ci](https://github.com/semanticworks-gmbh/datacrystal/actions/workflows/ci.yml/badge.svg)](https://github.com/semanticworks-gmbh/datacrystal/actions/workflows/ci.yml)
-[![version](https://img.shields.io/badge/version-0.6.0-blue)](CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-0.7.0-blue)](CHANGELOG.md)
 [![python](https://img.shields.io/badge/python-3.14-blue)](.python-version)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
+<p align="center">
+  <img src="assets/hero.png" alt="datacrystal hero — unstructured documents on the left flow rightward and crystallize into an ordered, faceted data crystal in the brand's navy, blue and teal" width="100%">
+</p>
 
 **Your live objects are the database.** Define typed dataclasses, mutate them, call `commit()`.
 datacrystal keeps the whole graph durable and queryable across restarts — same objects, same
@@ -125,15 +129,15 @@ from GitHub:
 
 ```bash
 # add it to your project (uv) — pin a release tag…
-uv add "datacrystal @ git+https://github.com/semanticworks-gmbh/datacrystal@v0.6.0"
+uv add "datacrystal @ git+https://github.com/semanticworks-gmbh/datacrystal@v0.7.0"
 # …or track main
 uv add "datacrystal @ git+https://github.com/semanticworks-gmbh/datacrystal@main"
 
 # pip works the same way
-pip install "datacrystal @ git+https://github.com/semanticworks-gmbh/datacrystal@v0.6.0"
+pip install "datacrystal @ git+https://github.com/semanticworks-gmbh/datacrystal@v0.7.0"
 
 # need an extra? name it in the brackets
-uv add "datacrystal[web] @ git+https://github.com/semanticworks-gmbh/datacrystal@v0.6.0"
+uv add "datacrystal[web] @ git+https://github.com/semanticworks-gmbh/datacrystal@v0.7.0"
 ```
 
 The example at the top is a complete program — run it twice and the data is still there.
@@ -171,5 +175,5 @@ datacrystal is maintained solo by Sven Hodapp; issues and small focused PRs are 
 [docs/design/ROADMAP.md](docs/design/ROADMAP.md) for what is in and out of scope (the *Punted*
 and *Never* lists). Per-release changes live in the [CHANGELOG](CHANGELOG.md).
 
-Status: **0.6.0** — the API froze at the v0.1.0 baseline; v0.2–0.6 are purely additive.
+Status: **0.7.0** — the API froze at the v0.1.0 baseline; v0.2–0.7 are purely additive.
 PyPI publication deferred (names reserved). License: [MIT](LICENSE).
