@@ -110,6 +110,21 @@ stale venv shebangs — `rm -rf .venv && uv sync`.
   are cut into their own issue + sprint only when actually pulled — never bulk-create sub-issues
   ahead of need.
 
+## Sprint token accounting
+
+- **Every sprint records its token spend, and the sprint PR cites it** — planning *and*
+  development — as a one-line `Token ledger:` in the PR body, so the cost of agent-driven delivery
+  is in the open and pitchable. Numbers are **output-token counts** (the comparable figure across
+  runs), never wall-clock.
+- **Where the numbers come from:** *planning analysis* = the planning `Workflow`'s reported
+  `subagent_tokens` (in the task-completion notification) **plus** the planning session's `/cost`;
+  *development* = each implementation session's `/cost` **plus** any implementation `Workflow`'s
+  `subagent_tokens`. (`npx ccusage@latest session` reads the local transcripts if a per-session
+  breakdown is wanted.)
+- **Ledger format** (in the PR body): `Token ledger: planning ≈ N tok · development ≈ M tok
+  (K agents, T tool calls)`. Capture the planning figure when planning closes; append the
+  development figure at PR-open time.
+
 ## Architecture map (`src/datacrystal/`)
 
 | Module | Role |
