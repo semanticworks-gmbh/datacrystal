@@ -178,7 +178,7 @@ So v0 ≈ **an HTTP transport (read tail + submit) + a snapshot encoder + a foll
 coordinator-side dedup/key-resolve step**, on locked contracts. The correctness-critical
 machinery already exists and is conformance-tested.
 
-## 4. Transport (v0 = four verbs)
+## 4. Transport (v0 = four data verbs + a trivial `/head`)
 
 Writer-served HTTP, msgpack frames reusing the COMMIT-DELTA-v1 wire format. **Outbound-only**
 (NAT-friendly): the edge follower GETs the tail and POSTs contributions; it never listens.
@@ -189,11 +189,26 @@ Writer-served HTTP, msgpack frames reusing the COMMIT-DELTA-v1 wire format. **Ou
 | `GET /v1/deltas?after=<tid>` | catch-up **and** live tail (same endpoint, held open); ordered frames; re-bootstrap signal if `<tid>` is below the retention horizon |
 | `POST /v1/submit` | contribute-write fan-in; idempotency-keyed batch; returns `{applied_tid, key→oid}` |
 | `GET /v1/types` | type-lineage schema (for the shared-package fallback, §6) |
+| `GET /v1/head` | the coordinator's current `last_tid` — a trivial liveness probe **and** the followers' "how far behind am I" reference |
 
-- **Live tail = the held-open `/deltas` response, not a second mechanism** (CouchDB `_changes`
-  model: `since=<watermark>` resume, same call held open for live). **SSE is an optional packaging
-  of this, deferred** — v0 can ship pull + held-open response and add an `Accept:
-  text/event-stream` variant later.
+**Three delivery modes, one endpoint — start simple, upgrade transparently.** `?after=<tid>` is the
+whole contract; the follower's logic ("apply after my watermark, advance") is identical across all
+three, so you can begin with plain polling and move to long-poll or SSE later with **zero** protocol
+or follower-logic change:
+
+| Mode | v0? | Latency | Moving parts |
+|---|---|---|---|
+| **Plain poll** | ✅ default | = poll interval | fewest — periodic GET, empty if nothing new |
+| **Long-poll** (held-open GET until a delta or timeout) | cheap upgrade | near-real-time | one held connection; CouchDB `feed=longpoll` |
+| **SSE** (server pushes frames) | deferred | lowest | streaming-connection management |
+
+For an indexer, eventual-consistency lag is fine by construction, so **plain polling is enough for
+v0**; long-poll is the cheap middle if near-real-time is wanted before committing to SSE.
+
+- **Observability falls out of the poll** — the sync poll already tells the follower its
+  `delta_lag` (local watermark vs `/v1/head`) and its connectivity, so a follower needs **no
+  separate healthcheck loop**. The coordinator stays **stateless re: followers** in v0 (no follower
+  registry — cut-list §8); follower liveness is the follower's/orchestrator's concern.
 - **The watermark is the source of truth.** A dropped/duplicated frame costs nothing: reconnect
   and reconcile from the watermark; COMMIT-DELTA-v1 is apply-twice ≡ apply-once.
 - **Snapshots are never streamed on the delta channel** — separate one-shot GET (Debezium/Kafka
@@ -277,6 +292,31 @@ This mirrors the precedent already in `datacrystal[web]`: reflection turns an `@
 REST/GraphQL with one call. Federation is the same move for the *machine-to-machine* path — the
 mountable router + `open_follower()` are the public surface; the L1 engine sits behind them. A
 **library you call into**, not a framework that owns your app's shape.
+
+**Polling — automatic by default, explicit if you want control.** `open_follower()` runs the
+sync poll loop for you (plain poll in v0, §4); reads are always served from the local replica at
+the latest applied watermark, and `delta_lag`/`watermark` are exposed so no separate healthcheck
+loop is needed. An app that prefers to drive sync itself (sync-on-demand, or to interleave with its
+own work) can turn the loop off and call `sync()`:
+
+```python
+# Automatic (default): background poll keeps the replica current
+store = dc.open_follower("https://coordinator", api_key=..., poll_interval=2.0)
+...
+if store.delta_lag > 0:
+    log.info("behind coordinator by %d commits", store.delta_lag)   # observability for free
+
+# Explicit: drive the poll yourself (one GET /v1/deltas?after=<watermark> per call)
+store = dc.open_follower("https://coordinator", api_key=..., auto_poll=False)
+while running:
+    applied = store.sync()          # fetch+apply deltas after the watermark; returns count
+    reindex_changed(store)          # your indexing work against the now-current replica
+    store.commit()                  # contribute results back (fan-in; loud on conflict/skew)
+    time.sleep(2.0)
+```
+
+(Illustrative names — nothing shipped.) Upgrading to long-poll or SSE later changes only the
+transport inside `open_follower`/`sync`, not this code.
 
 **Auth & extensibility — you bring authentication; the router stays agnostic.** Following the
 existing web extra's seam (dependency injection — `get_store`/`read_snapshot`/`submit_write` are all
