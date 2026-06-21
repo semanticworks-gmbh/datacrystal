@@ -161,6 +161,27 @@ none seeing the design) returned **proceed-with-changes**:
   large store stalls (mitigated only once the snapshot encoder lands — §5). The standing warning:
   replication is a **permanent correctness surface**, so v0 must be honestly small.
 
+### Decision provenance
+
+Each load-bearing choice was coined from a prior system's scar or principle; the full evidence +
+citations are the **literature appendix**
+([fractal-followers-prior-art.md](2026-06-20-fractal-followers-prior-art.md), referenced as **[PA]**).
+
+| Decision | Coined from |
+|---|---|
+| Single-writer; no multi-writer/CRDT | CRDTs don't preserve invariants for free → **ElectricSQL** pivot; multi-master hides conflicts → **CouchDB**; custom consensus = maintenance sink → **dqlite** [PA §2] |
+| Logical deltas (reuse COMMIT-DELTA-v1), not physical pages | page replication is wasteful → **Turso** CDC rewrite (8.9–312×) [PA §2] |
+| Snapshot + resumable `since=<watermark>` log over HTTP | the proven change-feed → **CouchDB `_changes`**; snapshot-then-stream → **Debezium/Litestream** [PA §2] |
+| Bootstrap completeness (checksum before serving) | silent corrupt replica → **Turso #5971**; rolling checksum → **LiteFS** [PA §3] |
+| OCC detection, never silent LWW | hidden-conflict data loss → **CouchDB**; tunable read-consistency → **rqlite** [PA §3] |
+| Idempotency key for fan-in writes | lost-ack ambiguity, at-least-once → **Stripe/Brandur/DBOS** [PA §2 fundamentals] |
+| Read-your-writes via watermark, opt-in | TXID cookie → **LiteFS**; session guarantees → **Terry/Bayou** [PA §3] |
+| Retention horizon → re-bootstrap | slow consumer fills disk → **Debezium slots**; generations → **Litestream**; tombstone resurrection → **Kafka** [PA §3] |
+| Avoid FUSE / avoid broker | FUSE ~100 tx/s + ops → **LiteFS**; broker ops cost → **transport memo** [PA §2] |
+| Partial replication deferred → "many small stores" | the universal tax → **ElectricSQL shapes / PowerSync buckets / CouchDB filters** [PA §2] |
+| "Remote ≠ local" honesty in the write path | **Waldo** (*A Note on Distributed Computing*); the **Fallacies** [PA §2 fundamentals] |
+| Single-writer + command fan-in spine | **Single Writer Principle** (Thompson/LMAX); Actor model; DBOS/Celery `concurrency=1` [PA §3] |
+
 ## 7. Next steps
 
 1. **Decision (yours):** sequence the tracer bullet vs the search/index roadmap. Persona is settled;

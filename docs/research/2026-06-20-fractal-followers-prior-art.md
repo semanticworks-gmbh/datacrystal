@@ -1,9 +1,12 @@
-# Fractal followers — prior art, experiences & pros/cons (research memo, 2026-06-20)
+# Fractal followers — literature & evidence appendix (research memo, 2026-06-20)
 
-**Status: research input** to [2026-06-20-fractal-followers.md](2026-06-20-fractal-followers.md)
-(the design) and ROADMAP item 21. No commitment implied. Every claim is sourced in §4; a few
-figures are marked *unverified* where a primary source could not be confirmed. Companion to the
-earlier transport memo ([2026-06-11-replication-transports.md](2026-06-11-replication-transports.md)).
+**Status: the evidence appendix** for [2026-06-20-fractal-followers.md](2026-06-20-fractal-followers.md)
+(the design) and ROADMAP item 21. This is the **literature section**: the systems studied, what
+worked, what bit them, the load-bearing lessons, and the citations behind every claim in the design.
+The design's *Decision provenance* table (§6) maps each choice back here (cited as **[PA]**). No
+commitment implied. Every claim is sourced in §4; a few figures are marked *unverified* where a
+primary source could not be confirmed. Companion to the transport memo
+([2026-06-11-replication-transports.md](2026-06-11-replication-transports.md)).
 
 ## 1. Why this memo
 
@@ -87,7 +90,7 @@ and *away* from CRDT/multi-master cores — including the team that invented CRD
 14. **Async replication has an inherent sub-second loss window — document it, don't pretend otherwise** (Litestream/LiteFS).
 15. **Make any lossy decision loud** (CouchDB's silent conflict-burial is the anti-pattern; aligns with our loud-error invariants).
 
-## 4. Citations
+## 4. Literature & citations
 
 Grouped; URL + the specific claim it backs. A few figures are flagged *unverified*.
 
