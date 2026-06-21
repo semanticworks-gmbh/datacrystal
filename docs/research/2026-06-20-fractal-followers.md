@@ -32,9 +32,10 @@ write patterns, and only one is hard:
   type has a **natural/unique key** (a document's path, a URL, a content hash), this is
   **idempotent by construction** — `upsert`-by-key applied twice ≡ once — so the scary parts
   (retry-double-apply, conflict resolution) simply do not fire.
-- **Concurrent edit of shared state (deferred):** two writers mutating the *same field of the same
-  existing entity*. This is where conflict policy, optimistic-reject and read-your-writes machinery
-  live. The indexer persona does **not** need it, so v0 does not ship it.
+- **Concurrent edit of shared state (resolution deferred):** two writers mutating the *same field of
+  the same existing entity*. v0 **detects this and rejects it loudly** (§3c) — it never silently
+  last-write-wins; what it defers is *automatic resolution* (auto-merge/LWW/CRDT) and the
+  read-your-writes dial. The indexer persona doesn't need those, so v0 ships detect-and-reject only.
 
 So v0 reuses already-locked, already-tested contracts (COMMIT-DELTA-v1 for the read tail; `Unique`
 indexes + key-merge `upsert` for idempotent contribution) plus a thin HTTP transport. That is why
@@ -100,13 +101,60 @@ Under the hood `commit()` on a follower:
 4. the same change also arrives on the delta tail (idempotent — already applied by OID), advancing
    the follower's watermark so the contribution becomes visible in the local replica.
 
+**Same code shape as a local write.** The app calls `store()`/`upsert()` to *earmark* (buffer)
+and `commit()` to flush — identical to a local store. The one honest difference (Waldo): a local
+`commit()` writes locally and always succeeds barring validation; a follower `commit()` is a
+**network fan-in** that can be rejected loudly (§3c). The buffering, dirty-tracking and graph
+discovery are reused unchanged.
+
 **What makes this the *easy* write case** (see §1): contributed types carry a natural key, so step 2
 is idempotent (re-`upsert` by path/URL/hash is a no-op, not a duplicate — a network blip after
 apply-before-ACK is safe to retry); existing cloud entities are referenced by their real OID (read
 from the replica); new own-entities are referenced by natural key and resolved by the coordinator.
-None of the conflict/optimistic-reject machinery is needed because nothing edits a shared field.
+No conflict-*resolution* machinery is needed — but the coordinator still *detects* a genuine
+collision and refuses loudly rather than silently overwriting (§3c).
 
-### 3c. What is net-new vs reused — the minimality claim
+### 3c. Loud conflict detection (not silent last-write-wins)
+
+A contribution that would overwrite a shared field someone else changed must **fail loudly**, never
+silently last-write-win — silent LWW is the CouchDB "hidden conflict = data loss" anti-pattern and
+violates datacrystal's *"make any lossy decision loud"* invariant. So v0 ships conflict
+**detection**, and defers only conflict **resolution policy** (auto-merge/LWW/CRDT — §7):
+
+- **Insert-only / new key:** if the contributed natural key already exists, the coordinator raises
+  `UniqueViolationError` — **already enforced today** (unique indexes validate in P1, pre-durability).
+  Zero new conflict code. Covers "add new documents I found".
+- **Optimistic concurrency for re-enrich:** the follower sends the base version it read (the
+  entity's last-write TID — `StoredRecord.tid` already records "the commit that wrote it"); the
+  coordinator compares and raises `ConflictError` if the entity moved since. The app re-reads and
+  retries. Small new plumbing (carry the base version out and back); no engine surgery.
+
+The coordinator is a normal datacrystal writer, so detection is just `get(Type, key=…)` →
+compare → `upsert`/`commit` or raise — no new storage machinery.
+
+### 3d. Why this is a facade, not a new storage backend
+
+Tempting but **wrong**: implementing the federation as an alternative `StorageBackend` (the
+`boot/load_many/scan_type/apply/read_view` Protocol). By the time `apply(CommitBatch)` runs, OIDs
+are **already minted** (at `store()` time — `_register_graph`, `_store.py:2056`) and the **TID is
+already allocated** (P1) — from the *follower's* sequence, which the coordinator does not own. A
+fan-in backend would ship follower-local OIDs/TIDs that diverge from the authoritative ones.
+
+So write-redirect must sit **above** the engine, at the `Store` facade's `commit()`, where it can
+serialize *intent* (new entities by natural key + fields + base version; existing refs by real OID)
+and let the coordinator allocate. Consequence — the reuse/new split:
+
+- **Read replica = a normal local store** (sqlite/memory backend) fed by the existing `deltalog`
+  applier over the network tail. ~100% reuse; reads work unchanged; **not** a new backend.
+- **Follower = a thin facade** that overrides `commit()` to fan in (and runs a delta-apply loop).
+  The object engine, dirty tracking, codec, indexes, query planner, snapshots, delta format,
+  delta applier and storage backends are all **reused**. Net-new is the transport, the snapshot
+  encoder, the follower's `commit()` override, and the coordinator-side dedup/key-resolve/detect.
+
+(If ever built, the follower's "new entity gets a local OID at `store()`, coordinator reassigns the
+real one" remapping deserves an ADR — it is facade-level, not engine-level.)
+
+### 3e. What is net-new vs reused — the minimality claim
 
 | Need | Provided by (today) | Net-new in v0 |
 |---|---|---|
@@ -176,10 +224,13 @@ Each is a real failure mode from prior art; most are already guaranteed by datac
      existing entities by real OID and its own new entities by natural key; the coordinator
      resolves keys→OIDs (including intra-batch references) and returns the map. A follower never
      mints shared-graph OIDs.
+8. **Loud conflict detection (§3c).** A genuine collision (key already exists, or the base version
+   moved) is rejected with `UniqueViolationError`/`ConflictError`, never silently overwritten.
+   Resolution policy is deferred (§7); detection is in v0.
 
 Net-new correctness code in v0 is small: the bootstrap checksum guard (#1), surfacing gaps as
-re-bootstrap (#2), the retention window + horizon check (#5), backoff (#6), and the
-coordinator-side dedup/key-resolve (#7). The rest is reuse.
+re-bootstrap (#2), the retention window + horizon check (#5), backoff (#6), the coordinator-side
+dedup/key-resolve (#7) and conflict detection (#8). The rest is reuse.
 
 ## 6. Schema distribution
 
@@ -191,17 +242,46 @@ coordinator-side dedup/key-resolve (#7). The rest is reuse.
 - **Private types** live in the follower's own local store (a separate `Store` the app opens). No
   unified two-store façade in v0 — keep it out until demand is real.
 
+## 6a. Developer experience — a library, not a framework
+
+The whole point of L2 (helpers, in `datacrystal[web]`) is that an app developer writes **their
+domain + their indexing logic**, and *nothing* of the replication machinery (no sync loop, no delta
+plumbing, no submit endpoint, no OID reassignment). Two entry points:
+
+```python
+# COORDINATOR app — a normal datacrystal app; mount one router to federate
+store = dc.Store.open("cabinet.store")
+app = FastAPI()
+app.include_router(dc.web.federation_router(store))   # serves /v1/snapshot, /deltas, /submit
+# (optionally also dc.web's existing reflection router for browser REST/GraphQL)
+
+# FOLLOWER app (e.g. a MacBook markdown indexer behind NAT) — one call gets a synced replica
+store = dc.open_follower("https://coordinator", api_key=...)
+known = {d.path for d in store.query(Document)}       # fast LOCAL read of the shared graph
+for path in scan_local_files():                       # specialised data only this node sees
+    if path not in known:
+        store.upsert(Document(path=path, text=extract(path)))
+store.commit()                                        # fan-in to the coordinator (loud on conflict)
+```
+
+This mirrors the precedent already in `datacrystal[web]`: reflection turns an `@entity` into
+REST/GraphQL with one call. Federation is the same move for the *machine-to-machine* path — the
+mountable router + `open_follower()` are the public surface; the L1 engine sits behind them. A
+**library you call into**, not a framework that owns your app's shape.
+
 ## 7. The harder write path (deferred — what v0 deliberately omits)
 
-Contribute-writes (§3b) is **in**. What stays out is **concurrent editing of the same shared
-state**, because that is where the genuinely hard distributed-systems decisions live:
+Contribute-writes (§3b) is **in**, and v0 *detects* conflicts loudly (§3c). What stays out is
+conflict **resolution** — automatically reconciling **concurrent edits of the same shared field** —
+because that is where the genuinely hard distributed-systems decisions live:
 
-1. **Conflict policy for shared fields.** Two writers (or a follower and the coordinator) mutate
-   the same field of the same existing entity. The intended model when this lands is
-   **LWW-with-authority** (the coordinator is authoritative; `upsert` already writes only changed
-   fields) — *not* CRDT (ElectricSQL abandoned that; preserving invariants under merge needs
-   unbounded machinery). For callers needing stronger guarantees, an **opt-in optimistic-reject**
-   (`expected_prior_tid` → `ConflictError`) is the rqlite-style lever.
+1. **Conflict resolution policy for shared fields.** When two writers mutate the same field of the
+   same existing entity, v0 rejects loudly and the app retries. *Automatic* reconciliation is
+   deferred; the intended model when it lands is **LWW-with-authority** (the coordinator is
+   authoritative; `upsert` already writes only changed fields) — *not* CRDT (ElectricSQL abandoned
+   that; preserving invariants under merge needs unbounded machinery). The opt-in optimistic-reject
+   (`expected_prior_tid` → `ConflictError`) is already the v0 *detection* lever (§3c); what's
+   deferred is any auto-merge on top of it.
 2. **A read-your-writes / freshness dial.** After a fan-in, the replica reflects the change only
    when the delta loops back. v0's indexer pattern does not need synchronous self-reads; when
    shared-edit workflows arrive, offer `submit()`-returns-TID + `wait_for(tid)` (LiteFS's
@@ -288,10 +368,12 @@ keeping error-translation in sync — both bounded.
 ## 12. Open questions (decision-forcing — for review)
 
 1. **Is contribute-writes the right v0 write scope** (insert/own-edge upsert, idempotent by natural
-   key) — with concurrent shared-field edits explicitly deferred? Confirms the persona is served
-   without opening conflict resolution.
+   key) — with conflict **resolution** deferred but loud **detection** (§3c) in? Confirms the
+   persona is served without a silent-LWW footgun.
 2. **Natural-key requirement:** acceptable to *require* a `Unique` key on contributed types (with a
    batch idempotency key as the keyless fallback)? This is the linchpin of low-risk contribution.
+2b. **Detection level for re-enrich:** is unique-key-collision rejection enough for v0, or is the
+   optimistic-concurrency check (carry the base TID, reject on staleness) wanted from the start?
 3. **Packaging:** both the coordinator router *and* the `open_follower()` client live in
    `datacrystal[web]` (one extra), correct? Or a separate `datacrystal[replica]` for the client.
 4. **Schema:** require the shared Python package and **cut** `/v1/types` synthesis from v0?
