@@ -323,6 +323,46 @@ because that is where the genuinely hard distributed-systems decisions live:
 These are well-understood but not "minimal," and the indexer persona doesn't need them — so they
 wait for an explicit decision (§12).
 
+## 7a. Schema evolution under rollout skew
+
+Schema changes reach nodes at different times. datacrystal's evolution is **additive type-lineage,
+not strict version-equality** (invariant 8): each shape change mints a new `cid`; records decode by
+name, filling missing fields from defaults and silently ignoring unknown ones. So a coordinator and
+follower on different versions of the same typename do **not** reject each other on sight — but the
+two rollout directions are **asymmetric**, and one hides a silent-loss trap.
+
+- **Coordinator-first (coordinator newer) — safe.** A follower submits an old-shape record; the
+  coordinator hydrates through its newer class. A new field **with a default** fills silently
+  (*accepted*); a new field **without a default** raises `SchemaMismatchError` in P1 — a **loud
+  reject** until the follower upgrades. An old follower reading the coordinator's newer deltas just
+  *ignores* fields it doesn't know → a truncated **view** (read-blindness), not data loss. So
+  coordinator-first only rejects for *non-additive* changes; additive ones flow through.
+- **Follower-first (follower newer) — silent-loss trap.** A newer follower contributes a field the
+  coordinator's class lacks. The naive fan-in (coordinator reconstructs through its own class +
+  `upsert`, which iterates only the coordinator's field names — `_store.py:690`) **silently drops
+  the extra field; the commit succeeds, no error.** This is the CouchDB hidden-loss anti-pattern,
+  and it is **not** recovered when everyone upgrades — the data was never written.
+
+So **schema compatibility self-heals** once all nodes upgrade, but **data silently truncated in a
+follower-first window is gone** — this is *not* free; it needs a guard. Two safe designs:
+
+- **Guard + coordinator-first discipline (minimal, v0):** the coordinator validates the submitted
+  record's `cid`/field-set against its known lineage for that typename (`_cids_by_typename` already
+  exists; the delta applier already rejects unknown cids — `applier.py:126`). Unknown →
+  `SchemaSkewError` **loudly**, instead of dropping. Turns follower-first into a clean "upgrade the
+  coordinator first" error. O(1) lookups.
+- **Store-by-lineage (fuller fidelity, later):** the coordinator persists the submitted record under
+  its shipped lineage (as the delta applier already does for reads), preserving forward fields it
+  can't yet interpret — follower-first then also works, the coordinator merely read-blind to the new
+  field until it upgrades. More work (persist a record whose class it lacks; decode only the known
+  key fields for OID/key resolution).
+
+**Recommendation:** roll out **coordinator-first** and build the **cid-lineage guard** so
+follower-first fails loudly, never silently. Then self-healing holds for the schema in both
+directions and no write is ever silently truncated. (Store-by-lineage is the optional upgrade for
+true follower-first fidelity.) If this becomes scope, the guard + the fan-in decode policy warrant
+an ADR (storage/contract-adjacent).
+
 ## 8. Out of scope (the cut-list)
 
 - **Concurrent shared-field edits + conflict dial** (§7) — deferred; contribute-writes covers the
@@ -410,6 +450,9 @@ keeping error-translation in sync — both bounded.
 3. **Packaging:** both the coordinator router *and* the `open_follower()` client live in
    `datacrystal[web]` (one extra), correct? Or a separate `datacrystal[replica]` for the client.
 4. **Schema:** require the shared Python package and **cut** `/v1/types` synthesis from v0?
+4b. **Schema-skew guard (§7a):** confirm coordinator-first rollout + a cid-lineage guard on `/submit`
+   (loud `SchemaSkewError` on unknown shape) for v0 — with store-by-lineage as a later fidelity
+   upgrade? Without the guard, follower-first rollout silently truncates contributed fields.
 5. **Retention horizon default** for the delta window (time / commit-count / both) — and is
    "aged-out follower → hard re-bootstrap" acceptable v0 behaviour?
 6. **Snapshot encoding:** reuse the web snapshot-pool view, or a dedicated chunked encoder from the
