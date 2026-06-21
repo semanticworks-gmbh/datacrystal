@@ -119,18 +119,26 @@ collision and refuses loudly rather than silently overwriting (§3c).
 A contribution that would overwrite a shared field someone else changed must **fail loudly**, never
 silently last-write-win — silent LWW is the CouchDB "hidden conflict = data loss" anti-pattern and
 violates datacrystal's *"make any lossy decision loud"* invariant. So v0 ships conflict
-**detection**, and defers only conflict **resolution policy** (auto-merge/LWW/CRDT — §7):
+**detection**, and defers only conflict **resolution policy** (auto-merge/LWW/CRDT — §7).
 
-- **Insert-only / new key:** if the contributed natural key already exists, the coordinator raises
-  `UniqueViolationError` — **already enforced today** (unique indexes validate in P1, pre-durability).
-  Zero new conflict code. Covers "add new documents I found".
-- **Optimistic concurrency for re-enrich:** the follower sends the base version it read (the
-  entity's last-write TID — `StoredRecord.tid` already records "the commit that wrote it"); the
-  coordinator compares and raises `ConflictError` if the entity moved since. The app re-reads and
-  retries. Small new plumbing (carry the base version out and back); no engine surgery.
+**v0 chooses optimistic concurrency (OCC) as the detection rule** — it is a strict superset of
+insert-only and handles both cases under one uniform check:
 
-The coordinator is a normal datacrystal writer, so detection is just `get(Type, key=…)` →
-compare → `upsert`/`commit` or raise — no new storage machinery.
+- The follower sends, per contributed entity, the **base version** it read — either *"new"* (this
+  key should not exist) or the entity's last-write TID (`StoredRecord.tid` already records "the
+  commit that wrote it").
+- The coordinator compares and applies only if the base still holds; otherwise it raises loudly —
+  `UniqueViolationError` (a *"new"* key already exists) or `ConflictError` (the entity moved since
+  the follower read it). The app re-reads and retries.
+
+This is the rule the indexer persona actually needs: it covers **insert** (base *"new"*) *and*
+**safe update** (re-index a changed file → update `Document.text` only if it hasn't moved), without
+the v0→later **semantic break** that insert-only would force the day an update is required.
+Insert-only is just the special case `base = "new"` always — appropriate for genuinely append-only
+data (events, immutable docs), and a possible *per-type* refinement later, but not the v0 default.
+The new plumbing is small (carry the base version out and back); no engine surgery — the
+coordinator is a normal datacrystal writer, so detection is just `get(Type, key=…)` → compare →
+`upsert`/`commit` or raise.
 
 ### 3d. Why this is a facade, not a new storage backend
 
@@ -224,9 +232,10 @@ Each is a real failure mode from prior art; most are already guaranteed by datac
      existing entities by real OID and its own new entities by natural key; the coordinator
      resolves keys→OIDs (including intra-batch references) and returns the map. A follower never
      mints shared-graph OIDs.
-8. **Loud conflict detection (§3c).** A genuine collision (key already exists, or the base version
-   moved) is rejected with `UniqueViolationError`/`ConflictError`, never silently overwritten.
-   Resolution policy is deferred (§7); detection is in v0.
+8. **Loud conflict detection via OCC (§3c).** Each contribution carries the base version it read;
+   the coordinator rejects with `UniqueViolationError` (a *"new"* key already exists) or
+   `ConflictError` (the entity moved) — never a silent overwrite. Resolution policy is deferred
+   (§7); detection is in v0.
 
 Net-new correctness code in v0 is small: the bootstrap checksum guard (#1), surfacing gaps as
 re-bootstrap (#2), the retention window + horizon check (#5), backoff (#6), the coordinator-side
@@ -268,6 +277,28 @@ This mirrors the precedent already in `datacrystal[web]`: reflection turns an `@
 REST/GraphQL with one call. Federation is the same move for the *machine-to-machine* path — the
 mountable router + `open_follower()` are the public surface; the L1 engine sits behind them. A
 **library you call into**, not a framework that owns your app's shape.
+
+**Auth & extensibility — you bring authentication; the router stays agnostic.** Following the
+existing web extra's seam (dependency injection — `get_store`/`read_snapshot`/`submit_write` are all
+`Depends`, and `create_app(path, routers=[...])` only composes routers), the federation router
+carries **no** built-in auth. You inject your own — API key, JWT, OAuth introspection, mTLS header —
+as a FastAPI dependency:
+
+```python
+async def verify(request: Request) -> Principal:
+    return await my_auth.check(request.headers.get("authorization"))   # raise 401/403 yourself
+
+app.include_router(dc.web.federation_router(store), dependencies=[Depends(verify)])
+```
+
+Three levers, none requiring a fork: **route/router-level `dependencies=[Depends(...)]`** (your
+auth + principal); **middleware** (rate-limit, CORS, IP allowlist); **selective mount** (it is a
+plain `APIRouter` — mount under a prefix, skip a route and supply your own, or wrap `/submit` to
+enforce per-principal authorization, e.g. "this key may contribute `Document` but not `Mineral`").
+Symmetric on the client: `open_follower(url, …)` takes configurable credentials (`api_key=` /
+`headers=` / an `auth=` callable) so the follower sends whatever the coordinator expects. The
+commitment: **the router ships the federation *mechanism*; the app owns authentication and
+authorization.**
 
 ## 7. The harder write path (deferred — what v0 deliberately omits)
 
@@ -372,8 +403,10 @@ keeping error-translation in sync — both bounded.
    persona is served without a silent-LWW footgun.
 2. **Natural-key requirement:** acceptable to *require* a `Unique` key on contributed types (with a
    batch idempotency key as the keyless fallback)? This is the linchpin of low-risk contribution.
-2b. **Detection level for re-enrich:** is unique-key-collision rejection enough for v0, or is the
-   optimistic-concurrency check (carry the base TID, reject on staleness) wanted from the start?
+2b. **Detection rule — DECIDED: OCC (§3c).** v0 uses optimistic concurrency (carry the base
+   version, reject on staleness) rather than insert-only, because the indexer re-indexes changed
+   files and so needs safe *update*, not just insert. Insert-only stays a possible per-type
+   refinement, not the default.
 3. **Packaging:** both the coordinator router *and* the `open_follower()` client live in
    `datacrystal[web]` (one extra), correct? Or a separate `datacrystal[replica]` for the client.
 4. **Schema:** require the shared Python package and **cut** `/v1/types` synthesis from v0?
