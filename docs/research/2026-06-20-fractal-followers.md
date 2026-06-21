@@ -55,6 +55,17 @@ ordinary local `Store` the app opens itself, no special routing in v0.
 Because the codebase is symmetric, a follower *could* later be promoted to coordinator (failover,
 §8) — the architecture enables it; v0 does not ship it.
 
+**Persona — validated (dogfood), 2026-06-21.** This is not a speculative persona: the maintainer
+runs a cloud datacrystal instance and wants edge indexers that (a) read the shared graph locally and
+(b) contribute back — including doing the *heavy compute on the edge* (local LLMs via Ollama:
+embeddings, extraction) so the **cloud machine can stay small**. The architecture fits that workload
+well: reads scale *out to the edge* (each node serves its own graph traversals — zero cloud read
+load), the expensive LLM work runs on edge hardware, and only a modest stream of *result* commits
+funnels into the single cloud writer. The single-writer throughput ceiling bites only under
+high-concurrency write storms; periodic indexer contributions are not that. (This resolves the
+strategic red-team's main objection — "unvalidated persona"; the remaining caution is effort/timing,
+addressed by the build order in §12.)
+
 ## 3. v0 — the minimal core (read replica + contribute-writes)
 
 ### 3a. Read path (a remote-fed replica)
@@ -419,6 +430,25 @@ an ADR (storage/contract-adjacent).
   same interface.
 - **Built-in monitoring/alerting** — v0 exposes `watermark`/`delta_lag` hooks; dashboards are docs.
 
+### 8a. Relationship to the object-store backend (item 16) — orthogonal, not an alternative
+
+A natural question: would an S3/object-store backend deliver this instead? **No — they are orthogonal
+layers, and a shared object store hits the *same* coordination wall.** The backend choice
+(SQLite-file vs S3) changes *where the bytes live*, not *who may write*: the single-writer lease
+(invariant 10) and the multi-writer **Never** still hold, so N instances cannot all write to one
+bucket. And readers-off-S3 don't get what the edge needs — reading a live object graph from S3 *per
+query* is high-latency per hop (fatal for multi-hop traversal), so an S3 reader **still** materializes
+a local copy and **still** must learn when the writer committed and catch up — i.e. the
+delta-stream/follower problem again, with S3 as the pipe instead of HTTP. Edge *contribute* is the
+clincher: writing to the shared store is multi-writer (forbidden) or it is fan-in (whether the queue
+is HTTP or S3 objects). So:
+
+- **Object store (item 16)** = the *coordinator's* durability + cheap storage + cross-machine writer
+  **fencing** (and optionally one transport for the delta feed). Makes the cloud writer durable and
+  failover-able.
+- **Fractal-followers** = the multi-node *read-locally + contribute-back* coordination. **Identical
+  problem regardless of backend.** The object store composes *under* it; it does not replace it.
+
 ## 9. Critical review — is the architecture effective?
 
 **Verdict: the topology is proven and right to be single-writer; the risk is seam-detail
@@ -452,6 +482,48 @@ delivers the indexer persona without opening the conflict-resolution can of worm
     types having a unique key; a keyless contribution falls back to the batch idempotency key.
     Document this as a first-class requirement, not an afterthought.
   - **Manual failover is a footgun** without fencing — hence cut (§8).
+
+### 9a. Must-fixes before any build (red-team gate, 2026-06-21)
+
+A fresh, unanchored red-team (independent re-derivation + four adversarial lenses + feasibility
+research, none seeing the design discussion) **converged on the same topology** and confirmed the
+reuse/minimality claim is real — but found six seams the doc *cited* yet never *bound*, plus two
+feasibility footguns. These are contract-and-guard issues, **not** architecture changes; the verdict
+was *proceed-with-changes*, gated on these. **No build ships without them:**
+
+1. **[CRITICAL] cid-lineage guard on `/submit` BEFORE `upsert()`.** Without it, follower-first
+   rollout silently truncates fields (§7a) — the CouchDB anti-pattern, pointed at us. Validate the
+   submitted record's cid/field-set against `_cids_by_typename`; reject unknown with `SchemaSkewError`.
+2. **[CRITICAL] Snapshot completeness + checksum, verified before serving.** The §5.1 guard is
+   *designed, not built*: the snapshot encoder must emit a checksum (xxhash64) and the follower must
+   verify `(watermark, checksum)` before answering a single read — else a commit landing mid-encode
+   yields a corrupt-but-"complete" replica (Turso #5971).
+3. **[HIGH] Intra-batch reference remapping is real engine work, not facade.** OIDs are minted in P1;
+   a batch where entity A references new entity B by natural key needs the fan-in handler to remap
+   refs to assigned OIDs *before* storing. This path **does not exist** and **warrants an ADR**
+   (it touches the OID/commit path, not just a wrapper). Must be explicit + tested (multi-entity
+   cross-ref batch).
+4. **[HIGH] `ConflictError` retry contract.** It must mean *"re-read the entity before retrying —
+   never retry with the stale base version."* Bind this in the docstring + GUIDE, or apps retry
+   stale predicates.
+5. **[HIGH] Hard rate-limit on `GET /snapshot`** (429 + `Retry-After`, per principal) — not "may".
+   Prevents the re-bootstrap thundering herd (100 followers reconnecting at once stall the writer).
+6. **[HIGH/MED] Read-your-writes opacity.** A follower `commit()` is async-from-visibility (the
+   delta must loop back). Document loudly; offer `wait_for(tid)` as the opt-in (post-v0). Undocumented,
+   this becomes a data-loss-on-retry bug.
+
+Plus two **feasibility footguns** to design against from the start:
+- **Concurrent-sync fencing.** Turso corrupts if the local DB is read while syncing; owner
+  confinement (ADR-001) must **fence the background delta-apply against local readers/writers** on
+  the follower — corruption is the worst failure class.
+- **Retention horizon is a two-way cliff with no safe default.** Too long → unbounded log/disk-fill
+  (Debezium's #1 incident); too short → frequent O(full-dataset) re-bootstraps. Requires
+  per-deployment tuning **and** a loud "you've aged out → must re-bootstrap" signal, never silent.
+
+Also reconfirmed: **batch idempotency must validate payload hash on a dedup hit** (else two
+submissions reusing a key with different payloads silently return the first result — §5.7), and the
+**natural-key requirement should be first-class** (a validator/DX warning when a contributed type
+lacks a `Unique` key), not just prose.
 
 ## 10. Performance envelope (honest)
 
@@ -499,8 +571,30 @@ keeping error-translation in sync — both bounded.
    start (large stores stall otherwise)? Checksum: xxhash64 vs sha256?
 7. **When (if ever) the harder write path (§7)?** Confirm LWW-with-authority + opt-in
    optimistic-reject + opt-in `wait_for(tid)` as the intended model when shared-edit demand arrives.
-8. **Does this become scope at all** (item 21 made concrete + a VISION line), or stay an
-   exploration while the search/index roadmap takes priority?
+8. **Does this become scope** (item 21 made concrete + a VISION line)? **Persona is resolved** —
+   the maintainer wants it for a real cloud + edge-indexer/Ollama deployment (§2). The remaining call
+   is *sequencing* vs the search/index roadmap, not whether anyone needs it.
+
+### 12a. Recommended build order (de-risk the effort tail)
+
+The feasibility research's sharpest warning: "reuse the change-log makes it cheap" gives you the easy
+20% (ordering, idempotency) and **none** of the hard 80% (large-store bootstrap, retention-vs-lag,
+reconnection/backpressure, TLS+auth, partial-apply recovery, command-queue durability,
+read-your-writes). To avoid that tail dominating, build in this order — each stage shippable and
+useful alone:
+
+1. **Read-only follower slice first** — `/snapshot` (+ checksum, must-fix #2) + `/deltas` + the
+   follower replica loop, run on a *real* dataset. This is ~all reuse, exercises bootstrap +
+   retention + reconnection on real data, and already delivers "read the cloud graph locally on the
+   edge" — *before* committing to the write path where the multi-quarter risk lives.
+2. **Then contribute-writes + OCC** — `/submit`, the cid-lineage guard (#1), intra-batch remap (#3,
+   with its ADR), `ConflictError` contract (#4). This is the genuinely new, riskier surface; gate it
+   on the must-fixes (§9a).
+3. **Then hardening** — rate-limit (#5), RYW dial (#6), concurrent-sync fencing, retention defaults +
+   alerting. Promotion/failover and partial replication stay out (§8).
+
+Honest scope: stage 1 is weeks; stages 2–3 are the part that is "quarters, done right." Treat
+replication as a **permanent correctness surface**, not a feature that finishes.
 
 ## 13. References
 
