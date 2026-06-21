@@ -41,6 +41,79 @@ So v0 reuses already-locked, already-tested contracts (COMMIT-DELTA-v1 for the r
 indexes + key-merge `upsert` for idempotent contribution) plus a thin HTTP transport. That is why
 it is simultaneously **contribution-capable** and **minimal**.
 
+## 1a. The tracer bullet — concrete v0 (smallest complete + correct slice)
+
+**Scope:** 1 cloud coordinator + 1–~10 edge followers, each an **indexer/annotator owning a data
+segment** (append-mostly contribution — new entities, new owned edges). Bulk migration/rewrite is
+*coordinator* work, never an edge concern, so the edge never needs an exclusive multi-commit window.
+Everything below is complete and correct for that setup; **every cut fails closed** (raises loudly,
+never silently corrupts).
+
+```
+COORDINATOR (cloud)                       FOLLOWER (edge indexer/annotator)
+ dc.Store.open("cabinet.store")            dc.open_follower(url, api_key=, segment="folderX")
+ + DeltaLog attached from TID 0             └─ bootstrap: GET /v1/deltas?after=0 → apply (replay-from-0)
+ + FastAPI federation router                  reads: LOCAL, full speed
+    GET  /v1/head    → {last_tid}            contribute:
+    GET  /v1/deltas?after=<tid> → frames       buffer upsert(Document/Annotation …)
+    POST /v1/submit  → fan-in                  commit() ─POST /v1/submit─▶ store.submit(fn):
+                                                                            cid guard → OCC check
+                                              ◀── {applied_tid, key→oid} ──  → upsert → commit
+                                              block until own delta loops back (sync read-your-writes)
+```
+
+**Endpoints** (coordinator, in `datacrystal[web]`): three — `GET /v1/head` (`{last_tid}`),
+`GET /v1/deltas?after=<tid>` (COMMIT-DELTA-v1 frames from the attached `DeltaLog`; catch-up +
+held-open tail; plain poll in v0), `POST /v1/submit` (runs on the owner thread via `store.submit`:
+**cid-lineage guard → OCC base check → `upsert` → `commit`**, idempotency-keyed, returns
+`{applied_tid, key→oid}`). Auth = an injected FastAPI `Depends`; optional segment-ownership authz.
+
+**Follower** (`open_follower`): open → replay `/v1/deltas?after=0` into a local store (no snapshot
+encoder); reads local; `commit()` = POST `/v1/submit`, blocking until its own delta loops back;
+**single-threaded** (deltas applied on the owner thread via explicit `sync()`/poll → no
+concurrent-sync hazard).
+
+**Data-model rules (load-bearing):** contributed types **must** carry a `Unique` natural key
+(`path`/`url`/`(of, kind)`) — the basis of idempotency + OCC; DX-warn if missing. A `segment`/`source`
+field marks ownership (optionally authz-enforced). A new entity may reference only **existing**
+entities (real OID from the replica), never another new entity in the same batch (loud error
+otherwise) — indexer/annotator contributions fit this naturally (`Annotation(of=<existing-OID>,
+kind="embedding", …)`).
+
+**Reuse vs net-new** (why it's *weeks*): **reuse** = `Store`, `DeltaLog` (replay + tail),
+`store.submit` (fan-in onto the owner), `upsert`/`commit` (apply + crash-safety), `Unique` index,
+msgpack codec, web lifespan/`Depends` — **no snapshot encoder**. **Net-new** = the 3-route router;
+the `/submit` handler (cid guard + OCC + idempotency dedup); `open_follower` (replay bootstrap + pull
+loop + commit-as-submit + sync RYW); error translation; the base-version carry.
+
+**Correctness kept (cheap, fail-closed):** cid-lineage guard (`SchemaSkewError`) · OCC detection
+(`ConflictError`) · natural-key + idempotency-key dedup · synchronous read-your-writes · single-writer
++ crash-safety inherited.
+
+**Exceptions — each fails closed, each names the next piece of work:**
+
+| Exception (assumed in the tracer bullet) | Fails closed because… | Lifting it later unlocks → |
+|---|---|---|
+| Small store — bootstrap by replay-from-0 | slow if huge, never *wrong* | snapshot encoder + checksum (§9a #2) |
+| Full-log retention — never prune | log grows visibly, not silent | retention horizon + re-bootstrap |
+| No same-batch new→new refs | violation → loud error | intra-batch OID remap (§9a #3, the ADR) |
+| ≤~10 followers, no rate-limit | fine at this scale; doc'd ceiling | `/snapshot` 429 / thundering herd (§9a #5) |
+| Single-threaded follower (`sync()` on owner) | no concurrent-sync hazard at all | background auto-poll + fencing |
+| Synchronous contribute (`commit()` blocks) | simple + correct, just not high-throughput | async contribute + `wait_for(tid)` dial |
+| Contribute-only (OCC detects, no resolve) | concurrent shared edits → loud reject | conflict resolution policy (§7) |
+
+**Acceptance (complete + correct proof, mineral-cabinet domain):** (1) replay-from-0 reproduces
+coordinator state exactly on a fresh follower; (2) contribute — new `Document`/`Annotation` appear in
+the cloud and a 2nd follower sees them after `sync()`; (3) retry — drop the ack, re-submit → no
+duplicate (idempotent); (4) conflict — two followers write the same field → loud `ConflictError`
+(never silent); (5) schema skew — unknown cid/extra field → loud `SchemaSkewError` (never silent
+drop). The consumer side can ride the existing `check_delta_consumer` conformance kit.
+
+**Effort:** weeks. The meat is the `/submit` handler + `open_follower`; the rest is glue + tests.
+The must-fixes that survive into this slice are the *cheap* ones (§9a #1 cid guard, #4 `ConflictError`
+contract, idempotency); the *expensive* ones (#2, #3, #5) are assumed away above with fail-closed
+exceptions, each pointing at its follow-on.
+
 ## 2. The fractal property (roles)
 
 | Role | Lease? | Writes | Reads | `dc.…open(...)` |
@@ -413,6 +486,32 @@ follower-first fails loudly, never silently. Then self-healing holds for the sch
 directions and no write is ever silently truncated. (Store-by-lineage is the optional upgrade for
 true follower-first fidelity.) If this becomes scope, the guard + the fan-in decode policy warrant
 an ADR (storage/contract-adjacent).
+
+### 7b. Considered & declined for v0: a write lease ("talking stick")
+
+A natural alternative to OCC: have the coordinator grant an **exclusive write token** so only one
+follower contributes at a time (pessimistic mutual exclusion instead of optimistic detection).
+Declined for v0 because it adds complexity without buying what it appears to:
+
+- **The consistency it promises already exists.** Object-graph mutual exclusion (only the
+  coordinator's owner thread mutates) and serialized one-at-a-time application (the `store.submit`
+  queue + atomic `commit`) are *already* guaranteed by single-writer fan-in. A stick adds only a
+  **cross-commit exclusive read-modify-write window** — which the indexer/annotator persona doesn't
+  need (its contributions are append-mostly, natural-keyed, referencing existing entities).
+- **A correct lease is more moving parts than the OCC it would replace:** TTL, renewal, crash
+  reclaim, and **zombie fencing** (a slow holder writing after its lease was reclaimed — the classic
+  "distributed locking is hard" problem). OCC is a *stateless* `record.tid` comparison with one
+  failure mode (conflict → loud reject → retry); the lease is stateful coordination with several.
+  It also doesn't remove idempotency (a stick-holder's ack can still be lost).
+- **OCC is the lightweight, fail-closed talking stick.** With followers partitioned by segment,
+  conflicts can't happen in the happy path, so OCC *never fires*; when the partition assumption is
+  violated it shouts `ConflictError` instead of silently last-write-winning. Segment **ownership**,
+  if it must be enforced rather than conventional, is a *stateless authz rule* on `/submit` (this
+  principal may write only its segment) — ownership without a lease.
+
+A coordinator-granted, fenced **exclusive write session** *is* the right tool for a long multi-commit
+atomic bulk rewrite — but that is **coordinator work, not an edge concern**, so it stays a possible
+future feature, never the edge contribute path.
 
 ## 8. Out of scope (the cut-list)
 
