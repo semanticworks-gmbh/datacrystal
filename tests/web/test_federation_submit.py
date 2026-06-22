@@ -88,3 +88,25 @@ def test_submit_batch_is_all_or_nothing(store_factory, tmp_path) -> None:
         assert store.get(Mineral, qid="Q2") is None
     finally:
         store.close()
+
+
+def test_submit_rejects_malformed_envelope(store_factory, tmp_path) -> None:
+    store = store_factory()
+    log = DeltaLog(tmp_path / "log")
+    store.attach(log)
+    try:
+
+        async def go() -> None:
+            malformed: list[dict[str, Any]] = [
+                {"ops": "notalist"},  # ops not a list
+                {"ops": [5]},  # an op that is not an object
+                {"ops": [{"type": _MINERAL}]},  # an op missing key/fields
+            ]
+            for body in malformed:
+                resp = await _post(store, log, body)
+                assert resp.status_code == 422, (body, resp.text)
+
+        asyncio.run(go())
+        assert store.last_tid == 0  # fail closed: a malformed envelope writes nothing
+    finally:
+        store.close()

@@ -23,7 +23,7 @@ from __future__ import annotations
 import asyncio
 import struct
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from fastapi import APIRouter, Body, HTTPException, Query, Response
 
@@ -104,8 +104,17 @@ def federation_router(
         check, idempotency) are added by their own stories; ``base``/``idem`` are
         accepted here but not yet enforced.
         """
+        raw_ops = body.get("ops")
+        if not isinstance(raw_ops, list):
+            raise HTTPException(422, detail="body 'ops' must be a list")
+        ops = cast("list[Any]", raw_ops)
         prepared: list[tuple[type, str, Any]] = []
-        for op in body.get("ops", []):
+        for raw_op in ops:
+            if not isinstance(raw_op, dict) or not all(
+                k in raw_op for k in ("type", "key", "fields")
+            ):
+                raise HTTPException(422, detail="each op needs 'type', 'key', 'fields'")
+            op = cast("dict[str, Any]", raw_op)
             info = TYPES_BY_NAME.get(op["type"])
             if info is None:  # unknown shape — cid-lineage guard hardens this (#154)
                 raise HTTPException(422, detail=f"unknown type {op['type']!r}")
