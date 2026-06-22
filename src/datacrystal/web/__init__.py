@@ -49,6 +49,9 @@ from datacrystal.web._app import (
     submit_write,
 )
 
+# --- _federation: replication read surface (#149, ROADMAP item 21) -----------
+from datacrystal.web._federation import federation_router
+
 __all__ = [
     # _reflect
     "FieldDescriptor",
@@ -72,4 +75,6 @@ __all__ = [
     "read_snapshot",
     "store_lifespan",
     "submit_write",
+    # _federation (#149): coordinator replication read endpoints (item 21)
+    "federation_router",
 ]

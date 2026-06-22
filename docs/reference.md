@@ -729,6 +729,18 @@ from datacrystal.web import (
   OIDs without a `store`; with `store=` every OID is resolved in one `store.get_many` and each
   rewrapped as `Lazy.of`.
 
+**Federation (replication — ROADMAP item 21, [FEDERATION-WIRE-v1](design/FEDERATION-WIRE-v1.md)):**
+
+- **`federation_router(store, deltalog, *, dependencies=None)`** — builds a FastAPI `APIRouter`
+  (prefix `/v1`) exposing the coordinator's **read** surface to edge followers:
+  `GET /v1/head` → `{tid, format, version}` (the watermark probe) and
+  `GET /v1/deltas?after=<tid>` → the COMMIT-DELTA-v1 frames with `tid > after`, in strict TID order,
+  byte-for-byte the length-prefixed frame the `DeltaLog` writes (re-encoded from `deltalog.replay`).
+  The `DeltaLog` is passed explicitly (attach it with `store.attach(deltalog)` first; the store
+  exposes no delta-log accessor). You bring authn/z via `dependencies=[Depends(...)]`, applied to
+  every route. Mount with `app.include_router(federation_router(store, log, dependencies=[...]))`.
+  The write endpoint (`POST /v1/submit`) is added alongside the contribute path.
+
 **GraphQL (Strawberry):**
 
 - **`reflect_strawberry_type(cls)`** — the convenience for one reflected root → one Strawberry type
