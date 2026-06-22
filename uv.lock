@@ -75,6 +75,9 @@ dependencies = [
 arrow = [
     { name = "pyarrow" },
 ]
+follower = [
+    { name = "httpx" },
+]
 fts = [
     { name = "snowballstemmer" },
 ]
@@ -96,6 +99,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "fastapi", marker = "extra == 'web'" },
+    { name = "httpx", marker = "extra == 'follower'", specifier = ">=0.28" },
     { name = "msgspec", specifier = ">=0.21.1" },
     { name = "pyarrow", marker = "extra == 'arrow'", specifier = ">=21" },
     { name = "pydantic", marker = "extra == 'web'", specifier = ">=2" },
@@ -103,7 +107,7 @@ requires-dist = [
     { name = "snowballstemmer", marker = "extra == 'fts'", specifier = ">=3.0" },
     { name = "strawberry-graphql", marker = "extra == 'web'" },
 ]
-provides-extras = ["fts", "arrow", "web"]
+provides-extras = ["fts", "arrow", "web", "follower"]
 
 [package.metadata.requires-dev]
 dev = [
