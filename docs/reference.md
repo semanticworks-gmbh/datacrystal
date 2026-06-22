@@ -80,6 +80,17 @@ lazy_timeout=None, cache_index=True)` (async: `await dc.aopen(...)`, same keywor
   [Concurrency primitives](#concurrency-primitives) and the
   [memory explanation](explanation.md#identity-and-memory).
 
+**`dc.open_follower(url, *, api_key=None, path=None, client=None)`** opens a **read replica** synced
+from a coordinator's federation endpoint (ROADMAP item 21,
+[FEDERATION-WIRE-v1](design/FEDERATION-WIRE-v1.md)). It bootstraps replay-from-0 over
+`GET /v1/deltas` and returns a real local `Store` you read at full speed — in memory, or
+sqlite-backed when `path=` is given. Each delta is validated through the reference applier (gaps
+refuse loudly, re-applies are idempotent) and persisted with the coordinator's own OIDs/TIDs, so the
+replica reproduces the coordinator's committed state exactly. `api_key` is sent as the `x-api-key`
+header; `client` injects an `httpx.Client`-compatible transport (advanced/testing). The HTTP
+transport is imported lazily, so a bare `import datacrystal` stays inside the `{msgspec, pyroaring}`
+budget. Catch-up and contribute land in later stories.
+
 ## Define entities
 
 An entity is a typed Python class; the decorator turns it into a slots dataclass and registers

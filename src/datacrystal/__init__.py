@@ -65,6 +65,7 @@ from datacrystal._errors import (
 from datacrystal._indexes import QueryPlan
 from datacrystal._lazy import BlobHandle, BlobSource, Lazy, blob_from_path
 from datacrystal._pipeline import DeltaConsumer
+from datacrystal._follower import open_follower
 from datacrystal._snapshot import EntityView, Ref, Snapshot, SnapshotIndexes
 from datacrystal._store import Store
 
@@ -88,6 +89,7 @@ __all__ = [
     "Store",
     "AsyncStore",
     "aopen",
+    "open_follower",
     "entity",
     "fields",
     "Lazy",
