@@ -280,6 +280,10 @@ def _contribute(
         oid for obj, base in items if base is None and (oid := oid_of(obj)) is not None
     }
     ops: list[dict[str, Any]] = []
+    # per-class memo of the field names whose container content must be scanned
+    # (everything that is NOT a handled list edge) — reflect() runs once per class
+    # in the batch, not once per item (reflect is uncached, get_type_hints is not free).
+    scan_fields: dict[type, tuple[str, ...]] = {}
     for obj, base in items:
         ti = type_info(obj)
         key = next((spec.name for spec in ti.specs if spec.unique), None)
@@ -295,13 +299,16 @@ def _contribute(
             )
         # §5 cut: an @entity nested in a container the OID-int boundary cannot
         # rebind would land as a bare int on the coordinator (silent corruption).
-        _, descriptors = reflect(ti.cls)
-        for d in descriptors:
-            if list_ref_target(d.core_type) is not None:
-                continue  # a list[Lazy[T]] / list[T] edge round-trips (handled)
-            if _container_holds_entity(getattr(obj, d.name)):
+        names = scan_fields.get(ti.cls)
+        if names is None:
+            _, descriptors = reflect(ti.cls)
+            # a list[Lazy[T]] / list[T] edge round-trips (handled) — skip it
+            names = tuple(d.name for d in descriptors if list_ref_target(d.core_type) is None)
+            scan_fields[ti.cls] = names
+        for name in names:
+            if _container_holds_entity(getattr(obj, name)):
                 raise NotImplementedError(
-                    f"{ti.typename}.{d.name} holds an @entity inside an unsupported "
+                    f"{ti.typename}.{name} holds an @entity inside an unsupported "
                     "container shape — only scalar refs (Lazy[T] / @entity) and "
                     "list edges (list[Lazy[T]] / list[T]) federate (v0)"
                 )
@@ -325,7 +332,15 @@ def _contribute(
             raise SchemaSkewError(message)
         if error == ERROR_DANGLING_REF:  # faithful, not folded into ConflictError
             raise DanglingRefError(message)
-        raise ConflictError(message)
+        # carry the LOCKED conflict envelope into the typed error so a caller can
+        # read exc.actual_base/expected_base to drive its re-read (the fields the
+        # coordinator sent — ConflictError's documented contract).
+        raise ConflictError(
+            message,
+            key=detail.get("key"),
+            expected_base=detail.get("expected_base"),
+            actual_base=detail.get("actual_base"),
+        )
     if status != 200:
         raise RuntimeError(f"/v1/submit returned {status}: {payload!r}")
     # applied_tid is null when the coordinator committed nothing (an idempotent

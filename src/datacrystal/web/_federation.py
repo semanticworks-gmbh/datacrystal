@@ -108,6 +108,12 @@ def federation_router(
         inline commit; ``replay``'s body never awaits, so the loop cannot
         interleave a commit into it (#149 peer-review fix; ADR-001 / DeltaLog
         owner-confinement).
+
+        v0 cost note: because it runs on the loop thread, a large ``replay``
+        (notably a from-genesis ``after=0`` bootstrap) blocks the event loop for
+        its duration — the deliberate v0 trade for a race-free wire. Bootstrap is
+        one-time per follower and the retained history is bounded by the operator's
+        DeltaLog retention; chunked/streamed replay is a demand-driven follow-on.
         """
         chunks: list[bytes] = []
         for delta in deltalog.replay(after_tid=after):

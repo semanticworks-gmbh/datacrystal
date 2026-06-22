@@ -150,6 +150,30 @@ def test_commit_refuses_to_contribute_a_delete(store_factory) -> None:
         store.close()
 
 
+def test_contribute_conflict_carries_envelope_fields(store) -> None:
+    """The follower-side ``ConflictError`` carries the LOCKED conflict envelope
+    (key/expected_base/actual_base) the coordinator sent, so a programmatic caller
+    can read ``exc.actual_base`` to drive its re-read (#155 re-verification fix —
+    the decode previously dropped the fields, keeping only the message).
+    """
+    store.upsert(Mineral(qid="QE", name="Quartz"))
+    store.commit()
+    m = store.get(Mineral, qid="QE")
+    envelope = {
+        "error": "conflict",
+        "key": "QE",
+        "expected_base": "a" * 64,
+        "actual_base": "b" * 64,
+        "message": "moved",
+    }
+    fake = _FakeClient(_FakeResp(409, {"detail": envelope}))
+    with pytest.raises(ConflictError) as exc:
+        _contribute([(m, "a" * 64)], url="http://x", api_key=None, client=fake)
+    assert exc.value.key == "QE"
+    assert exc.value.expected_base == "a" * 64
+    assert exc.value.actual_base == "b" * 64
+
+
 def test_contribute_refuses_entity_in_unsupported_container(store) -> None:
     """An @entity nested in a bare ``list`` field would land as a bare int on the
     coordinator (the OID-int boundary cannot rebind it) — fail loud before the
