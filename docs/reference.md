@@ -993,6 +993,8 @@ Everything derives from `dc.DataCrystalError`:
 | `NotAnEntityError` | a non-entity where an entity is required |
 | `UniqueViolationError` | duplicate value for a `dc.Unique` field in a commit |
 | `SchemaMismatchError` | a class change beyond additive evolution (see [the schema-evolution how-to](how-to/schema-evolution.md)) |
+| `SchemaSkewError` | a federated `/v1/submit` contribution carries a field the coordinator's class lacks (cid-lineage skew → HTTP 409; [FEDERATION-WIRE-v1](design/FEDERATION-WIRE-v1.md)) |
+| `ConflictError` | a federated `/v1/submit` OCC base token no longer matches the coordinator's current payload — the entity moved since it was read (→ HTTP 409; re-read and retry, never last-writer-wins) |
 | `UnregisteredTypeError` | store has records of a class not imported in this process |
 | `NewerStoreError` | store written by a newer format version |
 | `CorruptRecordError` | a record failed its checksum — the file is damaged |

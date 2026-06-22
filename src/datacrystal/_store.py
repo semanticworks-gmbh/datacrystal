@@ -759,6 +759,25 @@ class Store:
                 setattr(existing, name, new)  # the one-shot hook buffers it
         return existing
 
+    def _payload_digest(self, ti: TypeInfo, field: str, value: Any) -> str | None:
+        """Hex SHA-256 of the CURRENT persisted payload for the entity whose
+        unique ``field == value``, or ``None`` if the key is absent.
+
+        The OCC base token (#155, FEDERATION-WIRE-v1): ``/v1/submit`` compares a
+        follower's carried base against this. It reads the AUTHORITATIVE persisted
+        bytes (the backend record the follower itself hashed from the delta) — not
+        a re-encode of the live entity, whose lineage/defaults could diverge from
+        the stored bytes. Owner-thread (called inside the ``submit`` fan-in).
+        """
+        if self._cid_by_typename.get(ti.typename) is None:
+            return None
+        ci = self._index.ensure(ti)
+        oid = ci.unique[field].get(value)
+        if oid is None:
+            return None
+        rec = self._backend.load_many([oid]).get(oid)
+        return hashlib.sha256(rec.payload).hexdigest() if rec is not None else None
+
     def _find_by_key(self, ti: TypeInfo, field: str, value: Any) -> Any | None:
         """The upsert lookup: committed unique map (a key freed by a
         buffered delete is reusable, ADR-003), then earlier upserts of this

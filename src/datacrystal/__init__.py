@@ -40,6 +40,7 @@ from datacrystal._entity import (
     entity,
 )
 from datacrystal._errors import (
+    ConflictError,
     ConsumerDetachedWarning,
     CorruptRecordError,
     DanglingDeleteWarning,
@@ -54,6 +55,7 @@ from datacrystal._errors import (
     NotAnEntityError,
     QueryError,
     SchemaMismatchError,
+    SchemaSkewError,
     StoreClosedError,
     StoreLockedError,
     UniqueViolationError,
@@ -122,6 +124,8 @@ __all__ = [
     "NotAnEntityError",
     "UniqueViolationError",
     "SchemaMismatchError",
+    "SchemaSkewError",
+    "ConflictError",
     "UnregisteredTypeError",
     "NewerStoreError",
     "CorruptRecordError",

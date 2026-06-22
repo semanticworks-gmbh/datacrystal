@@ -69,6 +69,29 @@ class SchemaMismatchError(DataCrystalError):
     """
 
 
+class SchemaSkewError(DataCrystalError):
+    """A federated contribution carries a field the coordinator's class lacks.
+
+    The ``datacrystal[web]`` ``/v1/submit`` cid-lineage guard (ROADMAP item 21,
+    [FEDERATION-WIRE-v1]): a follower's ``@entity`` shape forked from the
+    coordinator's (a field added on the follower, or the two never in sync). The
+    whole submission is rejected (fail-closed, HTTP 409) rather than silently
+    dropping the unknown field — roll out coordinator-first.
+    """
+
+
+class ConflictError(DataCrystalError):
+    """A federated contribution conflicts with the coordinator's current state.
+
+    The ``/v1/submit`` OCC guard (ROADMAP item 21, [FEDERATION-WIRE-v1]): the
+    base token a follower read no longer matches the coordinator's current
+    payload for that natural key — the entity moved since it was read (or a
+    presence mismatch: ``base`` was given for an absent key, or omitted for a
+    present one). The whole submission is rejected (fail-closed, HTTP 409);
+    re-read the entity and retry. **Detect-and-reject, never last-writer-wins.**
+    """
+
+
 class UnregisteredTypeError(DataCrystalError):
     """The store contains records of a type whose ``@entity`` class has not
     been imported/defined in this process.
