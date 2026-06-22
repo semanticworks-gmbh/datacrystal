@@ -23,6 +23,15 @@ have to leave your objects to get one.
 operate. From a laptop to a fleet of instances, the same code, blazing fast: systems of record,
 knowledge graphs, search, FastAPI services, live analytics over your data.
 
+**And it's fractal.** Every node is the same datacrystal — the same objects, the same code; whether
+it leads or follows is only config. Point edge nodes at the shared graph — indexers, annotators,
+local LLMs — and each reads it locally at full speed and contributes back what it discovers. The
+whole has the shape of the part, so it composes without limit: any follower can be promoted to
+writer, and every discovery enriches the graph the next node reads. The cloud stays small while
+intelligence accretes at the edges and flows home — one graph, many minds, self-similar all the
+way up. That self-similarity is the point: the system grows more powerful by repeating one simple
+shape, not by adding new machinery.
+
 You came here to build, not to administer a database. Declare, deploy, ship — the data just follows.
 
 ---

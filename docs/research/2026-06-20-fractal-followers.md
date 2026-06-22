@@ -1,7 +1,9 @@
 # Fractal followers — single-writer replication for edge contributors (design exploration, 2026-06-20)
 
-**Status: design exploration. Nothing shipped; needs a `needs-owner-decision` + a VISION line before
-any story.** Rides ROADMAP **item 21** (networked replication), served from `datacrystal[web]`;
+**Status: STAGED for Sprint 13 (greenlit 2026-06-22).** Wire contract locked in
+[FEDERATION-WIRE-v1](../design/FEDERATION-WIRE-v1.md); tracked as epic
+[#146](https://github.com/semanticworks-gmbh/datacrystal/issues/146). Rides ROADMAP **item 21**
+(networked replication), served from `datacrystal[web]` + a core `open_follower`;
 failover would touch **item 16** (lease fencing). Multi-writer/CRDT stay **Never**
 ([ROADMAP](../design/ROADMAP.md)). The single-writer shape is already ratified
 ([ADR-001](../design/ADR-001-concurrency-contract.md); [SCALING.md](../design/SCALING.md);
