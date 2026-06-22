@@ -22,8 +22,10 @@ from __future__ import annotations
 
 import struct
 from collections.abc import Iterable, Iterator
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
+from datacrystal._entity import type_info
+from datacrystal._errors import ConflictError, SchemaSkewError
 from datacrystal._ids import CID_BASE, FORMAT_VERSION, OID_BASE, TID_BASE
 from datacrystal._storage.memory import MemoryBackend
 from datacrystal._storage.protocol import CommitBatch, StorageBackend, StoredRecord
@@ -165,6 +167,69 @@ def _fetch_deltas(
         return bytes(resp.content)
 
 
+def _post_submit(
+    url: str, ops: list[dict[str, Any]], *, api_key: str | None, client: Any | None
+) -> tuple[int, Any]:
+    """POST a contribution batch to ``/v1/submit``; return ``(status, json)``."""
+    body = {"ops": ops}
+    if client is not None:
+        resp = client.post("/v1/submit", json=body)
+        return resp.status_code, (resp.json() if resp.content else None)
+    try:
+        import httpx  # lazy: kept out of a bare ``import datacrystal`` (dep budget)
+    except ImportError as exc:  # pragma: no cover — exercised only without httpx
+        raise ImportError(
+            "open_follower contribute needs httpx (`pip install datacrystal[follower]`)"
+        ) from exc
+    headers = {"x-api-key": api_key} if api_key else None
+    with httpx.Client(base_url=url, headers=headers) as owned:
+        resp = owned.post("/v1/submit", json=body)
+        return resp.status_code, (resp.json() if resp.content else None)
+
+
+def _contribute(
+    items: list[tuple[Any, str | None]],
+    *,
+    url: str,
+    api_key: str | None,
+    client: Any | None,
+) -> int:
+    """Serialize buffered ``(entity, base)`` items and fan them into the coordinator.
+
+    Each entity is projected to its create-face wire shape via
+    :func:`~datacrystal.web.to_pydantic` (refs as OID ints) — lazily imported, so
+    a contribution needs ``datacrystal[follower]``'s pydantic, never a bare
+    ``import datacrystal``. A coordinator reject (HTTP 409) is translated to the
+    typed local exception (``ConflictError`` / ``SchemaSkewError``) so the caller
+    can re-read and retry. Returns the coordinator's applied TID.
+    """
+    from datacrystal.web._pydantic import to_pydantic  # lazy: needs pydantic
+
+    ops: list[dict[str, Any]] = []
+    for obj, base in items:
+        ti = type_info(obj)
+        key = next((spec.name for spec in ti.specs if spec.unique), None)
+        if key is None:
+            raise SchemaSkewError(
+                f"{ti.typename} has no dc.Unique natural key — cannot contribute it"
+            )
+        fields = to_pydantic(obj, face="create").model_dump(mode="json")
+        ops.append({"type": ti.typename, "key": key, "fields": fields, "base": base})
+
+    status, payload = _post_submit(url, ops, api_key=api_key, client=client)
+    body = cast("dict[str, Any]", payload) if isinstance(payload, dict) else {}
+    if status == 409:
+        raw = body.get("detail", body)
+        detail = cast("dict[str, Any]", raw) if isinstance(raw, dict) else {}
+        message = str(detail.get("message", "rejected"))
+        if detail.get("error") == "schema-skew":
+            raise SchemaSkewError(message)
+        raise ConflictError(message)
+    if status != 200:
+        raise RuntimeError(f"/v1/submit returned {status}: {payload!r}")
+    return int(body["applied_tid"])
+
+
 def open_follower(
     url: str,
     *,
@@ -188,7 +253,10 @@ def open_follower(
 
     Returns:
         A :class:`~datacrystal._store.Store` holding the coordinator's committed
-        state at bootstrap time (catch-up/contribute land in later stories).
+        state at bootstrap time. Call :meth:`~datacrystal._store.Store.sync` to
+        catch up; ``upsert`` + ``commit`` to contribute (fanned into the
+        coordinator — contribute serialization needs ``datacrystal[follower]``'s
+        pydantic).
     """
     if path is None:
         backend: StorageBackend = MemoryBackend()
@@ -212,6 +280,11 @@ def open_follower(
         )
         return _apply_catchup(backend, frames)
 
-    # the follower catch-up hook Store.sync() calls (#151); same-package.
+    def _contribute_fn(items: list[tuple[Any, str | None]]) -> int:
+        """Serialize + POST the buffered items (Store._contribute calls this)."""
+        return _contribute(items, url=url, api_key=api_key, client=client)
+
+    # the follower hooks Store.sync()/commit() call (#151/#153); same-package.
     store._sync_fn = _sync  # pyright: ignore[reportPrivateUsage]
+    store._contribute_fn = _contribute_fn  # pyright: ignore[reportPrivateUsage]
     return store

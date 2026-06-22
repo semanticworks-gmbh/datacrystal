@@ -229,6 +229,13 @@ class Store:
         # a closure that fetches + applies the coordinator's new deltas and
         # returns the new watermark; None for a normal (non-follower) store.
         self._sync_fn: Callable[[int], int] | None = None
+        # Follower contribute hook (#153): open_follower installs a closure that
+        # serializes the buffered (entity, base) items and POSTs them to the
+        # coordinator's /v1/submit, returning the applied TID; None for a normal
+        # store (commit() then takes the local P1/P2/P3 path).
+        self._contribute_fn: (
+            Callable[[list[tuple[Any, str | None]]], int] | None
+        ) = None
 
         # The index-cache sidecar (ADR-005 / #12) is per-session (tied to the
         # store dir); created here, then the (re)loadable state below reads it.
@@ -829,6 +836,8 @@ class Store:
             StoreClosedError: the store has already been closed.
         """
         self._enter()
+        if self._contribute_fn is not None:  # a follower: fan in to the coordinator
+            return self._contribute()
         capture = self._p1_capture()
         if capture is None:
             return None
@@ -838,6 +847,38 @@ class Store:
             self._p2_rollback(capture)
             raise
         return self._p3_finalize(capture)
+
+    def _contribute(self) -> int | None:
+        """A follower's ``commit()``: fan the buffered writes into the coordinator
+        (#153) instead of a local P1/P2/P3.
+
+        Serializes the buffered NEW/DIRTY entities — a NEW one carries
+        ``base=None``; an edited existing one the SHA-256 of the payload it was
+        read at (OCC) — and hands them to the installed ``_contribute_fn`` (which
+        POSTs ``/v1/submit``). On success the local buffers clear and a
+        :meth:`sync` pulls the committed delta back (read-your-writes); identity
+        is by OID, so re-query for the coordinator-minted instance. A coordinator
+        reject raises ``ConflictError``/``SchemaSkewError`` with the buffers left
+        intact — re-read and retry.
+        """
+        assert self._contribute_fn is not None
+        items: list[tuple[Any, str | None]] = []
+        for obj in self._new.values():
+            items.append((obj, None))
+        for oid, obj in self._dirty.items():
+            if oid in self._new:
+                continue
+            rec = self._backend.load_many([oid]).get(oid)
+            base = hashlib.sha256(rec.payload).hexdigest() if rec is not None else None
+            items.append((obj, base))
+        if not items:
+            return None
+        applied_tid = self._contribute_fn(items)
+        self._new.clear()
+        self._dirty.clear()
+        if self._sync_fn is not None:
+            self.sync()  # read-your-writes: pull the committed delta back
+        return applied_tid
 
     # -- the three commit phases (ADR-001 bound decision 2) ------------------
 

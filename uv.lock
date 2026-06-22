@@ -77,6 +77,7 @@ arrow = [
 ]
 follower = [
     { name = "httpx" },
+    { name = "pydantic" },
 ]
 fts = [
     { name = "snowballstemmer" },
@@ -102,6 +103,7 @@ requires-dist = [
     { name = "httpx", marker = "extra == 'follower'", specifier = ">=0.28" },
     { name = "msgspec", specifier = ">=0.21.1" },
     { name = "pyarrow", marker = "extra == 'arrow'", specifier = ">=21" },
+    { name = "pydantic", marker = "extra == 'follower'", specifier = ">=2" },
     { name = "pydantic", marker = "extra == 'web'", specifier = ">=2" },
     { name = "pyroaring", specifier = ">=1.1.0" },
     { name = "snowballstemmer", marker = "extra == 'fts'", specifier = ">=3.0" },

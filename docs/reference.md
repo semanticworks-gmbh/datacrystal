@@ -97,6 +97,13 @@ pulls the coordinator's deltas after the local watermark, applies them (a gap ra
 **re-query after a sync** — a live reference read *before* it sees stale field values. `sync()` is a
 follower-only method (a normal store raises) and refuses to run with buffered local writes.
 
+A follower **contributes** by the ordinary write API: `store.upsert(...)` then `store.commit()` —
+on a follower, `commit()` fans the buffered entities into the coordinator's `/v1/submit` (serialized
+via `to_pydantic`, so contribute needs `datacrystal[follower]`'s pydantic), then `sync()`s the
+committed delta back. A new entity carries `base=None`; an edited existing one carries the OCC base
+it was read at. A coordinator reject surfaces as a typed local `ConflictError`/`SchemaSkewError`
+(re-read and retry); the recovery loop is `sync()` → re-read → re-apply → `commit()`.
+
 ## Define entities
 
 An entity is a typed Python class; the decorator turns it into a slots dataclass and registers
