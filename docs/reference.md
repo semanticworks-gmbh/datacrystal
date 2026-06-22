@@ -750,7 +750,11 @@ from datacrystal.web import (
   The `DeltaLog` is passed explicitly (attach it with `store.attach(deltalog)` first; the store
   exposes no delta-log accessor). You bring authn/z via `dependencies=[Depends(...)]`, applied to
   every route. Mount with `app.include_router(federation_router(store, log, dependencies=[...]))`.
-  The write endpoint (`POST /v1/submit`) is added alongside the contribute path.
+  It also serves the **contribute** endpoint `POST /v1/submit` — a follower's batch of natural-key
+  upserts (`{ops: [{type, key, fields, base}]}`) fanned into the single writer via `store.submit`
+  (one batch = one commit), returning `{applied_tid, keys}` (each natural-key value → its OID). The
+  fail-closed guards on `/v1/submit` (cid-lineage `SchemaSkewError`, the OCC `base` check,
+  idempotency) ship in their own stories.
 
 **GraphQL (Strawberry):**
 
