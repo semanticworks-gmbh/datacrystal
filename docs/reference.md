@@ -102,7 +102,10 @@ on a follower, `commit()` fans the buffered entities into the coordinator's `/v1
 via `to_pydantic`, so contribute needs `datacrystal[follower]`'s pydantic), then `sync()`s the
 committed delta back. A new entity carries `base=None`; an edited existing one carries the OCC base
 it was read at. A coordinator reject surfaces as a typed local `ConflictError`/`SchemaSkewError`
-(re-read and retry); the recovery loop is `sync()` → re-read → re-apply → `commit()`.
+(re-read and retry); the recovery loop is `sync()` → re-read → re-apply → `commit()`. **v0 contribute is
+upsert-only** — a follower with a buffered `delete()` raises (delete on the coordinator instead) — and a
+contributed entity's references must point to **already-committed** entities; an intra-batch new→new
+reference raises loudly (its follower-local OID is not valid on the coordinator).
 
 ## Define entities
 

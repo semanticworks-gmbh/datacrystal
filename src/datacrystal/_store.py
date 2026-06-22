@@ -862,6 +862,11 @@ class Store:
         intact — re-read and retry.
         """
         assert self._contribute_fn is not None
+        if self._deleted:  # /v1/submit is upsert-only (FEDERATION-WIRE-v1 §3) —
+            raise NotImplementedError(  # fail loud, never silently drop the delete
+                "a follower cannot contribute deletes — /v1/submit is upsert-only "
+                "(v0); delete on the coordinator instead"
+            )
         items: list[tuple[Any, str | None]] = []
         for obj in self._new.values():
             items.append((obj, None))

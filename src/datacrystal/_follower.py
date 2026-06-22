@@ -24,7 +24,7 @@ import struct
 from collections.abc import Iterable, Iterator
 from typing import TYPE_CHECKING, Any, cast
 
-from datacrystal._entity import type_info
+from datacrystal._entity import oid_of, type_info
 from datacrystal._errors import ConflictError, SchemaSkewError
 from datacrystal._ids import CID_BASE, FORMAT_VERSION, OID_BASE, TID_BASE
 from datacrystal._storage.memory import MemoryBackend
@@ -187,6 +187,22 @@ def _post_submit(
         return resp.status_code, (resp.json() if resp.content else None)
 
 
+def _refs_local_new(value: Any, new_oids: set[int]) -> bool:
+    """True if ``value`` (a serialized create-face field, walked recursively)
+    references an OID in ``new_oids`` — a ref to a not-yet-committed local entity.
+    """
+    if isinstance(value, bool):  # bool is an int subclass — never an OID
+        return False
+    if isinstance(value, int):
+        return value in new_oids
+    if isinstance(value, list):
+        return any(_refs_local_new(item, new_oids) for item in cast("list[Any]", value))
+    if isinstance(value, dict):
+        items = cast("dict[Any, Any]", value).values()
+        return any(_refs_local_new(item, new_oids) for item in items)
+    return False
+
+
 def _contribute(
     items: list[tuple[Any, str | None]],
     *,
@@ -205,6 +221,13 @@ def _contribute(
     """
     from datacrystal.web._pydantic import to_pydantic  # lazy: needs pydantic
 
+    # the local OIDs of the NEW entities in this batch (base is None). A ref to
+    # one of these is an intra-batch new→new ref — its follower-local OID is
+    # meaningless on the coordinator (it could collide with an unrelated entity),
+    # so it MUST fail loud here, never cross the wire (FEDERATION-WIRE-v1 §5 cut).
+    new_oids = {
+        oid for obj, base in items if base is None and (oid := oid_of(obj)) is not None
+    }
     ops: list[dict[str, Any]] = []
     for obj, base in items:
         ti = type_info(obj)
@@ -214,6 +237,12 @@ def _contribute(
                 f"{ti.typename} has no dc.Unique natural key — cannot contribute it"
             )
         fields = to_pydantic(obj, face="create").model_dump(mode="json")
+        if _refs_local_new(fields, new_oids):
+            raise NotImplementedError(
+                f"{ti.typename} references a not-yet-committed entity — intra-batch "
+                "new→new references are unsupported (v0); contribute the referenced "
+                "entity first, then reference it by its coordinator OID"
+            )
         ops.append({"type": ti.typename, "key": key, "fields": fields, "base": base})
 
     status, payload = _post_submit(url, ops, api_key=api_key, client=client)

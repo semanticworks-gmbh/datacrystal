@@ -18,10 +18,11 @@ import pytest
 
 pytest.importorskip("pydantic", reason="contribute serializes via to_pydantic")
 
+import datacrystal as dc
 from datacrystal import ConflictError, SchemaSkewError
 from datacrystal._entity import type_info
 from datacrystal._follower import _contribute
-from tests.conftest import Mineral
+from tests.conftest import Locality, Mineral
 
 
 def test_commit_contributes_new_entity(store_factory) -> None:
@@ -115,3 +116,34 @@ def test_contribute_translates_409_to_typed_exceptions(store) -> None:
     with pytest.raises(SchemaSkewError) as skew_exc:
         _contribute([(m, None)], url="http://x", api_key=None, client=skew)
     assert "field" in str(skew_exc.value)
+
+
+def test_commit_refuses_to_contribute_a_delete(store_factory) -> None:
+    store = store_factory()
+    sent: list[tuple[Any, str | None]] = []
+
+    def stub(items: list[tuple[Any, str | None]]) -> int:
+        sent.extend(items)
+        return 1
+
+    try:
+        store.upsert(Mineral(qid="QX", name="X"))
+        store.commit()  # local commit (no contribute hook yet)
+        store._contribute_fn = stub
+        store.delete(Mineral, qid="QX")  # a buffered delete
+        with pytest.raises(NotImplementedError):
+            store.commit()
+        assert not sent  # fail loud: the delete was NOT silently fanned in (or dropped)
+    finally:
+        store.close()
+
+
+def test_contribute_refuses_new_to_new_reference(store) -> None:
+    loc = Locality(qid="LZ", name="Zomba")
+    mineral = Mineral(qid="QM", name="X", type_locality=dc.Lazy.of(loc))
+    store.store(loc)
+    store.store(mineral)  # both NEW; mineral references the not-yet-committed loc
+    fake = _FakeClient(_FakeResp(200, {"applied_tid": 1, "keys": {}}))
+    with pytest.raises(NotImplementedError):
+        _contribute([(mineral, None), (loc, None)], url="http://x", api_key=None, client=fake)
+    assert fake.posted is None  # the unsafe follower-local OID never crossed the wire

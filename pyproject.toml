@@ -44,6 +44,7 @@ dev = [
     "hypothesis>=6.155.2",
     "pytest>=9.0.3",
     "ruff>=0.15.16",
+    "uvicorn>=0.34",
 ]
 
 [build-system]
