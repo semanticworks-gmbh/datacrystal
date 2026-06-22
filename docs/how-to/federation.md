@@ -1,0 +1,150 @@
+# How-to: run a coordinator + edge followers (datacrystal[web])
+
+Goal: stand up **one writer** (the *coordinator*) and any number of read-mostly **followers** at
+the edge. Each follower is a real local datacrystal store that bootstraps from the coordinator,
+reads at full speed, and can *contribute* writes back — fanned into the coordinator's single writer.
+This is datacrystal's replication shape (ROADMAP item 21,
+[FEDERATION-WIRE-v1](../design/FEDERATION-WIRE-v1.md)); the API surface is in
+[the federation reference](../reference.md#datacrystalweb-reflection-api).
+
+`pip install 'datacrystal[web]'` on the coordinator; a follower additionally needs an HTTP transport
+and the contribute serializer (`pip install 'datacrystal[follower]'`). The wire is **three HTTP
+shapes** under `/v1`: `GET /v1/head` (the watermark probe), `GET /v1/deltas?after=<tid>` (the
+COMMIT-DELTA-v1 change-feed), and `POST /v1/submit` (contribute). A follower talks only those — it
+never touches the coordinator's process directly.
+
+## The coordinator: a store + a delta log + the federation router
+
+The coordinator is an ordinary single-writer store with a
+[`DeltaLog`](snapshots-and-delta-log.md#keep-a-durable-audit-log-datacrystaldeltalog) attached (the
+change-feed `/v1/deltas` is served from) and `federation_router` mounted on a FastAPI app:
+
+```python
+import datacrystal as dc
+from datacrystal.deltalog import DeltaLog
+from datacrystal.web import federation_router
+from fastapi import FastAPI
+
+store = dc.Store.open("coordinator.store")     # the ONE writer
+log = DeltaLog("coordinator.log")              # the retained change-feed
+store.attach(log)                              # serve /v1/deltas from it
+
+app = FastAPI()
+app.include_router(federation_router(store, log))   # mounts /v1/head, /v1/deltas, /v1/submit
+```
+
+Run it with **one worker** — a store is single-writer (the lease lock), and the coordinator opens
+the store on the startup thread, which becomes its owner thread (ADR-001):
+
+```bash
+uvicorn coordinator:app --host 0.0.0.0 --port 8000 --workers 1
+```
+
+`workers=1` is not a throughput compromise — `POST /v1/submit` runs **owner-confined** writes
+(`store.submit(...)` fans the contribution onto the owner thread, where the commit actually
+happens), so the store must be opened on the same thread that runs the event loop. A second writer
+process would fail to take the lease. Followers carry the read load; the coordinator scales *within*
+one process (see [the web deployment doctrine](web-deployment.md#the-deployment-doctrine--and-why-each-rule-holds)
+and [SCALING.md](../design/SCALING.md)).
+
+You bring your own authn/z: `federation_router(store, log, dependencies=[Depends(check_key)])`
+applies your dependency to **every** federation route — nothing is exempt.
+
+## A follower: bootstrap, read locally, stay current
+
+`open_follower(url)` opens a **real local store** by replaying the coordinator's change-feed from
+TID 0 (`GET /v1/deltas?after=0`). After bootstrap, reads hit the local store at full speed — no
+per-call round-trips, no snapshot encoder:
+
+```python
+import datacrystal as dc
+
+edge = dc.open_follower("http://coordinator:8000", api_key="...", path="edge.replica")
+# `path=None` (default) keeps the replica in memory; a path makes it sqlite-backed on disk.
+
+quartz = edge.get(Mineral, qid="Q1")           # local read — the coordinator's committed state
+hits = edge.query(Mineral.crystal_system == "trigonal")   # the full query API, locally
+```
+
+A follower stays current by calling **`store.sync()`** — a synchronous, owner-thread catch-up that
+pulls the coordinator's deltas after the local watermark and applies them in place. Each delta is
+validated through the same reference applier the engine uses, so a gap raises `DeltaGapError` (the
+follower must resync from 0 — its history is missing) and an already-seen delta is an idempotent
+no-op:
+
+```python
+new_watermark = edge.sync()                     # catch up to the coordinator's head
+```
+
+`sync()` is a follower-only method (a normal store raises) and refuses to run while local writes are
+buffered — flush a contribution first.
+
+## Contributing a write back to the coordinator
+
+A follower contributes by the **ordinary write API** — `upsert(...)` then `commit()`. On a
+follower, `commit()` does not write locally; it fans the buffered entities into the coordinator's
+`POST /v1/submit` (serialized via `to_pydantic`), then `sync()`s the result back so the follower
+reads its own write:
+
+```python
+edge.upsert(Mineral(qid="Q3", name="Topaz", crystal_system="orthorhombic", mohs=8.0))
+applied_tid = edge.commit()                     # fans into the coordinator, then syncs back
+topaz = edge.get(Mineral, qid="Q3")             # read-your-writes
+```
+
+Each contributed entity must have a `dc.Unique` natural key — that key is the idempotency anchor (a
+re-sent insert merges to the same entity on the coordinator, never a duplicate). An **update**
+carries an OCC base token (the hash of the payload the entity was read at); if the coordinator's
+entity has moved since, the commit raises `ConflictError` instead of clobbering it. The recovery
+loop is **sync → re-read → re-apply → commit**:
+
+```python
+from datacrystal import ConflictError
+
+while True:
+    m = edge.get(Mineral, qid="Q1")             # read the current value (sets the OCC base)
+    m.mohs = 7.5                                 # your edit
+    try:
+        edge.commit()
+        break
+    except ConflictError:
+        edge.sync()                              # someone moved Q1 first — pull their change,
+        continue                                 # re-read, re-apply your edit, retry
+```
+
+A `SchemaSkewError` on contribute means your follower sent a field the coordinator's class does not
+have (its schema is older) — upgrade the coordinator, or drop the field; the contribution is
+rejected, never silently truncated.
+
+## Cross-entity references
+
+A reference field (`type_locality: Lazy[Locality]`) crosses the wire as the referent's **coordinator
+OID**, so a contribution may reference any entity that is **already committed** on the coordinator:
+
+```python
+locality = edge.get(Locality, qid="LT")                 # already on the coordinator
+edge.upsert(Mineral(qid="Q5", name="Smithsonite", type_locality=dc.Lazy.of(locality)))
+edge.commit()                                            # the ref rides as the coordinator's OID
+```
+
+After another follower `sync()`s, the reference resolves to the right `Locality` — the OID is
+coordinator-global, identical on every replica.
+
+## The v0 limits (fail loud, never silently)
+
+- **Contribute is upsert-only.** A follower with a buffered `delete()` raises `NotImplementedError`
+  on `commit()` — delete on the coordinator directly. `/v1/submit` carries no delete op.
+- **References must point to already-committed entities.** Contributing a Mineral that references a
+  **new** Locality in the *same* batch (a new→new reference) raises `NotImplementedError`: the
+  follower-local OID of an uncommitted entity is meaningless on the coordinator. Contribute the
+  referenced entity first, let it commit, then reference it.
+
+Both are deliberate cuts, not bugs — they fail loudly at contribute time so an unsafe write never
+crosses the wire.
+
+---
+
+See also: [Snapshots, the commit stream, and the delta log](snapshots-and-delta-log.md) (the
+change-feed the coordinator serves), [Deploy behind FastAPI and GraphQL](web-deployment.md) (the
+broader `datacrystal[web]` doctrine), and the
+[federation reference](../reference.md#datacrystalweb-reflection-api).
