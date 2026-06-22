@@ -63,7 +63,6 @@ def federation_router(
     """
     router = APIRouter(prefix="/v1", dependencies=list(dependencies or []))
 
-    @router.get("/head")
     def head() -> dict[str, Any]:
         """The watermark probe: ``{tid, format, version}`` (liveness + lag)."""
         return {
@@ -72,7 +71,6 @@ def federation_router(
             "version": CONTRACT_VERSION,
         }
 
-    @router.get("/deltas")
     def deltas(after: int = Query(0, ge=0)) -> Response:
         """COMMIT-DELTA-v1 frames with ``tid > after``, in strict TID order.
 
@@ -88,4 +86,8 @@ def federation_router(
             content=b"".join(chunks), media_type="application/octet-stream"
         )
 
+    # add_api_route (not the @router.get decorator) so the handlers are
+    # *referenced* — the decorator form trips strict reportUnusedFunction.
+    router.add_api_route("/head", head, methods=["GET"])
+    router.add_api_route("/deltas", deltas, methods=["GET"])
     return router
