@@ -23,6 +23,11 @@ have to leave your objects to get one.
 operate. From a laptop to a fleet of instances, the same code, blazing fast: systems of record,
 knowledge graphs, search, FastAPI services, live analytics over your data.
 
+And the fleet pulls its weight. Edge nodes — indexers, annotators, local LLMs — read the graph
+locally at full speed and fan what they discover back to the single writer. The cloud node stays
+small; the work spreads to where the data and the compute already are. One writer, many
+contributors, the same objects.
+
 You came here to build, not to administer a database. Declare, deploy, ship — the data just follows.
 
 ---

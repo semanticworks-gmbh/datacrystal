@@ -54,6 +54,15 @@ Consequence flagged, NOT yet ranked: the vision leans on **S3-primary persistenc
 the next refinement session (today's honest answer stays Litestream + parquet-on-S3, single node).
 No item moves on this note alone; it records the lens.
 
+Amended 2026-06-22 (owner ratification): **item 21 (networked replication) promoted from Punted to
+STAGED for Sprint 13** — the *fractal-followers tracer bullet* (design
+[../research/2026-06-20-fractal-followers.md](../research/2026-06-20-fractal-followers.md), epic
+#146). Home reconciled to the merged design: the **server surface lives in `datacrystal[web]`** and
+the **follower client `open_follower` in core** (lazy transport import) — *not* a single new
+`datacrystal[replica]` extra. The wire is locked in
+[FEDERATION-WIRE-v1](FEDERATION-WIRE-v1.md); OCC rides item 3's existing prior-payload check, so **no
+new ADR**. Never-list intact (no multi-writer/CRDT/lease). Item 16 stays Punted (orthogonal).
+
 ## How this roadmap works
 
 **The live backlog lives in [GitHub Issues + Milestones](https://github.com/semanticworks-gmbh/datacrystal/issues)**
@@ -87,6 +96,7 @@ Ratified next work, now issues under milestones (decision rationale in each issu
 | ROADMAP # | Work | Issue | Sprint |
 |-----------|------|-------|--------|
 | 8 | Reverse-reference index + `incoming()` traversal — the ratified next step (🥇 Golden Ticket) | #20 | Sprint 3 |
+| 21 | Networked replication — fractal-followers tracer bullet (server `[web]` + core `open_follower`) | #146 | Sprint 13 |
 | 9 | DuckPGQ property-graph recipe (docs-only) | #21 | backlog |
 | 11 | `datacrystal[vector]` — usearch sidecar (≥2 `@Vector` fields) | #22 | backlog |
 | 12 | `datacrystal[web]` — FastAPI + strawberry GraphQL | #23 | Sprint 9 |
@@ -134,7 +144,11 @@ GitHub under the same milestones — scored and labelled (`priority:` / `theme:`
     Omnigraph get branching cheap precisely because their substrate is immutable columnar
     snapshots (Lance), which for us corresponds to the v1 Arrow mirror tier, not the live
     object graph. Demand-driven; merge semantics never promised for core.
-21. **Networked replication layer** — `datacrystal[replica]` (owner request 2026-06-11;
+21. **Networked replication layer.** → **PROMOTED 2026-06-22: STAGED for Sprint 13** (the
+    *fractal-followers tracer bullet* — see the Active & planned table + epic #146 +
+    [FEDERATION-WIRE-v1](FEDERATION-WIRE-v1.md)). Home reconciled: server in `datacrystal[web]`,
+    client `open_follower` in core (lazy transport) — *not* a single `datacrystal[replica]` extra.
+    The design rationale below stands. (owner request 2026-06-11;
     transports evaluated in
     [2026-06-11-replication-transports.md](../research/2026-06-11-replication-transports.md)).
     The *shape* is already ratified, not new scope: exactly one writer (lease, invariant 10)
