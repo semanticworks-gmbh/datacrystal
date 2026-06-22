@@ -88,8 +88,14 @@ sqlite-backed when `path=` is given. Each delta is validated through the referen
 refuse loudly, re-applies are idempotent) and persisted with the coordinator's own OIDs/TIDs, so the
 replica reproduces the coordinator's committed state exactly. `api_key` is sent as the `x-api-key`
 header; `client` injects an `httpx.Client`-compatible transport (advanced/testing). The HTTP
-transport is imported lazily, so a bare `import datacrystal` stays inside the `{msgspec, pyroaring}`
-budget. Catch-up and contribute land in later stories.
+transport ships in the **`datacrystal[follower]`** extra and is imported lazily, so a bare
+`import datacrystal` stays inside the `{msgspec, pyroaring}` budget.
+
+A follower stays current by calling **`store.sync()`** — a synchronous, owner-thread catch-up that
+pulls the coordinator's deltas after the local watermark, applies them (a gap raises `DeltaGapError`
+→ resync), and refreshes the live store; it returns the new watermark. Identity is by OID, so
+**re-query after a sync** — a live reference read *before* it sees stale field values. `sync()` is a
+follower-only method (a normal store raises) and refuses to run with buffered local writes.
 
 ## Define entities
 

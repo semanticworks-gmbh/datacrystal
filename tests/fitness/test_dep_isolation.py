@@ -17,6 +17,9 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 BANNED_AT_IMPORT = {
     "pyarrow", "duckdb", "polars", "usearch", "pydantic", "numpy",
     "psutil", "fastapi", "strawberry", "pandas", "sqlite3",
+    # the follower's HTTP transport (datacrystal[follower]) is imported lazily,
+    # inside open_follower's fetch — never at `import datacrystal` (#151).
+    "httpx", "httpcore", "h11", "requests", "urllib3", "aiohttp",
 }
 
 

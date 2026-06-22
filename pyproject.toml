@@ -32,6 +32,9 @@ web = [
     "fastapi",
     "strawberry-graphql",
 ]
+follower = [
+    "httpx>=0.28",
+]
 
 [dependency-groups]
 dev = [

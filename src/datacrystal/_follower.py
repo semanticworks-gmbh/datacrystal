@@ -24,11 +24,11 @@ import struct
 from collections.abc import Iterable, Iterator
 from typing import TYPE_CHECKING, Any
 
-from datacrystal._ids import CID_BASE, FORMAT_VERSION, OID_BASE
+from datacrystal._ids import CID_BASE, FORMAT_VERSION, OID_BASE, TID_BASE
 from datacrystal._storage.memory import MemoryBackend
 from datacrystal._storage.protocol import CommitBatch, StorageBackend, StoredRecord
 from datacrystal._store import Store
-from datacrystal.contract.applier import ReferenceApplier, decode_delta
+from datacrystal.contract.applier import DeltaGapError, ReferenceApplier, decode_delta
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -48,64 +48,98 @@ def _iter_frames(blob: bytes) -> Iterator[dict[str, Any]]:
         offset += size
 
 
+def _delta_to_batch(
+    delta: dict[str, Any], max_oid: int, max_cid: int, root: int | None
+) -> tuple[CommitBatch, int, int, int | None]:
+    """Reverse one COMMIT-DELTA-v1 delta into a CommitBatch with the coordinator's
+    own OIDs/TIDs, advancing the OID/CID/root high-water marks.
+
+    The synthesized meta lands the follower's watermark (``next_tid - 1``,
+    invariant 5); the OID/CID marks keep boot consistent (a read-only follower
+    never allocates locally).
+    """
+    tid = int(delta["tid"])
+    records: list[StoredRecord] = []
+    deletes: list[int] = []
+    for op in delta["ops"]:
+        cid = int(op["cid"])
+        oid = int(op["oid"])
+        max_cid = max(max_cid, cid)
+        if op["op"] == "upsert":
+            records.append(StoredRecord(oid=oid, cid=cid, tid=tid, payload=op["payload"]))
+            max_oid = max(max_oid, oid)
+        else:  # delete (ADR-003 unchecked) — the row is removed atomically
+            deletes.append(oid)
+    new_types: list[tuple[int, str, list[str]]] = []
+    for cid_row, typename, fields in delta["types"]:
+        new_types.append((int(cid_row), str(typename), [str(f) for f in fields]))
+        max_cid = max(max_cid, int(cid_row))
+    if delta["root"] is not None:
+        root = int(delta["root"])
+    meta = {
+        "next_oid": str(max_oid + 1),
+        "next_cid": str(max_cid + 1),
+        "next_tid": str(tid + 1),
+        "root_oid": "" if root is None else str(root),
+        "format_version": str(FORMAT_VERSION),
+    }
+    batch = CommitBatch(
+        tid=tid, records=records, new_types=new_types, deletes=deletes, meta=meta
+    )
+    return batch, max_oid, max_cid, root
+
+
 def _bootstrap_backend(
     backend: StorageBackend, deltas: Iterable[dict[str, Any]]
 ) -> ReferenceApplier:
-    """Validate ``deltas`` and persist each advancing one into ``backend``.
+    """Validate ``deltas`` from genesis and persist each advancing one into ``backend``.
 
     Every delta is fed to a :class:`ReferenceApplier` first — so an out-of-order
-    delta raises :class:`~datacrystal.contract.applier.DeltaGapError` and an
-    already-seen one is a no-op (``apply`` returns ``False``) **before** the
-    backend is touched: a gap never half-applies. The returned applier's
-    ``watermark`` / ``state_digest`` are the authoritative replayed state.
+    delta raises :class:`~datacrystal.contract.applier.DeltaGapError`, an
+    already-seen one is a no-op (``apply`` returns ``False``), and the ``prior``
+    payload is checked — all **before** the backend is touched: a gap never
+    half-applies. The returned applier's ``watermark`` / ``state_digest`` are the
+    authoritative replayed state.
     """
     applier = ReferenceApplier()
-    max_oid = OID_BASE - 1
-    max_cid = CID_BASE - 1
-    root: int | None = None
+    max_oid, max_cid, root = OID_BASE - 1, CID_BASE - 1, None
     for delta in deltas:
         if not applier.apply(delta):  # False = idempotent skip; gap/format raise
             continue
-        tid = int(delta["tid"])
-        records: list[StoredRecord] = []
-        deletes: list[int] = []
-        for op in delta["ops"]:
-            cid = int(op["cid"])
-            oid = int(op["oid"])
-            max_cid = max(max_cid, cid)
-            if op["op"] == "upsert":
-                records.append(
-                    StoredRecord(oid=oid, cid=cid, tid=tid, payload=op["payload"])
-                )
-                max_oid = max(max_oid, oid)
-            else:  # delete (ADR-003 unchecked) — the row is removed atomically
-                deletes.append(oid)
-        new_types: list[tuple[int, str, list[str]]] = []
-        for cid_row, typename, fields in delta["types"]:
-            new_types.append((int(cid_row), str(typename), [str(f) for f in fields]))
-            max_cid = max(max_cid, int(cid_row))
-        if delta["root"] is not None:
-            root = int(delta["root"])
-        # Synthesize the meta the reconstructed Store boots from: next_tid - 1 is
-        # the follower's watermark (invariant 5); the OID/CID high-water marks
-        # keep boot consistent (a read-only follower never allocates locally).
-        meta = {
-            "next_oid": str(max_oid + 1),
-            "next_cid": str(max_cid + 1),
-            "next_tid": str(tid + 1),
-            "root_oid": "" if root is None else str(root),
-            "format_version": str(FORMAT_VERSION),
-        }
-        backend.apply(
-            CommitBatch(
-                tid=tid,
-                records=records,
-                new_types=new_types,
-                deletes=deletes,
-                meta=meta,
-            )
-        )
+        batch, max_oid, max_cid, root = _delta_to_batch(delta, max_oid, max_cid, root)
+        backend.apply(batch)
     return applier
+
+
+def _apply_catchup(backend: StorageBackend, deltas: Iterable[dict[str, Any]]) -> int:
+    """Apply deltas *after* the backend's current watermark — follower catch-up.
+
+    Unlike :func:`_bootstrap_backend` (which replays from genesis with the full
+    ``prior`` check), catch-up has no prior state loaded, so it validates only
+    **gapless ordering** (a skip raises ``DeltaGapError``; an already-seen delta
+    is skipped) — the single-writer source plus the bootstrap-validated prefix
+    make that sufficient. The OID/CID/root bases come from the backend's current
+    meta, so a re-applied delta never regresses them. Returns the new watermark.
+    """
+    meta = backend.boot().meta
+    watermark = int(meta.get("next_tid", TID_BASE)) - 1
+    max_oid = int(meta.get("next_oid", OID_BASE)) - 1
+    max_cid = int(meta.get("next_cid", CID_BASE)) - 1
+    root_meta = meta.get("root_oid", "")
+    root: int | None = int(root_meta) if root_meta else None
+    for delta in deltas:
+        tid = int(delta["tid"])
+        if tid <= watermark:
+            continue  # idempotent skip (apply-twice ≡ apply-once)
+        if tid != watermark + 1:
+            raise DeltaGapError(
+                f"follower at watermark {watermark} got delta {tid}: history is "
+                "missing — resync from 0"
+            )
+        batch, max_oid, max_cid, root = _delta_to_batch(delta, max_oid, max_cid, root)
+        backend.apply(batch)
+        watermark = tid
+    return watermark
 
 
 def _fetch_deltas(
@@ -169,4 +203,15 @@ def open_follower(
     _bootstrap_backend(backend, _iter_frames(blob))
     # same-package engine cooperation: the no-lock backend constructor is the
     # right entry for a replica we have already populated via backend.apply.
-    return Store._from_backend(backend)  # pyright: ignore[reportPrivateUsage]
+    store = Store._from_backend(backend)  # pyright: ignore[reportPrivateUsage]
+
+    def _sync(after: int) -> int:
+        """Fetch + apply the coordinator's deltas after ``after`` (Store.sync)."""
+        frames = _iter_frames(
+            _fetch_deltas(url, after=after, api_key=api_key, client=client)
+        )
+        return _apply_catchup(backend, frames)
+
+    # the follower catch-up hook Store.sync() calls (#151); same-package.
+    store._sync_fn = _sync  # pyright: ignore[reportPrivateUsage]
+    return store

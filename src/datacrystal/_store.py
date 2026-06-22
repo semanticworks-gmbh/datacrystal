@@ -225,7 +225,29 @@ class Store:
         # deliver deltas only while this list is non-empty — an unwatched
         # store pays nothing for the pipeline (spec §5).
         self._consumers: list[DeltaConsumer] = []
+        # Follower catch-up hook (#151, ROADMAP item 21): open_follower installs
+        # a closure that fetches + applies the coordinator's new deltas and
+        # returns the new watermark; None for a normal (non-follower) store.
+        self._sync_fn: Callable[[int], int] | None = None
 
+        # The index-cache sidecar (ADR-005 / #12) is per-session (tied to the
+        # store dir); created here, then the (re)loadable state below reads it.
+        self._index_cache = (
+            IndexCache(cache_dir / "index.cache") if cache_dir is not None else None
+        )
+        self._load_state(use_cache=True)
+
+    def _load_state(self, *, use_cache: bool) -> None:
+        """(Re)derive all boot-time state from the backend, in one place.
+
+        Called at open (``use_cache=True``) and by a follower's :meth:`sync`
+        refresh (``use_cache=False``, #151) once new deltas have landed in the
+        backend: the allocator, watermark, root OID, type lineage, and a fresh
+        index manager are all re-read from ``backend.boot()``. A refresh rebuilds
+        the index from records (the watermark-stamped sidecar is only read at
+        open, never authoritative — invariant 11).
+        """
+        backend = self._backend
         boot = backend.boot()
         meta = boot.meta
         self._alloc = IdAllocator(
@@ -258,21 +280,64 @@ class Store:
             self._durable_cids.add(cid)
         self._ti_by_cid: dict[int, TypeInfo] = {}
         self._plan_by_cid: dict[int, list[tuple[Any, int | None, Any]]] = {}
-        # Index cache (ADR-005 / #12): a sidecar beside the store; read at boot
-        # only if its watermark matches (else the index rebuilds from records —
-        # the cache is never authoritative, invariant 11). Disk stores only.
-        self._index_cache = (
-            IndexCache(cache_dir / "index.cache") if cache_dir is not None else None
-        )
         cached = (
             self._index_cache.read(self._last_tid)
-            if self._index_cache is not None else None
+            if use_cache and self._index_cache is not None else None
         )
         cache_blobs = cached["classes"] if cached is not None else None
         reverse_blob = cached["reverse"] if cached is not None else None
         self._index = IndexManager(backend, self._lineage_for,
                                    self._persisted_fields.keys, cache_blobs,
                                    reverse_blob)
+
+    def _refresh_from_backend(self) -> None:
+        """Discard in-memory caches and re-derive all state from the backend.
+
+        For a follower whose backend just received new committed deltas
+        (:meth:`sync`, #151): the OID registry, the pinned root, and the
+        type-lineage + index manager are rebuilt so the next read reflects the
+        new state. Read-only — :meth:`sync` guards that no local writes are
+        buffered, so the dirty/new/deleted maps are clear here.
+        """
+        self._registry = ObjectRegistry()
+        self._root_holder = None
+        self._new.clear()
+        self._dirty.clear()
+        self._deleted.clear()
+        self._pending_upserts.clear()
+        self._fingerprints.clear()
+        self._load_state(use_cache=False)
+
+    def sync(self) -> int:
+        """Pull and apply the coordinator's new deltas — follower catch-up (#151).
+
+        Synchronous, owner-thread, single-threaded (the v0 follower contract):
+        fetch the deltas after the local watermark, apply them, and refresh this
+        live store so the next read reflects them. Returns the (possibly
+        unchanged) watermark. Only a store opened with
+        :func:`~datacrystal.open_follower` can sync.
+
+        A live reference to a CLEAN entity read *before* a sync sees stale field
+        values afterwards — re-query for fresh reads (identity is by OID, so a
+        re-read returns the updated instance).
+
+        Raises:
+            WrongThreadError: called off the owner thread (ADR-001).
+            StoreClosedError: the store is closed.
+            DeltaGapError: a delta skipped past the watermark — resync from 0.
+            RuntimeError: this store is not a follower, or local writes are
+                buffered (commit or discard them before syncing).
+        """
+        self._enter()
+        if self._sync_fn is None:
+            raise RuntimeError("sync() needs a follower store — see dc.open_follower")
+        if self._new or self._dirty or self._deleted:
+            raise RuntimeError("commit or discard buffered writes before sync()")
+        before = self._last_tid
+        applied = self._sync_fn(before)
+        if applied > before:
+            self._refresh_from_backend()
+        return self._last_tid
 
     # -- lifecycle -----------------------------------------------------------
 
