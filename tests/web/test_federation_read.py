@@ -7,6 +7,7 @@ order (each decode-round-trips); the auth seam rejects an unauthed request.
 
 from __future__ import annotations
 
+import inspect
 import struct
 from typing import Any
 
@@ -80,6 +81,28 @@ def test_head_and_deltas_serve_the_wire(store_factory, tmp_path) -> None:
                 client.get("/v1/deltas", params={"after": tids[0]}).content
             )
             assert [d["tid"] for d in mid] == tids[1:]
+    finally:
+        store.close()
+
+
+def test_read_routes_are_async(store_factory, tmp_path) -> None:
+    """``/v1/head`` and ``/v1/deltas`` MUST be ``async def`` (#149 peer-review fix).
+
+    A sync handler runs in Starlette's threadpool, OFF the store's owner thread,
+    where ``DeltaLog.replay`` would race a concurrent ``/v1/submit`` commit's
+    lock-free segment/buffer mutation and silently yield a short/repeated frame
+    stream. Async handlers run on the event-loop = owner thread, serialized with
+    the inline commit. Pin the contract structurally so a refactor back to ``def``
+    is caught (a deterministic guard for an otherwise racy bug).
+    """
+    store = store_factory()
+    log = DeltaLog(tmp_path / "deltalog")
+    _seed(store, log)
+    try:
+        router = federation_router(store, log)
+        endpoints = {route.path: route.endpoint for route in router.routes}  # type: ignore[attr-defined]
+        assert inspect.iscoroutinefunction(endpoints["/v1/head"])
+        assert inspect.iscoroutinefunction(endpoints["/v1/deltas"])
     finally:
         store.close()
 

@@ -97,15 +97,23 @@ pulls the coordinator's deltas after the local watermark, applies them (a gap ra
 **re-query after a sync** — a live reference read *before* it sees stale field values. `sync()` is a
 follower-only method (a normal store raises) and refuses to run with buffered local writes.
 
+**`store.discard()`** drops all buffered (uncommitted) writes and re-reads the committed state from
+the backend, returning the current watermark — the rollback the `sync()` "buffered writes" error
+names. It works on any store (an uncommitted local graph is dropped); a live reference held across it
+is detached, so re-`get()` for fresh values.
+
 A follower **contributes** by the ordinary write API: `store.upsert(...)` then `store.commit()` —
 on a follower, `commit()` fans the buffered entities into the coordinator's `/v1/submit` (serialized
 via `to_pydantic`, so contribute needs `datacrystal[follower]`'s pydantic), then `sync()`s the
 committed delta back. A new entity carries `base=None`; an edited existing one carries the OCC base
-it was read at. A coordinator reject surfaces as a typed local `ConflictError`/`SchemaSkewError`
-(re-read and retry); the recovery loop is `sync()` → re-read → re-apply → `commit()`. **v0 contribute is
-upsert-only** — a follower with a buffered `delete()` raises (delete on the coordinator instead) — and a
-contributed entity's references must point to **already-committed** entities; an intra-batch new→new
-reference raises loudly (its follower-local OID is not valid on the coordinator).
+it was read at. A coordinator reject surfaces as a typed local
+`ConflictError`/`SchemaSkewError`/`DanglingRefError`; the recovery loop is `discard()` → `sync()` →
+re-read → re-apply → `commit()`. **v0 contribute is upsert-only** — a follower with a buffered
+`delete()` raises (delete on the coordinator instead) — and a contributed entity's references must
+point to **already-committed** entities (an intra-batch new→new reference raises loudly, its
+follower-local OID is not valid on the coordinator). A `dc.Blob` field and an `@entity` nested in a
+bare `list`/`dict` container also raise on contribute (no create-face wire shape / the OID-int
+boundary cannot rebind them); see [the federation how-to](how-to/federation.md).
 
 ## Define entities
 

@@ -24,9 +24,16 @@ import struct
 from collections.abc import Iterable, Iterator
 from typing import TYPE_CHECKING, Any, cast
 
-from datacrystal._entity import oid_of, type_info
-from datacrystal._errors import ConflictError, SchemaSkewError
+from datacrystal._entity import is_entity, oid_of, type_info
+from datacrystal._errors import (
+    ERROR_DANGLING_REF,
+    ERROR_SCHEMA_SKEW,
+    ConflictError,
+    DanglingRefError,
+    SchemaSkewError,
+)
 from datacrystal._ids import CID_BASE, FORMAT_VERSION, OID_BASE, TID_BASE
+from datacrystal._lazy import Lazy
 from datacrystal._storage.memory import MemoryBackend
 from datacrystal._storage.protocol import CommitBatch, StorageBackend, StoredRecord
 from datacrystal._store import Store
@@ -187,6 +194,38 @@ def _post_submit(
         return resp.status_code, (resp.json() if resp.content else None)
 
 
+def _holds_entity(value: Any) -> bool:
+    """True if ``value`` is or (recursively) contains a live ``@entity`` / ``Lazy``
+    ref — used to detect an entity nested inside a container field.
+    """
+    if is_entity(value) or isinstance(value, Lazy):
+        return True
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return any(_holds_entity(item) for item in cast("Iterable[Any]", value))
+    if isinstance(value, dict):
+        return any(_holds_entity(v) for v in cast("dict[Any, Any]", value).values())
+    return False
+
+
+def _container_holds_entity(value: Any) -> bool:
+    """True if ``value`` is a *container* (list/dict/tuple/set) holding an ``@entity``.
+
+    A reference nested in a bare/untyped container (a bare ``list``/``dict``, a
+    ``dict[str, Entity]``) is the shape the OID-int boundary cannot rebind on the
+    coordinator — :func:`~datacrystal.web._pydantic.to_pydantic` projects each
+    entity to its OID, but ``from_pydantic`` only resolves scalar refs and
+    ``list``-edge fields, so the ref would land as a bare int (silent corruption).
+    A scalar ref field (a ``Lazy``/``@entity`` value, not in a container) is
+    handled and returns ``False`` here; a ``list[Lazy[T]]``/``list[T]`` edge is
+    excluded by the caller via ``list_ref_target`` before this is reached.
+    """
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return any(_holds_entity(item) for item in cast("Iterable[Any]", value))
+    if isinstance(value, dict):
+        return any(_holds_entity(v) for v in cast("dict[Any, Any]", value).values())
+    return False
+
+
 def _refs_local_new(value: Any, new_oids: set[int]) -> bool:
     """True if ``value`` (a serialized create-face field, walked recursively)
     references an OID in ``new_oids`` — a ref to a not-yet-committed local entity.
@@ -209,17 +248,29 @@ def _contribute(
     url: str,
     api_key: str | None,
     client: Any | None,
-) -> int:
+) -> int | None:
     """Serialize buffered ``(entity, base)`` items and fan them into the coordinator.
 
     Each entity is projected to its create-face wire shape via
     :func:`~datacrystal.web.to_pydantic` (refs as OID ints) — lazily imported, so
     a contribution needs ``datacrystal[follower]``'s pydantic, never a bare
     ``import datacrystal``. A coordinator reject (HTTP 409) is translated to the
-    typed local exception (``ConflictError`` / ``SchemaSkewError``) so the caller
-    can re-read and retry. Returns the coordinator's applied TID.
+    faithful typed local exception (``ConflictError`` / ``SchemaSkewError`` /
+    ``DanglingRefError``) so the caller can re-read and retry.
+
+    Two v0 shapes fail loud here BEFORE the wire (FEDERATION-WIRE-v1 §5 cuts), so
+    an unfederatable value can never silently corrupt the coordinator: a
+    ``dc.Blob`` field (out-of-line bytes have no create-face wire shape), and an
+    ``@entity`` reference nested in an unsupported container (a bare ``list``/
+    ``dict``, ``dict[str, Entity]`` — only scalar refs and ``list``-edges
+    round-trip). Returns the coordinator's applied TID, or ``None`` if the batch
+    committed nothing (an idempotent re-send / value-equal no-op).
     """
-    from datacrystal.web._pydantic import to_pydantic  # lazy: needs pydantic
+    # lazy: needs pydantic (to_pydantic) — _reflect is framework-free. Both reach
+    # through the web package, which lazy-imports its fastapi/strawberry submodules
+    # so a datacrystal[follower] install (pydantic + httpx, no fastapi) suffices.
+    from datacrystal.web._pydantic import to_pydantic
+    from datacrystal.web._reflect import list_ref_target, reflect
 
     # the local OIDs of the NEW entities in this batch (base is None). A ref to
     # one of these is an intra-batch new→new ref — its follower-local OID is
@@ -236,6 +287,24 @@ def _contribute(
             raise SchemaSkewError(
                 f"{ti.typename} has no dc.Unique natural key — cannot contribute it"
             )
+        if any(spec.blob for spec in ti.specs):  # §5 cut: out-of-line bytes
+            raise NotImplementedError(
+                f"{ti.typename} has a dc.Blob field — blob bytes live out-of-line "
+                "and have no /v1/submit wire shape (v0); contribute on the "
+                "coordinator, or model the bytes inline"
+            )
+        # §5 cut: an @entity nested in a container the OID-int boundary cannot
+        # rebind would land as a bare int on the coordinator (silent corruption).
+        _, descriptors = reflect(ti.cls)
+        for d in descriptors:
+            if list_ref_target(d.core_type) is not None:
+                continue  # a list[Lazy[T]] / list[T] edge round-trips (handled)
+            if _container_holds_entity(getattr(obj, d.name)):
+                raise NotImplementedError(
+                    f"{ti.typename}.{d.name} holds an @entity inside an unsupported "
+                    "container shape — only scalar refs (Lazy[T] / @entity) and "
+                    "list edges (list[Lazy[T]] / list[T]) federate (v0)"
+                )
         fields = to_pydantic(obj, face="create").model_dump(mode="json")
         if _refs_local_new(fields, new_oids):
             raise NotImplementedError(
@@ -251,12 +320,18 @@ def _contribute(
         raw = body.get("detail", body)
         detail = cast("dict[str, Any]", raw) if isinstance(raw, dict) else {}
         message = str(detail.get("message", "rejected"))
-        if detail.get("error") == "schema-skew":
+        error = detail.get("error")
+        if error == ERROR_SCHEMA_SKEW:
             raise SchemaSkewError(message)
+        if error == ERROR_DANGLING_REF:  # faithful, not folded into ConflictError
+            raise DanglingRefError(message)
         raise ConflictError(message)
     if status != 200:
         raise RuntimeError(f"/v1/submit returned {status}: {payload!r}")
-    return int(body["applied_tid"])
+    # applied_tid is null when the coordinator committed nothing (an idempotent
+    # re-send / value-equal no-op); pass that through as None, never int(None).
+    applied = body.get("applied_tid")
+    return int(applied) if applied is not None else None
 
 
 def open_follower(
@@ -309,7 +384,7 @@ def open_follower(
         )
         return _apply_catchup(backend, frames)
 
-    def _contribute_fn(items: list[tuple[Any, str | None]]) -> int:
+    def _contribute_fn(items: list[tuple[Any, str | None]]) -> int | None:
         """Serialize + POST the buffered items (Store._contribute calls this)."""
         return _contribute(items, url=url, api_key=api_key, client=client)
 

@@ -17,6 +17,7 @@ import pytest
 pytest.importorskip("httpx", reason="pip install httpx (ASGITransport)")
 
 import asyncio
+import threading
 
 import httpx
 from fastapi import FastAPI
@@ -112,6 +113,56 @@ def test_submit_rejects_malformed_envelope(store_factory, tmp_path) -> None:
         store.close()
 
 
+def test_submit_non_dict_fields_is_422_not_409(store_factory, tmp_path) -> None:
+    """A present-but-non-dict ``fields`` (or non-str ``type``/``key``) is a
+    malformed envelope → 422, never the 409 schema-skew the old ``set(str)`` bug
+    mis-fired (#154/#155 peer-review fix).
+    """
+    store = store_factory()
+    log = DeltaLog(tmp_path / "log")
+    store.attach(log)
+    try:
+
+        async def go() -> None:
+            non_dict = {"type": _MINERAL, "key": "qid", "fields": "NOTADICT", "base": None}
+            r1 = await _post(store, log, {"ops": [non_dict]})
+            assert r1.status_code == 422, r1.text  # not 409
+            non_str_key = {"type": _MINERAL, "key": 5, "fields": {"qid": "Q"}, "base": None}
+            r2 = await _post(store, log, {"ops": [non_str_key]})
+            assert r2.status_code == 422, r2.text
+
+        asyncio.run(go())
+        assert store.last_tid == 0  # fail closed
+    finally:
+        store.close()
+
+
+def test_submit_invalid_field_map_is_422_not_500(store_factory, tmp_path) -> None:
+    """A ``fields`` map that fails create-face validation (a missing required
+    field, a wrong-typed value) is a malformed envelope → 422, never an uncaught
+    pydantic.ValidationError surfacing as a 500 trace leak (#154/#155).
+    """
+    store = store_factory()
+    log = DeltaLog(tmp_path / "log")
+    store.attach(log)
+    try:
+
+        async def go() -> None:
+            # Mineral.name is required (no default) — omitting it must 422, not 500
+            missing = {"type": _MINERAL, "key": "qid", "fields": {"qid": "QV"}, "base": None}
+            r1 = await _post(store, log, {"ops": [missing]})
+            assert r1.status_code == 422, r1.text
+            # a wrong-typed value that cannot coerce to float
+            wrong = _op("QW", name="x", mohs="not-a-number")
+            r2 = await _post(store, log, {"ops": [wrong]})
+            assert r2.status_code == 422, r2.text
+
+        asyncio.run(go())
+        assert store.last_tid == 0
+    finally:
+        store.close()
+
+
 def test_submit_rejects_schema_skew(store_factory, tmp_path) -> None:
     store = store_factory()
     log = DeltaLog(tmp_path / "log")
@@ -189,6 +240,60 @@ def test_submit_reinsert_is_idempotent(store_factory, tmp_path) -> None:
         assert store.last_tid == 1  # the retry committed nothing
         rows = list(store.query(Mineral))
         assert len(rows) == 1 and oid_of(rows[0]) == oid  # one Q1, same OID
+    finally:
+        store.close()
+
+
+def test_submit_conflict_envelope_carries_bases(store_factory, tmp_path) -> None:
+    """The 409 conflict body is the LOCKED ``{error, key, expected_base,
+    actual_base}`` shape so a client can re-read and retry (#155 peer-review fix —
+    the fields were previously flattened into a message string and lost).
+    """
+    store = store_factory()
+    log = DeltaLog(tmp_path / "log")
+    store.attach(log)
+    try:
+
+        async def go() -> None:
+            assert (await _post(store, log, {"ops": [_op("Q1", name="Quartz", mohs=7.0)]})).status_code == 200
+            stale = "0" * 64
+            resp = await _post(store, log, {"ops": [_op("Q1", base=stale, name="Quartz", mohs=9.9)]})
+            assert resp.status_code == 409, resp.text
+            detail = resp.json()["detail"]
+            assert detail["error"] == "conflict"
+            assert detail["key"] == "Q1"  # which entity conflicted
+            assert detail["expected_base"] == stale  # what the client carried
+            assert detail["actual_base"] is not None and detail["actual_base"] != stale
+
+        asyncio.run(go())
+    finally:
+        store.close()
+
+
+def test_submit_off_owner_thread_fails_loud_not_hang(store_factory, tmp_path) -> None:
+    """If the event-loop thread is NOT the store's owner (a misdeployment), the
+    fan-in would queue with no pump and ``wrap_future`` await forever. The guard
+    turns that silent hang into a loud 500 (#155 peer-review fix).
+    """
+    store = store_factory()  # owner = this (main) test thread
+    log = DeltaLog(tmp_path / "log")
+    store.attach(log)
+    captured: dict[str, httpx.Response] = {}
+
+    def worker() -> None:
+        # asyncio.run here puts the event loop on THIS worker thread != owner.
+        async def go() -> httpx.Response:
+            return await _post(store, log, {"ops": [_op("Q1", name="Quartz")]})
+
+        captured["resp"] = asyncio.run(go())
+
+    try:
+        thread = threading.Thread(target=worker)
+        thread.start()
+        thread.join(timeout=15)
+        assert not thread.is_alive(), "submit hung — owner-thread guard missing (deadlock)"
+        assert captured["resp"].status_code == 500
+        assert store.last_tid == 0  # nothing written
     finally:
         store.close()
 

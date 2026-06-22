@@ -234,7 +234,7 @@ class Store:
         # coordinator's /v1/submit, returning the applied TID; None for a normal
         # store (commit() then takes the local P1/P2/P3 path).
         self._contribute_fn: (
-            Callable[[list[tuple[Any, str | None]]], int] | None
+            Callable[[list[tuple[Any, str | None]]], int | None] | None
         ) = None
 
         # The index-cache sidecar (ADR-005 / #12) is per-session (tied to the
@@ -344,6 +344,33 @@ class Store:
         applied = self._sync_fn(before)
         if applied > before:
             self._refresh_from_backend()
+        return self._last_tid
+
+    def discard(self) -> int:
+        """Drop all buffered (uncommitted) writes and re-read committed state.
+
+        The rollback the :meth:`sync` error message names. A follower whose
+        ``commit()`` the coordinator rejected (``ConflictError``) still holds its
+        buffered edit, so ``sync()`` refuses; ``discard()`` clears the buffered
+        ``upsert``/``delete``/``store`` set and re-derives the live store from the
+        backend's committed records, so the next read reflects the durable state
+        and a following ``sync()`` can run. This is the OCC recovery loop:
+        ``discard()`` → ``sync()`` → re-read → re-apply → ``commit()`` (#153
+        peer-review fix). Works on **any** store, not only a follower — an
+        uncommitted local graph is dropped, the durable state reloaded.
+
+        A live reference read *before* the discard is detached from identity (a
+        fresh registry); re-read for the current values (identity is by OID).
+
+        Returns:
+            The current committed watermark (unchanged by a discard).
+
+        Raises:
+            WrongThreadError: called off the owner thread (ADR-001).
+            StoreClosedError: the store has already been closed.
+        """
+        self._enter()
+        self._refresh_from_backend()
         return self._last_tid
 
     # -- lifecycle -----------------------------------------------------------

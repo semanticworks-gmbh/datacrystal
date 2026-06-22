@@ -22,13 +22,22 @@ from __future__ import annotations
 
 import asyncio
 import struct
+import threading
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, cast
 
+import pydantic
 from fastapi import APIRouter, Body, HTTPException, Query, Response
 
 from datacrystal._entity import TYPES_BY_NAME, oid_of
-from datacrystal._errors import ConflictError, DanglingRefError, SchemaSkewError
+from datacrystal._errors import (
+    ERROR_CONFLICT,
+    ERROR_DANGLING_REF,
+    ERROR_SCHEMA_SKEW,
+    ConflictError,
+    DanglingRefError,
+    SchemaSkewError,
+)
 from datacrystal.contract.applier import CONTRACT_VERSION, FORMAT_MARKER, encode_delta
 from datacrystal.web._pydantic import entity_model, from_pydantic
 
@@ -69,20 +78,36 @@ def federation_router(
     """
     router = APIRouter(prefix="/v1", dependencies=list(dependencies or []))
 
-    def head() -> dict[str, Any]:
-        """The watermark probe: ``{tid, format, version}`` (liveness + lag)."""
+    async def head() -> dict[str, Any]:
+        """The watermark probe: ``{tid, format, version}`` (liveness + lag).
+
+        ``async def`` on purpose: it runs on the event-loop thread = the store's
+        owner thread (ADR-001), so reading the watermark is serialized with the
+        inline ``/v1/submit`` commit rather than racing it from a threadpool
+        worker (#149 peer-review fix — see :func:`deltas`).
+        """
         return {
             "tid": store.last_tid,
             "format": FORMAT_MARKER,
             "version": CONTRACT_VERSION,
         }
 
-    def deltas(after: int = Query(0, ge=0)) -> Response:
+    async def deltas(after: int = Query(0, ge=0)) -> Response:
         """COMMIT-DELTA-v1 frames with ``tid > after``, in strict TID order.
 
         The body is zero or more ``[>Q length][encode_delta(delta)]`` frames —
         the exact bytes a follower applies through the reference applier. ``after``
         defaults to 0 (a from-genesis bootstrap).
+
+        ``async def`` is load-bearing: a *sync* handler would run in Starlette's
+        threadpool, OFF the owner thread, where :meth:`DeltaLog.replay` would
+        iterate the lock-free segment/buffer state while a concurrent
+        ``/v1/submit`` commit mutates it on the owner thread — silently yielding a
+        short or repeated frame stream (a wire gap the LOCKED contract forbids).
+        Running on the loop thread (= owner thread) serializes ``replay`` with the
+        inline commit; ``replay``'s body never awaits, so the loop cannot
+        interleave a commit into it (#149 peer-review fix; ADR-001 / DeltaLog
+        owner-confinement).
         """
         chunks: list[bytes] = []
         for delta in deltalog.replay(after_tid=after):
@@ -107,6 +132,19 @@ def federation_router(
         current payload → 409 (#155, ``ConflictError``). Idempotency rides the
         natural-key upsert (a retry re-merges to the same OID — no server ledger).
         """
+        # The write fans onto the store's owner thread (below). That only runs
+        # inline — never hangs — when the owner IS this event-loop thread, the
+        # documented deployment (open the store on the serving thread, ADR-001).
+        # A misdeployment would otherwise queue the fan-in with no pump and await
+        # forever; fail loud instead of a silent hang (#155 peer-review fix).
+        if threading.get_ident() != store._owner:  # pyright: ignore[reportPrivateUsage]
+            raise HTTPException(
+                500,
+                detail="coordinator store is not owned by the serving thread — open "
+                "it on the event-loop thread (uvicorn --workers 1; see "
+                "docs/how-to/federation.md)",
+            )
+
         raw_ops = body.get("ops")
         if not isinstance(raw_ops, list):
             raise HTTPException(422, detail="body 'ops' must be a list")
@@ -118,24 +156,47 @@ def federation_router(
             ):
                 raise HTTPException(422, detail="each op needs 'type', 'key', 'fields'")
             op = cast("dict[str, Any]", raw_op)
-            info = TYPES_BY_NAME.get(op["type"])
+            # Shape-check the envelope BEFORE any semantic read: a non-str
+            # type/key or a non-dict fields is a malformed envelope → 422, not a
+            # 409 (e.g. set("astring") would mis-fire the schema-skew guard,
+            # #154/#155 peer-review fix). FEDERATION-WIRE-v1 types fields as object.
+            op_type, op_key, op_fields = op["type"], op["key"], op["fields"]
+            if not (
+                isinstance(op_type, str)
+                and isinstance(op_key, str)
+                and isinstance(op_fields, dict)
+            ):
+                raise HTTPException(
+                    422, detail="each op needs 'type':str, 'key':str, 'fields':object"
+                )
+            fields = cast("dict[str, Any]", op_fields)
+            info = TYPES_BY_NAME.get(op_type)
             if info is None:
-                raise HTTPException(422, detail=f"unknown type {op['type']!r}")
-            key = op["key"]
-            spec = info.spec(key)
+                raise HTTPException(422, detail=f"unknown type {op_type!r}")
+            spec = info.spec(op_key)
             if spec is None or not spec.unique:  # #154: the natural key must be Unique
                 raise HTTPException(
-                    422, detail=f"key {key!r} is not a Unique field of {op['type']!r}"
+                    422, detail=f"key {op_key!r} is not a Unique field of {op_type!r}"
                 )
-            skew = set(op["fields"]) - set(info.field_names)
+            skew = set(fields) - set(info.field_names)
             if skew:  # #154 cid-lineage guard: never silently drop a newer field
                 raise HTTPException(
                     409,
-                    detail={"error": "schema-skew", "type": op["type"],
+                    detail={"error": ERROR_SCHEMA_SKEW, "type": op_type,
                             "unknown_fields": sorted(skew)},
                 )
-            dto = entity_model(info.cls, face="create").model_validate(op["fields"])
-            prepared.append((info, key, op.get("base"), dto))
+            try:
+                dto = entity_model(info.cls, face="create").model_validate(fields)
+            except pydantic.ValidationError as exc:
+                # A field map that does not form a valid create-face DTO (a missing
+                # required field, a wrong/uncoercible type) is a malformed envelope
+                # → 422, fail-closed, never an uncaught 500 trace leak (#154/#155).
+                raise HTTPException(
+                    422,
+                    detail={"error": "invalid-fields", "type": op_type,
+                            "errors": exc.errors(include_url=False)},
+                ) from exc
+            prepared.append((info, op_key, op.get("base"), dto))
 
         def fan_in() -> dict[str, Any]:
             survivors: dict[Any, Any] = {}
@@ -148,7 +209,10 @@ def federation_router(
                 if current != base:
                     raise ConflictError(
                         f"{info.typename}.{key}={value!r}: base {base!r} does not "
-                        f"match current {current!r} — re-read and retry"
+                        f"match current {current!r} — re-read and retry",
+                        key=value,
+                        expected_base=base,
+                        actual_base=current,
                     )
                 survivor = store.upsert(from_pydantic(dto, info.cls, store=store), key=key)
                 survivors[value] = survivor
@@ -161,11 +225,27 @@ def federation_router(
         try:
             return await asyncio.wrap_future(store.submit(fan_in))
         except ConflictError as exc:
-            raise HTTPException(409, detail={"error": "conflict", "message": str(exc)})
+            # The LOCKED conflict envelope: {error, key, expected_base,
+            # actual_base} so a client can re-read and retry (#155 peer-review fix
+            # — the fields were previously flattened into a message and lost).
+            raise HTTPException(
+                409,
+                detail={
+                    "error": ERROR_CONFLICT,
+                    "key": exc.key,
+                    "expected_base": exc.expected_base,
+                    "actual_base": exc.actual_base,
+                    "message": str(exc),
+                },
+            )
         except SchemaSkewError as exc:
-            raise HTTPException(409, detail={"error": "schema-skew", "message": str(exc)})
+            raise HTTPException(
+                409, detail={"error": ERROR_SCHEMA_SKEW, "message": str(exc)}
+            )
         except DanglingRefError as exc:
-            raise HTTPException(409, detail={"error": "dangling-ref", "message": str(exc)})
+            raise HTTPException(
+                409, detail={"error": ERROR_DANGLING_REF, "message": str(exc)}
+            )
 
     # add_api_route (not the @router.get decorator) so the handlers are
     # *referenced* — the decorator form trips strict reportUnusedFunction.

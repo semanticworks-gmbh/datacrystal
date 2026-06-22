@@ -96,7 +96,9 @@ Each contributed entity must have a `dc.Unique` natural key — that key is the 
 re-sent insert merges to the same entity on the coordinator, never a duplicate). An **update**
 carries an OCC base token (the hash of the payload the entity was read at); if the coordinator's
 entity has moved since, the commit raises `ConflictError` instead of clobbering it. The recovery
-loop is **sync → re-read → re-apply → commit**:
+loop is **discard → sync → re-read → re-apply → commit**: a rejected `commit()` leaves your edit
+buffered (so nothing is silently lost), and `sync()` refuses to run while writes are buffered — so
+`discard()` the rejected edit first, then pull the winner's change and retry:
 
 ```python
 from datacrystal import ConflictError
@@ -108,9 +110,13 @@ while True:
         edge.commit()
         break
     except ConflictError:
-        edge.sync()                              # someone moved Q1 first — pull their change,
-        continue                                 # re-read, re-apply your edit, retry
+        edge.discard()                          # drop the rejected edit (clears the buffer),
+        edge.sync()                             # pull the change that moved Q1, then
+        continue                                # retry: re-read the new value, re-apply, commit
 ```
+
+`discard()` drops every buffered (uncommitted) write and re-reads the committed state from the
+local replica, so a live reference held across it is detached — re-`get()` for fresh values.
 
 A `SchemaSkewError` on contribute means your follower sent a field the coordinator's class does not
 have (its schema is older) — upgrade the coordinator, or drop the field; the contribution is
@@ -138,9 +144,16 @@ coordinator-global, identical on every replica.
   **new** Locality in the *same* batch (a new→new reference) raises `NotImplementedError`: the
   follower-local OID of an uncommitted entity is meaningless on the coordinator. Contribute the
   referenced entity first, let it commit, then reference it.
+- **No `dc.Blob` fields.** An entity with an out-of-line blob field raises `NotImplementedError` on
+  contribute — blob bytes live out-of-line and have no `/v1/submit` create-face wire shape (v0).
+  Write blob-bearing entities on the coordinator directly.
+- **References cross only as scalars or list edges.** A scalar ref (`Lazy[T]` / a direct `@entity`
+  field) and a list edge (`list[Lazy[T]]` / `list[T]`) federate. An `@entity` nested in a bare
+  `list`/`dict` (or `dict[str, Entity]`) raises `NotImplementedError` — the OID-int boundary cannot
+  rebind it, so it would land as a bare int on the coordinator. Model such refs as a typed list edge.
 
-Both are deliberate cuts, not bugs — they fail loudly at contribute time so an unsafe write never
-crosses the wire.
+These are deliberate cuts, not bugs — they fail loudly at contribute time so an unsafe or lossy write
+never crosses the wire (FEDERATION-WIRE-v1 §5).
 
 ---
 

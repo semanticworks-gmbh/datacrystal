@@ -315,6 +315,47 @@ def test_occ_stale_base_commit_raises_conflict(coordinator: _CoordinatorServer) 
         f2.close()
 
 
+def test_occ_conflict_recovery_loop_converges(coordinator: _CoordinatorServer) -> None:
+    """The documented OCC recovery loop runs end-to-end: after a ConflictError,
+    ``discard()`` → ``sync()`` → re-read → re-apply → ``commit()`` succeeds and the
+    graph converges (#153 peer-review fix — recovery was previously wedged because
+    ``sync()`` refused the dirty buffer and no ``discard()`` existed).
+    """
+    f1 = dc.open_follower(coordinator.base_url, path=None)
+    f2 = dc.open_follower(coordinator.base_url, path=None)
+    try:
+        m1 = f1.get(Mineral, qid="Q2")
+        assert m1 is not None and m1.mohs == 3.0
+        # f2 moves Q2 first (carries the current base) → f1's edit goes stale
+        m2 = f2.get(Mineral, qid="Q2")
+        assert m2 is not None
+        m2.mohs = 3.5
+        f2.commit()
+        m1.mohs = 9.9
+        with pytest.raises(ConflictError):
+            f1.commit()
+        # recovery: drop the rejected edit, pull the winner, re-read, re-apply
+        f1.discard()
+        f1.sync()  # MUST NOT raise now (discard cleared the buffer)
+        m1b = f1.get(Mineral, qid="Q2")
+        assert m1b is not None and m1b.mohs == 3.5  # sees f2's committed value
+        m1b.mohs = 4.0
+        f1.commit()  # succeeds this time (base now matches)
+        # converged: f2 and a fresh follower both see 4.0, never f1's stale 9.9
+        f2.sync()
+        winner = f2.get(Mineral, qid="Q2")
+        assert winner is not None and winner.mohs == 4.0
+        f3 = dc.open_follower(coordinator.base_url, path=None)
+        try:
+            authoritative = f3.get(Mineral, qid="Q2")
+            assert authoritative is not None and authoritative.mohs == 4.0
+        finally:
+            f3.close()
+    finally:
+        f1.close()
+        f2.close()
+
+
 def test_lost_ack_reinsert_with_base_none_raises_conflict(
     coordinator: _CoordinatorServer,
 ) -> None:

@@ -113,3 +113,48 @@ def test_sync_refuses_with_buffered_writes(tmp_path) -> None:
                 follower.close()
     finally:
         coord.close()
+
+
+def test_discard_drops_uncommitted_writes(store) -> None:
+    """``discard()`` drops the buffered NEW/DIRTY set and re-reads committed state
+    — the rollback the sync error message names (#153 peer-review fix).
+    """
+    store.upsert(Mineral(qid="Q1", name="Quartz", mohs=5.0))
+    store.commit()
+    m = store.get(Mineral, qid="Q1")
+    assert m is not None
+    m.mohs = 9.0  # an uncommitted edit → DIRTY
+    store.upsert(Mineral(qid="Q2", name="Calcite"))  # an uncommitted NEW
+    assert store._new or store._dirty  # pyright: ignore[reportPrivateUsage]
+
+    store.discard()
+
+    assert not store._new and not store._dirty  # pyright: ignore[reportPrivateUsage]
+    assert store.get(Mineral, qid="Q2") is None  # the uncommitted NEW is gone
+    rolled = store.get(Mineral, qid="Q1")
+    assert rolled is not None and rolled.mohs == 5.0  # the edit was rolled back
+
+
+def test_discard_unblocks_sync(tmp_path) -> None:
+    """The OCC recovery seam: a follower holding a buffered write can ``discard()``
+    it and then ``sync()`` (which would otherwise refuse) (#153 peer-review fix).
+    """
+    coord, log = _coordinator(tmp_path)
+    app = FastAPI()
+    app.include_router(federation_router(coord, log))
+    try:
+        with TestClient(app) as client:
+            follower = open_follower("http://coord", client=client)
+            try:
+                follower.store(Mineral(qid="LOCAL", name="scratch"))  # buffer a write
+                with pytest.raises(RuntimeError):
+                    follower.sync()
+                follower.discard()  # drop the buffer
+                coord.store(Mineral(qid="Q2", name="Calcite"))  # coordinator moves
+                coord.commit()
+                assert follower.sync() == coord.last_tid  # sync now runs
+                assert {m.qid for m in follower.query(Mineral)} == {"Q1", "Q2"}
+            finally:
+                follower.close()
+    finally:
+        coord.close()
