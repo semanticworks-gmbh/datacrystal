@@ -566,6 +566,51 @@ class Store:
             raise
 
     @classmethod
+    def follower(
+        cls,
+        url: str,
+        *,
+        api_key: str | None = None,
+        path: str | Path | None = None,
+        client: Any | None = None,
+    ) -> Store:
+        """Open a **read replica** synced from a coordinator's federation endpoint.
+
+        The follower constructor (ROADMAP item 21, FEDERATION-WIRE-v1) — the
+        sibling of :meth:`open`: ``Store.open(path)`` opens a local single writer,
+        ``Store.follower(url)`` opens a replica of a remote coordinator. It
+        bootstraps by replaying the coordinator's COMMIT-DELTA-v1 stream from TID 0
+        over ``GET /v1/deltas`` and returns a **real local** :class:`Store` you read
+        at full local speed; :meth:`sync` catches it up, and ``upsert`` + ``commit``
+        contributes back through the coordinator's single writer (use
+        :meth:`committing` for a read-modify-write — the same code as on a local
+        store). The top-level :func:`~datacrystal.open_follower` is the equivalent
+        function form.
+
+        Args:
+            url: the coordinator base URL (e.g. ``"https://coordinator"``).
+            api_key: sent as the ``x-api-key`` header (your auth seam; optional).
+            path: where the replica lives on disk (sqlite-backed); ``None``
+                (default) keeps it in memory.
+            client: an ``httpx.Client``-compatible transport (advanced/testing,
+                e.g. a ``fastapi.testclient.TestClient``); ``url``/``api_key`` are
+                then the client's responsibility.
+
+        Returns:
+            A :class:`Store` holding the coordinator's committed state at bootstrap.
+
+        Note:
+            The HTTP transport ships in the ``datacrystal[follower]`` extra and is
+            imported lazily, so a bare ``import datacrystal`` stays inside the
+            ``{msgspec, pyroaring}`` budget.
+        """
+        # lazy: open_follower lives in datacrystal._follower, which imports Store —
+        # importing it at module load would be a cycle.
+        from datacrystal._follower import open_follower
+
+        return open_follower(url, api_key=api_key, path=path, client=client)
+
+    @classmethod
     def _from_backend(cls, backend: StorageBackend, *, debug: bool = False,
                       strict_deletes: bool = False,
                       lazy_timeout: float | None = None,

@@ -135,6 +135,27 @@ def test_discard_drops_uncommitted_writes(store) -> None:
     assert rolled is not None and rolled.mohs == 5.0  # the edit was rolled back
 
 
+def test_store_follower_is_the_follower_constructor(tmp_path) -> None:
+    """``Store.follower(url)`` is the sibling-of-``open`` constructor — equivalent to
+    the top-level ``dc.open_follower`` (#153 DX: an alternate constructor, not a
+    ``mode=`` flag)."""
+    coord, log = _coordinator(tmp_path)
+    app = FastAPI()
+    app.include_router(federation_router(coord, log))
+    try:
+        with TestClient(app) as client:
+            edge = Store.follower("http://coord", client=client)
+            try:
+                assert {m.qid for m in edge.query(Mineral)} == {"Q1"}
+                got = edge.get(Mineral, qid="Q1")
+                assert got is not None and got.name == "Quartz"
+                assert edge.last_tid == coord.last_tid  # bootstrapped to the watermark
+            finally:
+                edge.close()
+    finally:
+        coord.close()
+
+
 def test_committing_commits_once_on_single_node(store) -> None:
     """On a single-node store a commit can never conflict, so committing() runs the
     block exactly once and commits it — the same code a follower uses (#153 DX).

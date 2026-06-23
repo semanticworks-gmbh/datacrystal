@@ -52,15 +52,16 @@ applies your dependency to **every** federation route — nothing is exempt.
 
 ## A follower: bootstrap, read locally, stay current
 
-`open_follower(url)` opens a **real local store** by replaying the coordinator's change-feed from
-TID 0 (`GET /v1/deltas?after=0`). After bootstrap, reads hit the local store at full speed — no
-per-call round-trips, no snapshot encoder:
+`Store.follower(url)` — the sibling of `Store.open(path)` — opens a **real local store** by replaying
+the coordinator's change-feed from TID 0 (`GET /v1/deltas?after=0`). After bootstrap, reads hit the
+local store at full speed — no per-call round-trips, no snapshot encoder:
 
 ```python
 import datacrystal as dc
 
-edge = dc.open_follower("http://coordinator:8000", api_key="...", path="edge.replica")
+edge = dc.Store.follower("http://coordinator:8000", api_key="...", path="edge.replica")
 # `path=None` (default) keeps the replica in memory; a path makes it sqlite-backed on disk.
+# `dc.open_follower(...)` is the equivalent top-level function form.
 
 quartz = edge.get(Mineral, qid="Q1")           # local read — the coordinator's committed state
 hits = edge.query(Mineral.crystal_system == "trigonal")   # the full query API, locally

@@ -6,7 +6,7 @@ Run it::
 
 This is a *real* application, not a unit test: it stands up a genuine uvicorn
 coordinator (the single writer) on a background thread, opens two
-``dc.open_follower`` replicas that talk to it over localhost TCP, and walks the
+``dc.Store.follower`` replicas that talk to it over localhost TCP, and walks the
 whole fractal-followers surface — bootstrap, local reads, contribute, sync,
 cross-entity references, the OCC conflict + **recovery loop**, and every
 fail-closed guard — printing ``✓``/``✗`` for each behaviour. Exit code ``0``
@@ -187,8 +187,8 @@ def main() -> int:
         coord.start()
         print(f"coordinator (single writer) serving at {coord.url}")
 
-        edge_a = dc.open_follower(coord.url)            # in-memory replica
-        edge_b = dc.open_follower(coord.url, path=root / "edge_b.replica")  # sqlite replica
+        edge_a = dc.Store.follower(coord.url)            # in-memory replica
+        edge_b = dc.Store.follower(coord.url, path=root / "edge_b.replica")  # sqlite replica
         try:
             section("1. Bootstrap — each follower is a real local store replayed from TID 0")
             qa = edge_a.get(Mineral, qid="Q1")
@@ -286,7 +286,7 @@ def main() -> int:
             section("6. Convergence — coordinator and both followers agree on the whole graph")
             edge_a.sync()
             edge_b.sync()
-            witness = dc.open_follower(coord.url)  # a fresh replica = the coordinator's truth
+            witness = dc.Store.follower(coord.url)  # a fresh replica = the coordinator's truth
             try:
                 g_truth = mineral_graph(witness)
                 g_a = mineral_graph(edge_a)

@@ -358,6 +358,10 @@ def open_follower(
 ) -> Store:
     """Open a local replica synced from a coordinator's federation endpoint.
 
+    The function form of :meth:`Store.follower` (identical behaviour) — use
+    whichever reads better; ``Store.follower`` sits beside ``Store.open`` as the
+    sibling constructor, this is the top-level convenience.
+
     Bootstraps replay-from-0 (``GET /v1/deltas?after=0``) into a real local store
     and returns it; reads then hit the local store at full speed.
 
