@@ -297,6 +297,11 @@ tid = store.commit()                   # atomically persists everything buffered
 - `store.mark_dirty(obj)` exists as an escape hatch but is rarely needed — attribute writes and
   in-place list/dict mutation are both tracked.
 - `store.last_tid` is the current commit watermark.
+- For a **read-modify-write that may contend** — a follower contributing, or code you want identical
+  on a single-node store and a follower — prefer [`store.committing()`](#open-a-store)
+  over a bare `commit()`: it retries the block on an OCC `ConflictError` instead of surfacing it
+  (and is a no-op wrapper on a single-node store, where a commit can never conflict). A plain
+  single-node write needs only `commit()`.
 
 ### Upserting by natural key
 

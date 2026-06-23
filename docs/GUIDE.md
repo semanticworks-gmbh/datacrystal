@@ -29,7 +29,7 @@ Goal-oriented recipes with runnable snippets:
 - [Deploy behind FastAPI and GraphQL](how-to/web-deployment.md) — `datacrystal[web]` reflection +
   deployment doctrine.
 - [Run a coordinator + edge followers](how-to/federation.md) — `datacrystal[web]` federation:
-  `open_follower`, local reads, `sync()` catch-up, contribute + the OCC recovery loop.
+  `open_follower`, local reads, `sync()` catch-up, contribute + `committing()` (the OCC retry loop).
 - [Full-text search](how-to/search.md) — `datacrystal[fts]`, FTS5 + Snowball stemming.
 - [Vector and hybrid search](how-to/vector-search.md) — bring-your-own embeddings, exact top-k,
   RRF fusion with `datacrystal[fts]`.
