@@ -47,8 +47,21 @@ process would fail to take the lease. Followers carry the read load; the coordin
 one process (see [the web deployment doctrine](web-deployment.md#the-deployment-doctrine--and-why-each-rule-holds)
 and [SCALING.md](../design/SCALING.md)).
 
-You bring your own authn/z: `federation_router(store, log, dependencies=[Depends(check_key)])`
-applies your dependency to **every** federation route — nothing is exempt.
+**Secure the coordinator before you expose it.** The router ships no auth and binds nothing by
+itself — an exposed bind (`--host 0.0.0.0`) is open and *writable* until you add one. Pass your
+dependency to **every** route (read and write):
+
+```python
+app.include_router(federation_router(store, log, dependencies=[Depends(check_key)]))
+```
+
+`/v1/submit` then trusts an authenticated client. The follower-side cuts (new→new refs, container
+refs, blob fields) are client conveniences, **not** coordinator-enforced — gate write access with
+your auth. Two surfaces are unbounded by design, so run behind a **reverse proxy** that adds TLS plus
+**body-size and rate limits**: a `/v1/submit` batch (`ops`) has no built-in cap, and
+`GET /v1/deltas?after=0` (a from-genesis bootstrap) materializes the whole retained history and runs
+on the event loop — keep history bounded by your `DeltaLog` retention, and let the proxy bound
+request size.
 
 ## A follower: bootstrap, read locally, stay current
 

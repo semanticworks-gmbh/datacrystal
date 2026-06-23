@@ -7,12 +7,17 @@ polls), ``GET /v1/deltas?after=<tid>`` (COMMIT-DELTA-v1 frames — byte-for-byte
 the length-prefixed frame the :class:`~datacrystal.deltalog.DeltaLog` already
 writes, re-encoded from :meth:`~datacrystal.deltalog.DeltaLog.replay`), and
 ``POST /v1/submit`` (contribute: a follower's writes fanned into the single writer
-via ``store.submit``, ADR-001). The fail-closed guards on ``/v1/submit``
-(cid-lineage, OCC, idempotency) are added by their own stories.
+via ``store.submit``, ADR-001). ``/v1/submit`` is **fail-closed** (FEDERATION-WIRE-v1
+§5): a malformed envelope → 422, a cid-lineage skew → 409 (``SchemaSkewError``), and
+an OCC ``base`` mismatch → 409 (``ConflictError``); a batch is all-or-nothing (a
+rejected op discards the whole batch's buffered writes).
 
 You bring your own authn/z: pass FastAPI ``dependencies=[Depends(...)]`` and they
 apply to every federation route — nothing here is exempt from your auth (the same
-seam as the rest of the extra).
+seam as the rest of the extra). The coordinator trusts an authenticated client: the
+follower-side ref guards (new→new, container refs, blob) are client conveniences,
+not coordinator-enforced — gate write access with your auth, and run behind a
+reverse proxy (body/rate limits) as the deployment doctrine prescribes.
 
 ``fastapi`` is imported only inside this submodule, so a bare ``import
 datacrystal`` never pulls it (the dep-isolation fitness gate).
@@ -205,24 +210,35 @@ def federation_router(
             prepared.append((info, op_key, op.get("base"), dto))
 
         def fan_in() -> dict[str, Any]:
-            survivors: dict[Any, Any] = {}
-            for info, key, base, dto in prepared:
-                value = getattr(dto, key)
-                # OCC (#155): the carried base must equal the current payload hash.
-                # current is None ⇔ key absent; this single check covers all cases —
-                # stale update, insert of an existing key, and update with no base.
-                current = store._payload_digest(info, key, value)  # pyright: ignore[reportPrivateUsage]
-                if current != base:
-                    raise ConflictError(
-                        f"{info.typename}.{key}={value!r}: base {base!r} does not "
-                        f"match current {current!r} — re-read and retry",
-                        key=value,
-                        expected_base=base,
-                        actual_base=current,
-                    )
-                survivor = store.upsert(from_pydantic(dto, info.cls, store=store), key=key)
-                survivors[value] = survivor
-            applied_tid = store.commit()
+            # All-or-nothing (FEDERATION-WIRE-v1 §3): a batch interleaves the OCC
+            # check and upsert per op, so a rejected later op (OCC, schema-skew,
+            # dangling ref) would otherwise leave the EARLIER ops' upserts buffered
+            # — and the next /v1/submit's commit() would flush them, making a
+            # 409-rejected contribution silently durable + replicated. discard()
+            # (owner thread, here) clears the buffer so a failed batch leaves the
+            # store exactly as it was. The happy path commits and never discards.
+            try:
+                survivors: dict[Any, Any] = {}
+                for info, key, base, dto in prepared:
+                    value = getattr(dto, key)
+                    # OCC (#155): the carried base must equal the current payload hash.
+                    # current is None ⇔ key absent; this single check covers all cases —
+                    # stale update, insert of an existing key, and update with no base.
+                    current = store._payload_digest(info, key, value)  # pyright: ignore[reportPrivateUsage]
+                    if current != base:
+                        raise ConflictError(
+                            f"{info.typename}.{key}={value!r}: base {base!r} does not "
+                            f"match current {current!r} — re-read and retry",
+                            key=value,
+                            expected_base=base,
+                            actual_base=current,
+                        )
+                    survivor = store.upsert(from_pydantic(dto, info.cls, store=store), key=key)
+                    survivors[value] = survivor
+                applied_tid = store.commit()
+            except BaseException:
+                store.discard()  # drop the rejected batch's buffered writes (all-or-nothing)
+                raise
             return {
                 "applied_tid": applied_tid,
                 "keys": {value: oid_of(obj) for value, obj in survivors.items()},

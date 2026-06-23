@@ -122,10 +122,12 @@ def test_auth_seam_rejects_unauthed(store_factory, tmp_path) -> None:
             federation_router(store, log, dependencies=[Depends(require_token)])
         )
         with TestClient(app) as client:
+            auth = {"x-api-key": "secret"}
+            # the dependency guards EVERY route — read AND write — not just /v1/head
             assert client.get("/v1/head").status_code == 401
-            assert (
-                client.get("/v1/head", headers={"x-api-key": "secret"}).status_code
-                == 200
-            )
+            assert client.get("/v1/deltas", params={"after": 0}).status_code == 401
+            assert client.post("/v1/submit", json={"ops": []}).status_code == 401
+            assert client.get("/v1/head", headers=auth).status_code == 200
+            assert client.get("/v1/deltas", params={"after": 0}, headers=auth).status_code == 200
     finally:
         store.close()

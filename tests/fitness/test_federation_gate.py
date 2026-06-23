@@ -8,8 +8,8 @@ federation tests so those shortcuts go RED.
 
 Convention (so the build stories land green): federation tests live in files
 matching :data:`_FED_GLOBS` under ``tests/`` — ``test_federation*`` /
-``test_follower*`` / ``test_occ*``. There are none yet; these meters are forward
-guards that bite as #149–#156 add them.
+``test_follower*`` / ``test_occ*``. The #149–#156 suites now exist; these meters
+police them (both-backends coverage, no vacuous ``pytest.raises``-only asserts).
 """
 
 from __future__ import annotations

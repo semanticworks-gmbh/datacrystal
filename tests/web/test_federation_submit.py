@@ -92,6 +92,36 @@ def test_submit_batch_is_all_or_nothing(store_factory, tmp_path) -> None:
         store.close()
 
 
+def test_submit_mid_batch_failure_leaks_nothing(store_factory, tmp_path) -> None:
+    """A batch rejected MID-fan_in (op[1] OCC-conflicts after op[0] already upserted)
+    must leave nothing — not op[0]'s write, not the watermark — and must not leak into
+    the next submit's commit (FEDERATION-WIRE-v1 §3 all-or-nothing; pre-merge blocker).
+    """
+    store = store_factory()
+    log = DeltaLog(tmp_path / "log")
+    store.attach(log)
+    try:
+
+        async def go() -> None:
+            assert (await _post(store, log, {"ops": [_op("Q1", name="Quartz", mohs=7.0)]})).status_code == 200
+            sealed = store.last_tid
+            # op0 valid (new Q2), op1 a stale-base update of Q1 → 409 after op0 buffered
+            batch = {"ops": [_op("Q2", name="Calcite", mohs=3.0),
+                             _op("Q1", base="0" * 64, name="Quartz", mohs=9.9)]}
+            assert (await _post(store, log, batch)).status_code == 409
+            # the rejected batch left NOTHING: op0's Q2 absent, watermark unmoved
+            assert store.get(Mineral, qid="Q2") is None and store.last_tid == sealed
+            # a following valid submit must NOT carry the leaked Q2
+            assert (await _post(store, log, {"ops": [_op("Q3", name="Topaz")]})).status_code == 200
+            assert store.get(Mineral, qid="Q2") is None  # the leak is gone
+            assert store.get(Mineral, qid="Q3") is not None
+
+        asyncio.run(go())
+        assert {m.qid for m in store.query(Mineral)} == {"Q1", "Q3"}  # the rejected Q2 never landed
+    finally:
+        store.close()
+
+
 def test_submit_rejects_malformed_envelope(store_factory, tmp_path) -> None:
     store = store_factory()
     log = DeltaLog(tmp_path / "log")

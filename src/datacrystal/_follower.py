@@ -288,8 +288,9 @@ def _contribute(
         ti = type_info(obj)
         key = next((spec.name for spec in ti.specs if spec.unique), None)
         if key is None:
-            raise SchemaSkewError(
-                f"{ti.typename} has no dc.Unique natural key — cannot contribute it"
+            raise ValueError(
+                f"{ti.typename} has no dc.Unique natural key — cannot contribute it "
+                "(the natural key is the idempotency anchor; add a dc.Unique field)"
             )
         if any(spec.blob for spec in ti.specs):  # §5 cut: out-of-line bytes
             raise NotImplementedError(

@@ -13,6 +13,7 @@ same PR. That is the signal, not a nuisance.
 
 from __future__ import annotations
 
+import ast
 import dataclasses
 import hashlib
 import pathlib
@@ -27,7 +28,29 @@ from datacrystal._storage.protocol import (
 )
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-_SQLITE_SRC = (ROOT / "src" / "datacrystal" / "_storage" / "sqlite.py").read_text()
+_SRC = ROOT / "src" / "datacrystal"
+_SQLITE_SRC = (_SRC / "_storage" / "sqlite.py").read_text()
+_FED_SRC = (_SRC / "web" / "_federation.py").read_text()
+_FOLLOWER_SRC = (_SRC / "_follower.py").read_text()
+
+
+def _defines_delta_consumer(src: str) -> bool:
+    """True if the module names ``DeltaConsumer`` or defines a class shaped like one
+    (an ``apply`` method plus a ``watermark`` member) — the v1 §5 "no second consumer".
+    """
+    if "DeltaConsumer" in src:
+        return True
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, ast.ClassDef):
+            methods = {n.name for n in node.body if isinstance(n, ast.FunctionDef)}
+            has_watermark = "watermark" in methods or any(
+                isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name)
+                and n.target.id == "watermark"
+                for n in node.body
+            )
+            if "apply" in methods and has_watermark:
+                return True
+    return False
 
 
 def _field_names(dc: Any) -> tuple[str, ...]:
@@ -78,6 +101,15 @@ def test_storage_protocol_methods_pinned() -> None:
         "open_blob_stream",
         "close",
     }
+
+
+def test_federation_registers_no_delta_consumer() -> None:
+    # FEDERATION-WIRE-v1 §"Idempotency" (#157): exactly-once rides the natural-key
+    # upsert + OCC — NO second DeltaConsumer / dedup ledger ships in v1. The
+    # federation facade must not define or register one (the operator still attaches
+    # the DeltaLog; the engine never retains, §5).
+    assert not _defines_delta_consumer(_FED_SRC), "web/_federation.py adds a DeltaConsumer (§5 cut)"
+    assert not _defines_delta_consumer(_FOLLOWER_SRC), "_follower.py adds a DeltaConsumer (§5 cut)"
 
 
 def test_sqlite_table_set_pinned() -> None:
