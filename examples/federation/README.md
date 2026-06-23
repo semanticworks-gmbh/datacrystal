@@ -10,7 +10,7 @@ writes back through the single writer.
 uv run python examples/federation/demo.py
 ```
 
-This stands up a **real uvicorn coordinator** on a background thread and two `dc.open_follower`
+This stands up a **real uvicorn coordinator** on a background thread and two `dc.Store.follower`
 replicas (one in-memory, one sqlite-backed) talking to it over localhost TCP, then walks the whole
 surface and prints `✓`/`✗` for each behaviour (exit code `0` ⇔ every check passed):
 

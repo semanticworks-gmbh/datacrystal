@@ -3,8 +3,9 @@
 ROADMAP item 4 (bitmap indexes + Condition AST) and the SDA delta (unique
 secondary-key index). v0.1 indexes are **rebuildable derived data**: built
 lazily per class from a backend scan at first use, then maintained
-incrementally from each commit. They are never persisted and never
-participate in the commit transaction.
+incrementally from each commit. They may be cached on disk (ADR-005:
+watermark-validated, rebuilt on mismatch, never authoritative) but never
+participate in the commit transaction — the records stay the source of truth.
 
 The KICKOFF plan sketched these as "the second commit-delta consumer";
 they deliberately are NOT one (decided at M4): a DeltaConsumer would force
@@ -620,8 +621,9 @@ class IndexManager:
     def ensure_reverse(self) -> dict[int, BitMap64]:
         """Lazily build the global reverse-reference postings by scanning every
         committed record once and harvesting its outgoing refs (#20) — the same
-        rebuildable-derived-data contract as the forward indexes (invariant 11:
-        never persisted, never in the commit txn). Unlike ``build_class_indexes``
+        rebuildable-derived-data contract as the forward indexes (invariant 11,
+        ADR-005: may be cached on disk — watermark-validated, never authoritative —
+        but never in the commit txn). Unlike ``build_class_indexes``
         (per-class, indexed positions only) this is global and decodes every
         field of every record.
         """

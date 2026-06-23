@@ -117,6 +117,9 @@ journal for crash safety, and one live instance per object — `a.friend is b` s
 - **Single-writer** (owner-confined + a process lease lock); readers get point-in-time **snapshot isolation** from any thread (bitmap queries included).
 - Async stores (`aopen`); the COMMIT-DELTA-v1 watermark pipeline — locked contract + public conformance kit.
 
+**Distribution**
+- Edge followers: `Store.follower(url)` opens a **real local replica** that bootstraps from a single-writer coordinator, reads locally at full speed, and contributes writes back — optimistic-concurrency, fail-closed (`datacrystal[web]` coordinator + `datacrystal[follower]` client; `store.committing()` is the same read-modify-write on a single node or a follower).
+
 **Three extras ride the pipeline**
 - **`datacrystal[fts]`** — FTS5 full-text search, per-language Snowball stemming + BM25 over `dc.FullText` fields.
 - **`datacrystal[arrow]`** — persistent Parquet mirrors → zero-copy Arrow tables for DuckDB/polars/pandas.
@@ -158,7 +161,8 @@ uv run pytest
 - **[docs/GUIDE.md](docs/GUIDE.md) — the documentation**: the index into a
   [Diátaxis](https://diataxis.fr) split — a hand-held [Tutorial](docs/tutorial.md) (learn by
   doing), goal-oriented [How-to guides](docs/how-to/) (querying & paging, ingest & memory, schema
-  evolution, blobs, web deployment, search, analytics, snapshots & the delta log), a dry complete
+  evolution, blobs, web deployment, coordinator + edge followers, search, vector & hybrid search,
+  analytics, snapshots & the delta log), a dry complete
   [Reference](docs/reference.md) (every method, option, guarantee, and error — with planned
   features clearly marked), and an [Explanation](docs/explanation.md) of the design *why*.
 - [docs/design/](docs/design/) — design documents: [VISION.md](docs/design/VISION.md) (the

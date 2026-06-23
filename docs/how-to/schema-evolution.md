@@ -45,9 +45,9 @@ Glue fires **only when the field is absent** from a record's persisted shape —
 written in the new shape it is a no-op, and old records are never rewritten in place (additive,
 like `RenamedFrom`).
 
-v0.2 scopes both `RenamedFrom` and `Glue` to **non-indexed** fields read through live hydration
+`RenamedFrom` and `Glue` are scoped to **non-indexed** fields read through live hydration
 and decode (`get`/`query`/`pluck`); honoring them in the index, snapshot, and arrow decode
-paths, and renaming an indexed field, are `[planned — v0.2]`.
+paths, and renaming an indexed field, are `[planned — demand-driven]`.
 
 ## Materialize the new shape on disk: migrate and verify
 

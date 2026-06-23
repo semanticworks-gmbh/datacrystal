@@ -8,6 +8,7 @@ it rather than restating it.
 - [Identity and memory](#identity-and-memory)
 - [Query semantics: the planner, the residual, and the candidate set](#query-semantics-the-planner-the-residual-and-the-candidate-set)
 - [Why deletes are unchecked in v0.x](#why-deletes-are-unchecked-in-v0x)
+- [Why followers are real local stores (the fractal contract)](#why-followers-are-real-local-stores-the-fractal-contract)
 - [The design philosophy](#the-design-philosophy)
 
 ## Identity and memory
@@ -127,6 +128,27 @@ here are the loud signals and dev-time bridges until the real index lands." The 
 semantics and the bridges are in [the Deleting reference](reference.md#deleting); the
 commit-time-vs-follow-time guarantees are in
 [Transactional guarantees → Consistency](reference.md#transactional-guarantees-acid).
+
+## Why followers are real local stores (the fractal contract)
+
+datacrystal is single-writer by design — so how does it reach the edge without becoming the
+multi-writer system it explicitly is *not*? Through the **fractal** shape ratified in
+[VISION.md](design/VISION.md): every node is *the same datacrystal*. A follower
+(`Store.follower(url)`) is not a thin client or a cache in front of a remote database — it is a
+**real local store** that bootstraps by replaying the coordinator's COMMIT-DELTA-v1 stream and then
+reads at full local speed, no per-call round-trips. The coordinator is just an ordinary single-writer
+store with its change-feed served over HTTP; "coordinator" is a *role*, not a different kind of store.
+
+That is why the read/write API is **identical** on a single node and a follower, and why
+`store.committing()` is the same code in both places. The one thing a distributed setting genuinely
+adds — that a write can lose a race — is surfaced **honestly** (an OCC `ConflictError`, re-read and
+retry, never last-writer-wins) rather than hidden behind a remote-call-looks-local illusion (the
+classic distributed-objects trap). A follower *contributes* by the ordinary `upsert` + `commit`,
+fanned into the single writer; conflicts are detected and retried against fresh state, never silently
+merged. And the shape composes — a node can be a follower of one coordinator and a coordinator for
+its own followers, self-similar all the way up. The single-writer rationale is
+[SCALING.md](design/SCALING.md); the wire contract is
+[FEDERATION-WIRE-v1](design/FEDERATION-WIRE-v1.md).
 
 ## The design philosophy
 

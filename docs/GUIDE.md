@@ -3,7 +3,7 @@
 datacrystal is an embedded object-graph database for Python: your typed live objects **are** the
 database. Define dataclasses, mutate them, call `commit()` — datacrystal keeps the whole graph
 durable and queryable across restarts, same objects, same identities, same references. No ORM, no
-schema files, no `save()`, no pickle. This documents `0.6.0` (2026-06); the public API freezes at
+schema files, no `save()`, no pickle. This documents `0.7.0` (2026-06); the public API freezes at
 the v0.1.0 tag, and features that do not exist yet are always marked `[planned — …]`.
 
 The docs follow the [Diátaxis](https://diataxis.fr) split — four modes, each answering a different
