@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
+import socket
+import subprocess
+import sys
 import time
 
 import pytest
@@ -38,6 +42,55 @@ def test_stale_lease_is_taken_over(tmp_path):
     assert json.loads(path.read_text())["pid"] != 1
     lock.release()
     assert not path.exists()
+
+
+def test_dead_holder_same_host_reclaimed_immediately(tmp_path):
+    """A crashed/killed holder (dead pid, same host, FRESH timestamp) is stale at
+    once via the pid-liveness check — no ~2*ttl wait before a restart reclaims it.
+    """
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])  # spawn + reap → a dead pid
+    proc.wait()
+    path = tmp_path / "used.lock"
+    path.write_text(json.dumps(
+        {"pid": proc.pid, "token": "dead", "ts": time.time(),  # ts FRESH (ttl rule would NOT reclaim)
+         "host": socket.gethostname()}
+    ))
+    lock = LeaseLock(path, ttl=10.0)  # ttl*2 = 20s; only liveness can reclaim a fresh lock
+    lock.acquire()
+    assert json.loads(path.read_text())["pid"] == os.getpid()
+    lock.release()
+    assert not path.exists()
+
+
+def test_live_holder_same_host_stays_locked(tmp_path):
+    """A live same-host holder is never stolen by the liveness check (only a dead
+    pid is); a fresh lease held by a running process stays locked.
+    """
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        path = tmp_path / "used.lock"
+        path.write_text(json.dumps(
+            {"pid": proc.pid, "token": "alive", "ts": time.time(), "host": socket.gethostname()}
+        ))
+        lock = LeaseLock(path, ttl=10.0)
+        with pytest.raises(dc.StoreLockedError):
+            lock.acquire()
+    finally:
+        proc.terminate()
+        proc.wait()
+
+
+def test_foreign_host_lock_falls_back_to_ttl(tmp_path):
+    """A lock taken on another host (or a pre-host lock file) cannot be probed, so
+    it falls back to the ttl staleness rule — a fresh foreign lock stays locked.
+    """
+    path = tmp_path / "used.lock"
+    path.write_text(json.dumps(
+        {"pid": 999999, "token": "remote", "ts": time.time(), "host": "some-other-host"}
+    ))
+    lock = LeaseLock(path, ttl=10.0)
+    with pytest.raises(dc.StoreLockedError):
+        lock.acquire()
 
 
 def test_lost_lease_is_detected(tmp_path):
