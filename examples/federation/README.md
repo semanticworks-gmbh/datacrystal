@@ -32,3 +32,32 @@ It needs `datacrystal[web]` + `uvicorn` (coordinator) and `datacrystal[follower]
 `uv sync --all-extras` provides everything. See the
 [federation how-to](../../docs/how-to/federation.md) for the production deployment shape (a
 standalone `uvicorn coordinator:app --workers 1`, your own authn/z, retention policy).
+
+## Two-process live playground — watch changes, poke a follower yourself
+
+`demo.py` is a one-shot proof; for **interactive** testing run the coordinator and follower as two
+real processes. The coordinator seeds a cabinet and **ticks a `heartbeat` counter every few seconds**
+so you can watch a record change propagate.
+
+**Terminal 1 — the coordinator** (single writer, serves `/v1`, ticks the counter):
+
+```bash
+uv run python examples/federation/coordinator.py                      # :8848, ticks every 3s
+uv run python examples/federation/coordinator.py --port 9000 --interval 5 --path /tmp/coord
+```
+
+**Terminal 2 — a follower.** `watch` opens a real local replica and prints the heartbeat each second
+as it climbs; `repl` drops you into a Python REPL with helpers loaded so you can test by hand:
+
+```bash
+uv run python examples/federation/follower.py watch                   # poll + print the heartbeat
+uv run python examples/federation/follower.py repl                    # interactive: edge, sync(), bump(), …
+```
+
+In the `repl` the follower is `edge` (a real `Store`); `show()` prints the current state, `sync()`
+pulls the coordinator's latest, `bump('Q1')` contributes an increment via `committing()` (retries on
+conflict), and `contribute('Q9','Topaz',8.0)` adds a new mineral. Try `sync(); bump('Q1'); sync()`
+and watch it land — then run a second follower in another terminal to see it converge. Edit the
+helpers in `follower.py` (or just type in the REPL) to probe whatever you like. Both scripts declare
+the **same** `@entity` model and are run as scripts (so both are `__main__` and the persisted
+typenames match) — a follower can only resolve types it defines under the same module path.
