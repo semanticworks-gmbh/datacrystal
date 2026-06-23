@@ -135,6 +135,33 @@ def test_discard_drops_uncommitted_writes(store) -> None:
     assert rolled is not None and rolled.mohs == 5.0  # the edit was rolled back
 
 
+def test_committing_commits_once_on_single_node(store) -> None:
+    """On a single-node store a commit can never conflict, so committing() runs the
+    block exactly once and commits it — the same code a follower uses (#153 DX).
+    """
+    runs = 0
+    for txn in store.committing(retries=3):
+        with txn:
+            runs += 1
+            store.upsert(Mineral(qid="Q1", name="Quartz", mohs=7.0))
+    assert runs == 1  # no conflict possible single-node → no retry
+    m = store.get(Mineral, qid="Q1")
+    assert m is not None and m.mohs == 7.0
+
+
+def test_committing_propagates_block_errors_without_retrying(store) -> None:
+    """An error raised inside the block (a bug, not an OCC conflict) propagates and
+    is NOT retried — only a ConflictError is retried (#153 DX).
+    """
+    runs = 0
+    with pytest.raises(ValueError):
+        for txn in store.committing(retries=5):
+            with txn:
+                runs += 1
+                raise ValueError("boom")
+    assert runs == 1  # the block ran once and the error propagated, no retry
+
+
 def test_discard_unblocks_sync(tmp_path) -> None:
     """The OCC recovery seam: a follower holding a buffered write can ``discard()``
     it and then ``sync()`` (which would otherwise refuse) (#153 peer-review fix).

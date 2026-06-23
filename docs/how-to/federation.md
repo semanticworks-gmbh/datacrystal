@@ -95,28 +95,30 @@ topaz = edge.get(Mineral, qid="Q3")             # read-your-writes
 Each contributed entity must have a `dc.Unique` natural key — that key is the idempotency anchor (a
 re-sent insert merges to the same entity on the coordinator, never a duplicate). An **update**
 carries an OCC base token (the hash of the payload the entity was read at); if the coordinator's
-entity has moved since, the commit raises `ConflictError` instead of clobbering it. The recovery
-loop is **discard → sync → re-read → re-apply → commit**: a rejected `commit()` leaves your edit
-buffered (so nothing is silently lost), and `sync()` refuses to run while writes are buffered — so
-`discard()` the rejected edit first, then pull the winner's change and retry:
+entity has moved since, the commit raises `ConflictError` instead of clobbering it.
+
+The recommended way to write a read-modify-write is **`store.committing(...)`** — the same loop on a
+single-node store and a follower (the fractal contract). It re-runs your block against fresh state on
+a conflict (a `discard()` + `sync()` happen inside), so your *intent* is re-applied to the winning
+value — never last-writer-wins:
 
 ```python
-from datacrystal import ConflictError
-
-while True:
-    m = edge.get(Mineral, qid="Q1")             # read the current value (sets the OCC base)
-    m.mohs = 7.5                                 # your edit
-    try:
-        edge.commit()
-        break
-    except ConflictError:
-        edge.discard()                          # drop the rejected edit (clears the buffer),
-        edge.sync()                             # pull the change that moved Q1, then
-        continue                                # retry: re-read the new value, re-apply, commit
+for txn in edge.committing(retries=5):
+    with txn:
+        m = edge.get(Mineral, qid="Q1")         # the re-read is INSIDE the block,
+        m.mohs = (m.mohs or 0) + 0.5            # so a retry re-applies your edit to fresh state
+# single-node: the block runs once. follower: on ConflictError it discards+syncs and
+# re-runs the block, up to `retries` times, then re-raises if the entity keeps moving.
 ```
 
-`discard()` drops every buffered (uncommitted) write and re-reads the committed state from the
-local replica, so a live reference held across it is detached — re-`get()` for fresh values.
+Keep the **whole** read-modify-write inside the `with` block (the re-read must run each attempt) and
+do not call `commit()` yourself — the block's exit does. Put `retries=0` for a single strict attempt.
+
+The lower-level primitives are still there if you want to handle a conflict by hand: a rejected
+`commit()` raises `ConflictError` with the buffer left intact (nothing is silently lost), `discard()`
+drops the buffered writes and re-reads the committed state (a live reference held across it is
+detached — re-`get()` for fresh values), and `sync()` pulls the coordinator's change. `committing()`
+is exactly `discard → sync → re-read → re-apply → commit` wrapped up for you.
 
 A `SchemaSkewError` on contribute means your follower sent a field the coordinator's class does not
 have (its schema is older) — upgrade the coordinator, or drop the field; the contribution is

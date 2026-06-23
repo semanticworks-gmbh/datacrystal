@@ -220,7 +220,8 @@ def main() -> int:
             check("the reference rides the wire as an OID and resolves on B",
                   q4_loc is not None and q4_loc.qid == "LZ", f"Q4 → {q4_loc.name if q4_loc else '∅'}")
 
-            section("4. Concurrent edit of the SAME object — OCC conflict + recovery loop")
+            section("4. Concurrent edit of the SAME object — OCC + automatic recovery")
+            # First, the raw primitive: a stale commit is DETECTED, never last-writer-wins.
             a_q2 = edge_a.get(Mineral, qid="Q2")  # both read Q2 (mohs=3.0)
             b_q2 = edge_b.get(Mineral, qid="Q2")
             assert a_q2 is not None and b_q2 is not None
@@ -229,26 +230,27 @@ def main() -> int:
             b_q2.mohs = 9.9
             conflicted = False
             try:
-                edge_b.commit()                     # B's stale edit must be rejected
+                edge_b.commit()                     # B's stale raw commit must be rejected
             except ConflictError as exc:
                 conflicted = True
-                check("B's stale commit raises ConflictError (no last-writer-wins)", True,
+                check("a stale commit() raises ConflictError (no last-writer-wins)", True,
                       f"actual_base={str(exc.actual_base)[:12]}…")
             if not conflicted:
-                check("B's stale commit raises ConflictError (no last-writer-wins)", False)
-            # the documented recovery loop: discard → sync → re-read → re-apply → commit
-            edge_b.discard()
-            edge_b.sync()
-            b_q2_fresh = edge_b.get(Mineral, qid="Q2")
-            assert b_q2_fresh is not None
-            check("B sees A's winning value after recovery sync", b_q2_fresh.mohs == 3.5)
-            b_q2_fresh.mohs = 4.0
-            edge_b.commit()                          # succeeds now
+                check("a stale commit() raises ConflictError (no last-writer-wins)", False)
+            edge_b.discard()  # drop B's rejected raw edit, then recover the CLEAN way:
+            # store.committing() is the same code on a single-node store and a follower —
+            # it re-runs the block against fresh state on a conflict (discard+sync inside),
+            # so a read-modify-write applies your INTENT to the winning value, never a clobber.
+            for txn in edge_b.committing(retries=5):
+                with txn:
+                    q2 = edge_b.get(Mineral, qid="Q2")
+                    assert q2 is not None
+                    q2.mohs = (q2.mohs or 0) + 0.5   # increment: re-read + re-applied each try
             edge_a.sync()
             a_q2_final = edge_a.get(Mineral, qid="Q2")
-            check("recovery loop converges (no lost update)",
+            check("committing() recovers + converges automatically (no hand-written loop)",
                   a_q2_final is not None and a_q2_final.mohs == 4.0,
-                  "Q2 went 3.0 → 3.5 (A) → 4.0 (B recovered) — every write sequenced")
+                  "Q2: 3.0 → 3.5 (A) → +0.5 applied to A's 3.5 = 4.0 — no lost update")
 
             section("5. Fail-closed guards — unsafe contributions never cross the wire")
             loc_lt = edge_a.get(Locality, qid="LT")

@@ -356,6 +356,60 @@ def test_occ_conflict_recovery_loop_converges(coordinator: _CoordinatorServer) -
         f2.close()
 
 
+def test_committing_recovers_a_conflict_without_a_manual_loop(
+    coordinator: _CoordinatorServer,
+) -> None:
+    """``store.committing()`` re-runs the block against fresh state on a conflict
+    and converges — the recommended DX, no hand-written discard/sync loop, and the
+    increment is re-applied to the WINNING value (never last-writer-wins) (#153).
+    """
+    f1 = dc.open_follower(coordinator.base_url, path=None)
+    f2 = dc.open_follower(coordinator.base_url, path=None)
+    try:
+        # f2 moves Q2 (3.0 → 5.0) first; f1's replica is now stale.
+        m2 = f2.get(Mineral, qid="Q2")
+        assert m2 is not None
+        m2.mohs = 5.0
+        f2.commit()
+        # f1 increments Q2 via committing(): attempt 1 conflicts on the stale base,
+        # committing() discards+syncs+re-reads f2's 5.0, attempt 2 applies +1.0.
+        for txn in f1.committing(retries=5):
+            with txn:
+                m1 = f1.get(Mineral, qid="Q2")
+                assert m1 is not None
+                m1.mohs = (m1.mohs or 0) + 1.0
+        # converged on 6.0 = f2's winning 5.0 + 1.0 — proves the retry re-read fresh
+        # state (a lost-update bug would leave 4.0 = stale 3.0 + 1.0).
+        f2.sync()
+        winner = f2.get(Mineral, qid="Q2")
+        assert winner is not None and winner.mohs == 6.0
+    finally:
+        f1.close()
+        f2.close()
+
+
+def test_committing_exhausts_retries_and_raises(coordinator: _CoordinatorServer) -> None:
+    """``retries=0`` is a single strict attempt: a stale write surfaces
+    ``ConflictError`` (committing() never silently swallows an unresolved conflict).
+    """
+    f1 = dc.open_follower(coordinator.base_url, path=None)
+    f2 = dc.open_follower(coordinator.base_url, path=None)
+    try:
+        m2 = f2.get(Mineral, qid="Q2")
+        assert m2 is not None
+        m2.mohs = 5.0
+        f2.commit()  # move Q2 so f1's next commit is stale
+        with pytest.raises(ConflictError):
+            for txn in f1.committing(retries=0):  # one strict attempt, no retry
+                with txn:
+                    m1 = f1.get(Mineral, qid="Q2")
+                    assert m1 is not None
+                    m1.mohs = 9.9
+    finally:
+        f1.close()
+        f2.close()
+
+
 def test_lost_ack_reinsert_with_base_none_raises_conflict(
     coordinator: _CoordinatorServer,
 ) -> None:

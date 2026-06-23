@@ -102,6 +102,16 @@ the backend, returning the current watermark — the rollback the `sync()` "buff
 names. It works on any store (an uncommitted local graph is dropped); a live reference held across it
 is detached, so re-`get()` for fresh values.
 
+**`store.committing(*, retries=3)`** is the recommended read-modify-write loop — *the same code on a
+single-node store and a follower*. Drive it with `for txn in store.committing(): with txn: ...`: the
+block reads and mutates and is committed when it exits cleanly. On a follower a stale write raises
+`ConflictError`; instead of surfacing it, `committing()` re-runs your block against fresh state (a
+`discard()` + `sync()` happen first), up to `retries` times, then re-raises if the conflict persists.
+On a single-node store a commit can never conflict, so the block runs exactly once. Keep the whole
+read-modify-write inside the block (the re-read runs each attempt, so a retry re-applies your *intent*
+to the winning value — never last-writer-wins) and do not call `commit()` yourself; `retries=0` is a
+single strict attempt.
+
 A follower **contributes** by the ordinary write API: `store.upsert(...)` then `store.commit()` —
 on a follower, `commit()` fans the buffered entities into the coordinator's `/v1/submit` (serialized
 via `to_pydantic`, so contribute needs `datacrystal[follower]`'s pydantic), then `sync()`s the

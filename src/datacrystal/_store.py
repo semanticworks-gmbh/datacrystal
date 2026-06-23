@@ -33,6 +33,7 @@ import warnings
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
+from types import TracebackType
 from typing import Any, BinaryIO, Callable, Iterable, Iterator, cast
 
 from datacrystal._conditions import (
@@ -63,6 +64,7 @@ from datacrystal._entity import (
 )
 from datacrystal._state import STATE_CLEAN, STATE_DELETED, STATE_DIRTY, STATE_NEW
 from datacrystal._errors import (
+    ConflictError,
     ConsumerDetachedWarning,
     DanglingDeleteWarning,
     DanglingRefError,
@@ -152,6 +154,52 @@ class _Capture:
         # (obj, field, blob_oid, size, hash): swap each committed streamed-write
         # source to a readable BlobHandle in P3, AFTER durability (ADR-007 §4).
         self.blob_swaps = blob_swaps
+
+
+class _CommitAttempt:
+    """One iteration of a :meth:`Store.committing` loop — a context manager whose
+    block runs, then commits on a clean exit.
+
+    On a follower a stale write raises :class:`ConflictError` from ``commit()``;
+    this discards the rejected buffer, pulls the coordinator's change (``sync``),
+    and signals the loop to re-run the block against fresh state. Any other exception
+    (a bug in the block, or a non-retryable reject like ``SchemaSkewError``)
+    propagates unchanged — only an OCC conflict is retried. On a single-node store
+    ``commit()`` never conflicts, so the first attempt always commits.
+    """
+
+    __slots__ = ("_store", "committed", "conflict", "used")
+
+    def __init__(self, store: Store) -> None:
+        self._store = store
+        self.committed = False
+        self.conflict: ConflictError | None = None
+        self.used = False
+
+    def __enter__(self) -> _CommitAttempt:
+        self.used = True
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> bool:
+        if exc_type is not None:
+            return False  # the block raised — don't commit, don't retry, don't swallow
+        try:
+            self._store.commit()
+        except ConflictError as conflict:
+            # A conflict only arises on a follower (a single-node commit cannot),
+            # so recover so the loop can re-run: drop the rejected edit, then pull
+            # the coordinator's change that moved the entity under us.
+            self._store.discard()
+            self._store.sync()
+            self.conflict = conflict
+            return True  # swallow — committing() retries or re-raises after exhaustion
+        self.committed = True
+        return False
 
 
 class Store:
@@ -372,6 +420,63 @@ class Store:
         self._enter()
         self._refresh_from_backend()
         return self._last_tid
+
+    def committing(self, *, retries: int = 3) -> Iterator[_CommitAttempt]:
+        """A retrying commit loop — the same code on a single-node store and a follower.
+
+        Drive it with ``for txn in store.committing(): with txn: ...``: the
+        ``with`` block reads and mutates, and is committed when it exits cleanly.
+        On a follower a stale write raises :class:`ConflictError`; instead of
+        surfacing it, this **re-runs your block** against fresh state (after a
+        ``discard`` + ``sync``), up to ``retries`` times, then re-raises if the
+        conflict persists. On a single-node store a commit can never conflict, so
+        the block runs exactly once — *identical code, behaviour follows the
+        topology* (the fractal contract).
+
+        This is the recommended way to write a read-modify-write: the re-read lives
+        **inside** the block, so a retry re-applies your *intent* to the winning
+        value (never last-writer-wins). Put the whole read-modify-write in the
+        block and do **not** call :meth:`commit` yourself — the ``with`` exit does.
+
+        Example::
+
+            for txn in store.committing(retries=5):
+                with txn:
+                    m = store.get(Mineral, qid="Q1")
+                    m.mohs = (m.mohs or 0) + 0.5   # re-read + re-applied each try
+
+        Args:
+            retries: how many times to re-run the block on a conflict before
+                giving up (``0`` = a single attempt that raises on conflict). The
+                first attempt is not a retry, so up to ``retries + 1`` runs total.
+
+        Yields:
+            A :class:`_CommitAttempt` to use as ``with txn:``; the loop ends as
+            soon as one attempt commits.
+
+        Raises:
+            ConflictError: a follower's write still conflicts after ``retries``
+                recoveries (the entity keeps moving — surface it to the caller).
+            WrongThreadError: called off the owner thread (ADR-001).
+            StoreClosedError: the store has already been closed.
+        """
+        self._enter()
+        tries = 0
+        while True:
+            attempt = _CommitAttempt(self)
+            yield attempt
+            if attempt.committed:
+                return
+            if not attempt.used:
+                raise RuntimeError(
+                    "committing() loop body must be `with txn: ...` — the yielded "
+                    "attempt was never entered"
+                )
+            # __exit__ caught a ConflictError and already recovered (discard + sync)
+            if tries >= retries:
+                assert attempt.conflict is not None
+                raise attempt.conflict
+            tries += 1
 
     # -- lifecycle -----------------------------------------------------------
 
