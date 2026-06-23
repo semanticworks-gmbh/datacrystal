@@ -1,6 +1,6 @@
 # datacrystal reference
 
-Dry, complete, accurate API reference for `0.6.0` (2026-06). Everything documented here
+Dry, complete, accurate API reference for `0.7.0` (2026-06). Everything documented here
 **exists today**; features that do not exist yet are listed in [Planned features](#planned-features-and-when-they-land)
 and marked `[planned — …]`. The public API freezes at the v0.1.0 tag.
 
@@ -9,6 +9,7 @@ This is the lookup tier of the docs. For a guided first session see the
 *why* behind a design choice see [explanation.md](explanation.md).
 
 - [Open a store](#open-a-store)
+  - [Followers and federation](#followers-and-federation)
 - [Define entities](#define-entities)
 - [The root](#the-root)
   - [Self-referential adjacency (trees and graphs)](#self-referential-adjacency-trees-and-graphs)
@@ -79,6 +80,56 @@ lazy_timeout=None, cache_index=True)` (async: `await dc.aopen(...)`, same keywor
 - `lazy_timeout=<seconds>` enables the **LazyReferenceManager** — see
   [Concurrency primitives](#concurrency-primitives) and the
   [memory explanation](explanation.md#identity-and-memory).
+
+### Followers and federation
+
+**`Store.follower(url, *, api_key=None, path=None, client=None)`** opens a **read replica** synced
+from a coordinator's federation endpoint (ROADMAP item 21,
+[FEDERATION-WIRE-v1](design/FEDERATION-WIRE-v1.md)) — the sibling constructor to `Store.open`:
+`Store.open(path)` opens a local single writer, `Store.follower(url)` opens a replica of a remote
+coordinator. (`dc.open_follower(...)` is the equivalent top-level function form.) It bootstraps
+replay-from-0 over
+`GET /v1/deltas` and returns a real local `Store` you read at full speed — in memory, or
+sqlite-backed when `path=` is given. Each delta is validated through the reference applier (gaps
+refuse loudly, re-applies are idempotent) and persisted with the coordinator's own OIDs/TIDs, so the
+replica reproduces the coordinator's committed state exactly. `api_key` is sent as the `x-api-key`
+header; `client` injects an `httpx.Client`-compatible transport (advanced/testing). The HTTP
+transport ships in the **`datacrystal[follower]`** extra and is imported lazily, so a bare
+`import datacrystal` stays inside the `{msgspec, pyroaring}` budget.
+
+A follower stays current by calling **`store.sync()`** — a synchronous, owner-thread catch-up that
+pulls the coordinator's deltas after the local watermark, applies them (a gap raises `DeltaGapError`
+→ resync), and refreshes the live store; it returns the new watermark. Identity is by OID, so
+**re-query after a sync** — a live reference read *before* it sees stale field values. `sync()` is a
+follower-only method (a normal store raises) and refuses to run with buffered local writes.
+
+**`store.discard()`** drops all buffered (uncommitted) writes and re-reads the committed state from
+the backend, returning the current watermark — the rollback the `sync()` "buffered writes" error
+names. It works on any store (an uncommitted local graph is dropped); a live reference held across it
+is detached, so re-`get()` for fresh values.
+
+**`store.committing(*, retries=3)`** is the recommended read-modify-write loop — *the same code on a
+single-node store and a follower*. Drive it with `for txn in store.committing(): with txn: ...`: the
+block reads and mutates and is committed when it exits cleanly. On a follower a stale write raises
+`ConflictError`; instead of surfacing it, `committing()` re-runs your block against fresh state (a
+`discard()` + `sync()` happen first), up to `retries` times, then re-raises if the conflict persists.
+On a single-node store a commit can never conflict, so the block runs exactly once. Keep the whole
+read-modify-write inside the block (the re-read runs each attempt, so a retry re-applies your *intent*
+to the winning value — never last-writer-wins) and do not call `commit()` yourself; `retries=0` is a
+single strict attempt.
+
+A follower **contributes** by the ordinary write API: `store.upsert(...)` then `store.commit()` —
+on a follower, `commit()` fans the buffered entities into the coordinator's `/v1/submit` (serialized
+via `to_pydantic`, so contribute needs `datacrystal[follower]`'s pydantic), then `sync()`s the
+committed delta back. A new entity carries `base=None`; an edited existing one carries the OCC base
+it was read at. A coordinator reject surfaces as a typed local
+`ConflictError`/`SchemaSkewError`/`DanglingRefError`; the recovery loop is `discard()` → `sync()` →
+re-read → re-apply → `commit()`. **v0 contribute is upsert-only** — a follower with a buffered
+`delete()` raises (delete on the coordinator instead) — and a contributed entity's references must
+point to **already-committed** entities (an intra-batch new→new reference raises loudly, its
+follower-local OID is not valid on the coordinator). A `dc.Blob` field and an `@entity` nested in a
+bare `list`/`dict` container also raise on contribute (no create-face wire shape / the OID-int
+boundary cannot rebind them); see [the federation how-to](how-to/federation.md).
 
 ## Define entities
 
@@ -252,6 +303,11 @@ tid = store.commit()                   # atomically persists everything buffered
 - `store.mark_dirty(obj)` exists as an escape hatch but is rarely needed — attribute writes and
   in-place list/dict mutation are both tracked.
 - `store.last_tid` is the current commit watermark.
+- For a **read-modify-write that may contend** — a follower contributing, or code you want identical
+  on a single-node store and a follower — prefer [`store.committing()`](#followers-and-federation)
+  over a bare `commit()`: it retries the block on an OCC `ConflictError` instead of surfacing it
+  (and is a no-op wrapper on a single-node store, where a commit can never conflict). A plain
+  single-node write needs only `commit()`.
 
 ### Upserting by natural key
 
@@ -505,10 +561,13 @@ digital-twin / system-of-record traversal ("which records point at this one?").
   enumerates the entities now **dangling** at the dead OID (OIDs are never reused) — exactly the
   referrers a checked delete would act on. The watermark twin is `snap.incoming(...)`.
 - **What it does NOT do.** It is not checked delete (refuse-if-referenced, cascades is
-  `[planned — v1]`); it is not persisted (a rebuildable in-memory reverse index, invariant 11).
+  `[planned — v1]`). The reverse index is rebuildable derived data (invariant 11) — like the forward
+  indexes it **may be cached** to the watermark-stamped sidecar ([ADR-005](design/ADR-005-index-cache.md)),
+  never authoritative (any mismatch rebuilds from records).
 - **Cost.** The first `incoming()` scans the store once to build the reverse index (one-time
   O(extent), like the lazy forward indexes), then it is maintained incrementally at every commit —
-  a second, unrelated backlink is an O(1) posting lookup. An unwatched store pays **nothing**: the
+  a second, unrelated backlink is an O(1) posting lookup. With `cache_index=True` (default) a warm
+  reopen loads it from the sidecar instead of rescanning. An unwatched store pays **nothing**: the
   reverse index is built only on first use, so if you never call `incoming()` your commits are
   byte-identical and free of its upkeep.
 
@@ -719,7 +778,8 @@ from datacrystal.web import (
   marker flags ride along as OpenAPI `json_schema_extra` (`unique`→`candidate_key`,
   `indexed`→`queryable`, `fulltext`→`searchable`). The result is cached per `(class, face)` — a pure
   function of its inputs. A reference field crosses the edge as its OID (an int), a defaulted field
-  becomes optional, a frozen `@entity` becomes a frozen DTO. A **list-valued** reference (a
+  becomes optional, a frozen `@entity` becomes a frozen DTO, and a `bytes` field crosses as base64
+  JSON (a lossless round-trip for arbitrary binary). A **list-valued** reference (a
   `list[dc.Lazy[T]]` adjacency or a `list[T]` of `@entity` — the multi-valued edge) crosses as
   `list[int]` (a list of edge OIDs), not a collapsed single `int`.
 - **`to_pydantic(source, face=...)`** — projects a live entity *or* an `EntityView` into a detached,
@@ -728,6 +788,25 @@ from datacrystal.web import (
   constructor (`STATE_NEW`, never poking the engine slots). A `list[int]` edge stays a list of raw
   OIDs without a `store`; with `store=` every OID is resolved in one `store.get_many` and each
   rewrapped as `Lazy.of`.
+
+**Federation (replication — ROADMAP item 21, [FEDERATION-WIRE-v1](design/FEDERATION-WIRE-v1.md)):**
+
+- **`federation_router(store, deltalog, *, dependencies=None)`** — builds a FastAPI `APIRouter`
+  (prefix `/v1`) exposing the coordinator's **read** surface to edge followers:
+  `GET /v1/head` → `{tid, format, version}` (the watermark probe) and
+  `GET /v1/deltas?after=<tid>` → the COMMIT-DELTA-v1 frames with `tid > after`, in strict TID order,
+  byte-for-byte the length-prefixed frame the `DeltaLog` writes (re-encoded from `deltalog.replay`).
+  The `DeltaLog` is passed explicitly (attach it with `store.attach(deltalog)` first; the store
+  exposes no delta-log accessor). You bring authn/z via `dependencies=[Depends(...)]`, applied to
+  every route. Mount with `app.include_router(federation_router(store, log, dependencies=[...]))`.
+  It also serves the **contribute** endpoint `POST /v1/submit` — a follower's batch of natural-key
+  upserts (`{ops: [{type, key, fields, base}]}`) fanned into the single writer via `store.submit`
+  (one batch = one commit), returning `{applied_tid, keys}` (each natural-key value → its OID). The
+  fail-closed guards on `/v1/submit` are enforced (FEDERATION-WIRE-v1 §5): a malformed envelope → 422;
+  a field the coordinator's class lacks → 409 `SchemaSkewError`; an OCC `base` that no longer matches
+  the current payload → 409 `ConflictError` carrying `{error, key, expected_base, actual_base}`. A
+  `dc.Blob` field or an `@entity` nested in a bare container is rejected loudly. Idempotency rides the
+  natural-key upsert (a re-sent insert re-merges to the same OID — no server ledger).
 
 **GraphQL (Strawberry):**
 
@@ -960,6 +1039,8 @@ Everything derives from `dc.DataCrystalError`:
 | `NotAnEntityError` | a non-entity where an entity is required |
 | `UniqueViolationError` | duplicate value for a `dc.Unique` field in a commit |
 | `SchemaMismatchError` | a class change beyond additive evolution (see [the schema-evolution how-to](how-to/schema-evolution.md)) |
+| `SchemaSkewError` | a federated `/v1/submit` contribution carries a field the coordinator's class lacks (cid-lineage skew → HTTP 409; [FEDERATION-WIRE-v1](design/FEDERATION-WIRE-v1.md)) |
+| `ConflictError` | a federated `/v1/submit` OCC base token no longer matches the coordinator's current payload — the entity moved since it was read (→ HTTP 409; re-read and retry, never last-writer-wins). Carries `.key`, `.expected_base`, `.actual_base` (the conflict envelope) so a client can drive its re-read; `store.committing()` handles the retry for you |
 | `UnregisteredTypeError` | store has records of a class not imported in this process |
 | `NewerStoreError` | store written by a newer format version |
 | `CorruptRecordError` | a record failed its checksum — the file is damaged |
@@ -990,7 +1071,7 @@ the store has no committed records of (the result is empty — first run, or a f
 
 Sequencing follows the ratified [roadmap](design/ROADMAP.md); the live backlog (in/order)
 is on [GitHub Issues](https://github.com/semanticworks-gmbh/datacrystal/issues). **v0.1.0 (the API-freeze
-baseline) and the purely additive surface through v0.6.0 are all tagged (the v0.1.0 freeze is
+baseline) and the purely additive surface through v0.7.0 are all tagged (the v0.1.0 freeze is
 never broken); PyPI publication is still deferred (names reserved).**
 
 | Feature | Where it lands |
@@ -1015,7 +1096,8 @@ df = pd.DataFrame(store.pluck(Mineral, "qid", "name", "crystal_system"),
 - How-to guides — [querying & paging](how-to/querying-and-paging.md),
   [ingest & memory](how-to/ingest-and-memory.md),
   [schema evolution](how-to/schema-evolution.md), [blobs](how-to/blobs.md),
-  [web deployment](how-to/web-deployment.md), [search](how-to/search.md),
+  [web deployment](how-to/web-deployment.md), [coordinator + edge followers](how-to/federation.md),
+  [search](how-to/search.md), [vector & hybrid search](how-to/vector-search.md),
   [analytics](how-to/analytics.md),
   [snapshots & the delta log](how-to/snapshots-and-delta-log.md).
 - [Explanation](explanation.md) — the design *why*.

@@ -57,6 +57,15 @@ class LogEntry:
     kind: Annotated[str, dc.Index] = "misc"
 
 
+@dc.entity
+class Sample:
+    """A specimen with a small inline binary fingerprint (a plain ``bytes`` field,
+    NOT a ``dc.Blob``) — the create-face must round-trip arbitrary binary."""
+
+    qid: Annotated[str, dc.Unique]
+    fingerprint: bytes = b""
+
+
 def _stock(store: dc.Store) -> tuple[Mineral, Locality]:
     """A quartz-from-Brazil pair, committed; returns the live (mineral, locality)."""
     loc = Locality(qid="Q-BR", name="Brazil")
@@ -289,3 +298,24 @@ def test_rejects_non_entity_class() -> None:
     dto = entity_model(Mineral).model_validate({"qid": "Q", "name": "q"})
     with pytest.raises(dc.NotAnEntityError):
         from_pydantic(dto, dict)  # not an @entity class
+
+
+# --- binary bytes round-trip (#153 peer-review fix: base64, not utf-8) ----------
+
+
+def test_binary_bytes_field_round_trips_through_json() -> None:
+    """A non-utf-8 ``bytes`` value survives the create-face JSON round-trip
+    (``model_dump(mode='json')`` → ``model_validate`` → ``from_pydantic``).
+
+    Pydantic's default utf-8 bytes mode would RAISE on this content; the boundary
+    models are configured for base64, so arbitrary binary is lossless — the wire
+    shape a follower contributes through.
+    """
+    binary = b"\x89PNG\r\n\x00\xff\xfe"  # not valid utf-8
+    create = entity_model(Sample, face="create")
+    wire = to_pydantic(Sample(qid="S1", fingerprint=binary), face="create").model_dump(
+        mode="json"
+    )
+    assert isinstance(wire["fingerprint"], str)  # base64 text on the wire, not raw bytes
+    rebuilt = from_pydantic(create.model_validate(wire), Sample)
+    assert rebuilt.fingerprint == binary  # decoded back to the exact bytes

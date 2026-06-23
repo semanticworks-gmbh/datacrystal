@@ -138,7 +138,16 @@ def entity_model(cls: type, *, face: Face = "plain") -> type[pydantic.BaseModel]
 
     # from_attributes lets model_validate read fields by name off a live read
     # (the EntityView guarantee); a frozen @entity stays an immutable DTO.
-    config = ConfigDict(from_attributes=True, frozen=info.frozen)
+    # base64 for bytes (both directions) so a plain ``bytes`` field round-trips
+    # arbitrary binary through JSON — the default utf-8 mode raises on non-utf-8
+    # content and silently re-encodes utf-8 bytes (#153 peer-review fix; symmetric
+    # ser/val keeps the create-face DTO a lossless wire shape for binary).
+    config = ConfigDict(
+        from_attributes=True,
+        frozen=info.frozen,
+        ser_json_bytes="base64",
+        val_json_bytes="base64",
+    )
     model = create_model(
         cls.__name__ + _FACE_SUFFIX[face],
         __config__=config,

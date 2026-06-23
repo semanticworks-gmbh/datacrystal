@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import threading
 import time
 import uuid
@@ -90,7 +91,8 @@ class LeaseLock:
 
     def _payload(self) -> str:
         return json.dumps(
-            {"pid": os.getpid(), "token": self._token, "ts": self._clock()}
+            {"pid": os.getpid(), "token": self._token, "ts": self._clock(),
+             "host": socket.gethostname()}
         )
 
     def _read(self) -> dict[str, object] | None:
@@ -106,7 +108,28 @@ class LeaseLock:
         ts = holder.get("ts")
         if not isinstance(ts, (int, float)):
             return True  # unreadable/corrupt lock counts as stale
-        return (self._clock() - ts) > (self._ttl * 2)
+        if (self._clock() - ts) > (self._ttl * 2):
+            return True  # the refresher stopped long enough ago: holder is gone
+        # A same-host holder whose pid is gone is stale at once — a crashed or
+        # -9'd writer must not lock the store for the whole ~2*ttl window before a
+        # restart can reclaim it. Only probed when the lock was taken on THIS host
+        # (a pre-host lock file, or one from another host/NFS, falls back to the
+        # ttl rule above — we can't meaningfully probe a foreign pid).
+        return self._holder_pid_is_dead(holder)
+
+    def _holder_pid_is_dead(self, holder: dict[str, object]) -> bool:
+        if holder.get("host") != socket.gethostname():
+            return False  # different host (or no host recorded): probe is unsafe
+        pid = holder.get("pid")
+        if not isinstance(pid, int) or pid <= 0 or pid == os.getpid():
+            return False  # unknown, or our own (pid-reuse): never claim dead
+        try:
+            os.kill(pid, 0)  # signal 0: existence check, delivers nothing
+        except ProcessLookupError:
+            return True  # no such process — the holder really is gone
+        except OSError:
+            return False  # exists but unsignalable (PermissionError), or can't tell
+        return False  # signal accepted: the holder is alive
 
     def _refresh_loop(self) -> None:
         interval = self._ttl / 3

@@ -33,6 +33,7 @@ import warnings
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
+from types import TracebackType
 from typing import Any, BinaryIO, Callable, Iterable, Iterator, cast
 
 from datacrystal._conditions import (
@@ -63,6 +64,7 @@ from datacrystal._entity import (
 )
 from datacrystal._state import STATE_CLEAN, STATE_DELETED, STATE_DIRTY, STATE_NEW
 from datacrystal._errors import (
+    ConflictError,
     ConsumerDetachedWarning,
     DanglingDeleteWarning,
     DanglingRefError,
@@ -154,6 +156,52 @@ class _Capture:
         self.blob_swaps = blob_swaps
 
 
+class _CommitAttempt:
+    """One iteration of a :meth:`Store.committing` loop — a context manager whose
+    block runs, then commits on a clean exit.
+
+    On a follower a stale write raises :class:`ConflictError` from ``commit()``;
+    this discards the rejected buffer, pulls the coordinator's change (``sync``),
+    and signals the loop to re-run the block against fresh state. Any other exception
+    (a bug in the block, or a non-retryable reject like ``SchemaSkewError``)
+    propagates unchanged — only an OCC conflict is retried. On a single-node store
+    ``commit()`` never conflicts, so the first attempt always commits.
+    """
+
+    __slots__ = ("_store", "committed", "conflict", "used")
+
+    def __init__(self, store: Store) -> None:
+        self._store = store
+        self.committed = False
+        self.conflict: ConflictError | None = None
+        self.used = False
+
+    def __enter__(self) -> _CommitAttempt:
+        self.used = True
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> bool:
+        if exc_type is not None:
+            return False  # the block raised — don't commit, don't retry, don't swallow
+        try:
+            self._store.commit()
+        except ConflictError as conflict:
+            # A conflict only arises on a follower (a single-node commit cannot),
+            # so recover so the loop can re-run: drop the rejected edit, then pull
+            # the coordinator's change that moved the entity under us.
+            self._store.discard()
+            self._store.sync()
+            self.conflict = conflict
+            return True  # swallow — committing() retries or re-raises after exhaustion
+        self.committed = True
+        return False
+
+
 class Store:
     """An open datacrystal store. Create via :meth:`Store.open`."""
 
@@ -225,7 +273,36 @@ class Store:
         # deliver deltas only while this list is non-empty — an unwatched
         # store pays nothing for the pipeline (spec §5).
         self._consumers: list[DeltaConsumer] = []
+        # Follower catch-up hook (#151, ROADMAP item 21): open_follower installs
+        # a closure that fetches + applies the coordinator's new deltas and
+        # returns the new watermark; None for a normal (non-follower) store.
+        self._sync_fn: Callable[[int], int] | None = None
+        # Follower contribute hook (#153): open_follower installs a closure that
+        # serializes the buffered (entity, base) items and POSTs them to the
+        # coordinator's /v1/submit, returning the applied TID; None for a normal
+        # store (commit() then takes the local P1/P2/P3 path).
+        self._contribute_fn: (
+            Callable[[list[tuple[Any, str | None]]], int | None] | None
+        ) = None
 
+        # The index-cache sidecar (ADR-005 / #12) is per-session (tied to the
+        # store dir); created here, then the (re)loadable state below reads it.
+        self._index_cache = (
+            IndexCache(cache_dir / "index.cache") if cache_dir is not None else None
+        )
+        self._load_state(use_cache=True)
+
+    def _load_state(self, *, use_cache: bool) -> None:
+        """(Re)derive all boot-time state from the backend, in one place.
+
+        Called at open (``use_cache=True``) and by a follower's :meth:`sync`
+        refresh (``use_cache=False``, #151) once new deltas have landed in the
+        backend: the allocator, watermark, root OID, type lineage, and a fresh
+        index manager are all re-read from ``backend.boot()``. A refresh rebuilds
+        the index from records (the watermark-stamped sidecar is only read at
+        open, never authoritative — invariant 11).
+        """
+        backend = self._backend
         boot = backend.boot()
         meta = boot.meta
         self._alloc = IdAllocator(
@@ -258,21 +335,148 @@ class Store:
             self._durable_cids.add(cid)
         self._ti_by_cid: dict[int, TypeInfo] = {}
         self._plan_by_cid: dict[int, list[tuple[Any, int | None, Any]]] = {}
-        # Index cache (ADR-005 / #12): a sidecar beside the store; read at boot
-        # only if its watermark matches (else the index rebuilds from records —
-        # the cache is never authoritative, invariant 11). Disk stores only.
-        self._index_cache = (
-            IndexCache(cache_dir / "index.cache") if cache_dir is not None else None
-        )
         cached = (
             self._index_cache.read(self._last_tid)
-            if self._index_cache is not None else None
+            if use_cache and self._index_cache is not None else None
         )
         cache_blobs = cached["classes"] if cached is not None else None
         reverse_blob = cached["reverse"] if cached is not None else None
         self._index = IndexManager(backend, self._lineage_for,
                                    self._persisted_fields.keys, cache_blobs,
                                    reverse_blob)
+
+    def _refresh_from_backend(self) -> None:
+        """Discard in-memory caches and re-derive all state from the backend.
+
+        For a follower whose backend just received new committed deltas
+        (:meth:`sync`, #151): the OID registry, the pinned root, and the
+        type-lineage + index manager are rebuilt so the next read reflects the
+        new state. Read-only — :meth:`sync` guards that no local writes are
+        buffered, so the dirty/new/deleted maps are clear here.
+        """
+        self._registry = ObjectRegistry()
+        self._root_holder = None
+        self._new.clear()
+        self._dirty.clear()
+        self._deleted.clear()
+        self._pending_upserts.clear()
+        self._fingerprints.clear()
+        self._load_state(use_cache=False)
+
+    def sync(self) -> int:
+        """Pull and apply the coordinator's new deltas — follower catch-up (#151).
+
+        Synchronous, owner-thread, single-threaded (the v0 follower contract):
+        fetch the deltas after the local watermark, apply them, and refresh this
+        live store so the next read reflects them. Returns the (possibly
+        unchanged) watermark. Only a store opened with
+        :func:`~datacrystal.open_follower` can sync.
+
+        A live reference to a CLEAN entity read *before* a sync sees stale field
+        values afterwards — re-query for fresh reads (identity is by OID, so a
+        re-read returns the updated instance).
+
+        Raises:
+            WrongThreadError: called off the owner thread (ADR-001).
+            StoreClosedError: the store is closed.
+            DeltaGapError: a delta skipped past the watermark — resync from 0.
+            RuntimeError: this store is not a follower, or local writes are
+                buffered (commit or discard them before syncing).
+        """
+        self._enter()
+        if self._sync_fn is None:
+            raise RuntimeError("sync() needs a follower store — see dc.open_follower")
+        if self._new or self._dirty or self._deleted:
+            raise RuntimeError("commit or discard buffered writes before sync()")
+        before = self._last_tid
+        applied = self._sync_fn(before)
+        if applied > before:
+            self._refresh_from_backend()
+        return self._last_tid
+
+    def discard(self) -> int:
+        """Drop all buffered (uncommitted) writes and re-read committed state.
+
+        The rollback the :meth:`sync` error message names. A follower whose
+        ``commit()`` the coordinator rejected (``ConflictError``) still holds its
+        buffered edit, so ``sync()`` refuses; ``discard()`` clears the buffered
+        ``upsert``/``delete``/``store`` set and re-derives the live store from the
+        backend's committed records, so the next read reflects the durable state
+        and a following ``sync()`` can run. This is the OCC recovery loop:
+        ``discard()`` → ``sync()`` → re-read → re-apply → ``commit()`` (#153
+        peer-review fix). Works on **any** store, not only a follower — an
+        uncommitted local graph is dropped, the durable state reloaded.
+
+        A live reference read *before* the discard is detached from identity (a
+        fresh registry); re-read for the current values (identity is by OID).
+
+        Returns:
+            The current committed watermark (unchanged by a discard).
+
+        Raises:
+            WrongThreadError: called off the owner thread (ADR-001).
+            StoreClosedError: the store has already been closed.
+        """
+        self._enter()
+        self._refresh_from_backend()
+        return self._last_tid
+
+    def committing(self, *, retries: int = 3) -> Iterator[_CommitAttempt]:
+        """A retrying commit loop — the same code on a single-node store and a follower.
+
+        Drive it with ``for txn in store.committing(): with txn: ...``: the
+        ``with`` block reads and mutates, and is committed when it exits cleanly.
+        On a follower a stale write raises :class:`ConflictError`; instead of
+        surfacing it, this **re-runs your block** against fresh state (after a
+        ``discard`` + ``sync``), up to ``retries`` times, then re-raises if the
+        conflict persists. On a single-node store a commit can never conflict, so
+        the block runs exactly once — *identical code, behaviour follows the
+        topology* (the fractal contract).
+
+        This is the recommended way to write a read-modify-write: the re-read lives
+        **inside** the block, so a retry re-applies your *intent* to the winning
+        value (never last-writer-wins). Put the whole read-modify-write in the
+        block and do **not** call :meth:`commit` yourself — the ``with`` exit does.
+
+        Example::
+
+            for txn in store.committing(retries=5):
+                with txn:
+                    m = store.get(Mineral, qid="Q1")
+                    m.mohs = (m.mohs or 0) + 0.5   # re-read + re-applied each try
+
+        Args:
+            retries: how many times to re-run the block on a conflict before
+                giving up (``0`` = a single attempt that raises on conflict). The
+                first attempt is not a retry, so up to ``retries + 1`` runs total.
+
+        Yields:
+            A :class:`_CommitAttempt` to use as ``with txn:``; the loop ends as
+            soon as one attempt commits.
+
+        Raises:
+            ConflictError: a follower's write still conflicts after ``retries``
+                recoveries (the entity keeps moving — surface it to the caller).
+            WrongThreadError: called off the owner thread (ADR-001).
+            StoreClosedError: the store has already been closed.
+        """
+        self._enter()
+        tries = 0
+        while True:
+            attempt = _CommitAttempt(self)
+            yield attempt
+            if attempt.committed:
+                return
+            if not attempt.used:
+                raise RuntimeError(
+                    "committing() loop body must be `with txn: ...` — the yielded "
+                    "attempt was never entered"
+                )
+            # __exit__ caught a ConflictError and already recovered (discard + sync)
+            if tries >= retries:
+                assert attempt.conflict is not None
+                raise attempt.conflict
+            tries += 1
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -360,6 +564,51 @@ class Store:
         except BaseException:
             lock.release()
             raise
+
+    @classmethod
+    def follower(
+        cls,
+        url: str,
+        *,
+        api_key: str | None = None,
+        path: str | Path | None = None,
+        client: Any | None = None,
+    ) -> Store:
+        """Open a **read replica** synced from a coordinator's federation endpoint.
+
+        The follower constructor (ROADMAP item 21, FEDERATION-WIRE-v1) — the
+        sibling of :meth:`open`: ``Store.open(path)`` opens a local single writer,
+        ``Store.follower(url)`` opens a replica of a remote coordinator. It
+        bootstraps by replaying the coordinator's COMMIT-DELTA-v1 stream from TID 0
+        over ``GET /v1/deltas`` and returns a **real local** :class:`Store` you read
+        at full local speed; :meth:`sync` catches it up, and ``upsert`` + ``commit``
+        contributes back through the coordinator's single writer (use
+        :meth:`committing` for a read-modify-write — the same code as on a local
+        store). The top-level :func:`~datacrystal.open_follower` is the equivalent
+        function form.
+
+        Args:
+            url: the coordinator base URL (e.g. ``"https://coordinator"``).
+            api_key: sent as the ``x-api-key`` header (your auth seam; optional).
+            path: where the replica lives on disk (sqlite-backed); ``None``
+                (default) keeps it in memory.
+            client: an ``httpx.Client``-compatible transport (advanced/testing,
+                e.g. a ``fastapi.testclient.TestClient``); ``url``/``api_key`` are
+                then the client's responsibility.
+
+        Returns:
+            A :class:`Store` holding the coordinator's committed state at bootstrap.
+
+        Note:
+            The HTTP transport ships in the ``datacrystal[follower]`` extra and is
+            imported lazily, so a bare ``import datacrystal`` stays inside the
+            ``{msgspec, pyroaring}`` budget.
+        """
+        # lazy: open_follower lives in datacrystal._follower, which imports Store —
+        # importing it at module load would be a cycle.
+        from datacrystal._follower import open_follower
+
+        return open_follower(url, api_key=api_key, path=path, client=client)
 
     @classmethod
     def _from_backend(cls, backend: StorageBackend, *, debug: bool = False,
@@ -694,6 +943,25 @@ class Store:
                 setattr(existing, name, new)  # the one-shot hook buffers it
         return existing
 
+    def _payload_digest(self, ti: TypeInfo, field: str, value: Any) -> str | None:
+        """Hex SHA-256 of the CURRENT persisted payload for the entity whose
+        unique ``field == value``, or ``None`` if the key is absent.
+
+        The OCC base token (#155, FEDERATION-WIRE-v1): ``/v1/submit`` compares a
+        follower's carried base against this. It reads the AUTHORITATIVE persisted
+        bytes (the backend record the follower itself hashed from the delta) — not
+        a re-encode of the live entity, whose lineage/defaults could diverge from
+        the stored bytes. Owner-thread (called inside the ``submit`` fan-in).
+        """
+        if self._cid_by_typename.get(ti.typename) is None:
+            return None
+        ci = self._index.ensure(ti)
+        oid = ci.unique[field].get(value)
+        if oid is None:
+            return None
+        rec = self._backend.load_many([oid]).get(oid)
+        return hashlib.sha256(rec.payload).hexdigest() if rec is not None else None
+
     def _find_by_key(self, ti: TypeInfo, field: str, value: Any) -> Any | None:
         """The upsert lookup: committed unique map (a key freed by a
         buffered delete is reusable, ADR-003), then earlier upserts of this
@@ -745,6 +1013,8 @@ class Store:
             StoreClosedError: the store has already been closed.
         """
         self._enter()
+        if self._contribute_fn is not None:  # a follower: fan in to the coordinator
+            return self._contribute()
         capture = self._p1_capture()
         if capture is None:
             return None
@@ -754,6 +1024,43 @@ class Store:
             self._p2_rollback(capture)
             raise
         return self._p3_finalize(capture)
+
+    def _contribute(self) -> int | None:
+        """A follower's ``commit()``: fan the buffered writes into the coordinator
+        (#153) instead of a local P1/P2/P3.
+
+        Serializes the buffered NEW/DIRTY entities — a NEW one carries
+        ``base=None``; an edited existing one the SHA-256 of the payload it was
+        read at (OCC) — and hands them to the installed ``_contribute_fn`` (which
+        POSTs ``/v1/submit``). On success the local buffers clear and a
+        :meth:`sync` pulls the committed delta back (read-your-writes); identity
+        is by OID, so re-query for the coordinator-minted instance. A coordinator
+        reject raises ``ConflictError``/``SchemaSkewError`` with the buffers left
+        intact — re-read and retry.
+        """
+        assert self._contribute_fn is not None
+        if self._deleted:  # /v1/submit is upsert-only (FEDERATION-WIRE-v1 §3) —
+            raise NotImplementedError(  # fail loud, never silently drop the delete
+                "a follower cannot contribute deletes — /v1/submit is upsert-only "
+                "(v0); delete on the coordinator instead"
+            )
+        items: list[tuple[Any, str | None]] = []
+        for obj in self._new.values():
+            items.append((obj, None))
+        for oid, obj in self._dirty.items():
+            if oid in self._new:
+                continue
+            rec = self._backend.load_many([oid]).get(oid)
+            base = hashlib.sha256(rec.payload).hexdigest() if rec is not None else None
+            items.append((obj, base))
+        if not items:
+            return None
+        applied_tid = self._contribute_fn(items)
+        self._new.clear()
+        self._dirty.clear()
+        if self._sync_fn is not None:
+            self.sync()  # read-your-writes: pull the committed delta back
+        return applied_tid
 
     # -- the three commit phases (ADR-001 bound decision 2) ------------------
 

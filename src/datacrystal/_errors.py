@@ -12,6 +12,16 @@ class DataCrystalError(Exception):
     """Base class for all datacrystal errors."""
 
 
+# FEDERATION-WIRE-v1 §"Conflict envelope": the ``error`` discriminator strings a
+# ``/v1/submit`` 409 carries. The follower dispatches on these to raise the
+# faithful typed error, so they are load-bearing wire values — defined ONCE here
+# as the single source of truth for the encode (``web/_federation``) / decode
+# (``_follower``) pair (a rename then cannot drift the two halves apart).
+ERROR_CONFLICT = "conflict"
+ERROR_SCHEMA_SKEW = "schema-skew"
+ERROR_DANGLING_REF = "dangling-ref"
+
+
 class StoreClosedError(DataCrystalError):
     """The store has been closed; no further operations are possible."""
 
@@ -67,6 +77,48 @@ class SchemaMismatchError(DataCrystalError):
     remove+add (the old values are dropped); explicit data migrations are
     post-v0.1 work.
     """
+
+
+class SchemaSkewError(DataCrystalError):
+    """A federated contribution carries a field the coordinator's class lacks.
+
+    The ``datacrystal[web]`` ``/v1/submit`` cid-lineage guard (ROADMAP item 21,
+    [FEDERATION-WIRE-v1]): a follower's ``@entity`` shape forked from the
+    coordinator's (a field added on the follower, or the two never in sync). The
+    whole submission is rejected (fail-closed, HTTP 409) rather than silently
+    dropping the unknown field — roll out coordinator-first.
+    """
+
+
+class ConflictError(DataCrystalError):
+    """A federated contribution conflicts with the coordinator's current state.
+
+    The ``/v1/submit`` OCC guard (ROADMAP item 21, [FEDERATION-WIRE-v1]): the
+    base token a follower read no longer matches the coordinator's current
+    payload for that natural key — the entity moved since it was read (or a
+    presence mismatch: ``base`` was given for an absent key, or omitted for a
+    present one). The whole submission is rejected (fail-closed, HTTP 409);
+    re-read the entity and retry. **Detect-and-reject, never last-writer-wins.**
+
+    Carries the conflict envelope fields the LOCKED contract promises so the
+    coordinator's 409 body is ``{error, key, expected_base, actual_base}`` and a
+    client can drive its re-read: ``key`` is the natural-key value that
+    conflicted, ``expected_base`` the token the follower carried, ``actual_base``
+    the coordinator's current payload hash (``None`` ⇔ the key is absent).
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        key: object = None,
+        expected_base: str | None = None,
+        actual_base: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.key = key
+        self.expected_base = expected_base
+        self.actual_base = actual_base
 
 
 class UnregisteredTypeError(DataCrystalError):

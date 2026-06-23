@@ -117,10 +117,11 @@ for referrer in store.incoming(quartz):     # every entity that points at quartz
                                             # and inside list/dict containers
 ```
 
-- Answered from a **rebuildable in-memory reverse-reference index** (never persisted, invariant 11):
+- Answered from a **rebuildable reverse-reference index** (derived data, invariant 11; cached to the
+  watermark-stamped sidecar when `cache_index=True`, never authoritative — [ADR-005](../design/ADR-005-index-cache.md)):
   the first `incoming()` scans the store once to build it (one-time O(extent), like the lazy forward
   indexes), then it is maintained incrementally at every commit — a second, unrelated backlink is an
-  O(1) posting lookup.
+  O(1) posting lookup, and a warm reopen loads it from the sidecar instead of rescanning.
 - An unwatched store pays **nothing**: the reverse index is built only on first use, so if you never
   call `incoming()` your commits are byte-identical and free of its upkeep.
 - A deleted **target** keeps its postings, so `incoming(dead)` enumerates the entities now
