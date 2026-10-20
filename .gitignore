@@ -26,3 +26,6 @@ memory:/
 
 # agent worktrees (transient, isolation runs)
 .claude/worktrees/
+
+# mutmut work tree
+mutants/
