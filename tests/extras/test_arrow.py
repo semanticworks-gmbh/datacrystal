@@ -9,6 +9,7 @@ backends via ``store_factory``.
 from __future__ import annotations
 
 import datetime as dt
+from decimal import Decimal
 import itertools
 from typing import Annotated, Any
 
@@ -744,4 +745,63 @@ def test_parquet_dir_read_after_compact(store_factory, tmp_path) -> None:
     ).fetchone()
     assert n == len(finds)
     assert total == sum(f.mass_g for f in finds if f.mass_g is not None)
+    mirror.close()
+
+
+# -- Decimal (#184) ----------------------------------------------------------------
+
+
+@dc.entity
+class Bill:
+    number: str
+    net: Decimal | None = None
+
+
+def test_decimal_field_mirrors_as_an_arrow_decimal_column(tmp_path, store_factory) -> None:
+    store = store_factory()
+    mirror = fresh_mirror(tmp_path)
+    store.attach(mirror)
+    store.root = [Bill(number="a", net=Decimal("72.46")),
+                  Bill(number="b", net=Decimal("-0.30")),
+                  Bill(number="c", net=None)]
+    store.commit()
+
+    table = mirror.table(Bill)
+    assert pa.types.is_decimal(table.schema.field("net").type)
+    by_number = {r["number"]: r["net"] for r in table.to_pylist()}
+    assert by_number == {"a": Decimal("72.46"), "b": Decimal("-0.30"), "c": None}
+    store.close()
+    mirror.close()
+
+
+def test_decimal_column_widens_across_segments_without_losing_digits(
+        tmp_path, store_factory) -> None:
+    store = store_factory()
+    mirror = fresh_mirror(tmp_path)
+    store.attach(mirror)
+    first = Bill(number="a", net=Decimal("1.5"))
+    store.root = [first]
+    store.commit()
+    store.root = [first, Bill(number="b", net=Decimal("12345678901234567890.123456"))]
+    store.commit()
+
+    by_number = {r["number"]: r["net"] for r in mirror.table(Bill).to_pylist()}
+    assert by_number["a"] == Decimal("1.5")
+    assert by_number["b"] == Decimal("12345678901234567890.123456")
+    store.close()
+    mirror.close()
+
+
+def test_decimal_beyond_arrow_precision_falls_back_to_exact_text(
+        tmp_path, store_factory) -> None:
+    store = store_factory()
+    mirror = fresh_mirror(tmp_path)
+    store.attach(mirror)
+    too_wide = Decimal("1." + "1" * 40)
+    store.root = [Bill(number="w", net=too_wide)]
+    store.commit()
+
+    row = rows(mirror, Bill)[0]
+    assert decode_fallback(row["net"]) == too_wide
+    store.close()
     mirror.close()

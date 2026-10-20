@@ -157,7 +157,7 @@ class Mineral:
 - Field markers go inside `typing.Annotated`:
   - `dc.Index` — adds the field to the roaring-bitmap indexes; `==` and `.in_()` queries on it
     answer from bitmaps. Index/Unique fields must be scalar (`str | int | float | bool` or
-    `datetime`/`date`, optionally `| None`) — or a **`list` of scalars** for a multi-valued
+    `datetime`/`date`/`Decimal`, optionally `| None`) — or a **`list` of scalars** for a multi-valued
     (inverted) index (`Annotated[list[str], dc.Index]`), queried with `.contains(elem)` for exact
     element membership. A `datetime`/`date` indexes by value; a timezone-aware `datetime` keys by
     its UTC instant, so two clocks spelling the same instant collapse to one bitmap key. A bad
@@ -388,6 +388,7 @@ lists after reopen.)
 | `None`, `bool`, `int`, `float`, `str`, `bytes` | itself (msgpack) |
 | timezone-aware `datetime` | itself (msgpack timestamp; the instant is preserved, a non-UTC offset comes back as UTC) |
 | naive `datetime`, `date`, `time` | itself (datacrystal extension codes, format v2) |
+| `decimal.Decimal` | itself (datacrystal extension code 6 holding the exact text, so `Decimal("1.10")` stays `1.10`; `None`, negatives and any precision included) |
 | `timedelta` | **as an ISO-8601 duration string** — it comes back as `str`; store seconds, or convert at the edge |
 | `list`, `dict` | by value; nested fine; dict keys must be scalars |
 | `tuple` | **as a list** — it comes back as a list (msgpack has no tuple type) |
@@ -542,6 +543,12 @@ this is the contract):
   `dc.MixedTemporalIndexError` at `commit()` — before the TID is allocated, so the commit
   sequence stays gapless — instead of a confusing comparison failure; naive-only and
   aware-only fields both work.
+  `Decimal` is a valid key type for `dc.Index`, `dc.Unique` and `dc.SortedIndex` too, and a
+  `Decimal` field compares with `Decimal` and `int` literals (`==`, `>`, `>=`, `<`, `<=`,
+  `.in_()`); equal values with different exponents (`1.5`, `1.50`) are one key. A **`float`
+  literal** against a `Decimal` field raises `TypeError` naming the field when the condition is
+  built (a float is inexact: `Decimal("0.1") != 0.1`). `Decimal("NaN")` is not orderable and is
+  rejected in a `dc.SortedIndex` field at `commit()` (`ValueError`, before the TID is allocated).
 - A condition uses fields of **one entity class** — cross-entity joins are
   `[planned — v1, on Arrow mirrors]`.
 - `query()` and `get()` reflect **committed** state; uncommitted buffered changes are not
@@ -1042,6 +1049,10 @@ from datacrystal.web import (
   JSON (a lossless round-trip for arbitrary binary). A **list-valued** reference (a
   `list[dc.Lazy[T]]` adjacency or a `list[T]` of `@entity` — the multi-valued edge) crosses as
   `list[int]` (a list of edge OIDs), not a collapsed single `int`.
+- A `decimal.Decimal` field passes through the Pydantic boundary as a `Decimal` (JSON text on the
+  wire, never a float) and is a `Decimal` scalar in GraphQL; the `[arrow]` mirror stores it as an
+  Arrow `decimal128` column (precision widened per segment, a value beyond 38 digits or a
+  NaN/Infinity mirrors as exact-text fallback bytes).
 - **`to_pydantic(source, face=...)`** — projects a live entity *or* an `EntityView` into a detached,
   validated DTO. A list-valued reference projects as a `list[int]` of edge OIDs.
 - **`from_pydantic(dto, cls, store=...)`** — rebuilds a live `@entity` through the public

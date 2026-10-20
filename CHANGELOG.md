@@ -10,7 +10,13 @@ purely **additive** surface — the v0.1.0 freeze is never broken. PyPI publicat
 
 ## [Unreleased]
 
-_No unreleased changes yet._
+### Added
+
+- **`decimal.Decimal` fields** (#184): persisted as their exact text (a new record extension code,
+  additive on format v2), comparable with `Decimal` and `int` literals, and valid
+  `Index`/`Unique`/`SortedIndex` key types (the ADR-005 index cache round-trips them). A `float`
+  literal against a `Decimal` field raises `TypeError`; `Decimal("NaN")` is rejected in a
+  `SortedIndex`. `[arrow]` mirrors a `Decimal` as an Arrow decimal column; `[web]` passes it through.
 
 ## [0.9.0] — 2026-07-16
 
