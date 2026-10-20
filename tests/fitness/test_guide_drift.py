@@ -70,13 +70,13 @@ def _code_mentions(reference: str) -> str:
 
 
 def _errors_section(reference: str) -> str:
-    """Return the ## Errors reference region (up to the next H2); exceptions and warnings live here."""
+    """Return the ## Errors reference region up to the next H2."""
     m = re.search(r"\n## Errors\b(.*?)(?:\n## |\Z)", reference, re.DOTALL)
     return m.group(1) if m else ""
 
 
 def _planned_section(reference: str) -> str:
-    """Return the ## Planned features region (up to the next H2); empty when the section is missing."""
+    """Return the ## Planned features region up to the next H2, or empty."""
     m = re.search(r"\n## Planned features\b(.*?)(?:\n## |\Z)", reference, re.DOTALL)
     return m.group(1) if m else ""
 
