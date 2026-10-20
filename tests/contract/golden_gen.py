@@ -21,18 +21,22 @@ from dataclasses import field
 from typing import Annotated
 
 import datacrystal as dc
-from datacrystal.contract import encode_delta
 from datacrystal._storage.memory import MemoryBackend
+from datacrystal.contract import encode_delta
 
 
 @dc.entity
 class GoldenLocality:
+    """A locality of the golden session."""
+
     qid: Annotated[str, dc.Unique]
     name: str
 
 
 @dc.entity
 class GoldenMineral:
+    """A mineral of the golden session, with a lazy type locality and containers."""
+
     qid: Annotated[str, dc.Unique]
     name: str
     crystal_system: Annotated[str | None, dc.Index] = None
@@ -64,7 +68,7 @@ PINNED_ACTOR = dc.Principal(uid=2)  # a fixed non-anonymous stamp
 
 
 def stream() -> list[bytes]:
-    """The scripted session → the emitted deltas' wire bytes."""
+    """Run the scripted session and return the emitted deltas' wire bytes."""
     collector = _Collector()
     store = dc.Store._from_backend(MemoryBackend(), principal=PINNED_ACTOR)
     store._clock = lambda: PINNED_AT_NS  # the private clock seam, pinned
@@ -97,6 +101,7 @@ def stream() -> list[bytes]:
 
 
 def stream_digest() -> str:
+    """Return the sha256 over the whole emitted stream."""
     h = hashlib.sha256()
     for raw in stream():
         h.update(raw)
@@ -104,7 +109,8 @@ def stream_digest() -> str:
 
 
 def main() -> None:
-    print(stream_digest())
+    """Print the stream digest, the CLI output the replay-determinism gate compares."""
+    print(stream_digest())  # noqa: T201
 
 
 if __name__ == "__main__":  # pragma: no cover — fitness gate runs main() via -c

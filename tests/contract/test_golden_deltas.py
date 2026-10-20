@@ -10,14 +10,13 @@ the applier, regenerate, and add the new registry row.
 
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path
 
 import pytest
 
 from datacrystal.contract import CONTRACT_VERSION, ReferenceApplier, decode_delta
-from tests.contract.golden_gen import stream
+from tests.contract.golden_gen import stream, stream_digest
 
 GOLDENS = Path(__file__).parent / "goldens"
 
@@ -32,14 +31,6 @@ BUMP_HINT = (
 def golden_bytes(name: str) -> bytes:
     """Return the pinned bytes of one golden delta file."""
     return (GOLDENS / name).read_bytes()
-
-
-def stream_digest() -> str:
-    """Return the sha256 over the live engine stream, as registry.json pins it per draft rev."""
-    digest = hashlib.sha256()
-    for raw in stream():
-        digest.update(raw)
-    return digest.hexdigest()
 
 
 def test_engine_stream_has_as_many_deltas_as_are_pinned() -> None:
