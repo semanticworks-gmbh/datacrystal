@@ -10,6 +10,7 @@ contract can never quietly start depending on what it specifies.
 from __future__ import annotations
 
 import ast
+from collections.abc import Iterator
 from pathlib import Path
 
 CONTRACT = Path("src/datacrystal/contract")
@@ -23,7 +24,7 @@ _ALLOWED = {
 }
 
 
-def _imports(tree: ast.AST):
+def _imports(tree: ast.AST) -> Iterator[str]:
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             yield from (alias.name for alias in node.names)
@@ -31,15 +32,24 @@ def _imports(tree: ast.AST):
             yield node.module or ""
 
 
-def test_contract_package_imports_no_engine():
+def _engine_imports() -> list[str]:
     offenders = []
     for path in CONTRACT.rglob("*.py"):
         tree = ast.parse(path.read_text(), filename=str(path))
-        for name in _imports(tree):
-            root_ok = name in _ALLOWED
-            if not root_ok:
-                offenders.append(f"{path.name}: import {name}")
-    assert not offenders, (
+        offenders.extend(
+            f"{path.name}: import {name}" for name in _imports(tree) if name not in _ALLOWED
+        )
+    return offenders
+
+
+def test_contract_package_imports_no_engine() -> None:
+    """Given the contract package sources
+    When their imports are collected
+    Then every import is msgspec, stdlib or the error-taxonomy leaf
+    """
+    offenders = _engine_imports()
+
+    assert offenders == [], (
         "the contract package must stay engine-free (msgspec + stdlib + "
         f"the error-taxonomy leaf only), found: {offenders}"
     )
