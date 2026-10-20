@@ -7,36 +7,37 @@ walking skeleton's durability claim in CI.
 
 from __future__ import annotations
 
-import pathlib
 import subprocess
-import sys
-import time
+from collections.abc import Callable
 
-APP = pathlib.Path(__file__).with_name("_crash_app.py")
+from tests.integration._crash_harness import ROOT, Writer, app_command, newest_acked, report_of
+
+APP = "tests.integration._crash_app"
 
 
-def test_sigkill_mid_commit_preserves_every_acked_commit(tmp_path):
-    store_dir = str(tmp_path / "crash-store")
-    writer = subprocess.Popen(
-        [sys.executable, str(APP), "write", store_dir],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    try:
-        time.sleep(0.8)  # let it ack a few dozen commits
-    finally:
-        writer.kill()  # SIGKILL — no cleanup, no flushing, no goodbye
-    out, err = writer.communicate(timeout=10)
-    acked = [int(line) for line in out.split()]
-    assert acked, f"writer acked no commits before the kill (stderr: {err})"
+def test_sigkill_mid_commit_preserves_every_acked_commit(
+    start_writer: Callable[..., Writer],
+) -> None:
+    """Given a writer that acked 20 batches of 10 rows, each after its commit returned
+    When the writer is SIGKILLed mid-commit and the store is reopened
+    Then every acked batch survived whole
+    """
+    writer = start_writer(APP)
 
-    time.sleep(0.3)  # let the dead writer's lease go stale for the verifier
-    verify = subprocess.run(
-        [sys.executable, str(APP), "verify", store_dir, str(max(acked))],
+    writer.process.kill()
+    remaining_stdout, _ = writer.process.communicate(timeout=10)
+    verifier = subprocess.run(
+        app_command(APP, "verify", writer.work_dir),
+        cwd=ROOT,
         capture_output=True,
         text=True,
         timeout=30,
+        check=False,
     )
-    assert verify.returncode == 0, f"verify failed:\n{verify.stdout}\n{verify.stderr}"
-    assert "VERIFY-OK" in verify.stdout
+
+    report = report_of(verifier)
+    assert verifier.returncode == 0, f"verify failed:\n{verifier.stdout}\n{verifier.stderr}"
+    assert report["torn_batches"] == []
+    assert report["batch_sequence_has_holes"] is False
+    assert report["newest_batch"] >= newest_acked(writer, remaining_stdout)
+    assert report["rows_in_newest_batch"] == 10

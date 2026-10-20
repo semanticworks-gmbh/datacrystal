@@ -9,13 +9,14 @@ from __future__ import annotations
 
 import ast
 import pathlib
+from collections.abc import Iterator
 
 FORBIDDEN = {"pickle", "dill", "cloudpickle", "shelve", "joblib", "marshal", "copyreg"}
 
 SRC = pathlib.Path(__file__).resolve().parents[2] / "src" / "datacrystal"
 
 
-def _imports(tree: ast.AST):
+def _imports(tree: ast.AST) -> Iterator[str]:
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
@@ -24,11 +25,21 @@ def _imports(tree: ast.AST):
             yield node.module.split(".")[0]
 
 
-def test_no_pickle_family_imports():
+def _pickle_family_imports() -> list[str]:
     offenders = []
     for path in sorted(SRC.rglob("*.py")):
         tree = ast.parse(path.read_text(), filename=str(path))
-        for module in _imports(tree):
-            if module in FORBIDDEN:
-                offenders.append(f"{path.name}: imports {module}")
-    assert not offenders, "pickle-family import found:\n" + "\n".join(offenders)
+        offenders.extend(
+            f"{path.name}: imports {module}" for module in _imports(tree) if module in FORBIDDEN
+        )
+    return offenders
+
+
+def test_no_pickle_family_imports() -> None:
+    """Given every module of src/datacrystal
+    When their imports are collected
+    Then none is a module that deserializes arbitrary code
+    """
+    offenders = _pickle_family_imports()
+
+    assert offenders == [], "pickle-family import found:\n" + "\n".join(offenders)

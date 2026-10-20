@@ -3,259 +3,275 @@ literal, independent transcription of the ADR-008 access predicate
 (epic #168, issue #173).
 
 Hypothesis builds a labeled corpus — a mix of freshly protected rows with
-explicit (owner, groups, read_floor) labels (committed under a root
-principal, which bypasses the W2-5 write gate entirely, so arbitrary label
-combinations are reachable) and LEGACY rows (committed before the class
-turned ``protected=True``, decoding under the ADR-008 R7 fill) — plus a set
-of principals spanning every ADR-008 category (anonymous, uid-only,
-single/multi-membership, owner-of-a-row, root). For every (principal, row)
-pair it asserts a three-way equivalence:
+explicit (owner, groups, read_floor) labels and LEGACY rows (committed before the class
+turned ``protected=True``, decoding under the ADR-008 R7 fill) — plus principals spanning
+every ADR-008 category (anonymous, uid-only, single/multi-membership, owner-of-a-row, root).
+The corpus, the principals and the oracle live in ``_labeled_corpus.py``. For a principal
+and a row, three sources must agree:
 
 1. :func:`datacrystal._permissions.can_read_row` (the decode-level twin)
 2. ``oid in (readable_bitmap(p, ci) or ci.extent)`` (the bitmap compiler)
-3. ``_oracle_can_read`` below — a LITERAL transcription of the ADR-008
-   Context predicate block, written independently of ``_permissions.py`` so
-   a shared bug in the library code cannot cancel out against the oracle.
+3. ``oracle_can_read`` — a LITERAL transcription of the ADR-008 Context predicate block,
+   written independently of ``_permissions.py`` so a shared bug in the library code cannot
+   cancel out against the oracle.
 
-It also asserts :meth:`ClassIndexes.committed_labels` agrees with
-``Store._prior_labels`` (D1: the two committed-label sources must never
-diverge) for every committed row, including after an on-disk index-cache
-reopen (the deferred ``_rebuild_last_values`` / #12 path) — see the
-dedicated ``test_committed_labels...cache_reopen`` test at the bottom.
+``ClassIndexes.committed_labels`` must also agree with ``Store._prior_labels`` (D1: the two
+committed-label sources must never diverge) for every committed row, including after an
+on-disk index-cache reopen (the deferred ``_rebuild_last_values`` / #12 path).
 """
-# pyright: reportCallIssue=false, reportArgumentType=false, reportAttributeAccessIssue=false
-# pyright: reportFunctionMemberAccess=false
 
 from __future__ import annotations
 
-from typing import Annotated, Any
+from collections.abc import Iterator
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
+import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
 import datacrystal as dc
-from datacrystal._entity import oid_of, type_info
-from datacrystal._indexes import readable_bitmap
+from datacrystal._entity import type_info
+from datacrystal._indexes import ClassIndexes, readable_bitmap
 from datacrystal._permissions import can_read_row
-from datacrystal._storage.memory import MemoryBackend
+from tests.property._labeled_corpus import (
+    ANONYMOUS,
+    OUTSIDE_ROOT,
+    ROOT,
+    Labels,
+    committed_labels_by_oid,
+    labeled_corpus,
+    labeled_rows,
+    labels,
+    oracle_can_read,
+    owned_rows,
+    principals,
+    prior_labels_by_oid,
+    protected_rock,
+    readable_oids_by_oracle,
+)
 
-ROOT = dc.Principal(uid=1, memberships={dc.WORLD: dc.EXECUTIVE})
-REQUIRED = object()
-
-UIDS = [2, 3, 4, 5]
-GROUPS = [dc.WORLD, 7, 8, 9]
-LADDER = [dc.VIEWER, dc.AGENT, dc.AUTOMATION, dc.STAFF, dc.CURATOR, dc.ADMIN, dc.EXECUTIVE]
+corpora = {
+    "n_legacy": st.integers(min_value=0, max_value=3),
+    "labeled": st.lists(labeled_rows(), min_size=1, max_size=6),
+}
 
 
-def _rock(*, protected: bool, **fields: tuple[Any, Any]) -> type:
-    """(Re)define the 'Rock' entity with these fields under the SAME
-    typename — the schema-evolution retrofit pattern (see
-    tests/unit/test_schema_evolution.py / test_protected_stamping.py),
-    used here to fabricate a store whose Rock lineage mixes pre-protection
-    (legacy) rows with freshly protected ones.
+# --- can_read_row, the decode-level twin ----------------------------------------
+
+
+@given(row_labels=labels, principal=principals)
+def test_can_read_row_agrees_with_the_literal_oracle(
+    row_labels: Labels, principal: dc.Principal
+) -> None:
+    """Given a row's labels, freshly protected or legacy, and any principal
+    When can_read_row decides whether the principal reads the row
+    Then it decides as the ADR-008 oracle does
     """
-    annotations: dict[str, Any] = {}
-    namespace: dict[str, Any] = {
-        "__module__": __name__,
-        "__qualname__": "Rock",
-        "__annotations__": annotations,
-    }
-    for name, (annotation, default) in fields.items():
-        annotations[name] = annotation
-        if default is not REQUIRED:
-            namespace[name] = default
-    return dc.entity(type("Rock", (), namespace), protected=protected)
+    decision = can_read_row(principal, *row_labels)
+
+    assert decision == oracle_can_read(principal, *row_labels)
 
 
-# --- the literal, independent oracle (ADR-008 Context, transcribed by hand) ----
+@given(row=owned_rows())
+def test_the_owner_of_a_row_can_read_it(row: dict[str, Any]) -> None:
+    """Given a row with an owner and its owner as a principal with no memberships
+    When can_read_row decides
+    Then the owner reads the row
+    """
+    owner = dc.Principal(uid=row["owner"], memberships={})
+
+    decision = can_read_row(owner, row["owner"], row["groups"], row["read_floor"])
+
+    assert decision is True
 
 
-def _oracle_level(p: dc.Principal, g: int) -> int:
-    return p.memberships.get(g, dc.VIEWER if g == dc.WORLD else dc.NO_STANDING)
+@given(row_labels=labels)
+def test_root_can_read_any_row(row_labels: Labels) -> None:
+    """Given a row's labels and a root principal outside every group
+    When can_read_row decides
+    Then root reads the row
+    """
+    decision = can_read_row(OUTSIDE_ROOT, *row_labels)
+
+    assert decision is True
 
 
-def _oracle_is_owner(p: dc.Principal, owner: int) -> bool:
-    return p.uid != 0 and owner == p.uid
+@given(row_labels=labels)
+def test_anonymous_agrees_with_the_literal_oracle(row_labels: Labels) -> None:
+    """Given a row's labels and the anonymous principal
+    When can_read_row decides
+    Then it decides as the ADR-008 oracle does
+    """
+    decision = can_read_row(ANONYMOUS, *row_labels)
+
+    assert decision == oracle_can_read(ANONYMOUS, *row_labels)
 
 
-def _oracle_authority_towards(p: dc.Principal, owner: int, groups: list[int]) -> int:
-    levels = [_oracle_level(p, g) for g in groups]
-    if _oracle_is_owner(p, owner):
-        levels.append(max(p.memberships.values(), default=dc.VIEWER))
-    return max(levels, default=dc.NO_STANDING)
-
-
-def _oracle_is_root(p: dc.Principal) -> bool:
-    return p.uid != 0 and p.memberships.get(dc.WORLD, dc.VIEWER) >= dc.EXECUTIVE
-
-
-def _oracle_can_read(p: dc.Principal, owner: int, groups: list[int], read_floor: int) -> bool:
-    if _oracle_is_root(p):
-        return True
-    return _oracle_is_owner(p, owner) or _oracle_authority_towards(p, owner, groups) >= read_floor
-
-
-# --- hypothesis strategies -----------------------------------------------------
-
-
-@st.composite
-def _labeled_row(draw: Any) -> dict[str, Any]:
-    owner = draw(st.sampled_from([0, *UIDS]))
-    groups = draw(st.lists(st.sampled_from(GROUPS), min_size=0, max_size=3, unique=True))
-    read_floor = draw(st.sampled_from(LADDER))
-    return {"owner": owner, "groups": groups, "read_floor": read_floor}
-
-
-@st.composite
-def _principal(draw: Any) -> dc.Principal:
-    kind = draw(st.sampled_from(["anonymous", "uid_only", "single", "multi", "root"]))
-    if kind == "anonymous":
-        return dc.Principal(uid=0, memberships={})
-    uid = draw(st.sampled_from(UIDS))
-    if kind == "root":
-        return dc.Principal(uid=uid, memberships={dc.WORLD: dc.EXECUTIVE})
-    if kind == "uid_only":
-        return dc.Principal(uid=uid, memberships={})
-    if kind == "single":
-        g = draw(st.sampled_from(GROUPS))
-        lvl = draw(st.sampled_from(LADDER))
-        return dc.Principal(uid=uid, memberships={g: lvl})
-    gs = draw(st.lists(st.sampled_from(GROUPS), min_size=2, max_size=3, unique=True))
-    mem = {g: draw(st.sampled_from(LADDER)) for g in gs}
-    return dc.Principal(uid=uid, memberships=mem)
+# --- the bitmap compiler over a stored corpus -----------------------------------
 
 
 @settings(deadline=None, max_examples=40)
-@given(
-    n_legacy=st.integers(min_value=0, max_value=3),
-    labeled=st.lists(_labeled_row(), min_size=1, max_size=6),
-    principals=st.lists(_principal(), min_size=1, max_size=5),
-)
-def test_readable_bitmap_can_read_row_and_literal_oracle_agree(n_legacy, labeled, principals):
-    backend = MemoryBackend()
-
-    if n_legacy:
-        Unprotected = _rock(protected=False, name=(Annotated[str, dc.Unique], REQUIRED))
-        s0 = dc.Store._from_backend(backend)
-        for i in range(n_legacy):
-            s0.store(Unprotected(name=f"legacy-{i}"))
-        s0.commit()
-        s0.close()
-
-    Rock = _rock(protected=True, name=(Annotated[str, dc.Unique], REQUIRED))
-    s = dc.Store._from_backend(backend)
-
-    # oid -> (owner, groups, read_floor), the corpus's INTENDED labels — the
-    # independent ground truth (never derived from committed_labels/
-    # _prior_labels, which are also under test below).
-    oracle: dict[int, tuple[int, list[int], int]] = {}
-
-    for i in range(n_legacy):
-        rec = s.get(Rock, name=f"legacy-{i}")
-        assert rec is not None
-        oid = oid_of(rec)
-        assert oid is not None
-        oracle[oid] = (0, [dc.WORLD], dc.VIEWER)  # ADR-008 R7, hardcoded independently
-
-    with s.acting_as(ROOT):
-        for i, row in enumerate(labeled):
-            rec = Rock(name=f"post-{i}")
-            oid = s.store(rec)
-            rec._dc_owner = row["owner"]
-            for g in row["groups"]:
-                rec._dc_groups.append(g)
-            rec._dc_read_floor = row["read_floor"]
-            oracle[oid] = (row["owner"], list(row["groups"]), row["read_floor"])
-        s.commit()
-
-    ti = type_info(Rock)
-    ci = s._index.ensure(ti)
-    assert set(ci.extent) == set(oracle)  # the corpus tracking is exhaustive
-
-    # deterministic coverage layered on top of the fuzzed principals:
-    # anonymous, root, and "owner of every labeled row" (guarantees the
-    # ownership branch and the root bypass fire on EVERY example, not only
-    # when hypothesis happens to draw them).
-    all_principals = [
-        dc.Principal(uid=0, memberships={}),
-        dc.Principal(uid=999, memberships={dc.WORLD: dc.EXECUTIVE}),
-        *principals,
-    ]
-    for owner, _groups, _floor in oracle.values():
-        if owner != 0:
-            all_principals.append(dc.Principal(uid=owner, memberships={}))
-
-    for p in all_principals:
-        for oid, labels in oracle.items():
-            assert can_read_row(p, *labels) == _oracle_can_read(p, *labels), (p, oid, labels)
-
-        expected = {oid for oid, labels in oracle.items() if _oracle_can_read(p, *labels)}
-        rb = readable_bitmap(p, ci)
-        actual = set(ci.extent) if rb is None else set(rb)
-        assert actual == expected, (p, sorted(actual), sorted(expected))
-
-    # D1/D4: the two committed-label sources agree for every committed row.
-    for oid in oracle:
-        rec = s._backend.load_many([oid])[oid]
-        assert ci.committed_labels(oid) == s._prior_labels(rec)[:3]
-
-    s.close()
-
-
-# --- committed_labels across an index-cache reopen (D4, ADR-005 / #12) ---------
-
-
-def test_committed_labels_matches_prior_labels_after_index_cache_reopen(tmp_path):
-    """The deferred #12 ``_last_values`` rebuild (ADR-005: a cache load never
-    pays the O(extent) reconstruction on a read-only reopen) must still make
-    ``committed_labels`` agree with ``Store._prior_labels`` on the far side —
-    exercised with a REAL on-disk cache (``cache_index=True``, the default),
-    not just the in-memory backend the fuzz test above uses.
-
-    Groups compare as SETS, not as ordered lists: ``_rebuild_last_values``
-    reconstructs a multivalued field's list by walking postings-map keys
-    (dict-iteration order), not the record's original append order — a
-    pre-existing #12 property of every multivalued Index field, unrelated to
-    W3-1. ADR-008's predicate only ever asks ``∃g∈rec.groups`` (pure set
-    membership; see ``_oracle_authority_towards`` above), so this is not an
-    observable divergence for anything the read fence cares about.
+@given(**corpora)
+def test_corpus_extent_holds_exactly_the_stored_rows(
+    n_legacy: int, labeled: list[dict[str, Any]]
+) -> None:
+    """Given a corpus of legacy rows and rows with explicit labels
+    When the class index's extent is read
+    Then it holds exactly the oids the corpus stored
     """
-    path = tmp_path / "store"
-    Rock = _rock(protected=True, name=(Annotated[str, dc.Unique], REQUIRED))
+    with labeled_corpus(n_legacy, labeled) as corpus:
+        assert set(corpus.index.extent) == set(corpus.oracle)
 
-    s1 = dc.Store.open(path, cache_index=True)
+
+@settings(deadline=None, max_examples=40)
+@given(principal=principals, **corpora)
+def test_readable_bitmap_agrees_with_the_literal_oracle(
+    n_legacy: int, labeled: list[dict[str, Any]], principal: dc.Principal
+) -> None:
+    """Given a corpus of legacy rows and rows with explicit labels, and any principal
+    When readable_bitmap compiles the principal's readable rows
+    Then they are the oids the ADR-008 oracle lets the principal read
+    """
+    with labeled_corpus(n_legacy, labeled) as corpus:
+        bitmap = readable_bitmap(principal, corpus.index)
+
+        readable = set(corpus.index.extent) if bitmap is None else set(bitmap)
+
+        assert readable == readable_oids_by_oracle(corpus, principal)
+
+
+@settings(deadline=None, max_examples=40)
+@given(row=owned_rows())
+def test_the_owner_sees_their_row_in_the_readable_bitmap(row: dict[str, Any]) -> None:
+    """Given a corpus of one row with an owner, and its owner as a principal with no memberships
+    When readable_bitmap compiles the owner's readable rows
+    Then the owner's row is among them
+    """
+    with labeled_corpus(0, [row]) as corpus:
+        owner = dc.Principal(uid=row["owner"], memberships={})
+        (only_oid,) = corpus.oracle
+
+        bitmap = readable_bitmap(owner, corpus.index)
+
+        readable = set(corpus.index.extent) if bitmap is None else set(bitmap)
+        assert only_oid in readable
+
+
+# --- the two committed-label sources (D1/D4) ------------------------------------
+
+
+@settings(deadline=None, max_examples=40)
+@given(**corpora)
+def test_committed_labels_agree_with_prior_labels(
+    n_legacy: int, labeled: list[dict[str, Any]]
+) -> None:
+    """Given a corpus of legacy rows and rows with explicit labels
+    When the index's committed labels and the store's prior labels are read for every row
+    Then the two committed-label sources agree
+    """
+    with labeled_corpus(n_legacy, labeled) as corpus:
+        assert committed_labels_by_oid(corpus) == prior_labels_by_oid(corpus)
+
+
+# --- committed_labels across an index-cache reopen (D4, ADR-005 / #12) ----------
+#
+# The deferred #12 ``_last_values`` rebuild (ADR-005: a cache load never pays the O(extent)
+# reconstruction on a read-only reopen) must still make ``committed_labels`` agree with
+# ``Store._prior_labels`` on the far side, exercised with a REAL on-disk cache
+# (``cache_index=True``), not just the in-memory backend the fuzz tests above use.
+#
+# Groups compare as SETS, not as ordered lists: ``_rebuild_last_values`` reconstructs a
+# multivalued field's list by walking postings-map keys (dict-iteration order), not the
+# record's original append order, a pre-existing #12 property of every multivalued Index
+# field. ADR-008's predicate only ever asks for set membership, so it is not observable.
+
+CACHED_ROCK_LABELS: list[Labels] = [
+    (0, [], dc.VIEWER),
+    (2, [dc.WORLD], dc.AGENT),
+    (3, [7, 8], dc.CURATOR),
+    (0, [dc.WORLD, 9], dc.EXECUTIVE),
+]
+
+
+@dataclass
+class ReopenedCache:
+    """A store reopened over an on-disk index cache, and the rocks committed before."""
+
+    store: dc.Store
+    index: ClassIndexes
+    oids: list[int]
+
+
+@pytest.fixture
+def reopened_cache(tmp_path: Path) -> Iterator[ReopenedCache]:
+    """Yield a store reopened over the sidecar cache a closed predecessor wrote."""
+    path = tmp_path / "store"
+    rock_class = protected_rock()
+    first = dc.Store.open(path, cache_index=True)
     oids: list[int] = []
-    with s1.acting_as(ROOT):
-        for i, (owner, groups, floor) in enumerate([
-            (0, [], dc.VIEWER),
-            (2, [dc.WORLD], dc.AGENT),
-            (3, [7, 8], dc.CURATOR),
-            (0, [dc.WORLD, 9], dc.EXECUTIVE),
-        ]):
-            rec = Rock(name=f"r{i}")
-            oid = s1.store(rec)
+    with first.acting_as(ROOT):
+        for i, (owner, groups, floor) in enumerate(CACHED_ROCK_LABELS):
+            rec = rock_class(name=f"r{i}")
+            oid = first.store(rec)
             rec._dc_owner = owner
             for g in groups:
                 rec._dc_groups.append(g)
             rec._dc_read_floor = floor
             oids.append(oid)
-        s1.commit()
+        first.commit()
     # force an index build so the sidecar cache actually captures this class
-    # (apply() only folds into ALREADY-built indexes — an unbuilt class is
-    # never dumped at close()).
-    list(s1.query(Rock))
-    s1.close()
+    # (apply() only folds into ALREADY-built indexes; an unbuilt class is never dumped at close()).
+    list(first.query(rock_class))
+    first.close()
 
-    s2 = dc.Store.open(path, cache_index=True)
-    ti = type_info(Rock)
-    ci = s2._index.ensure(ti)
-    assert ci._needs_lv_rebuild is True  # confirms the cache-load path, not a from-scan build
-    for oid in oids:
-        rec = s2._backend.load_many([oid])[oid]
-        exp_owner, exp_groups, exp_floor = s2._prior_labels(rec)[:3]
-        got = ci.committed_labels(oid)
-        assert got is not None
-        got_owner, got_groups, got_floor = got
-        assert (got_owner, set(got_groups), got_floor) == (exp_owner, set(exp_groups), exp_floor)
-    assert ci._needs_lv_rebuild is False  # committed_labels triggered the deferred rebuild
-    s2.close()
+    store = dc.Store.open(path, cache_index=True)
+    yield ReopenedCache(store, store._index.ensure(type_info(rock_class)), oids)
+    store.close()
+
+
+def _label_sets_of_index(cache: ReopenedCache) -> dict[int, tuple[Any, ...] | None]:
+    labels_by_oid = {oid: cache.index.committed_labels(oid) for oid in cache.oids}
+    return {
+        oid: None if found is None else (found[0], set(found[1]), found[2])
+        for oid, found in labels_by_oid.items()
+    }
+
+
+def _label_sets_of_store(cache: ReopenedCache) -> dict[int, tuple[Any, ...] | None]:
+    prior = {
+        oid: cache.store._prior_labels(cache.store._backend.load_many([oid])[oid])[:3]
+        for oid in cache.oids
+    }
+    return {oid: (owner, set(groups), floor) for oid, (owner, groups, floor) in prior.items()}
+
+
+def test_cache_reopen_defers_the_committed_labels_rebuild(reopened_cache: ReopenedCache) -> None:
+    """Given a store reopened over an on-disk index cache
+    When nothing has read a committed label yet
+    Then the class index still owes the deferred rebuild, so it came from the cache not a scan
+    """
+    assert reopened_cache.index._needs_lv_rebuild is True
+
+
+def test_committed_labels_agree_with_prior_labels_after_cache_reopen(
+    reopened_cache: ReopenedCache,
+) -> None:
+    """Given a store reopened over an on-disk index cache
+    When the index's committed labels and the store's prior labels are read for every rock
+    Then they agree, groups compared as sets
+    """
+    assert _label_sets_of_index(reopened_cache) == _label_sets_of_store(reopened_cache)
+
+
+def test_reading_committed_labels_triggers_the_deferred_rebuild(
+    reopened_cache: ReopenedCache,
+) -> None:
+    """Given a store reopened over an on-disk index cache
+    When a committed label is read
+    Then the class index no longer owes the deferred rebuild
+    """
+    reopened_cache.index.committed_labels(reopened_cache.oids[0])
+
+    assert reopened_cache.index._needs_lv_rebuild is False

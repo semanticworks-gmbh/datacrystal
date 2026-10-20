@@ -17,6 +17,8 @@ from __future__ import annotations
 import ast
 import pathlib
 
+import pytest
+
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 _TESTS = ROOT / "tests"
 _FED_GLOBS = ("test_federation*.py", "test_follower*.py", "test_occ*.py")
@@ -56,32 +58,58 @@ def _has_assert(node: ast.AST) -> bool:
     return any(isinstance(sub, ast.Assert) for sub in ast.walk(node))
 
 
-def test_federation_tests_run_on_both_backends() -> None:
-    """A follower/OCC test that never touches sqlite is a memory-only false-green."""
-    for path in _fed_files():
-        src = path.read_text()
-        rel = path.relative_to(ROOT)
-        assert "store_factory" in src or "sqlite" in src, (
-            f"{rel}: federation tests must run on BOTH backends — use the "
-            "store_factory fixture or parametrize sqlite. A memory-only follower "
-            "test silently never exercises the sqlite read/commit path."
-        )
-
-
-def test_federation_negative_tests_assert_post_state() -> None:
-    """A guard test that only ``pytest.raises`` proves nothing about the post-state.
-
-    The design requires fail-closed guards to assert the bad value did NOT land
-    (watermark unchanged, record byte-identical, skew field absent) — not merely
-    that an exception was raised.
-    """
+def _raises_without_assert() -> list[str]:
     offenders: list[str] = []
     for path in _fed_files():
         tree = ast.parse(path.read_text(), str(path))
-        for fn in _test_defs(tree):
-            if _uses_raises(fn) and not _has_assert(fn):
-                offenders.append(f"{path.relative_to(ROOT)}::{fn.name}")
-    assert not offenders, (
+        offenders.extend(
+            f"{path.relative_to(ROOT)}::{fn.name}"
+            for fn in _test_defs(tree)
+            if _uses_raises(fn) and not _has_assert(fn)
+        )
+    return offenders
+
+
+_FED_FILE_NAMES = sorted(str(path.relative_to(ROOT)) for path in _fed_files())
+
+
+def test_federation_test_files_are_found() -> None:
+    """Given the tests directory
+    When the federation test files are globbed
+    Then at least one file is found, so the gates below police something
+    """
+    assert _FED_FILE_NAMES != []
+
+
+@pytest.mark.parametrize("relative_path", _FED_FILE_NAMES)
+def test_federation_tests_run_on_both_backends(relative_path: str) -> None:
+    """Given a federation test file
+    When its source is read
+    Then it uses the store_factory fixture or parametrizes sqlite
+
+    A follower/OCC test that never touches sqlite is a memory-only false-green.
+    """
+    source = (ROOT / relative_path).read_text()
+
+    assert "store_factory" in source or "sqlite" in source, (
+        f"{relative_path}: federation tests must run on BOTH backends — use the "
+        "store_factory fixture or parametrize sqlite. A memory-only follower "
+        "test silently never exercises the sqlite read/commit path."
+    )
+
+
+def test_federation_negative_tests_assert_post_state() -> None:
+    """Given every federation test that uses pytest.raises
+    When its body is searched for an assert
+    Then none lacks one, so each proves the bad value did not land
+
+    The design requires fail-closed guards to assert the bad value did NOT land
+    (watermark unchanged, record byte-identical, skew field absent), not merely
+    that an exception was raised.
+    """
+    offenders = _raises_without_assert()
+
+    assert offenders == [], (
         "federation negative tests use pytest.raises with no post-state assert "
         f"(prove the bad value did not land): {offenders}"
     )

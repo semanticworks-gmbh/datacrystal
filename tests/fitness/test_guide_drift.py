@@ -33,6 +33,7 @@ see ``test_web_surface_documented`` below.
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import re
 from pathlib import Path
 
@@ -69,86 +70,115 @@ def _code_mentions(reference: str) -> str:
 
 
 def _errors_section(reference: str) -> str:
-    """The ## Errors reference region (up to the next H2). Exceptions/warnings live here."""
+    """Return the ## Errors reference region up to the next H2."""
     m = re.search(r"\n## Errors\b(.*?)(?:\n## |\Z)", reference, re.DOTALL)
-    assert m, "docs/reference.md must have a '## Errors' reference section"
-    return m.group(1)
+    return m.group(1) if m else ""
 
 
 def _planned_section(reference: str) -> str:
-    """The ## Planned features region (up to the next H2)."""
+    """Return the ## Planned features region up to the next H2, or empty."""
     m = re.search(r"\n## Planned features\b(.*?)(?:\n## |\Z)", reference, re.DOTALL)
-    assert m, "docs/reference.md must have a '## Planned features' section"
-    return m.group(1)
+    return m.group(1) if m else ""
 
 
 def _mentioned(text: str, name: str) -> bool:
     return re.search(r"\b" + re.escape(name) + r"\b", text) is not None
 
 
-def test_core_all_is_documented():
-    reference = REFERENCE.read_text()
-    code = _code_mentions(reference)
-    errors = _errors_section(reference)
-
-    undocumented: list[str] = []
-    for name in _core_public_names():
-        kind = _classify(name)
-        if kind == "api":
-            ok = _mentioned(code, name)
-        else:  # exception or warning -> must be in the error/warning reference table
-            ok = _mentioned(errors, name)
-        if not ok:
-            undocumented.append(f"{name} ({kind})")
-
-    assert not undocumented, (
-        "core datacrystal.__all__ names missing from docs/reference.md "
-        f"(API symbols need a runnable/inline-code mention; exceptions & warnings need a "
-        f"row in the ## Errors reference table): {undocumented}"
-    )
-
-
-def test_no_shipped_feature_listed_as_planned():
-    reference = REFERENCE.read_text()
-    planned = _planned_section(reference)
-    exported = {n for n in _core_public_names()}
-
+def _exported_names_listed_as_planned(planned: str) -> list[str]:
+    exported = set(_core_public_names())
     offenders: list[str] = []
     for line in planned.splitlines():
         # A line that explicitly qualifies a symbol as already shipping is honest, not drift.
         if "already ship" in line:
             continue
-        for token in re.findall(r"`dc\.(\w+)", line):
-            if token in exported:
-                offenders.append(token)
-        # also catch a bare backticked exported name presented as planned
-        for token in re.findall(r"`(\w+)`", line):
-            if token in exported:
-                offenders.append(token)
+        offenders.extend(t for t in re.findall(r"`dc\.(\w+)", line) if t in exported)
+        offenders.extend(t for t in re.findall(r"`(\w+)`", line) if t in exported)
+    return sorted(set(offenders))
 
-    assert not offenders, (
-        "exported datacrystal.__all__ symbols are presented under '## Planned features' "
-        f"as if not yet shipped (shipped-under-Planned): {sorted(set(offenders))}"
+
+def _web_public_names() -> list[str]:
+    if importlib.util.find_spec("strawberry") is None:
+        return []
+    web = importlib.import_module("datacrystal.web")
+    return [n for n in getattr(web, "__all__", ()) if n != "__version__"]
+
+
+API_NAMES = [n for n in _core_public_names() if _classify(n) == "api"]
+ERROR_NAMES = [n for n in _core_public_names() if _classify(n) != "api"]
+
+
+@pytest.fixture
+def reference() -> str:
+    """Return the text of docs/reference.md."""
+    return REFERENCE.read_text()
+
+
+def test_reference_has_an_errors_section(reference: str) -> None:
+    """Given docs/reference.md
+    When its ## Errors section is looked up
+    Then the section exists and is not empty
+    """
+    assert _errors_section(reference).strip() != ""
+
+
+def test_reference_has_a_planned_features_section(reference: str) -> None:
+    """Given docs/reference.md
+    When its ## Planned features section is looked up
+    Then the section exists and is not empty
+    """
+    assert _planned_section(reference).strip() != ""
+
+
+@pytest.mark.parametrize("name", API_NAMES)
+def test_core_api_symbol_has_a_code_mention(name: str, reference: str) -> None:
+    """Given an API symbol in datacrystal.__all__
+    When the reference's fenced blocks and inline code are searched for it
+    Then the symbol is mentioned as code
+    """
+    assert _mentioned(_code_mentions(reference), name), (
+        f"{name} is in datacrystal.__all__ but has no runnable/inline-code mention "
+        "in docs/reference.md"
     )
 
 
-# --- #129: the documentation drift-guard now covers datacrystal.web ----------------
-# Mirror the core-__all__ API check over datacrystal.web.__all__: every exported web symbol
-# (the REST/GraphQL reflection surface — entity_model, reflect, reflect_strawberry_type,
-# StrawberryReflector, FieldDescriptor, snapshot_context, the context-key constants, …) must
-# appear as code somewhere in the reference. Adding a new datacrystal.web.__all__ name without
-# documenting it turns this gate red — the same Definition-of-Done discipline as core (#129
-# closed the original 8-symbol gap; this assertion is the standing guard). The web extra's
-# symbols are all API (no exception/warning classes), so the runnable-mention check is the whole
-# contract. importorskip so the bare suite (no web extra) stays green.
-def test_web_surface_documented():
-    pytest.importorskip("strawberry", reason="datacrystal[web] extra not installed")
-    web = importlib.import_module("datacrystal.web")
-    reference = REFERENCE.read_text()
-    code = _code_mentions(reference)
-    web_names = [n for n in getattr(web, "__all__", ()) if n != "__version__"]
-    undocumented = [n for n in web_names if not _mentioned(code, n)]
-    assert not undocumented, (
-        "datacrystal.web.__all__ names missing a runnable/inline-code mention in docs/reference.md "
-        f"(document them in the datacrystal[web] section, #129): {undocumented}"
+@pytest.mark.parametrize("name", ERROR_NAMES)
+def test_core_exception_has_a_row_in_the_errors_table(name: str, reference: str) -> None:
+    """Given an exception or warning class in datacrystal.__all__
+    When the reference's ## Errors section is searched for it
+    Then the class is listed there
+    """
+    assert _mentioned(_errors_section(reference), name), (
+        f"{name} is in datacrystal.__all__ but has no row in the ## Errors table "
+        "of docs/reference.md"
+    )
+
+
+def test_no_shipped_feature_is_listed_as_planned(reference: str) -> None:
+    """Given the reference's ## Planned features section
+    When its backticked names are compared with datacrystal.__all__
+    Then no exported symbol is presented as not yet shipped
+    """
+    planned = _planned_section(reference)
+
+    offenders = _exported_names_listed_as_planned(planned)
+
+    assert offenders == [], (
+        "exported datacrystal.__all__ symbols are presented under '## Planned features' "
+        f"as if not yet shipped (shipped-under-Planned): {offenders}"
+    )
+
+
+# #129: the drift-guard covers datacrystal.web.__all__ too (the REST/GraphQL reflection surface).
+# Its symbols are all API, so a code mention is the whole contract; with no web extra installed
+# the parameter set is empty and pytest skips the test.
+@pytest.mark.parametrize("name", _web_public_names())
+def test_web_symbol_has_a_code_mention(name: str, reference: str) -> None:
+    """Given a symbol in datacrystal.web.__all__
+    When the reference's fenced blocks and inline code are searched for it
+    Then the symbol is mentioned as code
+    """
+    assert _mentioned(_code_mentions(reference), name), (
+        f"{name} is in datacrystal.web.__all__ but has no code mention in docs/reference.md "
+        "(document it in the datacrystal[web] section, #129)"
     )
