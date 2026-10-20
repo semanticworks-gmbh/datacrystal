@@ -31,12 +31,10 @@ domain): a protected, self-referential ``Specimen`` (so one Specimen can be
 an ``incoming()`` REFERRER of another) plus an unprotected ``Cabinet``
 holding a direct ``Lazy`` handle onto the record under test.
 """
-# pyright: reportAttributeAccessIssue=false, reportCallIssue=false
-# pyright: reportArgumentType=false, reportFunctionMemberAccess=false
-# pyright: reportPrivateUsage=false
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Annotated
 
 import pytest
@@ -53,10 +51,10 @@ OUTSIDER = dc.Principal(uid=4, memberships={OTHER_TEAM: dc.CURATOR})
 ANON = dc.Principal(uid=0)
 ROOT = dc.Principal(uid=99, memberships={dc.WORLD: dc.EXECUTIVE})
 
-# The two principal buckets every surface below is checked against — the
-# ONE place a future principal category would be added to this file's sweep.
-DENIED = {"outsider": OUTSIDER, "anonymous": ANON}
-READABLE = {"owner": OWNER, "root": ROOT}
+# The ONE place a future principal category is added to this file's sweep.
+PRINCIPALS = {"outsider": OUTSIDER, "anonymous": ANON, "owner": OWNER, "root": ROOT}
+
+StoreFactory = Callable[[], dc.Store]
 
 
 @dc.entity(protected=True)
@@ -69,25 +67,29 @@ class Specimen:
 
     label: Annotated[str, dc.Unique]
     note: str = ""
-    linked: dc.Lazy["Specimen"] | None = None
+    linked: dc.Lazy[Specimen] | None = None
 
 
 @dc.entity
 class Cabinet:
-    """An unprotected referrer holding a direct ``Lazy`` handle onto the
-    record under test — the seam ``get_many(iterable)``/``Lazy.get()``
-    exercise (R14: a deref surface, not discovery)."""
+    """An unprotected referrer holding a direct ``Lazy`` handle onto the record under test.
+
+    The seam ``get_many(iterable)``/``Lazy.get()`` exercise (R14: a deref surface).
+    """
 
     tag: Annotated[str, dc.Unique]
     holds: dc.Lazy[Specimen] | None = None
 
 
-def _seed(store) -> tuple[Specimen, Specimen, Cabinet]:
-    """``hidden`` is the record under test: owner-only, unshared birth
-    labels (ADR-008 R6) — readable by nobody but OWNER/ROOT. It LINKS to a
-    WORLD ``anchor`` Specimen (so ``incoming(anchor)`` can prove ``hidden``
-    is included/excluded as a referrer), and a ``Cabinet`` holds a direct
-    ``Lazy`` handle straight onto ``hidden`` (the deref surfaces).
+F = dc.fields(Specimen)
+
+
+def _seed(store: dc.Store) -> tuple[Specimen, Specimen, Cabinet]:
+    """Store the hidden record, a WORLD anchor it links to and a cabinet holding a handle on it.
+
+    ``hidden`` has owner-only, unshared birth labels (ADR-008 R6): readable by nobody but
+    OWNER/ROOT. ``anchor`` is WORLD-readable, so ``incoming(anchor)`` can include or exclude
+    ``hidden`` as a referrer.
     """
     with store.acting_as(OWNER):
         anchor = Specimen(label="anchor")
@@ -95,7 +97,7 @@ def _seed(store) -> tuple[Specimen, Specimen, Cabinet]:
         dc.share(anchor, dc.WORLD, read=dc.VIEWER, write=dc.VIEWER)
 
         hidden = Specimen(label=LABEL, note="classified", linked=dc.Lazy.of(anchor))
-        store.store(hidden)  # stays owner-only — the record under test
+        store.store(hidden)
 
         cabinet = Cabinet(tag="drawer-1", holds=dc.Lazy.of(hidden))
         store.store(cabinet)
@@ -103,133 +105,250 @@ def _seed(store) -> tuple[Specimen, Specimen, Cabinet]:
     return hidden, anchor, cabinet
 
 
-def _discovery_report(store, anchor: Specimen) -> dict[str, bool]:
-    """One entry per discovery surface — True iff the ambient principal
-    sees ``hidden`` (identified by ``LABEL``) through that surface. Every
-    surface runs inside the SAME ``acting_as`` scope, from this ONE dict
-    literal — the single place a future surface must be added, and the
-    single place a forgotten filter shows up as a failed entry below.
-    """
-    F = dc.fields(Specimen)
-    return {
-        "get(cls, key)": store.get(Specimen, label=LABEL) is not None,
-        "get_many(cls, key=[...])": store.get_many(Specimen, label=[LABEL])[0] is not None,
-        "query(cls)": LABEL in {o.label for o in store.query(Specimen)},
-        "query(cond)": LABEL in {o.label for o in store.query(F.label == LABEL)},
-        "query_iter(cls)": LABEL in {o.label for o in store.query_iter(Specimen)},
-        "count(cond)": store.count(F.label == LABEL) == 1,
-        "pluck(cls, field)": LABEL in store.pluck(Specimen, "label"),
-        "explain(cls).extent": store.explain(Specimen).extent == 2,
-        "explain(cond).candidates": store.explain(F.label == LABEL).candidates == 1,
-        "incoming(anchor)": any(
-            getattr(referrer, "label", None) == LABEL for referrer in store.incoming(anchor)
-        ),
-    }
+def _commit_hidden_record(store_factory: StoreFactory) -> int:
+    """Commit the hidden record and a cabinet holding it, close the store and return its OID."""
+    store = store_factory()
+    with store.acting_as(OWNER):
+        hidden = Specimen(label=LABEL, note="classified")
+        hidden_oid = store.store(hidden)
+        store.store(Cabinet(tag="drawer-1", holds=dc.Lazy.of(hidden)))
+        store.commit()
+    store.close()
+    return hidden_oid
 
 
-def test_one_record_denied_or_present_consistently_across_every_discovery_surface(store):
-    """The R12 half of the sieve: an outsider/anonymous principal sees the
-    record on NONE of the ten discovery surfaces; the owner and root see it
-    on ALL ten. One dict, one loop, one failure message per leaking or
-    hiding surface.
+@pytest.mark.parametrize("principal_name", ["outsider", "anonymous"])
+def test_denied_principal_finds_the_record_on_no_discovery_surface(
+    store: dc.Store, principal_name: str
+) -> None:
+    """Given an owner-only record and a WORLD-readable anchor that it links to
+    When an outsider or anonymous principal runs every discovery surface
+    Then the record is silently absent from each of the ten
     """
     _hidden, anchor, _cabinet = _seed(store)
+    with store.acting_as(PRINCIPALS[principal_name]):
+        via_get = store.get(Specimen, label=LABEL)
+        via_get_many = store.get_many(Specimen, label=[LABEL])
+        via_query_cls = store.query(Specimen)
+        via_query_cond = store.query(F.label == LABEL)
+        via_query_iter = list(store.query_iter(Specimen))
+        via_count = store.count(F.label == LABEL)
+        via_pluck = store.pluck(Specimen, "label")
+        extent = store.explain(Specimen).extent
+        candidates = store.explain(F.label == LABEL).candidates
+        via_incoming = store.incoming(anchor)
+    assert via_get is None
+    assert via_get_many == [None]
+    assert LABEL not in [found.label for found in via_query_cls]
+    assert via_query_cond == []
+    assert LABEL not in [found.label for found in via_query_iter]
+    assert via_count == 0
+    assert LABEL not in via_pluck
+    assert extent == 1
+    assert candidates == 0
+    assert via_incoming == []
 
-    for name, principal in DENIED.items():
-        with store.acting_as(principal):
-            report = _discovery_report(store, anchor)
-        leaked = [surface for surface, visible in report.items() if visible]
-        assert not leaked, (
-            f"{name} should see NOTHING of the hidden record on any discovery "
-            f"surface, but it leaked through: {leaked}"
-        )
 
-    for name, principal in READABLE.items():
-        with store.acting_as(principal):
-            report = _discovery_report(store, anchor)
-        hidden_from = [surface for surface, visible in report.items() if not visible]
-        assert not hidden_from, (
-            f"{name} should see the record on EVERY discovery surface, but it "
-            f"was hidden from: {hidden_from}"
-        )
-
-
-def test_one_record_denied_or_present_consistently_across_every_deref_surface(store):
-    """The R14 half of the sieve: an outsider/anonymous principal derefing a
-    reference they already hold gets a twin on EVERY deref surface (never an
-    error, never the real data) and ``Lazy.peek()`` never caches it; the
-    owner and root get the real, identical-labelled instance on every one.
+@pytest.mark.parametrize("principal_name", ["owner", "root"])
+def test_readable_principal_finds_the_record_on_every_discovery_surface(
+    store: dc.Store, principal_name: str
+) -> None:
+    """Given an owner-only record and a WORLD-readable anchor that it links to
+    When the owner or root runs every discovery surface
+    Then the record is present on each of the ten
     """
-    hidden, _anchor, cabinet = _seed(store)
-    hidden_oid = oid_of(hidden)
-
-    for name, principal in DENIED.items():
-        with store.acting_as(principal):
-            [via_get_many] = store.get_many([hidden_oid])
-            handle = cabinet.holds
-            assert handle is not None
-            via_lazy = handle.get()
-            peeked = handle.peek()
-        for surface, obj in (("get_many([oid])", via_get_many), ("Lazy.get()", via_lazy)):
-            assert isinstance(obj, dc.Redacted), f"{name} via {surface} should get a twin"
-            assert isinstance(obj, Specimen)
-            with pytest.raises(dc.ReadDeniedError):
-                _ = obj.label
-        assert peeked is None, f"{name}: Lazy.peek() must never cache a protected target"
-
-    for name, principal in READABLE.items():
-        with store.acting_as(principal):
-            [via_get_many] = store.get_many([hidden_oid])
-            handle = cabinet.holds
-            assert handle is not None
-            via_lazy = handle.get()
-        for surface, obj in (("get_many([oid])", via_get_many), ("Lazy.get()", via_lazy)):
-            assert not isinstance(obj, dc.Redacted), (
-                f"{name} via {surface} got a twin, expected the real record"
-            )
-            assert obj.label == LABEL
+    _hidden, anchor, _cabinet = _seed(store)
+    with store.acting_as(PRINCIPALS[principal_name]):
+        via_get = store.get(Specimen, label=LABEL)
+        via_get_many = store.get_many(Specimen, label=[LABEL])
+        via_query_cls = store.query(Specimen)
+        via_query_cond = store.query(F.label == LABEL)
+        via_query_iter = list(store.query_iter(Specimen))
+        via_count = store.count(F.label == LABEL)
+        via_pluck = store.pluck(Specimen, "label")
+        extent = store.explain(Specimen).extent
+        candidates = store.explain(F.label == LABEL).candidates
+        via_incoming = store.incoming(anchor)
+    assert via_get is not None
+    assert via_get_many[0] is not None
+    assert LABEL in [found.label for found in via_query_cls]
+    assert LABEL in [found.label for found in via_query_cond]
+    assert LABEL in [found.label for found in via_query_iter]
+    assert via_count == 1
+    assert LABEL in via_pluck
+    assert extent == 2
+    assert candidates == 1
+    assert LABEL in [getattr(referrer, "label", None) for referrer in via_incoming]
 
 
-def test_cross_scope_identity_never_poisoned_by_a_denied_deref(store_factory):
-    """Invariant 6, exercised across the deref surfaces above: load the SAME
-    ``Lazy`` handle under OWNER (real, registered), deref it under
-    ``acting_as(outsider)`` — a twin that registers NOTHING — then back
-    under OWNER: the exact SAME live instance, never re-materialized, never
-    poisoned by the denied scope in between. A first pass proves the mirror
-    case too: an outsider deref BEFORE anyone has ever loaded the record
-    also registers nothing.
+@pytest.mark.parametrize("principal_name", ["outsider", "anonymous"])
+def test_denied_principal_derefing_get_many_gets_a_twin(
+    store: dc.Store, principal_name: str
+) -> None:
+    """Given an owner-only record whose OID a denied principal already holds
+    When the denied principal derefs it through get_many
+    Then it gets a redacted twin of the record's type
+    And reading the twin's label raises ReadDeniedError
     """
-    s = store_factory()
-    with s.acting_as(OWNER):
-        hidden = Specimen(label=LABEL, note="classified")
-        s.store(hidden)
-        cabinet = Cabinet(tag="drawer-1", holds=dc.Lazy.of(hidden))
-        s.store(cabinet)
-        s.commit()
-    hidden_oid = oid_of(hidden)
-    s.close()
+    hidden, _anchor, _cabinet = _seed(store)
+    with store.acting_as(PRINCIPALS[principal_name]):
+        [via_get_many] = store.get_many([oid_of(hidden)])
+    assert isinstance(via_get_many, dc.Redacted)
+    assert isinstance(via_get_many, Specimen)
+    with pytest.raises(dc.ReadDeniedError):
+        _ = via_get_many.label
 
-    s2 = store_factory()
-    with s2.acting_as(OUTSIDER):  # outsider derefs FIRST — nothing registered yet
-        cab2 = s2.get(Cabinet, tag="drawer-1")
-        handle = cab2.holds
+
+@pytest.mark.parametrize("principal_name", ["outsider", "anonymous"])
+def test_denied_principal_derefing_a_lazy_handle_gets_a_twin(
+    store: dc.Store, principal_name: str
+) -> None:
+    """Given a cabinet whose Lazy handle points at an owner-only record
+    When a denied principal calls get on the handle
+    Then it gets a redacted twin of the record's type
+    And reading the twin's label raises ReadDeniedError
+    """
+    _hidden, _anchor, cabinet = _seed(store)
+    handle = cabinet.holds
+    assert handle is not None
+    with store.acting_as(PRINCIPALS[principal_name]):
+        via_lazy = handle.get()
+    assert isinstance(via_lazy, dc.Redacted)
+    assert isinstance(via_lazy, Specimen)
+    with pytest.raises(dc.ReadDeniedError):
+        _ = via_lazy.label
+
+
+@pytest.mark.parametrize("principal_name", ["outsider", "anonymous"])
+def test_denied_principal_peeking_a_lazy_handle_finds_nothing_cached(
+    store: dc.Store, principal_name: str
+) -> None:
+    """Given a cabinet whose Lazy handle points at an owner-only record
+    When a denied principal derefs and then peeks at the handle
+    Then peek returns None
+    """
+    _hidden, _anchor, cabinet = _seed(store)
+    handle = cabinet.holds
+    assert handle is not None
+    with store.acting_as(PRINCIPALS[principal_name]):
+        handle.get()
+        peeked = handle.peek()
+    assert peeked is None
+
+
+@pytest.mark.parametrize("principal_name", ["owner", "root"])
+def test_readable_principal_derefing_get_many_gets_the_real_record(
+    store: dc.Store, principal_name: str
+) -> None:
+    """Given an owner-only record whose OID is held
+    When the owner or root derefs it through get_many
+    Then it gets the real record, not a twin
+    And the record carries its label
+    """
+    hidden, _anchor, _cabinet = _seed(store)
+    with store.acting_as(PRINCIPALS[principal_name]):
+        [via_get_many] = store.get_many([oid_of(hidden)])
+    assert not isinstance(via_get_many, dc.Redacted)
+    assert via_get_many.label == LABEL
+
+
+@pytest.mark.parametrize("principal_name", ["owner", "root"])
+def test_readable_principal_derefing_a_lazy_handle_gets_the_real_record(
+    store: dc.Store, principal_name: str
+) -> None:
+    """Given a cabinet whose Lazy handle points at an owner-only record
+    When the owner or root calls get on the handle
+    Then it gets the real record, not a twin
+    And the record carries its label
+    """
+    _hidden, _anchor, cabinet = _seed(store)
+    handle = cabinet.holds
+    assert handle is not None
+    with store.acting_as(PRINCIPALS[principal_name]):
+        via_lazy = handle.get()
+    assert not isinstance(via_lazy, dc.Redacted)
+    assert via_lazy.label == LABEL
+
+
+def test_denied_deref_before_anyone_loaded_the_record_registers_nothing(
+    store_factory: StoreFactory,
+) -> None:
+    """Given a reopened store where nobody has loaded the owner-only record
+    When an outsider calls get on a Lazy handle onto it
+    Then the outsider gets a twin
+    And the identity registry holds nothing for the record
+    """
+    hidden_oid = _commit_hidden_record(store_factory)
+    reopened = store_factory()
+    with reopened.acting_as(OUTSIDER):
+        cabinet = reopened.query(Cabinet)[0]
+        handle = cabinet.holds
         assert handle is not None
         first_twin = handle.get()
     assert isinstance(first_twin, dc.Redacted)
-    assert s2._registry.get(hidden_oid) is None  # the denied deref registered NOTHING
+    assert reopened._registry.get(hidden_oid) is None
+    reopened.close()
 
-    with s2.acting_as(OWNER):
+
+def test_owner_deref_after_a_denied_deref_loads_the_real_registered_record(
+    store_factory: StoreFactory,
+) -> None:
+    """Given a reopened store where an outsider already derefed the record into a twin
+    When the owner calls get on the same Lazy handle
+    Then the owner gets the real record
+    And the identity registry holds that instance
+    """
+    hidden_oid = _commit_hidden_record(store_factory)
+    reopened = store_factory()
+    with reopened.acting_as(OUTSIDER):
+        handle = reopened.query(Cabinet)[0].holds
+        assert handle is not None
+        handle.get()
+    with reopened.acting_as(OWNER):
         real = handle.get()
     assert not isinstance(real, dc.Redacted)
     assert real.label == LABEL
-    assert s2._registry.get(hidden_oid) is real
+    assert reopened._registry.get(hidden_oid) is real
+    reopened.close()
 
-    with s2.acting_as(OUTSIDER):
-        second_twin = handle.get()  # registry now HOLDS the real instance
+
+def test_denied_deref_after_the_owner_loaded_the_record_leaves_the_registry_alone(
+    store_factory: StoreFactory,
+) -> None:
+    """Given a reopened store where the owner already loaded the real record
+    When an outsider calls get on the same Lazy handle
+    Then the outsider gets a twin
+    And the identity registry still holds the real instance
+    """
+    hidden_oid = _commit_hidden_record(store_factory)
+    reopened = store_factory()
+    with reopened.acting_as(OWNER):
+        handle = reopened.query(Cabinet)[0].holds
+        assert handle is not None
+        real = handle.get()
+    with reopened.acting_as(OUTSIDER):
+        second_twin = handle.get()
     assert isinstance(second_twin, dc.Redacted)
-    assert s2._registry.get(hidden_oid) is real  # untouched by the denied deref
+    assert reopened._registry.get(hidden_oid) is real
+    reopened.close()
 
-    with s2.acting_as(OWNER):
+
+def test_owner_deref_after_a_denied_deref_returns_the_same_instance(
+    store_factory: StoreFactory,
+) -> None:
+    """Given a reopened store where the owner loaded the record and an outsider then derefed it
+    When the owner calls get on the same Lazy handle again
+    Then the owner gets the identical instance, not a re-materialized one
+    """
+    _commit_hidden_record(store_factory)
+    reopened = store_factory()
+    with reopened.acting_as(OWNER):
+        handle = reopened.query(Cabinet)[0].holds
+        assert handle is not None
+        real = handle.get()
+    with reopened.acting_as(OUTSIDER):
+        handle.get()
+    with reopened.acting_as(OWNER):
         real_again = handle.get()
-    assert real_again is real  # same identity — never re-materialized
-    s2.close()
+    assert real_again is real
+    reopened.close()
