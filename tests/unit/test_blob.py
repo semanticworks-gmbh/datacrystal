@@ -12,25 +12,34 @@ image/PDF of a specimen label as a blob (the SOR-archive shape from ADR-007's
 context).
 
 The schema-evolution test fabricates same-typename classes (inline bytes →
-dc.Blob) like the existing evolution tests, hence the per-file pyright pragmas.
+dc.Blob) like the existing evolution tests.
 """
-# pyright: reportCallIssue=false, reportArgumentType=false, reportAttributeAccessIssue=false
-# pyright: reportFunctionMemberAccess=false
 
 from __future__ import annotations
 
 import hashlib
+import sqlite3
+from collections.abc import Callable, Iterable, Sequence
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Annotated
 
 import pytest
 
 import datacrystal as dc
+from datacrystal import UntrackedMutationWarning
+from datacrystal._entity import type_info
 from datacrystal._records import BlobToken
 from datacrystal._storage.memory import MemoryBackend
+from datacrystal._storage.protocol import StoredBlob
+
+StoreFactory = Callable[[], dc.Store]
 
 
 @dc.entity
 class Scan:
+    """The scanned image of a specimen label, with an optional thumbnail."""
+
     qid: Annotated[str, dc.Unique]
     label: Annotated[str, dc.Index]
     image: Annotated[bytes, dc.Blob] = b""
@@ -38,90 +47,59 @@ class Scan:
 
 
 IMG = b"\x89PNG\r\n\x1a\n" + b"pixels" * 4096  # ~24 KB, not trivially small
-BIG = b"M" * (1024 * 1024)                     # 1 MB, the "stays tiny" probe
+BIG = b"M" * (1024 * 1024)  # 1 MB, the "stays tiny" probe
 
 
 class _SpyBackend(MemoryBackend):
-    """A memory backend that counts ``load_blob`` calls — the op-count gate
-    (invariant 12) for 'a query never reads the blobs table'."""
+    """A memory backend that counts ``load_blob`` calls.
+
+    It is the op-count gate (invariant 12) for 'a query never reads the blobs table'.
+    """
 
     def __init__(self) -> None:
         super().__init__()
         self.load_blob_calls = 0
 
-    def load_blob(self, oid: int):
+    def load_blob(self, oid: int) -> StoredBlob | None:
         self.load_blob_calls += 1
         return super().load_blob(oid)
 
 
-# -- round-trip --------------------------------------------------------------
+class _Clock:
+    now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
 
 
-def test_blob_roundtrip_reopen(store_factory):
-    store = store_factory()
-    store.root = [Scan(qid="Q1", label="azurite", image=IMG)]
-    store.commit()
-    store.close()
-
-    reopened = store_factory()
-    scan = reopened.root[0]
-    handle = scan.image
-    assert isinstance(handle, dc.BlobHandle)
-    assert handle.size == len(IMG)
-    assert handle.hash == hashlib.sha256(IMG).digest()
-    assert handle.bytes() == IMG
-    reopened.close()
+@dataclass
+class _SpyCabinet:
+    store: dc.Store
+    backend: _SpyBackend
+    clock: _Clock
 
 
-def test_size_and_hash_need_no_fetch(store_factory):
-    store = store_factory()
-    store.root = [Scan(qid="Q1", label="azurite", image=IMG)]
-    store.commit()
-    store.close()
-
-    reopened = store_factory()
-    handle = reopened.root[0].image
-    # .size / .hash come straight from the descriptor — never loaded.
-    assert not handle.loaded
-    assert handle.size == len(IMG)
-    assert handle.hash == hashlib.sha256(IMG).digest()
-    assert not handle.loaded  # still not fetched
-    reopened.close()
+def _handle(blob_field: object) -> dc.BlobHandle:
+    """Return a blob field as the handle a stored scan hydrates to (the field is typed bytes)."""
+    return blob_field  # pyrefly: ignore[bad-return]
 
 
-def test_bytes_caches_then_demotes_and_reloads():
-    class _Clock:
-        now = 0.0
-
-        def __call__(self) -> float:
-            return self.now
-
+@pytest.fixture
+def spy_cabinet() -> _SpyCabinet:
+    """Return a 10 s lazy-timeout store, over a spy backend, holding one stored azurite scan."""
     clock = _Clock()
     backend = _SpyBackend()
     seed = dc.Store._from_backend(backend)
     seed.root = [Scan(qid="Q1", label="azurite", image=IMG)]
     seed.commit()
     seed.close()
-
     store = dc.Store._from_backend(backend, lazy_timeout=10.0, lazy_clock=clock)
-    handle = store.root[0].image
-    assert handle.bytes() == IMG  # first fetch, tracked at t=0
-    assert backend.load_blob_calls == 1
-    assert handle.bytes() == IMG  # cached — no re-fetch
-    assert backend.load_blob_calls == 1
-
-    clock.now = 11.0
-    store.root  # boundary sweep: idle 11s > 10s → demote the cached bytes
-    assert not handle.loaded
-    assert handle.bytes() == IMG  # transparent reload through the store
-    assert backend.load_blob_calls == 2
-    store.close()
+    return _SpyCabinet(store, backend, clock)
 
 
-# -- the promise: a scan/query/count never reads the blobs table -------------
-
-
-def test_query_does_not_read_blobs():
+@pytest.fixture
+def two_scans_on_a_spy_backend() -> tuple[dc.Store, _SpyBackend]:
+    """Return a reopened store of the azurite and cuprite scans over a spy backend."""
     backend = _SpyBackend()
     seed = dc.Store._from_backend(backend)
     seed.root = [
@@ -130,39 +108,248 @@ def test_query_does_not_read_blobs():
     ]
     seed.commit()
     seed.close()
+    return dc.Store._from_backend(backend), backend
 
+
+@pytest.fixture
+def committed_original_scan() -> tuple[MemoryBackend, dc.Store, Scan, int]:
+    """Return a memory backend, its store, a committed scan imaged b"original", and the blob oid."""
+    backend = MemoryBackend()
     store = dc.Store._from_backend(backend)
-    assert store.count(Scan) == 2
-    assert len(store.query(Scan.label == "azurite")) == 1
-    assert len(store.query(Scan)) == 2
-    plucked = store.pluck(Scan, "label", "image")
-    # No blob fetch happened for any decode-level read.
+    scan = Scan(qid="Q1", label="azurite", image=b"original")
+    store.root = [scan]
+    store.commit()
+    (first_oid,) = list(backend._blobs)
+    return backend, store, scan, first_oid
+
+
+# -- round-trip --------------------------------------------------------------
+
+
+def test_blob_field_reads_back_as_a_handle_after_reopen(store_factory: StoreFactory) -> None:
+    """Given a stored scan with an image blob
+    When the store is reopened and the scan is read
+    Then the image is a BlobHandle
+    And its size is the image length
+    And its hash is the sha256 of the image
+    And its bytes are the image
+    """
+    store = store_factory()
+    store.root = [Scan(qid="Q1", label="azurite", image=IMG)]
+    store.commit()
+    store.close()
+    reopened = store_factory()
+
+    handle = _handle(reopened.root[0].image)
+
+    assert isinstance(handle, dc.BlobHandle)
+    assert handle.size == len(IMG)
+    assert handle.hash == hashlib.sha256(IMG).digest()
+    assert handle.bytes() == IMG
+    reopened.close()
+
+
+def test_size_and_hash_need_no_fetch(store_factory: StoreFactory) -> None:
+    """Given a stored scan with an image blob, reopened
+    When the handle's size and hash are read
+    Then they match the image
+    And the handle is still not loaded
+    """
+    store = store_factory()
+    store.root = [Scan(qid="Q1", label="azurite", image=IMG)]
+    store.commit()
+    store.close()
+    reopened = store_factory()
+    handle = _handle(reopened.root[0].image)
+
+    size, digest = handle.size, handle.hash
+
+    assert size == len(IMG)
+    assert digest == hashlib.sha256(IMG).digest()
+    assert not handle.loaded
+    reopened.close()
+
+
+def test_first_bytes_call_fetches_the_blob_once(spy_cabinet: _SpyCabinet) -> None:
+    """Given a reopened store whose scan blob was never fetched
+    When the handle's bytes are read
+    Then they are the image
+    And the backend served one blob load
+    """
+    handle = _handle(spy_cabinet.store.root[0].image)
+
+    fetched = handle.bytes()
+
+    assert fetched == IMG
+    assert spy_cabinet.backend.load_blob_calls == 1
+    spy_cabinet.store.close()
+
+
+def test_second_bytes_call_is_served_from_the_cache(spy_cabinet: _SpyCabinet) -> None:
+    """Given a handle whose bytes were fetched once
+    When its bytes are read again
+    Then they are the image
+    And the backend still served only one blob load
+    """
+    handle = _handle(spy_cabinet.store.root[0].image)
+    handle.bytes()
+
+    again = handle.bytes()
+
+    assert again == IMG
+    assert spy_cabinet.backend.load_blob_calls == 1
+    spy_cabinet.store.close()
+
+
+def test_idle_blob_is_demoted_at_the_next_boundary_sweep(spy_cabinet: _SpyCabinet) -> None:
+    """Given a handle fetched at t=0 with a 10 s lazy timeout
+    When the clock reads 11 s and the store's root is touched
+    Then the handle is no longer loaded
+    """
+    handle = _handle(spy_cabinet.store.root[0].image)
+    handle.bytes()
+    spy_cabinet.clock.now = 11.0
+
+    _ = spy_cabinet.store.root
+
+    assert not handle.loaded
+    spy_cabinet.store.close()
+
+
+def test_demoted_blob_reloads_transparently(spy_cabinet: _SpyCabinet) -> None:
+    """Given a handle that was fetched, then demoted after 11 s idle
+    When its bytes are read again
+    Then they are the image
+    And the backend served a second blob load
+    """
+    handle = _handle(spy_cabinet.store.root[0].image)
+    handle.bytes()
+    spy_cabinet.clock.now = 11.0
+    _ = spy_cabinet.store.root
+
+    reloaded = handle.bytes()
+
+    assert reloaded == IMG
+    assert spy_cabinet.backend.load_blob_calls == 2
+    spy_cabinet.store.close()
+
+
+# -- the promise: a scan/query/count never reads the blobs table -------------
+
+
+def test_count_does_not_read_blobs(two_scans_on_a_spy_backend: tuple[dc.Store, _SpyBackend]) -> None:
+    """Given a store of two scans with image blobs
+    When the scans are counted
+    Then the count is 2
+    And the blobs table was never read
+    """
+    store, backend = two_scans_on_a_spy_backend
+
+    counted = store.count(Scan)
+
+    assert counted == 2
     assert backend.load_blob_calls == 0
-    # pluck returns the inert descriptor, not the bytes.
-    for _label, image in plucked:
-        assert isinstance(image, BlobToken)
-        assert image.size == len(IMG)
-    # the bytes only load when explicitly asked for
-    store.query(Scan.label == "azurite")[0].image.bytes()
+    store.close()
+
+
+def test_filtered_query_does_not_read_blobs(
+    two_scans_on_a_spy_backend: tuple[dc.Store, _SpyBackend],
+) -> None:
+    """Given a store of two scans with image blobs
+    When the scans labelled azurite are queried
+    Then one scan is returned
+    And the blobs table was never read
+    """
+    store, backend = two_scans_on_a_spy_backend
+
+    azurite = store.query(Scan.label == "azurite")  # pyrefly: ignore[bad-argument-type]
+
+    assert len(azurite) == 1
+    assert backend.load_blob_calls == 0
+    store.close()
+
+
+def test_full_query_does_not_read_blobs(
+    two_scans_on_a_spy_backend: tuple[dc.Store, _SpyBackend],
+) -> None:
+    """Given a store of two scans with image blobs
+    When all scans are queried
+    Then two scans are returned
+    And the blobs table was never read
+    """
+    store, backend = two_scans_on_a_spy_backend
+
+    scans = store.query(Scan)
+
+    assert len(scans) == 2
+    assert backend.load_blob_calls == 0
+    store.close()
+
+
+def test_pluck_returns_inert_descriptors_without_reading_blobs(
+    two_scans_on_a_spy_backend: tuple[dc.Store, _SpyBackend],
+) -> None:
+    """Given a store of two scans with image blobs
+    When label and image are plucked
+    Then every image is a BlobToken descriptor
+    And each descriptor carries the image size
+    And the blobs table was never read
+    """
+    store, backend = two_scans_on_a_spy_backend
+
+    plucked = store.pluck(Scan, "label", "image")
+
+    assert all(isinstance(image, BlobToken) for _label, image in plucked)
+    assert all(image.size == len(IMG) for _label, image in plucked)
+    assert backend.load_blob_calls == 0
+    store.close()
+
+
+def test_bytes_load_only_when_explicitly_asked_for(
+    two_scans_on_a_spy_backend: tuple[dc.Store, _SpyBackend],
+) -> None:
+    """Given a store of two scans with image blobs
+    When the bytes of the azurite scan's image are read
+    Then the blobs table was read exactly once
+    """
+    store, backend = two_scans_on_a_spy_backend
+    azurite = store.query(Scan.label == "azurite")[0]  # pyrefly: ignore[bad-argument-type]
+
+    _handle(azurite.image).bytes()
+
     assert backend.load_blob_calls == 1
     store.close()
 
 
-def test_object_record_stays_tiny_for_a_megabyte_blob():
+def test_record_stays_tiny_for_a_megabyte_blob() -> None:
+    """Given a committed scan with a 1 MB image blob
+    When the stored object records are measured
+    Then the largest record is under 200 bytes
+    """
     backend = MemoryBackend()
     store = dc.Store._from_backend(backend)
     store.root = [Scan(qid="Q1", label="big", image=BIG)]
     store.commit()
     store.close()
 
-    payloads = {oid: rec.payload for oid, rec in backend._objects.items()}
-    # The Scan record must be a couple dozen bytes — the descriptor, never the
-    # 1 MB. (The largest record in the store is the Scan; assert it's tiny.)
-    biggest = max(len(p) for p in payloads.values())
-    assert biggest < 200, f"a blob-bearing record is not tiny: {biggest} bytes"
-    # The bytes live in exactly one blob row, raw and whole.
-    assert len(backend._blobs) == 1
+    assert max(len(rec.payload) for rec in backend._objects.values()) < 200
+
+
+def test_megabyte_blob_lives_in_one_raw_whole_blob_row() -> None:
+    """Given a committed scan with a 1 MB image blob
+    When the blobs table is read
+    Then it holds exactly one row
+    And that row is the 1 MB image, raw and whole
+    """
+    backend = MemoryBackend()
+    store = dc.Store._from_backend(backend)
+    store.root = [Scan(qid="Q1", label="big", image=BIG)]
+    store.commit()
+    store.close()
+
     (stored,) = backend._blobs.values()
+
+    assert len(backend._blobs) == 1
     assert stored.size == len(BIG)
     assert stored.data == BIG
 
@@ -170,67 +357,133 @@ def test_object_record_stays_tiny_for_a_megabyte_blob():
 # -- None blob, immutability --------------------------------------------------
 
 
-def test_none_blob_writes_no_row_and_reads_back_none(store_factory):
+def test_none_blob_reads_back_as_none(store_factory: StoreFactory) -> None:
+    """Given a stored scan with an image and a None thumb
+    When the store is reopened and the scan is read
+    Then the thumb is None
+    """
     store = store_factory()
     store.root = [Scan(qid="Q1", label="azurite", image=IMG, thumb=None)]
     store.commit()
     store.close()
-
     reopened = store_factory()
+
     scan = reopened.root[0]
-    assert scan.thumb is None          # a None blob field is just None
-    assert isinstance(scan.image, dc.BlobHandle)  # the non-None one is a handle
+
+    assert scan.thumb is None
     reopened.close()
 
 
-def test_none_blob_makes_exactly_one_blob_row():
+def test_non_none_blob_beside_a_none_one_reads_back_as_a_handle(
+    store_factory: StoreFactory,
+) -> None:
+    """Given a stored scan with an image and a None thumb
+    When the store is reopened and the scan is read
+    Then the image is a BlobHandle
+    """
+    store = store_factory()
+    store.root = [Scan(qid="Q1", label="azurite", image=IMG, thumb=None)]
+    store.commit()
+    store.close()
+    reopened = store_factory()
+
+    scan = reopened.root[0]
+
+    assert isinstance(scan.image, dc.BlobHandle)
+    reopened.close()
+
+
+def test_none_blob_writes_no_row() -> None:
+    """Given a scan with an image and a None thumb
+    When it is committed
+    Then the blobs table holds one row, for the image alone
+    """
     backend = MemoryBackend()
     store = dc.Store._from_backend(backend)
     store.root = [Scan(qid="Q1", label="a", image=IMG, thumb=None)]
+
     store.commit()
-    # image → 1 row; thumb=None → 0 rows
+
     assert len(backend._blobs) == 1
     store.close()
 
 
-def test_changing_a_blob_mints_a_new_oid():
-    backend = MemoryBackend()
-    store = dc.Store._from_backend(backend)
-    scan = Scan(qid="Q1", label="azurite", image=b"original")
-    store.root = [scan]
-    store.commit()
-    (first_oid,) = list(backend._blobs)
+def test_changing_a_blob_leaves_the_old_row_untouched(
+    committed_original_scan: tuple[MemoryBackend, dc.Store, Scan, int],
+) -> None:
+    """Given a committed scan whose image is b"original"
+    When the image is replaced with b"replacement" and committed
+    Then the old blob row still holds b"original"
+    """
+    backend, store, scan, first_oid = committed_original_scan
 
-    scan.image = b"replacement"  # mutate the live field
+    scan.image = b"replacement"
     store.commit()
 
-    # A new blob row exists; the OLD row is untouched (immutable, ADR-007).
-    assert first_oid in backend._blobs
     assert backend._blobs[first_oid].data == b"original"
-    new_oids = [o for o in backend._blobs if o != first_oid]
-    assert len(new_oids) == 1
-    assert backend._blobs[new_oids[0]].data == b"replacement"
     store.close()
 
+
+def test_changing_a_blob_mints_one_new_row(
+    committed_original_scan: tuple[MemoryBackend, dc.Store, Scan, int],
+) -> None:
+    """Given a committed scan whose image is b"original"
+    When the image is replaced with b"replacement" and committed
+    Then exactly one new blob row exists
+    And it holds b"replacement"
+    """
+    backend, store, scan, first_oid = committed_original_scan
+
+    scan.image = b"replacement"
+    store.commit()
+
+    new_oids = set(backend._blobs) - {first_oid}
+    assert len(new_oids) == 1
+    (new_oid,) = new_oids
+    assert backend._blobs[new_oid].data == b"replacement"
+    store.close()
+
+
+def test_changed_blob_reads_back_after_reopen(
+    committed_original_scan: tuple[MemoryBackend, dc.Store, Scan, int],
+) -> None:
+    """Given a committed scan whose image was replaced with b"replacement" and committed
+    When the store is reopened and the image bytes are read
+    Then they are b"replacement"
+    """
+    backend, store, scan, _ = committed_original_scan
+    scan.image = b"replacement"
+    store.commit()
+    store.close()
     reopened = dc.Store._from_backend(backend)
-    assert reopened.root[0].image.bytes() == b"replacement"
+
+    fetched = _handle(reopened.root[0].image).bytes()
+
+    assert fetched == b"replacement"
     reopened.close()
 
 
 # -- both backends agree (parametrized) --------------------------------------
 
 
-def test_both_backends_whole_value(store_factory):
+def test_both_backends_return_the_whole_value(store_factory: StoreFactory) -> None:
+    """Given a stored scan with an image and a thumb blob
+    When the store is reopened and the scan is read
+    Then the image bytes equal the image
+    And the thumb bytes equal the thumb
+    And the image size is the image length
+    """
     store = store_factory()
     store.root = [Scan(qid="Q1", label="azurite", image=IMG, thumb=b"tiny-thumb")]
     store.commit()
     store.close()
-
     reopened = store_factory()
+
     scan = reopened.root[0]
-    assert scan.image.bytes() == IMG
-    assert scan.thumb.bytes() == b"tiny-thumb"
-    assert scan.image.size == len(IMG)
+
+    assert _handle(scan.image).bytes() == IMG
+    assert _handle(scan.thumb).bytes() == b"tiny-thumb"
+    assert _handle(scan.image).size == len(IMG)
     reopened.close()
 
 
@@ -238,71 +491,110 @@ def test_both_backends_whole_value(store_factory):
 
 
 class _FailOnApply(MemoryBackend):
-    """Raises mid-``apply`` so the commit's P2 fails after the batch was
-    handed over — proving the record and its blob land together or not at all."""
+    """A memory backend whose ``apply`` raises after the batch was handed over.
 
-    def apply(self, batch) -> None:
+    It proves the record and its blob land together or not at all.
+    """
+
+    def apply(self, batch: object) -> None:
         raise RuntimeError("injected storage failure")
 
 
-def test_failed_apply_persists_neither_record_nor_blob():
+def test_failed_apply_raises_the_storage_error() -> None:
+    """Given a backend whose apply fails
+    When a scan with an image blob is committed
+    Then the commit raises the injected storage error
+    """
+    store = dc.Store._from_backend(_FailOnApply())
+    store.root = [Scan(qid="Q1", label="azurite", image=IMG)]
+
+    with pytest.raises(RuntimeError, match="injected storage failure"):
+        store.commit()
+    store.close()
+
+
+def test_failed_apply_persists_neither_record_nor_blob() -> None:
+    """Given a backend whose apply fails
+    When a scan with an image blob fails to commit
+    Then the backend holds no records
+    And it holds no blobs
+    """
     backend = _FailOnApply()
     store = dc.Store._from_backend(backend)
     store.root = [Scan(qid="Q1", label="azurite", image=IMG)]
     with pytest.raises(RuntimeError, match="injected storage failure"):
         store.commit()
-    # Nothing durable: no records, no blobs.
+
     assert backend._objects == {}
     assert backend._blobs == {}
     store.close()
 
 
 class _FlakyConn:
-    """A thin proxy over a real sqlite3 connection that blows up on the meta
-    INSERT — i.e. AFTER apply() has put the objects AND blobs rows in the open
-    BEGIN IMMEDIATE txn but BEFORE COMMIT. Everything else delegates, so the
-    real ROLLBACK path runs on the real connection."""
+    """A proxy over a sqlite3 connection that blows up on the meta INSERT.
 
-    def __init__(self, conn) -> None:
+    That is AFTER apply() has put the objects AND blobs rows in the open BEGIN IMMEDIATE txn
+    but BEFORE COMMIT. Everything else delegates, so the real ROLLBACK runs on the real connection.
+    """
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
         self._conn = conn
 
-    def executemany(self, sql, seq):
+    def executemany(self, sql: str, seq: Iterable[Sequence[object]]) -> sqlite3.Cursor:
         if sql.startswith("INSERT OR REPLACE INTO meta"):
             raise RuntimeError("injected mid-txn failure")
         return self._conn.executemany(sql, seq)
 
-    def __getattr__(self, name):
+    def __getattr__(self, name: str) -> object:
         return getattr(self._conn, name)
 
 
-def test_sqlite_failed_txn_rolls_back_both(tmp_path):
-    """On the real sqlite backend, an exception raised inside apply()'s
-    BEGIN IMMEDIATE…COMMIT must roll back the blobs INSERT together with the
-    record INSERT (ADR-007: one atomic transaction)."""
+def test_sqlite_failed_txn_rolls_back_the_record(tmp_path: Path) -> None:
+    """Given a sqlite store whose connection fails at the meta INSERT inside apply()
+    When a scan with an image blob fails to commit
+    Then the objects table is empty
+    """
     store = dc.Store.open(tmp_path / "store", lock_ttl=0.5)
-    backend = store._backend
-    real_conn = backend._conn
-    backend._conn = _FlakyConn(real_conn)  # apply() now fails at the meta INSERT
-
+    real_conn = store._backend._conn  # pyrefly: ignore[missing-attribute]
+    store._backend._conn = _FlakyConn(real_conn)  # pyrefly: ignore[missing-attribute]
     store.root = [Scan(qid="Q1", label="azurite", image=IMG)]
     with pytest.raises(RuntimeError, match="injected mid-txn failure"):
         store.commit()
+    store._backend._conn = real_conn  # pyrefly: ignore[missing-attribute]
 
-    backend._conn = real_conn  # restore for the assertions + close
-    # The whole transaction rolled back: neither the record nor the blob row.
-    objects = real_conn.execute("SELECT count(*) FROM objects").fetchone()
-    blobs = real_conn.execute("SELECT count(*) FROM blobs").fetchone()
-    assert objects[0] == 0
-    assert blobs[0] == 0
+    (objects,) = real_conn.execute("SELECT count(*) FROM objects").fetchone()
+
+    assert objects == 0
+    store.close()
+
+
+def test_sqlite_failed_txn_rolls_back_the_blob(tmp_path: Path) -> None:
+    """Given a sqlite store whose connection fails at the meta INSERT inside apply()
+    When a scan with an image blob fails to commit
+    Then the blobs table is empty
+    """
+    store = dc.Store.open(tmp_path / "store", lock_ttl=0.5)
+    real_conn = store._backend._conn  # pyrefly: ignore[missing-attribute]
+    store._backend._conn = _FlakyConn(real_conn)  # pyrefly: ignore[missing-attribute]
+    store.root = [Scan(qid="Q1", label="azurite", image=IMG)]
+    with pytest.raises(RuntimeError, match="injected mid-txn failure"):
+        store.commit()
+    store._backend._conn = real_conn  # pyrefly: ignore[missing-attribute]
+
+    (blobs,) = real_conn.execute("SELECT count(*) FROM blobs").fetchone()
+
+    assert blobs == 0
     store.close()
 
 
 # -- schema evolution: inline bytes -> dc.Blob -------------------------------
 
 
-def _evolve_scan(image_annotation):
-    """(Re)define a 'EvolvingScan' entity with a given annotation for `image`,
-    same typename across runs (the code-changed-between-runs simulation)."""
+def _evolve_scan(image_annotation: object) -> type:
+    """Redefine 'EvolvingScan' with the given annotation for `image`, under one typename.
+
+    The same typename across runs simulates code changed between runs.
+    """
     annotations = {
         "qid": Annotated[str, dc.Unique],
         "image": image_annotation,
@@ -316,112 +608,196 @@ def _evolve_scan(image_annotation):
     return dc.entity(type("EvolvingScan", (), namespace))
 
 
-def test_inline_bytes_to_blob_evolution(store_factory):
-    # v1: image is a plain inline `bytes` field.
-    V1 = _evolve_scan(bytes)
+def test_an_old_inline_record_still_reads_as_a_scan_of_the_new_shape(
+    store_factory: StoreFactory,
+) -> None:
+    """Given a stored scan written when image was plain inline bytes
+    When the store is reopened after image became a dc.Blob
+    Then the scan is an instance of the new shape
+    """
+    v1 = _evolve_scan(bytes)
     store = store_factory()
-    store.root = [V1(qid="Q1", image=b"inline-bytes")]
+    store.root = [v1(qid="Q1", image=b"inline-bytes")]
     store.commit()
     store.close()
-
-    # v2: the SAME field is now Annotated[bytes, dc.Blob] (out-of-line).
-    V2 = _evolve_scan(Annotated[bytes, dc.Blob])
+    v2 = _evolve_scan(Annotated[bytes, dc.Blob])
     reopened = store_factory()
-    scan = reopened.root[0]
-    assert isinstance(scan, V2)
-    # Old inline record decodes by name through its own shape: the bytes come
-    # back as raw bytes (no descriptor was ever written), NOT a handle.
-    assert scan.image == b"inline-bytes"
-    assert not isinstance(scan.image, dc.BlobHandle)
 
-    # A NEW record written under the v2 shape stores out-of-line and reads back
-    # as a handle. NOTE: marking a field dc.Blob does NOT mint a new cid (the cid
-    # splits on the field-NAME shape, unchanged here), so the asymmetry is
-    # value-driven — old payloads carry inline bytes → bytes, new ones a
-    # descriptor → handle. migrate() does not yet normalize old inline records
-    # into blob rows; cid-shape-aware mode change is a follow-on (#76 sibling).
-    reopened.store(V2(qid="Q2", image=b"out-of-line-bytes"))
-    reopened.commit()
+    scan = reopened.root[0]
+
+    assert isinstance(scan, v2)
     reopened.close()
 
+
+def test_an_old_inline_record_reads_its_image_as_raw_bytes(store_factory: StoreFactory) -> None:
+    """Given a stored scan written when image was plain inline bytes
+    When the store is reopened after image became a dc.Blob
+    Then the image is the raw bytes, decoded through its own shape
+    And it is not a BlobHandle
+    """
+    v1 = _evolve_scan(bytes)
+    store = store_factory()
+    store.root = [v1(qid="Q1", image=b"inline-bytes")]
+    store.commit()
+    store.close()
+    _evolve_scan(Annotated[bytes, dc.Blob])
+    reopened = store_factory()
+
+    scan = reopened.root[0]
+
+    assert scan.image == b"inline-bytes"
+    assert not isinstance(scan.image, dc.BlobHandle)
+    reopened.close()
+
+
+def test_a_new_record_under_the_blob_shape_reads_back_as_a_handle(
+    store_factory: StoreFactory,
+) -> None:
+    """Given an inline-bytes scan stored before image became a dc.Blob
+    When a second scan is stored under the dc.Blob shape and the store is reopened
+    Then the second scan's image is a BlobHandle
+    And its bytes are the stored bytes
+    """
+    v1 = _evolve_scan(bytes)
+    store = store_factory()
+    store.root = [v1(qid="Q1", image=b"inline-bytes")]
+    store.commit()
+    store.close()
+    v2 = _evolve_scan(Annotated[bytes, dc.Blob])
+    reopened = store_factory()
+    reopened.store(v2(qid="Q2", image=b"out-of-line-bytes"))
+    reopened.commit()
+    reopened.close()
     third = store_factory()
-    q1 = third.get(V2, qid="Q1")
-    q2 = third.get(V2, qid="Q2")
-    assert q1.image == b"inline-bytes"            # still inline → raw bytes
-    assert isinstance(q2.image, dc.BlobHandle)    # new shape → handle
+
+    q2 = third.get(v2, qid="Q2")
+
+    assert q2 is not None
+    assert isinstance(q2.image, dc.BlobHandle)
     assert q2.image.bytes() == b"out-of-line-bytes"
+    third.close()
+
+
+def test_the_old_inline_record_stays_raw_bytes_beside_a_new_blob_record(
+    store_factory: StoreFactory,
+) -> None:
+    """Given an inline-bytes scan stored before image became a dc.Blob, and a blob scan after
+    When the store is reopened and the old scan is fetched
+    Then its image is still the raw inline bytes
+    """
+    v1 = _evolve_scan(bytes)
+    store = store_factory()
+    store.root = [v1(qid="Q1", image=b"inline-bytes")]
+    store.commit()
+    store.close()
+    v2 = _evolve_scan(Annotated[bytes, dc.Blob])
+    reopened = store_factory()
+    reopened.store(v2(qid="Q2", image=b"out-of-line-bytes"))
+    reopened.commit()
+    reopened.close()
+    third = store_factory()
+
+    q1 = third.get(v2, qid="Q1")
+
+    assert q1 is not None
+    assert q1.image == b"inline-bytes"
     third.close()
 
 
 # -- debug fingerprint net (must not false-positive on blob fields) ----------
 
 
-def test_debug_mode_does_not_flag_unchanged_blob_entity(recwarn):
+def test_debug_mode_does_not_flag_unchanged_blob_entity(recwarn: pytest.WarningsRecorder) -> None:
+    """Given a debug store holding a clean scan whose blob was rehydrated as a handle
+    When another scan is stored and committed, so the sweep walks the clean one
+    Then no untracked-mutation warning is raised
+    """
     backend = MemoryBackend()
     seed = dc.Store._from_backend(backend, debug=True)
     seed.root = [Scan(qid="Q1", label="azurite", image=IMG)]
     seed.commit()
-    # touch nothing, just re-commit a no-op and read — the sweep recomputes the
-    # fingerprint and must NOT think the (unchanged) blob entity mutated.
-    seed.commit()  # no-op
+    seed.commit()
     seed.close()
-
     reopened = dc.Store._from_backend(backend, debug=True)
-    scan = reopened.root[0]
-    assert scan.image.bytes() == IMG  # rehydrate to a handle
+    _handle(reopened.root[0].image).bytes()
     reopened.store(Scan(qid="Q2", label="other", image=b"small"))
-    reopened.commit()  # the sweep walks the CLEAN Q1 (a handle) — no warning
-    from datacrystal import UntrackedMutationWarning
-    assert not any(isinstance(w.message, UntrackedMutationWarning)
-                   for w in recwarn.list)
+
+    reopened.commit()
+
+    assert not any(isinstance(w.message, UntrackedMutationWarning) for w in recwarn.list)
     reopened.close()
 
 
 # -- marker guards ------------------------------------------------------------
 
 
-def test_blob_on_non_bytes_field_raises():
+def test_blob_on_non_bytes_field_raises() -> None:
+    """Given an entity declaring a str field as dc.Blob
+    When the entity class is created
+    Then TypeError says the field must be bytes
+    """
     with pytest.raises(TypeError, match="must be bytes"):
+
         @dc.entity
         class Bad:
             qid: Annotated[str, dc.Unique]
             oops: Annotated[str, dc.Blob] = ""
 
 
-def test_blob_plus_index_raises():
+def test_blob_plus_index_raises() -> None:
+    """Given an entity declaring a bytes field as both dc.Blob and dc.Index
+    When the entity class is created
+    Then TypeError says a blob cannot also be Index/Unique/SortedIndex
+    """
     with pytest.raises(TypeError, match="cannot also be Index/Unique/SortedIndex"):
+
         @dc.entity
         class Bad:
             qid: Annotated[str, dc.Unique]
             oops: Annotated[bytes, dc.Blob, dc.Index] = b""
 
 
-def test_blob_plus_unique_raises():
+def test_blob_plus_unique_raises() -> None:
+    """Given an entity declaring a bytes field as both dc.Blob and dc.Unique
+    When the entity class is created
+    Then TypeError says a blob cannot also be Index/Unique/SortedIndex
+    """
     with pytest.raises(TypeError, match="cannot also be Index/Unique/SortedIndex"):
+
         @dc.entity
         class Bad:
             qid: Annotated[str, dc.Unique]
             oops: Annotated[bytes, dc.Blob, dc.Unique] = b""
 
 
-def test_blob_plus_renamed_from_raises():
+def test_blob_plus_renamed_from_raises() -> None:
+    """Given an entity declaring a bytes field as both dc.Blob and dc.RenamedFrom
+    When the entity class is created
+    Then TypeError says a blob cannot also be FullText/RenamedFrom/Glue
+    """
     with pytest.raises(TypeError, match="cannot also be FullText/RenamedFrom/Glue"):
+
         @dc.entity
         class Bad:
             qid: Annotated[str, dc.Unique]
             oops: Annotated[bytes, dc.Blob, dc.RenamedFrom("old")] = b""
 
 
-def test_optional_bytes_blob_is_allowed():
+def test_optional_bytes_blob_is_allowed() -> None:
+    """Given an entity declaring an optional bytes field as dc.Blob
+    When the entity class is created
+    Then the field spec resolves and is a blob
+    """
+
     @dc.entity
     class Ok:
         qid: Annotated[str, dc.Unique]
         data: Annotated[bytes | None, dc.Blob] = None
 
-    # resolving specs (eager at @entity) did not raise — the field is a blob.
-    from datacrystal._entity import type_info
     spec = type_info(Ok).spec("data")
-    assert spec is not None and spec.blob
+
+    assert spec is not None
+    assert spec.blob
 
 
 # -- regression: re-committing a REOPENED blob entity (adversarial review) ----
@@ -429,73 +805,161 @@ def test_optional_bytes_blob_is_allowed():
 # blob entity cannot be updated and upsert silently re-stores/wipes the blob.
 
 
-def test_edit_sibling_field_of_reopened_blob_preserves_blob(store_factory):
+def test_editing_a_sibling_field_of_a_reopened_blob_entity_commits(
+    store_factory: StoreFactory,
+) -> None:
+    """Given a stored scan reopened, its image a handle
+    When the scan's label is edited and committed
+    Then the commit succeeds and the new label is stored
+    """
     store = store_factory()
     store.root = [Scan(qid="S1", label="draft", image=IMG)]
     store.commit()
     store.close()
-
     reopened = store_factory()
     scan = reopened.get(Scan, qid="S1")
-    assert isinstance(scan.image, dc.BlobHandle)   # reopened → a handle, not bytes
-    scan.label = "final"                            # edit a SIBLING field
-    reopened.commit()                               # must NOT raise (was the crash)
+    assert scan is not None
+    scan.label = "final"
+    reopened.commit()
     reopened.close()
-
     third = store_factory()
-    scan = third.get(Scan, qid="S1")
-    assert scan.label == "final"
-    assert scan.image.bytes() == IMG               # the blob survived untouched
-    assert scan.image.hash == hashlib.sha256(IMG).digest()
+
+    back = third.get(Scan, qid="S1")
+
+    assert back is not None
+    assert back.label == "final"
     third.close()
 
 
-def test_upsert_resupplying_identical_blob_does_not_restore(store_factory):
+def test_editing_a_sibling_field_leaves_the_blob_untouched(store_factory: StoreFactory) -> None:
+    """Given a stored scan reopened, its label edited and committed
+    When the store is reopened again and the image is read
+    Then its bytes are the original image
+    And its hash is the sha256 of the original image
+    """
+    store = store_factory()
+    store.root = [Scan(qid="S1", label="draft", image=IMG)]
+    store.commit()
+    store.close()
+    reopened = store_factory()
+    scan = reopened.get(Scan, qid="S1")
+    assert scan is not None
+    scan.label = "final"
+    reopened.commit()
+    reopened.close()
+    third = store_factory()
+
+    back = third.get(Scan, qid="S1")
+
+    assert back is not None
+    assert _handle(back.image).bytes() == IMG
+    assert _handle(back.image).hash == hashlib.sha256(IMG).digest()
+    third.close()
+
+
+def test_upsert_with_an_identical_blob_updates_the_label(store_factory: StoreFactory) -> None:
+    """Given a stored scan S1 labelled v1
+    When S1 is upserted with the same image and the label v2
+    Then the label is v2
+    And the image bytes are unchanged
+    """
     store = store_factory()
     store.root = []
     store.upsert(Scan(qid="S1", label="v1", image=IMG))
     store.commit()
-    oid1 = store.get(Scan, qid="S1").image.blob_oid
-
-    store.upsert(Scan(qid="S1", label="v2", image=IMG))   # same image, new label
+    store.upsert(Scan(qid="S1", label="v2", image=IMG))
     store.commit()
+
     scan = store.get(Scan, qid="S1")
+
+    assert scan is not None
     assert scan.label == "v2"
-    assert scan.image.bytes() == IMG
-    assert scan.image.blob_oid == oid1               # identical blob → not re-stored
+    assert _handle(scan.image).bytes() == IMG
     store.close()
 
 
-def test_upsert_with_a_changed_blob_restores(store_factory):
+def test_upsert_with_an_identical_blob_does_not_restore_it(store_factory: StoreFactory) -> None:
+    """Given a stored scan S1 whose image has a blob oid
+    When S1 is upserted with the same image and a new label
+    Then the image keeps the same blob oid
+    """
     store = store_factory()
     store.root = []
     store.upsert(Scan(qid="S1", label="v1", image=IMG))
     store.commit()
-    oid1 = store.get(Scan, qid="S1").image.blob_oid
+    first = store.get(Scan, qid="S1")
+    assert first is not None
+    oid1 = _handle(first.image).blob_oid
+    del first  # let the live entity go, so the next get rehydrates from the store
+    store.upsert(Scan(qid="S1", label="v2", image=IMG))
+    store.commit()
 
+    scan = store.get(Scan, qid="S1")
+
+    assert scan is not None
+    assert _handle(scan.image).blob_oid == oid1
+    store.close()
+
+
+def test_upsert_with_a_changed_blob_stores_the_new_bytes(store_factory: StoreFactory) -> None:
+    """Given a stored scan S1
+    When S1 is upserted with a longer image
+    Then the image bytes are the longer image
+    """
+    store = store_factory()
+    store.root = []
+    store.upsert(Scan(qid="S1", label="v1", image=IMG))
+    store.commit()
     bigger = IMG + b"!"
     store.upsert(Scan(qid="S1", label="v1", image=bigger))
     store.commit()
+
     scan = store.get(Scan, qid="S1")
-    assert scan.image.bytes() == bigger
-    assert scan.image.blob_oid != oid1               # changed → a fresh blob OID
+
+    assert scan is not None
+    assert _handle(scan.image).bytes() == bigger
     store.close()
 
 
-def test_unmarking_a_blob_field_errors_clearly(store_factory):
-    # store a blob, then re-declare the field as plain `bytes` (drop dc.Blob):
-    # the old descriptor record hydrates to a handle the inline encoder can't
-    # write — fail loudly with the remedy, never a cryptic msgpack error.
+def test_upsert_with_a_changed_blob_mints_a_fresh_blob_oid(store_factory: StoreFactory) -> None:
+    """Given a stored scan S1 whose image has a blob oid
+    When S1 is upserted with a longer image
+    Then the image has a different blob oid
+    """
+    store = store_factory()
+    store.root = []
+    store.upsert(Scan(qid="S1", label="v1", image=IMG))
+    store.commit()
+    first = store.get(Scan, qid="S1")
+    assert first is not None
+    oid1 = _handle(first.image).blob_oid
+    del first  # let the live entity go, so the next get rehydrates from the store
+    store.upsert(Scan(qid="S1", label="v1", image=IMG + b"!"))
+    store.commit()
+
+    scan = store.get(Scan, qid="S1")
+
+    assert scan is not None
+    assert _handle(scan.image).blob_oid != oid1
+    store.close()
+
+
+def test_unmarking_a_blob_field_errors_clearly(store_factory: StoreFactory) -> None:
+    """Given a stored scan whose image was a dc.Blob, now redeclared as plain bytes
+    When the reopened scan is marked dirty and committed
+    Then TypeError says the field is an un-marked dc.Blob
+    """
     blobbed = _evolve_scan(Annotated[bytes, dc.Blob])
     store = store_factory()
     store.root = [blobbed(qid="Q1", image=b"x" * 100)]
     store.commit()
     store.close()
-
-    _evolve_scan(bytes)  # same typename, field now plain bytes
+    plain = _evolve_scan(bytes)
     reopened = store_factory()
-    scan = reopened.get(_evolve_scan(bytes), qid="Q1")
+    scan = reopened.get(plain, qid="Q1")
+    assert scan is not None
     reopened.mark_dirty(scan)
-    with pytest.raises(TypeError, match="un-marked dc.Blob"):
+
+    with pytest.raises(TypeError, match=r"un-marked dc\.Blob"):
         reopened.commit()
     reopened.close()
