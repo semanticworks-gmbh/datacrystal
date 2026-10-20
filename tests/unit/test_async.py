@@ -85,6 +85,7 @@ class _ParkedCommit(NamedTuple):
 
 @pytest.fixture
 def runner() -> Iterator[asyncio.Runner]:
+    """Give the test its own event loop, closed afterwards."""
     with asyncio.Runner() as runner:
         yield runner
 
@@ -153,6 +154,7 @@ def parked_commit(runner: asyncio.Runner) -> Iterator[_ParkedCommit]:
 
 @pytest.fixture
 def async_dir_store(runner: asyncio.Runner, tmp_path: Path) -> dc.AsyncStore:
+    """Open an async store on a real directory with trigonal quartz stored, not committed."""
     astore = runner.run(dc.aopen(tmp_path / "s", lock_ttl=0.5))
     astore.store(Mineral(qid="Q43010", name="quartz", crystal_system="trigonal"))
     return astore

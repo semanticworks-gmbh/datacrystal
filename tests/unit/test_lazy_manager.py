@@ -51,6 +51,7 @@ def _seeded_backend() -> MemoryBackend:
 
 @pytest.fixture
 def clock() -> _Clock:
+    """Provide a manual clock starting at t=0."""
     return _Clock()
 
 
@@ -184,6 +185,7 @@ def test_demotion_records_the_owner_thread(
 
 @pytest.fixture
 def runner() -> Iterator[asyncio.Runner]:
+    """Give the test its own event loop, closed afterwards."""
     with asyncio.Runner() as runner:
         yield runner
 
