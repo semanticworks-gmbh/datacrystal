@@ -19,10 +19,10 @@ from __future__ import annotations
 
 import hashlib
 import sqlite3
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, cast
 
 import pytest
 
@@ -32,6 +32,7 @@ from datacrystal._entity import type_info
 from datacrystal._records import BlobToken
 from datacrystal._storage.memory import MemoryBackend
 from datacrystal._storage.protocol import StoredBlob
+from datacrystal._storage.sqlite import SqliteBackend
 
 StoreFactory = Callable[[], dc.Store]
 
@@ -46,6 +47,7 @@ class Scan:
     thumb: Annotated[bytes | None, dc.Blob] = None
 
 
+F = dc.fields(Scan)
 IMG = b"\x89PNG\r\n\x1a\n" + b"pixels" * 4096  # ~24 KB, not trivially small
 BIG = b"M" * (1024 * 1024)  # 1 MB, the "stays tiny" probe
 
@@ -81,7 +83,7 @@ class _SpyCabinet:
 
 def _handle(blob_field: object) -> dc.BlobHandle:
     """Return a blob field as the handle a stored scan hydrates to (the field is typed bytes)."""
-    return blob_field  # pyrefly: ignore[bad-return]
+    return cast("dc.BlobHandle", blob_field)
 
 
 @pytest.fixture
@@ -262,7 +264,7 @@ def test_filtered_query_does_not_read_blobs(
     """
     store, backend = two_scans_on_a_spy_backend
 
-    azurite = store.query(Scan.label == "azurite")  # pyrefly: ignore[bad-argument-type]
+    azurite = store.query(F.label == "azurite")
 
     assert len(azurite) == 1
     assert backend.load_blob_calls == 0
@@ -313,7 +315,7 @@ def test_bytes_load_only_when_explicitly_asked_for(
     Then the blobs table was read exactly once
     """
     store, backend = two_scans_on_a_spy_backend
-    azurite = store.query(Scan.label == "azurite")[0]  # pyrefly: ignore[bad-argument-type]
+    azurite = store.query(F.label == "azurite")[0]
 
     _handle(azurite.image).bytes()
 
@@ -549,42 +551,52 @@ class _FlakyConn:
         return getattr(self._conn, name)
 
 
-def test_sqlite_failed_txn_rolls_back_the_record(tmp_path: Path) -> None:
+@pytest.fixture
+def sqlite_store_failing_at_the_meta_insert(
+    tmp_path: Path,
+) -> Iterator[tuple[dc.Store, sqlite3.Connection]]:
+    """Yield a sqlite store whose apply() fails at the meta INSERT, and its real connection."""
+    store = dc.Store.open(tmp_path / "store", lock_ttl=0.5)
+    backend = cast("SqliteBackend", store._backend)
+    real_conn = backend._conn
+    backend._conn = cast("sqlite3.Connection", _FlakyConn(real_conn))
+    yield store, real_conn
+    backend._conn = real_conn
+    store.close()
+
+
+def test_sqlite_failed_txn_rolls_back_the_record(
+    sqlite_store_failing_at_the_meta_insert: tuple[dc.Store, sqlite3.Connection],
+) -> None:
     """Given a sqlite store whose connection fails at the meta INSERT inside apply()
     When a scan with an image blob fails to commit
     Then the objects table is empty
     """
-    store = dc.Store.open(tmp_path / "store", lock_ttl=0.5)
-    real_conn = store._backend._conn  # pyrefly: ignore[missing-attribute]
-    store._backend._conn = _FlakyConn(real_conn)  # pyrefly: ignore[missing-attribute]
+    store, real_conn = sqlite_store_failing_at_the_meta_insert
     store.root = [Scan(qid="Q1", label="azurite", image=IMG)]
     with pytest.raises(RuntimeError, match="injected mid-txn failure"):
         store.commit()
-    store._backend._conn = real_conn  # pyrefly: ignore[missing-attribute]
 
     (objects,) = real_conn.execute("SELECT count(*) FROM objects").fetchone()
 
     assert objects == 0
-    store.close()
 
 
-def test_sqlite_failed_txn_rolls_back_the_blob(tmp_path: Path) -> None:
+def test_sqlite_failed_txn_rolls_back_the_blob(
+    sqlite_store_failing_at_the_meta_insert: tuple[dc.Store, sqlite3.Connection],
+) -> None:
     """Given a sqlite store whose connection fails at the meta INSERT inside apply()
     When a scan with an image blob fails to commit
     Then the blobs table is empty
     """
-    store = dc.Store.open(tmp_path / "store", lock_ttl=0.5)
-    real_conn = store._backend._conn  # pyrefly: ignore[missing-attribute]
-    store._backend._conn = _FlakyConn(real_conn)  # pyrefly: ignore[missing-attribute]
+    store, real_conn = sqlite_store_failing_at_the_meta_insert
     store.root = [Scan(qid="Q1", label="azurite", image=IMG)]
     with pytest.raises(RuntimeError, match="injected mid-txn failure"):
         store.commit()
-    store._backend._conn = real_conn  # pyrefly: ignore[missing-attribute]
 
     (blobs,) = real_conn.execute("SELECT count(*) FROM blobs").fetchone()
 
     assert blobs == 0
-    store.close()
 
 
 # -- schema evolution: inline bytes -> dc.Blob -------------------------------
