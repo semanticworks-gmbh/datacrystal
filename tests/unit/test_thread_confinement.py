@@ -2,57 +2,88 @@
 
 from __future__ import annotations
 
-import threading
+from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
 import datacrystal as dc
 from tests.conftest import Mineral
 
-
-def _run_in_thread(fn):
-    result: list = []
-
-    def target():
-        try:
-            result.append(("ok", fn()))
-        except Exception as exc:  # noqa: BLE001
-            result.append(("err", exc))
-
-    t = threading.Thread(target=target)
-    t.start()
-    t.join()
-    return result[0]
+StoreFactory = Callable[[], dc.Store]
 
 
-def test_foreign_thread_store_access_raises(store):
-    kind, value = _run_in_thread(lambda: store.root)
-    assert kind == "err" and isinstance(value, dc.WrongThreadError)
-    assert "snapshot" in str(value)  # the message carries the escape recipe
+@pytest.fixture
+def foreign_thread() -> Iterator[ThreadPoolExecutor]:
+    """Yield an executor whose one thread is never the store's owner."""
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        yield pool
 
 
-def test_foreign_thread_query_raises(store):
+def test_foreign_thread_store_access_raises_wrong_thread(
+    store: dc.Store, foreign_thread: ThreadPoolExecutor
+) -> None:
+    """Given a store owned by the test thread
+    When another thread reads its root
+    Then the read raises WrongThreadError
+    And the message carries the snapshot recipe
+    """
+    read_root = foreign_thread.submit(getattr, store, "root")
+    with pytest.raises(dc.WrongThreadError, match="snapshot"):
+        read_root.result()
+
+
+def test_foreign_thread_query_raises_wrong_thread(
+    store: dc.Store, foreign_thread: ThreadPoolExecutor
+) -> None:
+    """Given a store holding a committed cubic mineral
+    When another thread queries it
+    Then the query raises WrongThreadError
+    """
     store.root = [Mineral(qid="Q1", name="quartz", crystal_system="cubic")]
     store.commit()
-    kind, value = _run_in_thread(lambda: store.query(Mineral.crystal_system == "cubic"))
-    assert kind == "err" and isinstance(value, dc.WrongThreadError)
+    query = foreign_thread.submit(store.query, Mineral)
+    with pytest.raises(dc.WrongThreadError):
+        query.result()
 
 
-def test_foreign_thread_write_raises_before_mutating(store):
-    store.root = [Mineral(qid="Q1", name="quartz")]
+def test_foreign_thread_write_raises_before_mutating(
+    store: dc.Store, foreign_thread: ThreadPoolExecutor
+) -> None:
+    """Given a committed quartz named "quartz"
+    When another thread renames it
+    Then the rename raises WrongThreadError
+    And the quartz is still named "quartz"
+    """
+    quartz = Mineral(qid="Q1", name="quartz")
+    store.root = [quartz]
     store.commit()
-    quartz = store.get(Mineral, qid="Q1")
-
-    def mutate():
-        quartz.name = "changed"
-
-    kind, value = _run_in_thread(mutate)
-    assert kind == "err" and isinstance(value, dc.WrongThreadError)
-    assert quartz.name == "quartz"  # the guard fired BEFORE the write landed
-    assert store.commit() is None  # and nothing was buffered
+    rename = foreign_thread.submit(setattr, quartz, "name", "changed")
+    with pytest.raises(dc.WrongThreadError):
+        rename.result()
+    assert quartz.name == "quartz"
 
 
-def test_closed_store_raises(store_factory):
+def test_foreign_thread_write_buffers_nothing(
+    store: dc.Store, foreign_thread: ThreadPoolExecutor
+) -> None:
+    """Given a committed quartz and a rename refused on another thread
+    When the owner commits
+    Then there is nothing to commit
+    """
+    quartz = Mineral(qid="Q1", name="quartz")
+    store.root = [quartz]
+    store.commit()
+    foreign_thread.submit(setattr, quartz, "name", "changed").exception()
+    committed = store.commit()
+    assert committed is None
+
+
+def test_closed_store_raises_store_closed(store_factory: StoreFactory) -> None:
+    """Given a store that has been closed
+    When its root is read
+    Then the read raises StoreClosedError
+    """
     store = store_factory()
     store.close()
     with pytest.raises(dc.StoreClosedError):
