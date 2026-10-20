@@ -58,6 +58,7 @@ the other instance's fresh segments as crash debris).
 from __future__ import annotations
 
 import datetime as _dt
+import decimal as _decimal
 import hashlib
 import json
 import os
@@ -74,6 +75,7 @@ from datacrystal._permissions import PERM_FIELDS, is_root
 from datacrystal._records import (
     DATE_EXT_CODE,
     NAIVE_DATETIME_EXT_CODE,
+    decimal_ext,
     REF_EXT_CODE,
     TIME_EXT_CODE,
     _ext_hook,  # pyright: ignore[reportPrivateUsage]  # codec primitive, parquet mirror
@@ -162,6 +164,8 @@ def _tag_of(value: Any) -> str:
     if isinstance(value, _dt.time):
         # ISO offset times survive the codec but have no arrow type — fallback
         return "time" if value.tzinfo is None else "fallback"
+    if isinstance(value, _decimal.Decimal):
+        return _decimal_tag(value)
     if isinstance(value, (list, tuple)):
         inner = "null"
         for item in cast("tuple[object, ...] | list[object]", value):
@@ -170,9 +174,47 @@ def _tag_of(value: Any) -> str:
     return "fallback"  # dicts/mappings and anything exotic
 
 
+_DECIMAL_PREFIX = "decimal:"
+_DECIMAL_MAX_PRECISION = 38  # Arrow decimal128
+
+
+def _decimal_tag(value: _decimal.Decimal) -> str:
+    """``decimal:<precision>:<scale>`` fitting ``value`` exactly; a NaN/Infinity
+    or a value beyond Arrow decimal128's 38 digits takes the exact-text fallback.
+    """
+    if not value.is_finite():
+        return "fallback"
+    _sign, digits, exponent = value.as_tuple()
+    assert isinstance(exponent, int)
+    scale = max(-exponent, 0)
+    integer_digits = max(len(digits) + exponent, 1)
+    if integer_digits + scale > _DECIMAL_MAX_PRECISION:
+        return "fallback"
+    return f"{_DECIMAL_PREFIX}{integer_digits + scale}:{scale}"
+
+
+def _decimal_parts(tag: str) -> tuple[int, int]:
+    precision, scale = tag[len(_DECIMAL_PREFIX):].split(":")
+    return int(precision), int(scale)
+
+
+def _unify_decimal_tags(a: str, b: str) -> str:
+    """The narrowest decimal wide enough for both: the larger integer part plus
+    the larger scale, or the fallback when that exceeds 38 digits.
+    """
+    (pa_, sa), (pb, sb) = _decimal_parts(a), _decimal_parts(b)
+    scale = max(sa, sb)
+    precision = max(pa_ - sa, pb - sb) + scale
+    if precision > _DECIMAL_MAX_PRECISION:
+        return "fallback"
+    return f"{_DECIMAL_PREFIX}{precision}:{scale}"
+
+
 def _unify_tags(a: str, b: str) -> str:
     if a == b:
         return a
+    if a.startswith(_DECIMAL_PREFIX) and b.startswith(_DECIMAL_PREFIX):
+        return _unify_decimal_tags(a, b)
     if a == "null":
         return b
     if b == "null":
@@ -186,6 +228,9 @@ def _unify_tags(a: str, b: str) -> str:
 
 
 def _arrow_type(tag: str) -> pa.DataType:
+    if tag.startswith(_DECIMAL_PREFIX):
+        precision, scale = _decimal_parts(tag)
+        return pa.decimal128(precision, scale)
     if tag.startswith("list<"):
         return pa.list_(_arrow_type(tag[5:-1]))
     return {
@@ -269,6 +314,8 @@ def _reswizzle(value: Any) -> Any:
         return msgspec.msgpack.Ext(DATE_EXT_CODE, value.isoformat().encode())
     if isinstance(value, _dt.time):
         return msgspec.msgpack.Ext(TIME_EXT_CODE, value.isoformat().encode())
+    if isinstance(value, _decimal.Decimal):
+        return decimal_ext(value)
     if isinstance(value, (list, tuple)):
         return [_reswizzle(item) for item in cast("tuple[object, ...] | list[object]", value)]
     if isinstance(value, Mapping):
