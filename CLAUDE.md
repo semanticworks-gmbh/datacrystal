@@ -1,6 +1,6 @@
 @AGENTS.md
 
-Version `0.9.0` (single-sourced from `pyproject.toml`; `release.yml` bumps every mirror — never by
+Version `0.10.0` (single-sourced from `pyproject.toml`; `release.yml` bumps every mirror — never by
 hand). The engineering guide above is vendor-neutral and lives in `AGENTS.md`; the notes below are
 Claude Code idiom that other agents don't share.
 
