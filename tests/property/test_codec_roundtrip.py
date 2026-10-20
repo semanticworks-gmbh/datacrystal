@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from hypothesis import given
 from hypothesis import strategies as st
 
@@ -16,20 +18,27 @@ scalars = st.one_of(
     st.binary(max_size=50),
 )
 
-values = st.recursive(
-    scalars,
-    lambda children: st.one_of(
+
+def _containers_of(children: st.SearchStrategy[Any]) -> st.SearchStrategy[Any]:
+    return st.one_of(
         st.lists(children, max_size=5),
         st.dictionaries(st.text(max_size=10), children, max_size=5),
-    ),
-    max_leaves=20,
-)
+    )
 
 
-def _no_refs(obj):
+values = st.recursive(scalars, _containers_of, max_leaves=20)
+
+
+def _refuse_refs(entity: object) -> int:
     raise AssertionError("scalar trees must not hit the ref path")
 
 
 @given(st.lists(values, max_size=5))
-def test_roundtrip(payload_values):
-    assert decode_payload(encode_payload(payload_values, _no_refs)) == payload_values
+def test_scalar_trees_survive_an_encode_decode_roundtrip(payload_values: list[Any]) -> None:
+    """Given any list of scalar and container trees
+    When it is encoded to a record payload and decoded again
+    Then the decoded list equals the original
+    """
+    decoded = decode_payload(encode_payload(payload_values, _refuse_refs))
+
+    assert decoded == payload_values
