@@ -17,6 +17,8 @@ sqlite-only by design: the memory backend has no SQL transaction to roll back.
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated
 
@@ -32,35 +34,66 @@ from datacrystal._storage.sqlite import SqliteBackend
 
 @dc.entity
 class Mineral:
+    """A mineral with an optional out-of-line photo."""
+
     qid: Annotated[str, dc.Unique]
     name: str
     photo: Annotated[bytes | None, dc.Blob] = None
 
 
-def _row_counts(db: Path) -> tuple[int, int, int]:
-    """(objects, blobs, watermark) read straight from the file, bypassing
-    the engine — the on-disk truth after a reopen."""
+PHOTO = b"\x89PNG fake bytes"
+
+
+@dataclass
+class InTxnRows:
+    """How many rows the faulted apply saw live inside its transaction, before the fault."""
+
+    objects_added: int = 0
+    blobs_added: int = 0
+
+
+@dataclass
+class StagedBatch:
+    """A store with two new minerals staged and ``apply`` faulted before ``COMMIT``."""
+
+    db: Path
+    store: dc.Store
+    azurite: Mineral
+    beryl: Mineral
+    seen: InTxnRows
+
+
+def _count_rows(db: Path, table: str) -> int:
+    """Count a table's rows straight from the file, bypassing the engine."""
     conn = sqlite3.connect(db)
     try:
-        objects = conn.execute("SELECT COUNT(*) FROM objects").fetchone()[0]
-        blobs = conn.execute("SELECT COUNT(*) FROM blobs").fetchone()[0]
-        row = conn.execute(
-            "SELECT value FROM meta WHERE key='next_tid'"
-        ).fetchone()
-        next_tid = int(row[0]) if row is not None else TID_BASE
+        return conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
     finally:
         conn.close()
-    return objects, blobs, next_tid - 1  # watermark = next_tid - 1
 
 
-def _fault_apply_after_inserts(backend: SqliteBackend):
-    """Patch ``apply`` to run the real ``objects``/``blobs`` INSERTs inside the
-    ``BEGIN IMMEDIATE`` txn, then raise *before* ``COMMIT`` (at the deletes/meta
-    step). Mirrors the production statements so the fault exercises a genuinely
-    half-written batch; the ``except: ROLLBACK; raise`` is the production one."""
+def _watermark(db: Path) -> int:
+    """Read the committed watermark (next_tid - 1) straight from the file."""
+    conn = sqlite3.connect(db)
+    try:
+        row = conn.execute("SELECT value FROM meta WHERE key='next_tid'").fetchone()
+    finally:
+        conn.close()
+    next_tid = int(row[0]) if row is not None else TID_BASE
+    return next_tid - 1
+
+
+def _fault_apply_after_inserts(backend: SqliteBackend, seen: InTxnRows) -> None:
+    """Patch ``apply`` to run the real INSERTs inside ``BEGIN IMMEDIATE``, then raise.
+
+    The fault comes before ``COMMIT`` (at the deletes/meta step). It mirrors the production
+    statements so the fault exercises a genuinely half-written batch; the
+    ``except: ROLLBACK; raise`` is the production one. What it saw inside the transaction goes
+    to ``seen``.
+    """
 
     def faulting_apply(batch: CommitBatch) -> None:
-        conn = backend._conn  # pyright: ignore[reportPrivateUsage]
+        conn = backend._conn
         conn.execute("BEGIN IMMEDIATE")
         try:
             objects_before = conn.execute("SELECT COUNT(*) FROM objects").fetchone()[0]
@@ -68,34 +101,23 @@ def _fault_apply_after_inserts(backend: SqliteBackend):
             if batch.new_types:
                 conn.executemany(
                     "INSERT INTO types (cid, name, fields) VALUES (?, ?, ?)",
-                    [
-                        (cid, name, "\x1f".join(fields))
-                        for cid, name, fields in batch.new_types
-                    ],
+                    [(cid, name, "\x1f".join(fields)) for cid, name, fields in batch.new_types],
                 )
             conn.executemany(
                 "INSERT OR REPLACE INTO objects (oid, cid, tid, payload, crc) "
                 "VALUES (?, ?, ?, ?, ?)",
                 [(r.oid, r.cid, r.tid, r.payload, _crc(r.payload)) for r in batch.records],
             )
-            assert batch.blobs, "the staged batch must carry an out-of-line blob"
             conn.executemany(
                 "INSERT OR REPLACE INTO blobs (oid, tid, size, hash, crc, data) "
                 "VALUES (?, ?, ?, ?, ?, ?)",
-                [
-                    (b.oid, b.tid, b.size, b.hash, _crc(b.data), b.data)
-                    for b in batch.blobs
-                ],
+                [(b.oid, b.tid, b.size, b.hash, _crc(b.data), b.data) for b in batch.blobs],
             )
-            # The rows are now live *inside* the txn — prove SQLite holds both
-            # the records and the blob before we tear the batch in half.
-            assert (
-                conn.execute("SELECT COUNT(*) FROM objects").fetchone()[0]
-                == objects_before + len(batch.records)
+            seen.objects_added = (
+                conn.execute("SELECT COUNT(*) FROM objects").fetchone()[0] - objects_before
             )
-            assert (
-                conn.execute("SELECT COUNT(*) FROM blobs").fetchone()[0]
-                == blobs_before + len(batch.blobs)
+            seen.blobs_added = (
+                conn.execute("SELECT COUNT(*) FROM blobs").fetchone()[0] - blobs_before
             )
             # Fault at the deletes/meta step, before COMMIT: a torn batch.
             raise OSError("injected fault mid-apply (after inserts, before COMMIT)")
@@ -103,66 +125,222 @@ def _fault_apply_after_inserts(backend: SqliteBackend):
             conn.execute("ROLLBACK")
             raise
 
-    backend.apply = faulting_apply  # type: ignore[method-assign]
+    backend.apply = faulting_apply
 
 
-def test_sql_rollback_undoes_a_torn_batch_and_keeps_the_tid_gapless(tmp_path):
+@pytest.fixture
+def baseline_db(tmp_path: Path) -> Path:
+    """Return a database file holding one committed mineral at the first TID.
+
+    The baseline commit gives the rolled-back batch a real predecessor watermark to fall back
+    to, not just the empty store.
+    """
     db = tmp_path / "data.sqlite"
-
-    # A baseline commit so the rolled-back batch has a real predecessor
-    # watermark to fall back to (not just the empty store).
-    backend = SqliteBackend(db, durability="commit")
-    store = dc.Store._from_backend(backend)
+    store = dc.Store._from_backend(SqliteBackend(db, durability="commit"))
     store.store(Mineral(qid="Q1", name="quartz"))
-    baseline_tid = store.commit()
-    assert baseline_tid == TID_BASE
+    store.commit()
     store.close()
+    return db
 
-    base_objects, base_blobs, base_watermark = _row_counts(db)
-    assert base_objects == 1 and base_blobs == 0
-    assert base_watermark == baseline_tid
 
-    # Reopen; stage a multi-statement batch (two records + a blob), then fault
-    # apply after the inserts but before COMMIT.
-    backend = SqliteBackend(db, durability="commit")
+@pytest.fixture
+def staged_batch(baseline_db: Path) -> Iterator[StagedBatch]:
+    """Yield a reopened store with two minerals (one with a photo) staged and apply faulted."""
+    backend = SqliteBackend(baseline_db, durability="commit")
     store = dc.Store._from_backend(backend)
-    azurite = Mineral(qid="Q2", name="azurite", photo=b"\x89PNG fake bytes")
+    azurite = Mineral(qid="Q2", name="azurite", photo=PHOTO)
     beryl = Mineral(qid="Q3", name="beryl")
     store.store(azurite)
     store.store(beryl)
-    _fault_apply_after_inserts(backend)
+    seen = InTxnRows()
+    _fault_apply_after_inserts(backend, seen)
+    yield StagedBatch(baseline_db, store, azurite, beryl, seen)
+    store.close()
+
+
+@pytest.fixture
+def rolled_back_db(staged_batch: StagedBatch) -> Path:
+    """Return the database file after the staged batch faulted and the store closed."""
     with pytest.raises(OSError, match="injected fault mid-apply"):
-        store.commit()
+        staged_batch.store.commit()
+    staged_batch.store.close()
+    return staged_batch.db
 
-    # Engine compensation (mirrors test_three_phase): never durable, so the
-    # captured NEW entities are re-buffered and the TID was *not* consumed.
-    assert object.__getattribute__(azurite, "__dc_state__") == STATE_NEW
-    assert object.__getattribute__(beryl, "__dc_state__") == STATE_NEW
-    assert store.last_tid == baseline_tid
+
+@pytest.fixture
+def reopened_store(rolled_back_db: Path) -> Iterator[dc.Store]:
+    """Yield a fresh store over the database whose torn batch was rolled back."""
+    store = dc.Store._from_backend(SqliteBackend(rolled_back_db, durability="commit"))
+    yield store
     store.close()
 
-    # SQL-layer truth, read straight from the file: the torn batch left NO
-    # rows behind and the watermark is still the pre-batch one — SQLite rolled
-    # the half-written txn back, not the engine.
-    objects_now, blobs_now, watermark_now = _row_counts(db)
-    assert objects_now == base_objects  # the two staged records did not land
-    assert blobs_now == base_blobs  # nor the staged blob
-    assert watermark_now == base_watermark
 
-    # Gapless: a fresh open commits the same batch successfully and reuses the
-    # burned TID (invariant 5 — replay determinism is a public contract).
-    backend = SqliteBackend(db, durability="commit")
-    store = dc.Store._from_backend(backend)
-    assert store.get(Mineral, qid="Q2") is None  # confirms the rollback via the engine
-    assert store.get(Mineral, qid="Q3") is None
-    store.store(Mineral(qid="Q2", name="azurite", photo=b"\x89PNG fake bytes"))
-    store.store(Mineral(qid="Q3", name="beryl"))
-    retry_tid = store.commit()
-    assert retry_tid == baseline_tid + 1  # the very TID the torn batch burned
+# --- the torn commit, seen through the engine ---------------------------------
 
-    survivor = store.get(Mineral, qid="Q2")
-    assert survivor is not None and survivor.name == "azurite"
-    handle = store.get(Mineral, qid="Q2").photo  # type: ignore[union-attr]
-    assert handle is not None and handle.bytes() == b"\x89PNG fake bytes"
-    assert store.get(Mineral, qid="Q3") is not None
-    store.close()
+
+def test_baseline_commit_takes_the_first_tid(baseline_db: Path) -> None:
+    """Given a store with one mineral committed
+    When the file is read back
+    Then its watermark is the first TID
+    """
+    assert _watermark(baseline_db) == TID_BASE
+
+
+def test_faulted_apply_had_both_records_live_inside_its_transaction(
+    staged_batch: StagedBatch,
+) -> None:
+    """Given two staged minerals and an apply faulted after its inserts
+    When the store commits
+    Then SQLite held both records inside the transaction before the fault
+    """
+    with pytest.raises(OSError, match="injected fault mid-apply"):
+        staged_batch.store.commit()
+
+    assert staged_batch.seen.objects_added == 2
+
+
+def test_faulted_apply_had_the_blob_live_inside_its_transaction(
+    staged_batch: StagedBatch,
+) -> None:
+    """Given two staged minerals, one with a photo, and an apply faulted after its inserts
+    When the store commits
+    Then SQLite held the blob inside the transaction before the fault
+    """
+    with pytest.raises(OSError, match="injected fault mid-apply"):
+        staged_batch.store.commit()
+
+    assert staged_batch.seen.blobs_added == 1
+
+
+def test_failed_commit_rebuffers_the_azurite_as_new(staged_batch: StagedBatch) -> None:
+    """Given two staged minerals and an apply faulted before COMMIT
+    When the store commits
+    Then the azurite is NEW again, as it never became durable
+    """
+    with pytest.raises(OSError, match="injected fault mid-apply"):
+        staged_batch.store.commit()
+
+    assert object.__getattribute__(staged_batch.azurite, "__dc_state__") == STATE_NEW
+
+
+def test_failed_commit_rebuffers_the_beryl_as_new(staged_batch: StagedBatch) -> None:
+    """Given two staged minerals and an apply faulted before COMMIT
+    When the store commits
+    Then the beryl is NEW again, as it never became durable
+    """
+    with pytest.raises(OSError, match="injected fault mid-apply"):
+        staged_batch.store.commit()
+
+    assert object.__getattribute__(staged_batch.beryl, "__dc_state__") == STATE_NEW
+
+
+def test_failed_commit_does_not_consume_the_tid(staged_batch: StagedBatch) -> None:
+    """Given two staged minerals and an apply faulted before COMMIT
+    When the store commits
+    Then the store's last TID is still the baseline one
+    """
+    with pytest.raises(OSError, match="injected fault mid-apply"):
+        staged_batch.store.commit()
+
+    assert staged_batch.store.last_tid == TID_BASE
+
+
+# --- the SQL-layer truth, read straight from the file --------------------------
+
+
+def test_rollback_leaves_no_staged_record_in_the_file(rolled_back_db: Path) -> None:
+    """Given a batch of two records and a blob torn before COMMIT
+    When the file is read back after the store closed
+    Then only the baseline record is there, as SQLite rolled the staged ones back
+    """
+    assert _count_rows(rolled_back_db, "objects") == 1
+
+
+def test_rollback_leaves_no_staged_blob_in_the_file(rolled_back_db: Path) -> None:
+    """Given a batch of two records and a blob torn before COMMIT
+    When the file is read back after the store closed
+    Then no blob is there
+    """
+    assert _count_rows(rolled_back_db, "blobs") == 0
+
+
+def test_rollback_keeps_the_pre_batch_watermark_in_the_file(rolled_back_db: Path) -> None:
+    """Given a batch of two records and a blob torn before COMMIT
+    When the file is read back after the store closed
+    Then the watermark is still the baseline one
+    """
+    assert _watermark(rolled_back_db) == TID_BASE
+
+
+# --- gapless: a fresh open commits the same batch and reuses the burned TID ----
+
+
+@pytest.mark.parametrize("qid", ["Q2", "Q3"])
+def test_rolled_back_mineral_is_absent_through_the_engine(
+    reopened_store: dc.Store, qid: str
+) -> None:
+    """Given a database whose torn batch of Q2 and Q3 was rolled back
+    When a fresh store looks a staged mineral up by its qid
+    Then there is none
+    """
+    found = reopened_store.get(Mineral, qid=qid)
+
+    assert found is None
+
+
+def test_retry_reuses_the_tid_the_torn_batch_burned(reopened_store: dc.Store) -> None:
+    """Given a database whose torn batch was rolled back
+    When a fresh store stores the same two minerals and commits
+    Then the commit takes the TID right after the baseline one (invariant 5)
+    """
+    reopened_store.store(Mineral(qid="Q2", name="azurite", photo=PHOTO))
+    reopened_store.store(Mineral(qid="Q3", name="beryl"))
+
+    retry_tid = reopened_store.commit()
+
+    assert retry_tid == TID_BASE + 1
+
+
+def test_retried_batch_keeps_the_azurite(reopened_store: dc.Store) -> None:
+    """Given a database whose torn batch was rolled back
+    When a fresh store stores the same two minerals and commits
+    Then the azurite can be fetched by its qid
+    """
+    reopened_store.store(Mineral(qid="Q2", name="azurite", photo=PHOTO))
+    reopened_store.store(Mineral(qid="Q3", name="beryl"))
+    reopened_store.commit()
+
+    survivor = reopened_store.get(Mineral, qid="Q2")
+
+    assert survivor is not None
+    assert survivor.name == "azurite"
+
+
+def test_retried_batch_keeps_the_azurite_photo_bytes(reopened_store: dc.Store) -> None:
+    """Given a database whose torn batch was rolled back
+    When a fresh store stores the same two minerals and commits
+    Then the azurite's photo reads back byte for byte
+    """
+    reopened_store.store(Mineral(qid="Q2", name="azurite", photo=PHOTO))
+    reopened_store.store(Mineral(qid="Q3", name="beryl"))
+    reopened_store.commit()
+
+    survivor = reopened_store.get(Mineral, qid="Q2")
+
+    assert survivor is not None
+    assert survivor.photo is not None
+    assert survivor.photo.bytes() == PHOTO
+
+
+def test_retried_batch_keeps_the_beryl(reopened_store: dc.Store) -> None:
+    """Given a database whose torn batch was rolled back
+    When a fresh store stores the same two minerals and commits
+    Then the beryl can be fetched by its qid
+    """
+    reopened_store.store(Mineral(qid="Q2", name="azurite", photo=PHOTO))
+    reopened_store.store(Mineral(qid="Q3", name="beryl"))
+    reopened_store.commit()
+
+    survivor = reopened_store.get(Mineral, qid="Q3")
+
+    assert survivor is not None
