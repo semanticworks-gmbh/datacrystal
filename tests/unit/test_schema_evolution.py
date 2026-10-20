@@ -14,6 +14,7 @@ Dynamic class fabrication is untypeable, so the fabricated classes are `type[Any
 from __future__ import annotations
 
 import dataclasses
+import operator
 import sqlite3
 from collections.abc import Callable, Iterable
 from pathlib import Path
@@ -295,7 +296,7 @@ def test_added_index_field_matches_every_old_record_on_none(store_factory: Store
     v2 = _add_crystal_system_index()
     reopened = store_factory()
 
-    hits = reopened.query(v2.crystal_system == None)
+    hits = reopened.query(operator.eq(v2.crystal_system, None))
 
     assert len(hits) == 2
     reopened.close()
@@ -337,7 +338,7 @@ def test_added_index_field_still_matches_the_unassigned_on_none(
     reopened.close()
     third = store_factory()
 
-    hits = third.query(v2.crystal_system == None)
+    hits = third.query(operator.eq(v2.crystal_system, None))
 
     assert len(hits) == 1
     third.close()
