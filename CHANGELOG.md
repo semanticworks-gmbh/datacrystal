@@ -10,6 +10,10 @@ purely **additive** surface — the v0.1.0 freeze is never broken. PyPI publicat
 
 ## [Unreleased]
 
+_No unreleased changes yet._
+
+## [0.10.0] — 2026-10-20
+
 ### Added
 
 - **`decimal.Decimal` fields** (#184): persisted as their exact text (a new record extension code,
