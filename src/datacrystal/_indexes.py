@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import dataclasses
 import datetime as _dt
+import decimal as _decimal
 from bisect import bisect_left, bisect_right, insort
 from typing import Any, Callable, Iterable, Iterator, cast
 
@@ -612,6 +613,11 @@ class IndexManager:
             ci = self._by_cls.get(ti.cls)  # only an already-built index — never build
             for field in sorted_fields:
                 value = values.get(field)
+                if isinstance(value, _decimal.Decimal) and value.is_nan():
+                    raise ValueError(
+                        f"{ti.cls.__name__}.{field} is a SortedIndex field and cannot "
+                        "hold Decimal NaN: NaN is not orderable (use None for 'no value')"
+                    )
                 if not isinstance(value, _dt.datetime):
                     continue
                 key = (ti.cls, field)
