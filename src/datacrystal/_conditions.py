@@ -93,6 +93,26 @@ def _flatten(kind: type, cond: Condition) -> tuple[Condition, ...]:
     return (cond,)
 
 
+def _refuse_float_against_decimal(cls: type, field: str, value: object) -> None:
+    """A ``float`` literal against a ``Decimal`` field is a TypeError (#184):
+    ``Decimal`` against ``float`` compares the float's binary expansion, so
+    ``== 0.1`` is False and a range edge lands on the wrong side; ``Decimal`` and
+    ``int`` literals are exact.
+    """
+    literals = cast("tuple[object, ...]", value) if isinstance(value, tuple) else (value,)
+    if not any(isinstance(v, float) for v in literals):
+        return
+    from datacrystal._entity import type_info  # lazy: _entity imports us
+
+    spec = type_info(cls).spec(field)
+    if spec is not None and spec.decimal:
+        raise TypeError(
+            f"{cls.__name__}.{field} is a Decimal field; compare it with a Decimal "
+            "or int, not a float (a float literal is inexact: "
+            "Decimal('0.1') != 0.1)"
+        )
+
+
 class Pred(Condition):
     """A leaf predicate: ``field <op> value``."""
 
@@ -103,6 +123,7 @@ class Pred(Condition):
 
     def __init__(self, cls: type, field: str, op: str, value: Any) -> None:
         assert op in self._OPS
+        _refuse_float_against_decimal(cls, field, value)
         self.cls = cls
         self.field = field
         self.op = op

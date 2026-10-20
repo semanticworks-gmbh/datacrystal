@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import dataclasses
 import datetime as _dt
+import decimal as _decimal
 import types
 import weakref
 from typing import (
@@ -185,7 +186,9 @@ class Glue(_Marker):
 # — aware datetimes ride msgspec's timestamp ext as a UTC instant, naive ones
 # an ISO-text ext). The aware-vs-naive comparability fork is handled in the
 # sorted run (_indexes.py), not here at the type gate.
-_INDEXABLE_TYPES = (str, int, float, bool, _dt.datetime, _dt.date)
+# Decimal joins them (#184): exact, total-ordered against Decimal and int, and
+# round-tripped as its exact text by DECIMAL_EXT_CODE.
+_INDEXABLE_TYPES = (str, int, float, bool, _dt.datetime, _dt.date, _decimal.Decimal)
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -207,6 +210,7 @@ class FieldSpec:
     # Conservatively True unless the resolved type is provably ref-free — drives
     # the flat-entity ingest fast-path (#52). Default True = always safe.
     entity_ref: bool = True
+    decimal: bool = False  # Decimal (or Decimal | None): float literals are refused (#184)
 
 
 class TypeInfo:
@@ -618,13 +622,13 @@ def _resolve_specs(cls: type, field_names: tuple[str, ...]) -> tuple[FieldSpec, 
         if (indexed or unique) and not (_is_indexable(core) or is_list):
             raise TypeError(
                 f"{cls.__name__}.{name}: Index/Unique fields must be scalar "
-                f"(str, int, float, bool, datetime or date, optionally | None) "
+                f"(str, int, float, bool, datetime, date or Decimal, optionally | None) "
                 f"or a list of scalars, got {hint!r}"
             )
         if srt and not _is_indexable(core):
             raise TypeError(
                 f"{cls.__name__}.{name}: SortedIndex fields must be a scalar "
-                f"(str, int, float, bool, datetime or date, optionally | None) — "
+                f"(str, int, float, bool, datetime, date or Decimal, optionally | None) — "
                 f"a range index needs an orderable single value, got {hint!r}"
             )
         if unique and is_list:
@@ -661,8 +665,19 @@ def _resolve_specs(cls: type, field_names: tuple[str, ...]) -> tuple[FieldSpec, 
             sorted=srt,
             blob=is_blob,
             entity_ref=_may_hold_entity(core),
+            decimal=_is_decimal(core),
         ))
     return tuple(specs)
+
+
+def _is_decimal(hint: Any) -> bool:
+    """``Decimal`` or ``Decimal | None``."""
+    if hint is _decimal.Decimal:
+        return True
+    if _is_union(hint):
+        args = [a for a in get_args(hint) if a is not type(None)]
+        return args == [_decimal.Decimal]
+    return False
 
 
 def _is_bytes_or_optional(hint: Any) -> bool:
@@ -746,7 +761,7 @@ def _is_union(hint: Any) -> bool:
 
 
 def _is_indexable(hint: Any) -> bool:
-    """A scalar (str/int/float/bool/datetime/date) or optional scalar (``| None``).
+    """A scalar (str/int/float/bool/datetime/date/Decimal) or optional scalar (``| None``).
 
     datetime/date are admitted because they are total-ordered and round-trip
     natively (#106 / ADR-004 §1) — the same key set Index/Unique/SortedIndex and
@@ -774,7 +789,7 @@ def _is_indexable(hint: Any) -> bool:
 # Any, object, a bare/unparameterised container, an unknown type — is treated as
 # possibly ref-bearing, so the walk is never wrongly skipped.
 _REF_FREE_LEAVES = (str, int, float, bool, bytes, _dt.datetime, _dt.date, _dt.time,
-                    type(None))
+                    _decimal.Decimal, type(None))
 
 
 def _may_hold_entity(hint: Any) -> bool:

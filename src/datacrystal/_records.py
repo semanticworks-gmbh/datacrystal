@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import dataclasses
 import datetime as _dt
+import decimal
 import struct
 import zlib
 from typing import Any, Callable, cast
@@ -42,6 +43,7 @@ NAIVE_DATETIME_EXT_CODE = 2  # ISO text; tz-aware datetimes use msgpack timestam
 DATE_EXT_CODE = 3            # ISO text
 TIME_EXT_CODE = 4            # ISO text (naive or with offset — ISO carries both)
 BLOB_EXT_CODE = 5           # out-of-line blob descriptor (ADR-007 / #82): oid+size+sha256
+DECIMAL_EXT_CODE = 6        # exact text of a decimal.Decimal (str(value)), #184
 _OID_STRUCT = struct.Struct(">q")
 # Blob descriptor head: blob_oid (int64) + size (uint64); the 32-byte sha256
 # hash is appended raw (so the ext payload is a fixed 48 bytes). The record
@@ -112,6 +114,14 @@ def _blob_ext(blob_oid: int, size: int, hash: bytes) -> msgspec.msgpack.Ext:
     )
 
 
+def decimal_ext(value: decimal.Decimal) -> msgspec.msgpack.Ext:
+    """A ``Decimal`` as its exact text: ``str`` keeps sign, digits and exponent
+    (``Decimal("1.10")`` stays ``1.10``), so a reopened value compares and prints
+    identically (#184).
+    """
+    return msgspec.msgpack.Ext(DECIMAL_EXT_CODE, str(value).encode())
+
+
 def swizzle(value: Any, oid_for: Callable[[Any], int]) -> Any:
     """Replace entities/Lazy handles in a value tree with OID extensions.
 
@@ -167,6 +177,8 @@ def swizzle(value: Any, oid_for: Callable[[Any], int]) -> Any:
         return msgspec.msgpack.Ext(DATE_EXT_CODE, value.isoformat().encode())
     if isinstance(value, _dt.time):
         return msgspec.msgpack.Ext(TIME_EXT_CODE, value.isoformat().encode())
+    if isinstance(value, decimal.Decimal):
+        return decimal_ext(value)
     if dataclasses.is_dataclass(value):
         raise TypeError(
             f"{type(value).__name__} is a plain dataclass, not an @entity — "
@@ -242,6 +254,8 @@ def _ext_hook(code: int, data: memoryview) -> Any:
         return _dt.date.fromisoformat(str(data, "ascii"))
     if code == TIME_EXT_CODE:
         return _dt.time.fromisoformat(str(data, "ascii"))
+    if code == DECIMAL_EXT_CODE:
+        return decimal.Decimal(str(data, "ascii"))
     if code == BLOB_EXT_CODE:
         blob_oid, size = _BLOB_HEAD.unpack_from(data)
         return BlobToken(blob_oid, size, bytes(data[_BLOB_HEAD.size:]))
