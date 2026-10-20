@@ -200,7 +200,8 @@ def _timed_deltas(store: dc.Store, prefix: str) -> list[float]:
     """Commit 12 one-specimen deltas, timing each commit (the consumer is
     already attached)."""
     anchor = store.get(_gen.Mineral, qid="QM0000")
-    assert anchor is not None
+    if anchor is None:
+        raise RuntimeError("anchor mineral QM0000 is missing from the benchmark store")
     times: list[float] = []
     for i in range(12):
         store.store(_gen.Specimen(

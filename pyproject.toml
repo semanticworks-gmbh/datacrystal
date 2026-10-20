@@ -60,7 +60,7 @@ testpaths = ["tests"]
 
 [tool.pyrefly]
 project-includes = ["src", "examples", "benchmarks"]
-search-path = ["typings", "src", "."]  # "." resolves `from benchmarks import _gen`; src first, so datacrystal is not src.datacrystal
+search-path = ["typings", "src", "."]  # typings first (stubs), then src so datacrystal is not src.datacrystal, then "." for `from benchmarks import _gen`
 
 [tool.mutmut]
 source_paths = ["src/datacrystal/"]

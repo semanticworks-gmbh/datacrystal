@@ -5,11 +5,12 @@ Copied from tetrahedron's `architecture/standards/STANDARDS.md` on 2026-10-20 (#
 Cite a rule by its slug.
 
 Gates that switch on in a later wave say so by issue: tests (ANN, D, PT, FBT001) in #190; D401, docstring form and length, T20 in `src/` in #191; ANN401, C901, PLR2004 in `src/` in #192.
+#191 also switches on ruff's own default rule set, now replaced by an explicit E4, E7, E9, F select (322 findings, mostly autofix).
 
 ### self-documenting-code
 - **Rule:** Code states its intent through names, explaining variables, named predicates and constants; a docstring or comment adds only what the code cannot say — a one-line summary in the imperative, at most five body lines, the why — never a restated name, type or next line.
 - **Applies to:** all code, tests included.
-- **Enforced by:** ci — `ruff.toml` selects the google docstring rules and W505 (docs and comments within 100 columns) that are at 0 today; review for the rest — the PR reviewer reads every new name, condition, docstring and comment, until #191 selects D401, D102, D105, D107, D403, D415 and the five-line limit for `src/` and #190 selects D for tests; cannot see: stale or wrong text, name quality.
+- **Enforced by:** ci — `ruff.toml` selects the google docstring rules and W505 (docs and comments within 100 columns) that are at 0 today; review for the rest — the PR reviewer reads every new name, condition, docstring and comment and checks the five-line docstring limit (ruff has no rule for it), until #191 selects D401, D102, D105, D107, D403, D415 for `src/` and #190 selects D for tests; cannot see: stale or wrong text, name quality.
 - **Example:** `scripts/testrules.py::check_file`
 - **Source:** tetrahedron decision 542, copied 2026-10-20 (#186).
 
@@ -19,11 +20,12 @@ Gates that switch on in a later wave say so by issue: tests (ANN, D, PT, FBT001)
 - **Enforced by:** ci — `uv run pyrefly check` at 0 on `src`, `examples`, `benchmarks`; `uvx ruff check .` selects ANN001–ANN003 and ANN2xx for `src`, `examples` and `scripts`, ANN401 (`Any`) from #192 and ANN for `tests`, `benchmarks` and `evals` from #190; `uvx pyright tests` (standard mode) stays until #190; cannot see: an `Any` that hides a real type, a suppression without a reason.
 - **Example:** `src/datacrystal/web/_pydantic.py` (the one `bad-return` suppression, with its reason)
 - **Source:** tetrahedron decision 552, copied 2026-10-20 (#186); pyright leaves `src/` CI here.
+- **Exceptions:** the 9 `# type: ignore` in `src/` (7 without a reason), the 31 stale `# pyright: ignore` and 2 dead `# noqa` stay until #191 converts or deletes them.
 
 ### readable-tests
 - **Rule:** A test names its behaviour and outcome, reads Given / When / Then, is straight-line code — no `if`, `for`, `while`, `try` or lambda in a test, no comprehension outside an `assert` — calls the system and asserts in its own body with the values stated, one fact per assert, through the public API, any fixture function-scoped — except a session-scoped process handle that only a function-scoped fixture requests — no `sleep()`; a helper builds data only; `parametrize` rows hold plain values only.
-- **Applies to:** every test, `benchmarks/test_*.py` included. The domain is the mineral cabinet only. An engine test runs on both backends through `store_factory` (`tests/conftest.py`), and memory and sqlite behave identically.
-- **Enforced by:** ci — the `test-rules` job in `.github/workflows/ci.yml` runs `scripts/testrules.py` on every `tests/**/test_*.py` a PR changes and fails on a finding; review for what it cannot see — a name that lies, a Then the asserts skip, a helper that acts without asserting, a mock that hides the behaviour; ruff `PT` and `FBT001` join in #190; `scripts/mutation_check.py` lists mutants the baseline killed that survive after #190 rewrites the tests.
+- **Applies to:** every test; `benchmarks/test_pr_gates.py` joins in #190. The domain is the mineral cabinet only. An engine test runs on both backends through `store_factory` (`tests/conftest.py`), and memory and sqlite behave identically.
+- **Enforced by:** ci — the `test-rules` job in `.github/workflows/ci.yml` runs `scripts/testrules.py` on every `tests/**/test_*.py` a PR changes and fails on a finding (`benchmarks/test_pr_gates.py` joins in #190); review for what it cannot see — a name that lies, a Then the asserts skip, a helper that acts without asserting, a mock that hides the behaviour; ruff `PT` and `FBT001` join in #190; `scripts/mutation_check.py` is run by hand on #190's branch before merge and in CI from #193, and lists mutants the baseline killed that survive after #190 rewrites the tests.
 - **Example:** none until #190 produces the first clean module.
 - **Source:** tetrahedron decision 568, copied 2026-10-20 (#186) — the rules after *Software Engineering at Google* ch. 11–13 and Testing on the Toilet, Beck's Test Desiderata, Meszaros' test smells.
 - **Exceptions:** every test existing on 2026-10-20 (`scripts/testrules.py` finds 1,710 in `tests/`), until #190 rewrites them; a PR that changes a test module must leave that module clean.
@@ -33,6 +35,7 @@ Gates that switch on in a later wave say so by issue: tests (ANN, D, PT, FBT001)
 - **Applies to:** `src/`; a script for its diagnostics, not its output.
 - **Enforced by:** review — the PR reviewer checks new log calls and `print()` calls, until #191 selects ruff `T20` for `src/`; cannot see: a secret inside a field. Nothing in `src/` logs today.
 - **Source:** tetrahedron decision 553, copied 2026-10-20 (#186), in library form: structlog and `configure_logging` are for apps, not for a library.
+- **Exceptions:** the contract vector generator `src/datacrystal/contract/vectors/_generate.py` prints, until #191 moves it to `scripts/`.
 
 ### english-only
 - **Rule:** Code, comments, docstrings and technical documentation are written in English; a term from another language is translated or, where no English term is established, kept.

@@ -17,6 +17,7 @@ select = [
     # typed-python: ANN401 (Any) is left out until #192
     "ANN001", "ANN002", "ANN003", "ANN201", "ANN202", "ANN204", "ANN205", "ANN206",
 ]
+# Ruff's current default set (E4, E7, E9, F) is selected explicitly above; #191 switches ruff's own default set on (322 findings, mostly autofix).
 # Not selected yet: D102, D105, D107, D403, D415, D401 (docstring form) and T20 (print in src/): #191;
 # C901, PLR2004, ANN401 in src/: #192; PT, FBT001 and ANN, D in tests/: #190.
 # D205 stays off as in tetrahedron (the summary may run into the first paragraph).
