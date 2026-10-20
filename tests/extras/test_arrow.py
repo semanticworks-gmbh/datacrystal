@@ -9,33 +9,52 @@ backends via ``store_factory``.
 from __future__ import annotations
 
 import datetime as dt
-from decimal import Decimal
 import itertools
-from typing import Annotated, Any
+import json
+from collections.abc import Callable, Iterable, Iterator
+from decimal import Decimal
+from pathlib import Path
+from types import ModuleType
+from typing import Annotated, Any, NamedTuple
 
 import pytest
 
 pytest.importorskip("pyarrow", reason="datacrystal[arrow] extra not installed")
 
 import pyarrow as pa
+import pyarrow.parquet as pq
+import pyarrow.types as pa_types
 
 import datacrystal as dc
 from datacrystal._records import RefToken
-from datacrystal.arrow import ArrowMirror, MirrorConfigError, decode_fallback
+from datacrystal._snapshot import Snapshot
+from datacrystal._storage.memory import MemoryBackend
+from datacrystal.arrow import (
+    ArrowMirror,
+    MirrorConfigError,
+    _encode_fallback,
+    _TableState,
+    decode_fallback,
+)
 from datacrystal.contract.applier import DeltaGapError
 from datacrystal.testing import STREAM_TYPENAME, check_delta_consumer
 
 _ids = itertools.count()
+QUARRY_TYPENAME = "tests.extras.test_arrow:Quarry"
 
 
 @dc.entity
 class Quarry:
+    """A quarry a find was recovered from."""
+
     qid: Annotated[str, dc.Unique]
     name: str
 
 
 @dc.entity
 class Find:
+    """A mineral find with a measure, an indexed grade, a date and a lazy quarry."""
+
     label: str
     mass_g: float | None = None
     grade: Annotated[str | None, dc.Index] = None
@@ -44,236 +63,547 @@ class Find:
     tags: Any = None  # Any on purpose: the lattice tests feed it mixed shapes
 
 
-def fresh_mirror(tmp_path, **kwargs) -> ArrowMirror:
-    return ArrowMirror(tmp_path / f"mirror-{next(_ids)}", **kwargs)
-
-
-def rows(mirror: ArrowMirror, target) -> list[dict]:
+def rows(mirror: ArrowMirror, target: type | str) -> list[dict]:
+    """Return the mirror's table for a class or typename as a list of row dicts."""
     return mirror.table(target).to_pylist()
 
 
-def content_probe(mirror: ArrowMirror):
-    return sorted(
-        tuple(sorted(row.items())) for row in rows(mirror, STREAM_TYPENAME)
-    )
+def content_probe(mirror: ArrowMirror) -> object:
+    """Return the derived state for the conformance kit: every stream-type row."""
+    return sorted(tuple(sorted(row.items())) for row in rows(mirror, STREAM_TYPENAME))
+
+
+def by_column(table: pa.Table, key: str, value: str) -> dict:
+    """Return a table's rows as a dict from the key column to the value column."""
+    return {row[key]: row[value] for row in table.to_pylist()}
+
+
+def oids_of(views: Iterable[Any]) -> list[int]:
+    """Return the oids of the entity views."""
+    return [view.oid for view in views]
+
+
+class MirrorShop:
+    """Opens parquet mirrors under one directory and closes every one of them afterwards."""
+
+    def __init__(self, directory: Path) -> None:
+        """Remember the directory the mirrors live in."""
+        self.directory = directory
+        self.opened: list[ArrowMirror] = []
+
+    def open(
+        self,
+        name: str | None = None,
+        only: Iterable[type | str] | None = None,
+        flush_every: int = 1,
+        max_segments: int = 16,
+    ) -> ArrowMirror:
+        """Open a mirror directory by name, or a fresh one."""
+        mirror = ArrowMirror(
+            self.directory / (name or f"mirror-{next(_ids)}"),
+            only=only,
+            flush_every=flush_every,
+            max_segments=max_segments,
+        )
+        self.opened.append(mirror)
+        return mirror
+
+    def bootstrap(
+        self, name: str, snapshot: Snapshot, batch: int = 50_000, max_segments: int = 16
+    ) -> ArrowMirror:
+        """Build a mirror directory from a snapshot."""
+        mirror = ArrowMirror.bootstrap(
+            self.directory / name, snapshot, batch=batch, max_segments=max_segments
+        )
+        self.opened.append(mirror)
+        return mirror
+
+    def close_all(self) -> None:
+        """Close every mirror this shop opened."""
+        for mirror in self.opened:
+            mirror.close()
+
+
+@pytest.fixture
+def shop(tmp_path: Path) -> Iterator[MirrorShop]:
+    """Provide a mirror shop under tmp_path and close its mirrors afterwards."""
+    mirror_shop = MirrorShop(tmp_path)
+    yield mirror_shop
+    mirror_shop.close_all()
+
+
+@pytest.fixture
+def fresh_mirror_factory(shop: MirrorShop) -> Callable[[], ArrowMirror]:
+    """Return a factory for fresh mirrors."""
+    return shop.open
+
+
+@pytest.fixture
+def mirror(shop: MirrorShop, store: dc.Store) -> ArrowMirror:
+    """Open a fresh mirror and attach it to the store."""
+    attached = shop.open()
+    store.attach(attached)
+    return attached
 
 
 # -- conformance ----------------------------------------------------------------
 
 
-def test_conformance_kit_certifies_arrow_mirror(tmp_path) -> None:
-    ran = check_delta_consumer(
-        lambda: fresh_mirror(tmp_path),
-        content=content_probe,
-    )
+def test_conformance_kit_runs_the_prior_section_for_the_arrow_mirror(
+    fresh_mirror_factory: Callable[[], ArrowMirror],
+) -> None:
+    """Given the arrow mirror as a consumer
+    When the conformance kit certifies it
+    Then the prior un-index section ran
+    """
+    ran = check_delta_consumer(fresh_mirror_factory, content=content_probe)
+
     assert any("prior" in label for label in ran)
+
+
+def test_conformance_kit_runs_the_delete_section_for_the_arrow_mirror(
+    fresh_mirror_factory: Callable[[], ArrowMirror],
+) -> None:
+    """Given the arrow mirror as a consumer
+    When the conformance kit certifies it
+    Then the delete totality section ran
+    """
+    ran = check_delta_consumer(fresh_mirror_factory, content=content_probe)
+
     assert any("delete" in label for label in ran)
 
 
 # -- end-to-end over both backends ------------------------------------------------
 
 
-def test_mirror_end_to_end(store_factory, tmp_path) -> None:
-    store = store_factory()
-    mirror = fresh_mirror(tmp_path)
-    store.attach(mirror)
+class MirroredAzurite(NamedTuple):
+    """A mirror of a committed quarry and an azurite find that refers to it."""
+
+    quarry: Quarry
+    find: Find
+    mirror: ArrowMirror
+
+
+@pytest.fixture
+def mirrored_azurite(store: dc.Store, mirror: ArrowMirror) -> MirroredAzurite:
+    """Commit a quarry and an azurite find with every column kind into a mirrored store."""
     quarry = Quarry(qid="Q1", name="Tsumeb")
-    find = Find(label="azurite vug", mass_g=412.5, grade="A",
-                found_on=dt.date(2026, 5, 1), quarry=dc.Lazy.of(quarry),
-                tags=["blue", "vug"])
+    find = Find(
+        label="azurite vug",
+        mass_g=412.5,
+        grade="A",
+        found_on=dt.date(2026, 5, 1),
+        quarry=dc.Lazy.of(quarry),
+        tags=["blue", "vug"],
+    )
     store.root = [quarry, find]
     store.commit()
+    return MirroredAzurite(quarry, find, mirror)
 
-    table = mirror.table(Find)
+
+def test_mirror_holds_one_row_per_committed_find(mirrored_azurite: MirroredAzurite) -> None:
+    """Given a committed azurite find in a mirrored store
+    When the Find table is read
+    Then it has one row
+    """
+    table = mirrored_azurite.mirror.table(Find)
+
     assert table.num_rows == 1
-    row = table.to_pylist()[0]
-    assert row["label"] == "azurite vug"
-    assert row["mass_g"] == 412.5
+
+
+@pytest.mark.parametrize(
+    ("column", "expected"), [("label", "azurite vug"), ("mass_g", 412.5), ("grade", "A")]
+)
+def test_mirrored_row_carries_the_plain_columns(
+    column: str, expected: object, mirrored_azurite: MirroredAzurite
+) -> None:
+    """Given a committed azurite find in a mirrored store
+    When the Find row is read
+    Then a plain column carries the committed value
+    """
+    row = rows(mirrored_azurite.mirror, Find)[0]
+
+    assert row[column] == expected
+
+
+def test_mirrored_row_carries_the_date_column(mirrored_azurite: MirroredAzurite) -> None:
+    """Given a find committed with the date 2026-05-01
+    When the Find row is read
+    Then found_on is that date
+    """
+    row = rows(mirrored_azurite.mirror, Find)[0]
+
     assert row["found_on"] == dt.date(2026, 5, 1)
+
+
+def test_mirrored_row_carries_the_list_column(mirrored_azurite: MirroredAzurite) -> None:
+    """Given a find committed with the tags blue and vug
+    When the Find row is read
+    Then tags is the list blue, vug
+    """
+    row = rows(mirrored_azurite.mirror, Find)[0]
+
     assert row["tags"] == ["blue", "vug"]
-    # entity references mirror as int64 OID columns
-    quarry_oid = mirror.table(Quarry).to_pylist()[0]["__oid__"]
+
+
+def test_entity_reference_mirrors_as_the_oid_of_its_target(
+    mirrored_azurite: MirroredAzurite,
+) -> None:
+    """Given a find that refers to a quarry
+    When the Find row is read
+    Then the reference column is the quarry row's int64 OID
+    """
+    row = rows(mirrored_azurite.mirror, Find)[0]
+    quarry_oid = rows(mirrored_azurite.mirror, Quarry)[0]["__oid__"]
+
     assert row["quarry"] == quarry_oid
 
-    # updates fold newest-wins; deletes drop the row
-    find.mass_g = 388.0
+
+def test_update_folds_newest_wins(store: dc.Store, mirrored_azurite: MirroredAzurite) -> None:
+    """Given a mirrored azurite find with 412.5 g
+    When its mass is changed to 388.0 g and committed
+    Then the Find row carries 388.0
+    """
+    mirrored_azurite.find.mass_g = 388.0
+
     store.commit()
-    assert rows(mirror, Find)[0]["mass_g"] == 388.0
-    store.delete(find)
-    store.root = [quarry]
-    store.commit()
-    assert rows(mirror, Find) == []
-    assert mirror.table(Quarry).num_rows == 1
-    store.close()
-    mirror.close()
+
+    assert rows(mirrored_azurite.mirror, Find)[0]["mass_g"] == 388.0
 
 
-def test_persistence_and_reattach(store_factory, tmp_path) -> None:
-    store = store_factory()
-    path = tmp_path / "persist.mirror"
-    mirror = ArrowMirror(path)
+def test_delete_drops_the_row(store: dc.Store, mirrored_azurite: MirroredAzurite) -> None:
+    """Given a mirrored azurite find
+    When it is deleted and committed
+    Then the Find table has no row
+    """
+    store.delete(mirrored_azurite.find)
+    store.root = [mirrored_azurite.quarry]
+
+    store.commit()
+
+    assert rows(mirrored_azurite.mirror, Find) == []
+
+
+def test_delete_of_a_find_leaves_its_quarry_row(
+    store: dc.Store, mirrored_azurite: MirroredAzurite
+) -> None:
+    """Given a mirrored azurite find and its quarry
+    When the find is deleted and committed
+    Then the Quarry table still has one row
+    """
+    store.delete(mirrored_azurite.find)
+    store.root = [mirrored_azurite.quarry]
+
+    store.commit()
+
+    assert mirrored_azurite.mirror.table(Quarry).num_rows == 1
+
+
+class ClosedQuarryMirror(NamedTuple):
+    """A mirror closed after one committed quarry, with what it held."""
+
+    name: str
+    watermark: int
+    quarry_rows: list[dict]
+
+
+@pytest.fixture
+def closed_quarry_mirror(store: dc.Store, shop: MirrorShop) -> ClosedQuarryMirror:
+    """Mirror one quarry commit, detach and close the mirror."""
+    mirror = shop.open("persist.mirror")
     store.attach(mirror)
     store.root = [Quarry(qid="Q1", name="Tsumeb")]
     store.commit()
     store.detach(mirror)
+    held = ClosedQuarryMirror("persist.mirror", mirror.watermark, rows(mirror, Quarry))
     mirror.close()
+    return held
 
-    reopened = ArrowMirror(path)
-    assert reopened.watermark == mirror.watermark
-    assert rows(reopened, Quarry) == rows(mirror, Quarry)
-    store.attach(reopened)                     # watermark equality: accepted
-    store.root = list(store.root) + [Quarry(qid="Q2", name="Broken Hill")]
+
+def test_reopened_mirror_keeps_its_watermark(
+    closed_quarry_mirror: ClosedQuarryMirror, shop: MirrorShop
+) -> None:
+    """Given a mirror closed after one commit
+    When it is reopened
+    Then its watermark is the one it had when closed
+    """
+    reopened = shop.open(closed_quarry_mirror.name)
+
+    assert reopened.watermark == closed_quarry_mirror.watermark
+
+
+def test_reopened_mirror_keeps_its_rows(
+    closed_quarry_mirror: ClosedQuarryMirror, shop: MirrorShop
+) -> None:
+    """Given a mirror closed after one quarry commit
+    When it is reopened
+    Then its Quarry rows are the ones it held when closed
+    """
+    reopened = shop.open(closed_quarry_mirror.name)
+
+    assert rows(reopened, Quarry) == closed_quarry_mirror.quarry_rows
+
+
+def test_reopened_mirror_is_accepted_at_the_store_watermark_and_follows_on(
+    store: dc.Store, closed_quarry_mirror: ClosedQuarryMirror, shop: MirrorShop
+) -> None:
+    """Given a mirror reopened at the store's last transaction id
+    When it is attached and a second quarry is committed
+    Then the Quarry table has two rows
+    """
+    reopened = shop.open(closed_quarry_mirror.name)
+    store.attach(reopened)
+    store.root = [*store.root, Quarry(qid="Q2", name="Broken Hill")]
+
     store.commit()
+
     assert reopened.table(Quarry).num_rows == 2
-    store.close()
-    reopened.close()
 
 
-def test_stale_mirror_refused_and_rebuilt(store_factory, tmp_path) -> None:
-    store = store_factory()
-    path = tmp_path / "stale.mirror"
-    mirror = ArrowMirror(path)
+@pytest.fixture
+def store_ahead_of_closed_mirror(store: dc.Store, shop: MirrorShop) -> dc.Store:
+    """Mirror one quarry, detach and close the mirror, then commit a second quarry it misses."""
+    mirror = shop.open("stale.mirror")
     store.attach(mirror)
     store.root = [Quarry(qid="Q1", name="Tsumeb")]
     store.commit()
     store.detach(mirror)
     mirror.close()
+    store.root = [*store.root, Quarry(qid="Q2", name="Broken Hill")]
+    store.commit()
+    return store
 
-    store.root = list(store.root) + [Quarry(qid="Q2", name="Broken Hill")]
-    store.commit()  # the mirror misses this delta
 
-    reopened = ArrowMirror(path)
+def test_stale_mirror_is_refused_on_attach(
+    store_ahead_of_closed_mirror: dc.Store, shop: MirrorShop
+) -> None:
+    """Given a mirror that missed the store's second delta
+    When it is reopened and attached
+    Then the attach is refused as a gap
+    """
+    reopened = shop.open("stale.mirror")
+
     with pytest.raises(DeltaGapError):
-        store.attach(reopened)
-    reopened.close()
+        store_ahead_of_closed_mirror.attach(reopened)
 
-    with store.snapshot() as snap:
-        rebuilt = ArrowMirror.bootstrap(path, snap)
-    store.attach(rebuilt)
+
+def test_stale_mirror_is_rebuilt_by_bootstrap_and_accepted(
+    store_ahead_of_closed_mirror: dc.Store, shop: MirrorShop
+) -> None:
+    """Given a mirror that missed the store's second delta
+    When it is rebuilt from a snapshot by bootstrap and attached
+    Then the Quarry table has both rows
+    """
+    with store_ahead_of_closed_mirror.snapshot() as snap:
+        rebuilt = shop.bootstrap("stale.mirror", snap)
+    store_ahead_of_closed_mirror.attach(rebuilt)
+
     assert rebuilt.table(Quarry).num_rows == 2
-    store.close()
-    rebuilt.close()
 
 
-def test_bootstrap_equals_incremental(store_factory, tmp_path) -> None:
-    """Fitness #13 shape: a mirror bootstrapped mid-life and then fed
-    deltas must equal a from-scratch rebuild at the same watermark."""
-    store = store_factory()
+@pytest.fixture
+def incremental_mirror(store: dc.Store, shop: MirrorShop) -> ArrowMirror:
+    """Bootstrap a mirror mid-life, attach it, then commit an update and an addition."""
     quarry = Quarry(qid="Q1", name="Tsumeb")
     find = Find(label="azurite", quarry=dc.Lazy.of(quarry))
     store.root = [quarry, find]
     store.commit()
-
     with store.snapshot() as snap:
-        mirror = ArrowMirror.bootstrap(tmp_path / "boot.mirror", snap)
+        mirror = shop.bootstrap("boot.mirror", snap)
     store.attach(mirror)
-
     find.mass_g = 99.5
-    store.root = list(store.root) + [Find(label="malachite", grade="B")]
+    store.root = [*store.root, Find(label="malachite", grade="B")]
     store.commit()
+    return mirror
 
+
+def test_bootstrapped_then_fed_mirror_equals_a_rebuild_for_quarries(
+    store: dc.Store, shop: MirrorShop, incremental_mirror: ArrowMirror
+) -> None:
+    """Given a mirror bootstrapped mid-life and then fed deltas (fitness #13)
+    When a from-scratch rebuild is made at the same watermark
+    Then both Quarry tables hold the same rows
+    """
     with store.snapshot() as snap:
-        rebuilt = ArrowMirror.bootstrap(tmp_path / "rebuilt.mirror", snap)
-    for target in (Quarry, Find):
-        assert rows(mirror, target) == rows(rebuilt, target)
-    assert mirror.watermark == rebuilt.watermark
-    store.close()
-    mirror.close()
-    rebuilt.close()
+        rebuilt = shop.bootstrap("rebuilt.mirror", snap)
+
+    assert rows(incremental_mirror, Quarry) == rows(rebuilt, Quarry)
+
+
+def test_bootstrapped_then_fed_mirror_equals_a_rebuild_for_finds(
+    store: dc.Store, shop: MirrorShop, incremental_mirror: ArrowMirror
+) -> None:
+    """Given a mirror bootstrapped mid-life and then fed deltas (fitness #13)
+    When a from-scratch rebuild is made at the same watermark
+    Then both Find tables hold the same rows
+    """
+    with store.snapshot() as snap:
+        rebuilt = shop.bootstrap("rebuilt.mirror", snap)
+
+    assert rows(incremental_mirror, Find) == rows(rebuilt, Find)
+
+
+def test_bootstrapped_then_fed_mirror_ends_at_the_rebuilt_watermark(
+    store: dc.Store, shop: MirrorShop, incremental_mirror: ArrowMirror
+) -> None:
+    """Given a mirror bootstrapped mid-life and then fed deltas (fitness #13)
+    When a from-scratch rebuild is made at the same watermark
+    Then both stand at the same watermark
+    """
+    with store.snapshot() as snap:
+        rebuilt = shop.bootstrap("rebuilt.mirror", snap)
+
+    assert incremental_mirror.watermark == rebuilt.watermark
 
 
 # -- schema lattice ---------------------------------------------------------------
 
 
-def test_schema_promotion_int_to_float(tmp_path, store_factory) -> None:
-    store = store_factory()
-    mirror = fresh_mirror(tmp_path)
-    store.attach(mirror)
-    f1 = Find(label="a", mass_g=100.0)
-    store.root = [f1]
+def test_float_mass_mirrors_as_a_float64_column(store: dc.Store, mirror: ArrowMirror) -> None:
+    """Given a find committed with a float mass
+    When the Find table is read
+    Then the mass_g column is float64
+    """
+    store.root = [Find(label="a", mass_g=100.0)]
+
     store.commit()
-    table = mirror.table(Find)
-    assert table.schema.field("mass_g").type == pa.float64()
-    store.close()
-    mirror.close()
+
+    assert mirror.table(Find).schema.field("mass_g").type == pa.float64()
 
 
-def test_mixed_shapes_fall_back_to_msgpack(tmp_path, store_factory) -> None:
-    """A field holding a dict mirrors as msgpack binary (the total-lattice
-    top) and decode_fallback restores the value — never a wedged mirror."""
-    store = store_factory()
-    mirror = fresh_mirror(tmp_path)
-    store.attach(mirror)
+@pytest.fixture
+def mirrored_dict_tags(store: dc.Store, mirror: ArrowMirror) -> ArrowMirror:
+    """Commit a find whose tags are a dict into a mirrored store."""
     store.root = [Find(label="x", tags={"color": "blue", "n": 3})]
     store.commit()
-    row = rows(mirror, Find)[0]
+    return mirror
+
+
+def test_mixed_shapes_mirror_as_msgpack_binary(mirrored_dict_tags: ArrowMirror) -> None:
+    """Given a find whose tags field holds a dict, the top of the total lattice
+    When the Find row is read
+    Then tags is msgpack binary, never a wedged mirror
+    """
+    row = rows(mirrored_dict_tags, Find)[0]
+
     assert isinstance(row["tags"], bytes)
+
+
+def test_decode_fallback_restores_the_dict_value(mirrored_dict_tags: ArrowMirror) -> None:
+    """Given a find whose tags field holds a dict mirrored as msgpack binary
+    When decode_fallback decodes the tags
+    Then the original dict is restored
+    """
+    row = rows(mirrored_dict_tags, Find)[0]
+
     assert decode_fallback(row["tags"]) == {"color": "blue", "n": 3}
-    store.close()
-    mirror.close()
 
 
-def test_promotion_across_segments_recasts_old_rows(tmp_path,
-                                                    store_factory) -> None:
-    """A later delta may promote a column's type (here list<str> →
-    fallback); rows already persisted under the old tag must read back
-    under the new one."""
-    store = store_factory()
-    mirror = fresh_mirror(tmp_path)
-    store.attach(mirror)
+@pytest.fixture
+def mirrored_promoted_tags(store: dc.Store, mirror: ArrowMirror) -> ArrowMirror:
+    """Commit a list-tag find, then a dict-tag find that promotes the column to fallback."""
     store.root = [Find(label="first", tags=["plain", "strings"])]
-    store.commit()                                     # segment 1: list<str>
-    store.root = list(store.root) + [Find(label="second", tags={"odd": True})]
-    store.commit()                                     # segment 2: fallback
-    by_label = {row["label"]: row for row in rows(mirror, Find)}
-    assert decode_fallback(by_label["first"]["tags"]) == ["plain", "strings"]
-    assert decode_fallback(by_label["second"]["tags"]) == {"odd": True}
-    store.close()
-    mirror.close()
-
-
-def test_temporals_mirror_natively(tmp_path, store_factory) -> None:
-    store = store_factory()
-    mirror = fresh_mirror(tmp_path)
-    store.attach(mirror)
-    cet = dt.timezone(dt.timedelta(hours=2))
-    aware = dt.datetime(2026, 6, 12, 14, 30, 5, tzinfo=cet)
-    store.root = [Find(label="t", tags=[aware], found_on=dt.date(2026, 6, 12))]
     store.commit()
-    table = mirror.table(Find)
+    store.root = [*store.root, Find(label="second", tags={"odd": True})]
+    store.commit()
+    return mirror
+
+
+def test_promotion_recasts_the_old_segment_rows(mirrored_promoted_tags: ArrowMirror) -> None:
+    """Given a later delta that promoted the tags column from list<str> to fallback
+    When the earlier row is read back
+    Then it decodes under the new tag to its original list
+    """
+    tags_by_label = by_column(mirrored_promoted_tags.table(Find), "label", "tags")
+
+    assert decode_fallback(tags_by_label["first"]) == ["plain", "strings"]
+
+
+def test_promotion_keeps_the_new_segment_rows(mirrored_promoted_tags: ArrowMirror) -> None:
+    """Given a later delta that promoted the tags column from list<str> to fallback
+    When the later row is read back
+    Then it decodes to its original dict
+    """
+    tags_by_label = by_column(mirrored_promoted_tags.table(Find), "label", "tags")
+
+    assert decode_fallback(tags_by_label["second"]) == {"odd": True}
+
+
+CET = dt.timezone(dt.timedelta(hours=2))
+AWARE = dt.datetime(2026, 6, 12, 14, 30, 5, tzinfo=CET)
+
+
+@pytest.fixture
+def mirrored_temporals(store: dc.Store, mirror: ArrowMirror) -> ArrowMirror:
+    """Commit a find with a date and a list of one timezone-aware datetime."""
+    store.root = [Find(label="t", tags=[AWARE], found_on=dt.date(2026, 6, 12))]
+    store.commit()
+    return mirror
+
+
+def test_date_mirrors_as_a_date32_column(mirrored_temporals: ArrowMirror) -> None:
+    """Given a find with a date
+    When the Find table is read
+    Then found_on is a date32 column
+    """
+    table = mirrored_temporals.table(Find)
+
     assert table.schema.field("found_on").type == pa.date32()
-    row = table.to_pylist()[0]
+
+
+def test_date_value_survives_the_mirror(mirrored_temporals: ArrowMirror) -> None:
+    """Given a find with the date 2026-06-12
+    When the Find row is read
+    Then found_on is that date
+    """
+    row = rows(mirrored_temporals, Find)[0]
+
     assert row["found_on"] == dt.date(2026, 6, 12)
-    # aware datetimes mirror as UTC-instant timestamps (format-v2 codec:
-    # the offset's identity is not preserved, the instant is)
-    assert table.schema.field("tags").type == pa.list_(
-        pa.timestamp("us", tz="UTC")
-    )
-    assert row["tags"][0] == aware  # same instant, compared tz-aware
-    store.close()
-    mirror.close()
 
 
-def test_newer_mirror_format_refused(tmp_path, store_factory) -> None:
-    """Format honesty (invariant 9): a manifest from a newer datacrystal
-    [arrow] must refuse loudly, never half-read."""
-    import json
+def test_aware_datetimes_mirror_as_utc_timestamps(mirrored_temporals: ArrowMirror) -> None:
+    """Given a find with a list of one aware datetime (format-v2 codec)
+    When the Find table is read
+    Then tags is a list of UTC microsecond timestamps
+    """
+    table = mirrored_temporals.table(Find)
 
-    store = store_factory()
-    path = tmp_path / "newer.mirror"
-    mirror = ArrowMirror(path)
+    assert table.schema.field("tags").type == pa.list_(pa.timestamp("us", tz="UTC"))
+
+
+def test_aware_datetime_keeps_its_instant(mirrored_temporals: ArrowMirror) -> None:
+    """Given a find with an aware datetime at UTC+2
+    When the Find row is read
+    Then the mirrored value is the same instant, compared tz-aware
+    """
+    row = rows(mirrored_temporals, Find)[0]
+
+    assert row["tags"][0] == AWARE
+
+
+@pytest.fixture
+def mirror_with_newer_manifest(store: dc.Store, shop: MirrorShop, tmp_path: Path) -> str:
+    """Close a one-quarry mirror and bump its manifest to a newer format version."""
+    mirror = shop.open("newer.mirror")
     store.attach(mirror)
     store.root = [Quarry(qid="Q1", name="Tsumeb")]
     store.commit()
     store.detach(mirror)
     mirror.close()
-
-    manifest = json.loads((path / "manifest.json").read_text())
+    manifest_path = tmp_path / "newer.mirror" / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
     manifest["version"] += 1
-    (path / "manifest.json").write_text(json.dumps(manifest))
+    manifest_path.write_text(json.dumps(manifest))
+    return "newer.mirror"
+
+
+def test_newer_mirror_format_is_refused(mirror_with_newer_manifest: str, shop: MirrorShop) -> None:
+    """Given a manifest from a newer datacrystal[arrow] (format honesty, invariant 9)
+    When the mirror is opened
+    Then it is refused loudly, never half-read
+    """
     with pytest.raises(MirrorConfigError):
-        ArrowMirror(path)
-    store.close()
+        shop.open(mirror_with_newer_manifest)
 
 
 # -- W4-7: a class that flips to protected=True mid-life --------------------------
@@ -293,338 +623,731 @@ ANNA = dc.Principal(uid=2, memberships={ORG: dc.CURATOR})
 _RELIC = "tests.extras.test_arrow:Relic"
 
 
-def _relic(*, protected: bool):
-    """(Re)define the 'Relic' entity — same typename each call, so persisted
-    records decode through their own lineage row (simulating a protected=True
-    retrofit between runs, exactly like the store's R7 stamping tests)."""
-    ns: dict = {
+def _relic(*, protected: bool) -> type:
+    """Define the 'Relic' entity again under the same typename.
+
+    Persisted records decode through their own lineage row, simulating a protected=True
+    retrofit between runs, exactly like the store's R7 stamping tests.
+    """
+    namespace: dict = {
         "__module__": __name__,
         "__qualname__": "Relic",
         "__annotations__": {"name": Annotated[str, dc.Unique], "grade": str},
         "grade": "common",
     }
-    return dc.entity(type("Relic", (), ns), protected=protected)  # pyright: ignore[reportCallIssue]
+    return dc.entity(type("Relic", (), namespace), protected=protected)  # pyrefly: ignore[no-matching-overload]
 
 
-def test_flip_to_protected_promotes_labels_across_segments(store_factory,
-                                                           tmp_path) -> None:
-    # 1) pre-protection: two unprotected Relics mirror to an OLD segment whose
-    #    schema carries the plain fields only — no _dc_* label columns.
-    Relic1 = _relic(protected=False)
+class UnprotectedRelics(NamedTuple):
+    """The directory and the closed mirror of two unprotected relics."""
+
+    name: str
+    mirror: ArrowMirror
+
+
+class FlippedRelics(NamedTuple):
+    """The store and mirror after the Relic class flipped protected and one relic was born."""
+
+    store: dc.Store
+    mirror: ArrowMirror
+    relic_class: type
+
+
+@pytest.fixture
+def unprotected_relics(store_factory: Callable[[], dc.Store], shop: MirrorShop) -> UnprotectedRelics:
+    """Mirror two unprotected relics to an old segment without _dc_* label columns, then close."""
+    relic = _relic(protected=False)
     store = store_factory()
-    path = tmp_path / "relic.mirror"
-    mirror = ArrowMirror(path)
+    mirror = shop.open("relic.mirror")
     store.attach(mirror)
-    store.root = [Relic1(name="w1-a", grade="fine"),
-                  Relic1(name="w1-b", grade="common")]
+    store.root = [relic(name="w1-a", grade="fine"), relic(name="w1-b", grade="common")]
     store.commit()
     store.detach(mirror)
     mirror.close()
     store.close()  # single-writer sqlite: release the lock before reopening
-    assert "_dc_owner" not in mirror._tables[_RELIC].columns   # unlabelled segment
+    return UnprotectedRelics("relic.mirror", mirror)
 
-    # 2) the class flips protected; a NEW protected Relic commits through the
-    #    reopened mirror → a NEW segment carrying the four _dc_* label columns.
-    Relic2 = _relic(protected=True)
-    store2 = store_factory()
-    reopened = ArrowMirror(path)
-    assert reopened.watermark == mirror.watermark              # resumes, no gap
-    store2.attach(reopened)
-    with store2.acting_as(ANNA):
-        fresh = Relic2(name="w2-new", grade="rare")
-        store2.store(fresh)
+
+@pytest.fixture
+def flipped_relics(
+    unprotected_relics: UnprotectedRelics, store_factory: Callable[[], dc.Store], shop: MirrorShop
+) -> Iterator[FlippedRelics]:
+    """Flip Relic to protected and commit a new protected relic through the reopened mirror."""
+    relic = _relic(protected=True)
+    store = store_factory()
+    reopened = shop.open(unprotected_relics.name)
+    store.attach(reopened)
+    with store.acting_as(ANNA):
+        fresh = relic(name="w2-new", grade="rare")
+        store.store(fresh)
         dc.share(fresh, ORG, read=dc.VIEWER, write=dc.CURATOR)
-        store2.commit()
+        store.commit()
+    yield FlippedRelics(store, reopened, relic)
+    store.close()
 
-    # the promotion lattice folds the unlabelled + labelled segments into one
-    # readable table (fitness: incremental mirror stays consistent across a flip).
-    tbl = reopened.table(Relic2)
-    assert tbl.num_rows == 3
-    assert "_dc_owner" in tbl.schema.names
-    by_name = {r["name"]: r for r in tbl.to_pylist()}
-    # pre-protection rows: the label columns discovered after their segment
-    # promote to null — the incremental mirror never rewrites mirrored rows.
-    assert by_name["w1-a"]["_dc_owner"] is None
-    assert by_name["w1-b"]["_dc_read_floor"] is None
-    # the born-protected row carries its persisted stamps.
-    assert by_name["w2-new"]["_dc_owner"] == ANNA.uid
-    assert ORG in by_name["w2-new"]["_dc_groups"]
-    reopened.close()
 
-    # 3) a root re-bootstrap is a full copy — snapshot decode applies the R7
-    #    legacy fill, so the pre-protection rows gain honest labels on disk.
-    with store2.snapshot(principal=dc.root_principal(1)) as root_snap:
-        rebuilt = ArrowMirror.bootstrap(tmp_path / "relic.rebuilt", root_snap)
-    r_by_name = {r["name"]: r for r in rebuilt.table(Relic2).to_pylist()}
-    assert len(r_by_name) == 3
-    assert r_by_name["w1-a"]["_dc_owner"] == 0                   # R7: nobody
-    assert list(r_by_name["w1-a"]["_dc_groups"]) == [dc.WORLD]   # read-as-before
-    assert r_by_name["w1-a"]["_dc_read_floor"] == dc.VIEWER
-    assert r_by_name["w1-a"]["_dc_write_floor"] == dc.ADMIN      # fenced at the top
-    assert r_by_name["w2-new"]["_dc_owner"] == ANNA.uid          # persisted stamp
-    rebuilt.close()
+def test_unprotected_segment_has_no_label_columns(unprotected_relics: UnprotectedRelics) -> None:
+    """Given two unprotected relics mirrored to an old segment
+    When the mirror's Relic columns are read
+    Then there is no _dc_owner column
+    """
+    columns = unprotected_relics.mirror._tables[_RELIC].columns
 
-    # 4) mirroring protected data demands the audited root — a non-root
-    #    bootstrap over the now-protected class fails closed, writing nothing.
-    dest = tmp_path / "relic.denied"
-    with store2.snapshot(principal=ANNA) as anna_snap:
-        with pytest.raises(dc.ReadDeniedError):
-            ArrowMirror.bootstrap(dest, anna_snap)
-    assert not dest.exists()                                     # nothing wiped/written
-    store2.close()
+    assert "_dc_owner" not in columns
+
+
+def test_reopened_mirror_resumes_without_a_gap_after_the_flip(
+    unprotected_relics: UnprotectedRelics, shop: MirrorShop
+) -> None:
+    """Given a mirror closed after two relics were mirrored while the class was unprotected
+    When it is reopened after the Relic class flipped to protected
+    Then its watermark is the closed mirror's, with no gap
+    """
+    _relic(protected=True)
+
+    reopened = shop.open(unprotected_relics.name)
+
+    assert reopened.watermark == unprotected_relics.mirror.watermark
+
+
+def test_promotion_folds_both_segments_into_three_rows(flipped_relics: FlippedRelics) -> None:
+    """Given two unlabelled relic rows and one labelled one
+    When the Relic table is read
+    Then it has three rows
+    """
+    table = flipped_relics.mirror.table(flipped_relics.relic_class)
+
+    assert table.num_rows == 3
+
+
+def test_promotion_adds_the_label_columns_to_the_schema(flipped_relics: FlippedRelics) -> None:
+    """Given two unlabelled relic rows and one labelled one
+    When the Relic table schema is read
+    Then it includes _dc_owner
+    """
+    table = flipped_relics.mirror.table(flipped_relics.relic_class)
+
+    assert "_dc_owner" in table.schema.names
+
+
+def test_pre_protection_rows_promote_their_owner_to_null(flipped_relics: FlippedRelics) -> None:
+    """Given a relic mirrored before the class turned protected
+    When its row is read after the flip
+    Then its _dc_owner is null, as the mirror never rewrites mirrored rows
+    """
+    table = flipped_relics.mirror.table(flipped_relics.relic_class)
+
+    owner_by_name = by_column(table, "name", "_dc_owner")
+
+    assert owner_by_name["w1-a"] is None
+
+
+def test_pre_protection_rows_promote_their_read_floor_to_null(flipped_relics: FlippedRelics) -> None:
+    """Given a relic mirrored before the class turned protected
+    When its row is read after the flip
+    Then its _dc_read_floor is null, as the mirror never rewrites mirrored rows
+    """
+    table = flipped_relics.mirror.table(flipped_relics.relic_class)
+
+    floor_by_name = by_column(table, "name", "_dc_read_floor")
+
+    assert floor_by_name["w1-b"] is None
+
+
+def test_born_protected_row_carries_its_persisted_owner(flipped_relics: FlippedRelics) -> None:
+    """Given a relic born protected under Anna
+    When its row is read
+    Then its _dc_owner is Anna's uid
+    """
+    table = flipped_relics.mirror.table(flipped_relics.relic_class)
+
+    owner_by_name = by_column(table, "name", "_dc_owner")
+
+    assert owner_by_name["w2-new"] == ANNA.uid
+
+
+def test_born_protected_row_carries_its_shared_group(flipped_relics: FlippedRelics) -> None:
+    """Given a relic born protected under Anna and shared to the org
+    When its row is read
+    Then its _dc_groups include the org
+    """
+    table = flipped_relics.mirror.table(flipped_relics.relic_class)
+
+    groups_by_name = by_column(table, "name", "_dc_groups")
+
+    assert ORG in groups_by_name["w2-new"]
+
+
+@pytest.fixture
+def root_rebuilt_relics(
+    flipped_relics: FlippedRelics, shop: MirrorShop
+) -> dict:
+    """Re-bootstrap the flipped store from a root snapshot and return its Relic rows by name."""
+    with flipped_relics.store.snapshot(principal=dc.root_principal(1)) as root_snap:
+        rebuilt = shop.bootstrap("relic.rebuilt", root_snap)
+    return {row["name"]: row for row in rebuilt.table(flipped_relics.relic_class).to_pylist()}
+
+
+def test_root_rebootstrap_copies_every_relic(root_rebuilt_relics: dict) -> None:
+    """Given a protected-flipped store with three relics
+    When a root re-bootstrap rebuilds the mirror
+    Then all three relics are in the Relic table
+    """
+    assert len(root_rebuilt_relics) == 3
+
+
+def test_root_rebootstrap_fills_the_legacy_owner_with_nobody(root_rebuilt_relics: dict) -> None:
+    """Given a relic from before the class turned protected
+    When a root re-bootstrap decodes it (R7 legacy fill)
+    Then its _dc_owner is nobody, 0
+    """
+    assert root_rebuilt_relics["w1-a"]["_dc_owner"] == 0
+
+
+def test_root_rebootstrap_fills_the_legacy_groups_with_world(root_rebuilt_relics: dict) -> None:
+    """Given a relic from before the class turned protected
+    When a root re-bootstrap decodes it (R7 legacy fill)
+    Then it reads as before, in the WORLD group
+    """
+    assert list(root_rebuilt_relics["w1-a"]["_dc_groups"]) == [dc.WORLD]
+
+
+def test_root_rebootstrap_fills_the_legacy_read_floor_with_viewer(
+    root_rebuilt_relics: dict,
+) -> None:
+    """Given a relic from before the class turned protected
+    When a root re-bootstrap decodes it (R7 legacy fill)
+    Then its read floor is viewer
+    """
+    assert root_rebuilt_relics["w1-a"]["_dc_read_floor"] == dc.VIEWER
+
+
+def test_root_rebootstrap_fences_the_legacy_write_floor_at_the_top(
+    root_rebuilt_relics: dict,
+) -> None:
+    """Given a relic from before the class turned protected
+    When a root re-bootstrap decodes it (R7 legacy fill)
+    Then its write floor is admin
+    """
+    assert root_rebuilt_relics["w1-a"]["_dc_write_floor"] == dc.ADMIN
+
+
+def test_root_rebootstrap_keeps_the_persisted_stamp_of_the_born_protected_relic(
+    root_rebuilt_relics: dict,
+) -> None:
+    """Given a relic born protected under Anna
+    When a root re-bootstrap decodes it
+    Then its _dc_owner is still Anna's uid
+    """
+    assert root_rebuilt_relics["w2-new"]["_dc_owner"] == ANNA.uid
+
+
+def test_non_root_bootstrap_over_a_protected_class_fails_closed(
+    flipped_relics: FlippedRelics, shop: MirrorShop, tmp_path: Path
+) -> None:
+    """Given a class that is now protected
+    When Anna bootstraps a mirror from her non-root snapshot
+    Then it is denied, as mirroring protected data demands the audited root
+    """
+    with flipped_relics.store.snapshot(principal=ANNA) as anna_snap, pytest.raises(
+        dc.ReadDeniedError
+    ):
+        shop.bootstrap("relic.denied", anna_snap)
+
+
+def test_denied_bootstrap_writes_nothing(
+    flipped_relics: FlippedRelics, shop: MirrorShop, tmp_path: Path
+) -> None:
+    """Given a class that is now protected
+    When Anna's non-root bootstrap is denied
+    Then nothing is wiped or written at the destination
+    """
+    with flipped_relics.store.snapshot(principal=ANNA) as anna_snap, pytest.raises(
+        dc.ReadDeniedError
+    ):
+        shop.bootstrap("relic.denied", anna_snap)
+
+    assert not (tmp_path / "relic.denied").exists()
 
 
 # -- compaction + fold ---------------------------------------------------------------
 
 
-def test_compaction_bounds_segments_and_preserves_content(
-    store_factory, tmp_path
-) -> None:
-    store = store_factory()
-    mirror = fresh_mirror(tmp_path, max_segments=4)
+@pytest.fixture
+def ten_commit_mirror(store: dc.Store, shop: MirrorShop) -> ArrowMirror:
+    """Commit ten quarries one per commit into a mirror that keeps at most four segments."""
+    mirror = shop.open(max_segments=4)
     store.attach(mirror)
-    store.root = []
-    quarries = []
-    for i in range(10):  # 10 commits → many segments → auto-compaction
+    quarries: list[Quarry] = []
+    for i in range(10):
         quarries.append(Quarry(qid=f"Q{i}", name=f"site {i}"))
         store.root = list(quarries)
         store.commit()
-    before = rows(mirror, Quarry)
+    return mirror
+
+
+def test_ten_commits_leave_ten_quarry_rows(ten_commit_mirror: ArrowMirror) -> None:
+    """Given ten commits of one quarry each
+    When the Quarry table is read
+    Then it has ten rows
+    """
+    before = rows(ten_commit_mirror, Quarry)
+
     assert len(before) == 10
-    state = mirror._tables["tests.extras.test_arrow:Quarry"]
-    assert len(state.segments) <= 4
 
-    mirror.compact()
-    assert len(mirror._tables["tests.extras.test_arrow:Quarry"].segments) == 1
-    assert rows(mirror, Quarry) == before
-    # after compact, the data dir is plain parquet, current state only
-    import pyarrow.parquet as pq
 
-    seg_dir = mirror._segment_dir("tests.extras.test_arrow:Quarry")
-    files = list(seg_dir.glob("seg-*.parquet"))
+def test_auto_compaction_bounds_the_segments(ten_commit_mirror: ArrowMirror) -> None:
+    """Given ten commits into a mirror with max_segments=4
+    When its Quarry segments are counted
+    Then there are at most four
+    """
+    segments = ten_commit_mirror._tables[QUARRY_TYPENAME].segments
+
+    assert len(segments) <= 4
+
+
+def test_compact_leaves_one_segment(ten_commit_mirror: ArrowMirror) -> None:
+    """Given ten commits into a mirror with max_segments=4
+    When the mirror is compacted
+    Then the Quarry type has one segment
+    """
+    ten_commit_mirror.compact()
+
+    assert len(ten_commit_mirror._tables[QUARRY_TYPENAME].segments) == 1
+
+
+def test_compact_preserves_the_content(ten_commit_mirror: ArrowMirror) -> None:
+    """Given ten quarry rows in a mirror with max_segments=4
+    When the mirror is compacted
+    Then the Quarry rows are unchanged
+    """
+    before = rows(ten_commit_mirror, Quarry)
+
+    ten_commit_mirror.compact()
+
+    assert rows(ten_commit_mirror, Quarry) == before
+
+
+def test_compact_leaves_one_plain_parquet_file(ten_commit_mirror: ArrowMirror) -> None:
+    """Given ten commits into a mirror with max_segments=4
+    When the mirror is compacted
+    Then the Quarry data dir holds one plain parquet file
+    """
+    ten_commit_mirror.compact()
+
+    files = list(ten_commit_mirror._segment_dir(QUARRY_TYPENAME).glob("seg-*.parquet"))
+
     assert len(files) == 1
-    assert pq.read_table(files[0]).num_rows == 10
-    store.close()
-    mirror.close()
 
 
-def test_flush_batching_trails_durably_but_not_live(store_factory,
-                                                    tmp_path) -> None:
-    store = store_factory()
-    path = tmp_path / "batched.mirror"
-    mirror = ArrowMirror(path, flush_every=10)
+def test_compacted_parquet_file_holds_the_current_state_only(ten_commit_mirror: ArrowMirror) -> None:
+    """Given ten quarry rows in a mirror with max_segments=4
+    When the mirror is compacted and its one parquet file is read
+    Then it holds ten rows
+    """
+    ten_commit_mirror.compact()
+    [parquet_file] = ten_commit_mirror._segment_dir(QUARRY_TYPENAME).glob("seg-*.parquet")
+
+    table = pq.read_table(parquet_file)
+
+    assert table.num_rows == 10
+
+
+@pytest.fixture
+def batched_mirror(store: dc.Store, shop: MirrorShop) -> ArrowMirror:
+    """Commit two quarries into a mirror that flushes only every tenth commit."""
+    mirror = shop.open("batched.mirror", flush_every=10)
     store.attach(mirror)
     store.root = [Quarry(qid="Q1", name="one")]
     store.commit()
-    store.root = list(store.root) + [Quarry(qid="Q2", name="two")]
+    store.root = [*store.root, Quarry(qid="Q2", name="two")]
     store.commit()
-    assert mirror.watermark == 2
-    assert mirror.table(Quarry).num_rows == 2   # unflushed rows still visible
-    mirror.flush()
-    reopened = ArrowMirror(path, flush_every=10)
+    return mirror
+
+
+def test_batched_mirror_advances_the_live_watermark(batched_mirror: ArrowMirror) -> None:
+    """Given a mirror with flush_every=10 after two commits
+    When its watermark is read
+    Then it is 2
+    """
+    assert batched_mirror.watermark == 2
+
+
+def test_batched_mirror_shows_its_unflushed_rows(batched_mirror: ArrowMirror) -> None:
+    """Given a mirror with flush_every=10 after two commits
+    When the Quarry table is read
+    Then the unflushed rows are visible
+    """
+    assert batched_mirror.table(Quarry).num_rows == 2
+
+
+def test_flush_makes_the_batched_commits_durable(batched_mirror: ArrowMirror, shop: MirrorShop) -> None:
+    """Given a mirror with flush_every=10 after two commits
+    When it is flushed and reopened
+    Then the reopened watermark is 2
+    """
+    batched_mirror.flush()
+
+    reopened = shop.open("batched.mirror", flush_every=10)
+
     assert reopened.watermark == 2
-    store.close()
-    mirror.close()
-    reopened.close()
 
 
 # -- configuration honesty -------------------------------------------------------------
 
 
-def test_only_filter_and_drift_refusal(store_factory, tmp_path) -> None:
-    store = store_factory()
-    path = tmp_path / "only.mirror"
-    mirror = ArrowMirror(path, only=[Quarry])
+@pytest.fixture
+def only_quarry_mirror(store: dc.Store, shop: MirrorShop) -> ArrowMirror:
+    """Commit a quarry and a find into a mirror restricted to Quarry."""
+    mirror = shop.open("only.mirror", only=[Quarry])
     store.attach(mirror)
     store.root = [Quarry(qid="Q1", name="Tsumeb"), Find(label="azurite")]
     store.commit()
-    assert mirror.table(Quarry).num_rows == 1
-    assert mirror.table(Find).num_rows == 0     # filtered out
-    store.detach(mirror)
-    mirror.close()
+    return mirror
+
+
+def test_only_filter_mirrors_the_listed_class(only_quarry_mirror: ArrowMirror) -> None:
+    """Given a mirror restricted to Quarry
+    When a quarry and a find are committed
+    Then the Quarry table has one row
+    """
+    assert only_quarry_mirror.table(Quarry).num_rows == 1
+
+
+def test_only_filter_leaves_other_classes_out(only_quarry_mirror: ArrowMirror) -> None:
+    """Given a mirror restricted to Quarry
+    When a quarry and a find are committed
+    Then the Find table has no rows
+    """
+    assert only_quarry_mirror.table(Find).num_rows == 0
+
+
+def test_only_drift_is_refused_on_reopen(
+    store: dc.Store, only_quarry_mirror: ArrowMirror, shop: MirrorShop
+) -> None:
+    """Given a mirror created restricted to Quarry
+    When it is reopened without the filter
+    Then the drift is refused: rebuild, do not guess
+    """
+    store.detach(only_quarry_mirror)
+    only_quarry_mirror.close()
 
     with pytest.raises(MirrorConfigError):
-        ArrowMirror(path)                        # only-drift: rebuild, not guess
-    store.close()
+        shop.open("only.mirror")
 
 
-def test_crash_between_segment_and_manifest_is_swept(store_factory,
-                                                     tmp_path) -> None:
-    """A segment without a manifest entry is debris from a crash mid-flush:
-    the next open must sweep it and resume from the durable watermark."""
-    store = store_factory()
-    path = tmp_path / "crash.mirror"
-    mirror = ArrowMirror(path)
+@pytest.fixture
+def mirror_with_orphan_segment(store: dc.Store, shop: MirrorShop) -> Path:
+    """Close a one-quarry mirror and plant a segment its manifest never named."""
+    mirror = shop.open("crash.mirror")
     store.attach(mirror)
     store.root = [Quarry(qid="Q1", name="Tsumeb")]
     store.commit()
     store.detach(mirror)
     mirror.close()
+    segment_dir = mirror._segment_dir(QUARRY_TYPENAME)
+    orphan = segment_dir / "seg-000002.parquet"
+    orphan.write_bytes((segment_dir / "seg-000001.parquet").read_bytes())
+    return orphan
 
-    seg_dir = mirror._segment_dir("tests.extras.test_arrow:Quarry")
-    orphan = seg_dir / "seg-000002.parquet"
-    orphan.write_bytes((seg_dir / "seg-000001.parquet").read_bytes())
 
-    reopened = ArrowMirror(path)
-    assert not orphan.exists()                  # swept on open
+def test_crash_debris_segment_is_swept_on_open(
+    mirror_with_orphan_segment: Path, shop: MirrorShop
+) -> None:
+    """Given a segment without a manifest entry, debris from a crash mid-flush
+    When the mirror is reopened
+    Then the debris is swept
+    """
+    shop.open("crash.mirror")
+
+    assert not mirror_with_orphan_segment.exists()
+
+
+def test_reopen_after_a_crash_resumes_from_the_durable_watermark(
+    mirror_with_orphan_segment: Path, shop: MirrorShop
+) -> None:
+    """Given a segment without a manifest entry, debris from a crash mid-flush
+    When the mirror is reopened
+    Then its watermark is the durable 1
+    """
+    reopened = shop.open("crash.mirror")
+
     assert reopened.watermark == 1
+
+
+def test_reopen_after_a_crash_keeps_the_durable_rows(
+    mirror_with_orphan_segment: Path, shop: MirrorShop
+) -> None:
+    """Given a segment without a manifest entry, debris from a crash mid-flush
+    When the mirror is reopened
+    Then the Quarry table has its one durable row
+    """
+    reopened = shop.open("crash.mirror")
+
     assert reopened.table(Quarry).num_rows == 1
-    store.close()
-    reopened.close()
 
 
-def test_apply_is_o_delta_not_o_corpus(tmp_path) -> None:
-    """Fitness #9 shape: rows flushed for one fixed-size delta must not
-    grow with the corpus."""
-    from datacrystal._storage.memory import MemoryBackend
+@pytest.fixture
+def indexed_corpus(shop: MirrorShop) -> Iterator[Callable[[int], tuple[dc.Store, ArrowMirror]]]:
+    """Return a factory for a committed, mirrored in-memory corpus; close the stores after."""
+    stores: list[dc.Store] = []
 
-    flushed: list[int] = []
-    for corpus in (10, 100):
-        store = dc.Store._from_backend(MemoryBackend())
-        mirror = fresh_mirror(tmp_path)
-        store.attach(mirror)
-        store.root = [Quarry(qid=f"Q{corpus}-{i}", name=f"s{i}")
-                      for i in range(corpus)]
-        store.commit()
-        store.root = list(store.root) + [Quarry(qid=f"Qx-{corpus}", name="probe")]
-        store.commit()
-        flushed.append(mirror.rows_flushed)
-        store.close()
-        mirror.close()
-    assert flushed[0] == flushed[1], (
-        f"rows flushed per fixed delta grew with corpus size: {flushed}"
-    )
+    def build(size: int) -> tuple[dc.Store, ArrowMirror]:
+        corpus_store = dc.Store._from_backend(MemoryBackend())
+        stores.append(corpus_store)
+        mirror = shop.open()
+        corpus_store.attach(mirror)
+        corpus_store.root = [Quarry(qid=f"Q{size}-{i}", name=f"s{i}") for i in range(size)]
+        corpus_store.commit()
+        return corpus_store, mirror
+
+    yield build
+    for corpus_store in stores:
+        corpus_store.close()
 
 
-def test_refs_decode_fallback_roundtrip_in_lists(store_factory,
-                                                 tmp_path) -> None:
-    """Lists of refs mirror as list<int64> ref columns."""
-    store = store_factory()
-    mirror = fresh_mirror(tmp_path)
-    store.attach(mirror)
+def test_apply_cost_does_not_grow_with_the_corpus(
+    indexed_corpus: Callable[[int], tuple[dc.Store, ArrowMirror]],
+) -> None:
+    """Given two independent stores mirroring 10 and 100 quarries (fitness #9)
+    When one fixed-size quarry is committed into each
+    Then the same number of rows is flushed for both
+    """
+    small_store, small_mirror = indexed_corpus(10)
+    large_store, large_mirror = indexed_corpus(100)
+    small_store.root = [*small_store.root, Quarry(qid="Qx-10", name="probe")]
+    large_store.root = [*large_store.root, Quarry(qid="Qx-100", name="probe")]
+
+    small_store.commit()
+    large_store.commit()
+
+    assert large_mirror.rows_flushed == small_mirror.rows_flushed
+
+
+@pytest.fixture
+def mirrored_hoard(store: dc.Store, mirror: ArrowMirror) -> ArrowMirror:
+    """Commit a find whose tags are a list of two quarry references."""
     a = Quarry(qid="QA", name="a")
     b = Quarry(qid="QB", name="b")
     store.root = [a, b, Find(label="hoard", tags=[a, b])]
     store.commit()
-    quarry_oids = {row["__oid__"] for row in rows(mirror, Quarry)}
-    tag_oids = set(rows(mirror, Find)[0]["tags"])
-    assert tag_oids == quarry_oids
-    field = mirror.table(Find).schema.field("tags")
+    return mirror
+
+
+def test_list_of_refs_mirrors_the_oids_of_its_targets(mirrored_hoard: ArrowMirror) -> None:
+    """Given a find whose tags list refers to two quarries
+    When the Find row is read
+    Then the tags are the OIDs of the two Quarry rows
+    """
+    row = rows(mirrored_hoard, Find)[0]
+
+    assert set(row["tags"]) == {quarry["__oid__"] for quarry in rows(mirrored_hoard, Quarry)}
+
+
+def test_list_of_refs_mirrors_as_a_list_of_int64(mirrored_hoard: ArrowMirror) -> None:
+    """Given a find whose tags list refers to two quarries
+    When the Find table schema is read
+    Then tags is list<int64>
+    """
+    field = mirrored_hoard.table(Find).schema.field("tags")
+
     assert field.type == pa.list_(pa.int64())
-    store.close()
-    mirror.close()
 
 
 def test_decode_fallback_restores_reftokens() -> None:
-    from datacrystal.arrow import _encode_fallback
-
+    """Given a value with a RefToken, a date and a mixed list, encoded as a fallback
+    When decode_fallback decodes it
+    Then the original value is restored
+    """
     value = {"ref": RefToken(42), "when": dt.date(2026, 1, 1), "xs": [1, "two"]}
-    assert decode_fallback(_encode_fallback(value)) == value
+    encoded = _encode_fallback(value)
+
+    decoded = decode_fallback(encoded)
+
+    assert decoded == value
 
 
 # -- #16: streaming bootstrap (larger-than-RAM) -----------------------------------
 
-def _store_with_finds(store_factory, n: int):
-    store = store_factory()
-    store.root = [Find(label=f"f{i}", mass_g=float(i)) for i in range(n)]
-    store.commit()
-    return store
+
+@pytest.fixture
+def commit_finds(store: dc.Store) -> Callable[[int], dc.Store]:
+    """Return a function that commits n finds into the store and returns the store."""
+
+    def commit(count: int) -> dc.Store:
+        store.root = [Find(label=f"f{i}", mass_g=float(i)) for i in range(count)]
+        store.commit()
+        return store
+
+    return commit
 
 
-def test_bootstrap_streams_without_caching(store_factory, tmp_path) -> None:
-    # AC1: the cache-bypassing _stream materializes nothing, and the streamed
-    # mirror is byte-identical to a single-shot bootstrap.
-    store = _store_with_finds(store_factory, 50)
+def test_streamed_bootstrap_caches_nothing(
+    commit_finds: Callable[[int], dc.Store], shop: MirrorShop
+) -> None:
+    """Given a store of 50 finds
+    When a mirror is bootstrapped with batch=10 from the cache-bypassing stream
+    Then the snapshot's cache stays empty
+    """
+    store = commit_finds(50)
+
     with store.snapshot() as snap:
-        mirror = ArrowMirror.bootstrap(tmp_path / "boot", snap, batch=10)
-        assert len(snap._core.cache) == 0  # pyright: ignore[reportPrivateUsage]
-    assert mirror.table(Find).num_rows == 50
+        shop.bootstrap("boot", snap, batch=10)
+        cached = len(snap._core.cache)
+
+    assert cached == 0
+
+
+def test_streamed_bootstrap_mirrors_every_find(
+    commit_finds: Callable[[int], dc.Store], shop: MirrorShop
+) -> None:
+    """Given a store of 50 finds
+    When a mirror is bootstrapped with batch=10
+    Then the Find table has 50 rows
+    """
+    store = commit_finds(50)
+
+    with store.snapshot() as snap:
+        streamed = shop.bootstrap("boot", snap, batch=10)
+
+    assert streamed.table(Find).num_rows == 50
+
+
+def test_streamed_bootstrap_equals_a_single_shot_bootstrap(
+    commit_finds: Callable[[int], dc.Store], shop: MirrorShop
+) -> None:
+    """Given a store of 50 finds
+    When one mirror is bootstrapped with batch=10 and one with batch=10000
+    Then both Find tables hold the same rows
+    """
+    store = commit_finds(50)
+    with store.snapshot() as snap:
+        streamed = shop.bootstrap("boot", snap, batch=10)
     with store.snapshot() as snap2:
-        ref = ArrowMirror.bootstrap(tmp_path / "ref", snap2, batch=10_000)
-    assert rows(mirror, Find) == rows(ref, Find)
-    store.close()
-    mirror.close()
-    ref.close()
+        single_shot = shop.bootstrap("ref", snap2, batch=10_000)
+
+    assert rows(streamed, Find) == rows(single_shot, Find)
 
 
-def test_bootstrap_pending_bounded_by_batch(store_factory, tmp_path,
-                                            monkeypatch) -> None:
-    # AC2: peak resident rows is O(batch), not O(extent) — _pending never holds
-    # the whole extent (this fails on the old single-flush impl). batch is
-    # independent of flush_every (which defaults to 1 — chunking by it would
-    # write one segment per row, the regression this design avoids).
-    store = _store_with_finds(store_factory, 50)
-    peaks: list[int] = []
+class FlushSpy:
+    """Records what ArrowMirror.flush saw: the pending rows and the watermark at each call."""
+
+    def __init__(self) -> None:
+        """Start with nothing recorded."""
+        self.pending_sizes: list[int] = []
+        self.watermarks: list[int] = []
+
+
+@pytest.fixture
+def flush_spy(monkeypatch: pytest.MonkeyPatch) -> FlushSpy:
+    """Replace ArrowMirror.flush with a recording wrapper around the real one."""
+    spy = FlushSpy()
     real_flush = ArrowMirror.flush
 
-    def spy(self):
-        peaks.append(sum(len(r) for r in self._pending.values()))
-        return real_flush(self)
+    def recording_flush(self: ArrowMirror) -> None:
+        spy.pending_sizes.append(sum(len(pending) for pending in self._pending.values()))
+        spy.watermarks.append(self._watermark)
+        real_flush(self)
 
-    monkeypatch.setattr(ArrowMirror, "flush", spy)
+    monkeypatch.setattr(ArrowMirror, "flush", recording_flush)
+    return spy
+
+
+def test_bootstrap_flushes_at_least_once(
+    commit_finds: Callable[[int], dc.Store], shop: MirrorShop, flush_spy: FlushSpy
+) -> None:
+    """Given a store of 50 finds
+    When a mirror is bootstrapped with batch=10
+    Then flush ran
+    """
+    store = commit_finds(50)
+
     with store.snapshot() as snap:
-        ArrowMirror.bootstrap(tmp_path / "boot", snap, batch=10)
-    assert peaks and max(peaks) <= 10, f"peak pending {max(peaks)} > batch"
-    store.close()
+        shop.bootstrap("boot", snap, batch=10)
+
+    assert flush_spy.pending_sizes != []
 
 
-def test_bootstrap_default_batch_is_few_segments(store_factory, tmp_path) -> None:
-    # Regression guard: the DEFAULT bootstrap (flush_every=1) must NOT flush per
-    # row — chunking the bootstrap by flush_every would write one parquet
-    # segment per row (50 here), catastrophically slow at scale.
-    store = _store_with_finds(store_factory, 50)
-    path = tmp_path / "boot"
+def test_bootstrap_pending_rows_stay_bounded_by_the_batch(
+    commit_finds: Callable[[int], dc.Store], shop: MirrorShop, flush_spy: FlushSpy
+) -> None:
+    """Given a store of 50 finds, where chunking by flush_every=1 would write a segment per row
+    When a mirror is bootstrapped with batch=10
+    Then no flush saw more than 10 pending rows, so peak residency is O(batch), not O(extent)
+    """
+    store = commit_finds(50)
+
     with store.snapshot() as snap:
-        mirror = ArrowMirror.bootstrap(path, snap)  # all defaults
-    segments = list(path.rglob("*.parquet"))
-    assert len(segments) <= 2, (
-        f"default bootstrap wrote {len(segments)} segments for 50 rows — it "
-        "must batch, not flush per row"
-    )
-    store.close()
-    mirror.close()
+        shop.bootstrap("boot", snap, batch=10)
+
+    assert max(flush_spy.pending_sizes) <= 10, f"peak pending {max(flush_spy.pending_sizes)} > batch"
 
 
-def test_bootstrap_watermark_deferred_to_final_flush(store_factory, tmp_path,
-                                                     monkeypatch) -> None:
-    # AC3: only the final flush stamps the real watermark — a crash mid-stream
-    # leaves the manifest at 0 (!= snapshot.tid), forcing a clean re-bootstrap.
-    store = _store_with_finds(store_factory, 30)
-    seen: list[int] = []
-    real_flush = ArrowMirror.flush
+def test_bootstrap_defers_the_real_watermark_to_the_final_flush(
+    commit_finds: Callable[[int], dc.Store], shop: MirrorShop, flush_spy: FlushSpy
+) -> None:
+    """Given a store of 30 finds
+    When a mirror is bootstrapped with batch=10
+    Then there are at least two flushes
+    And every flush but the last still saw watermark 0, so a mid-stream crash forces a re-bootstrap
+    And the last flush saw the snapshot's tid
+    And the mirror ends at that tid
+    """
+    store = commit_finds(30)
 
-    def spy(self):
-        seen.append(self._watermark)
-        return real_flush(self)
-
-    monkeypatch.setattr(ArrowMirror, "flush", spy)
     with store.snapshot() as snap:
         tid = snap.tid
-        mirror = ArrowMirror.bootstrap(tmp_path / "boot", snap, batch=10)
-    assert len(seen) >= 2
-    assert all(w == 0 for w in seen[:-1]), seen
-    assert seen[-1] == tid and mirror.watermark == tid
-    store.close()
-    mirror.close()
+        mirror = shop.bootstrap("boot", snap, batch=10)
+
+    assert len(flush_spy.watermarks) >= 2
+    assert all(watermark == 0 for watermark in flush_spy.watermarks[:-1]), flush_spy.watermarks
+    assert flush_spy.watermarks[-1] == tid
+    assert mirror.watermark == tid
 
 
-def test_bootstrap_suppresses_compaction_thrash(store_factory, tmp_path,
-                                                monkeypatch) -> None:
-    # AC4: many small batches over > max_segments rows would compact repeatedly;
-    # bootstrap suppresses it (<=1 per type — here 0).
-    store = _store_with_finds(store_factory, 40)
-    compactions: list[str] = []
+def test_bootstrap_default_batch_writes_few_segments(
+    commit_finds: Callable[[int], dc.Store], shop: MirrorShop, tmp_path: Path
+) -> None:
+    """Given a store of 50 finds, where a segment per row would be catastrophically slow at scale
+    When a mirror is bootstrapped with all defaults
+    Then at most two parquet segments are written
+    """
+    store = commit_finds(50)
+
+    with store.snapshot() as snap:
+        shop.bootstrap("boot", snap)
+
+    segments = list((tmp_path / "boot").rglob("*.parquet"))
+    assert len(segments) <= 2, f"default bootstrap wrote {len(segments)} segments for 50 rows"
+
+
+@pytest.fixture
+def compaction_spy(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Replace ArrowMirror._compact_type with a wrapper recording the typenames it compacts."""
+    compacted: list[str] = []
     real_compact = ArrowMirror._compact_type
 
-    def spy(self, typename, state):
-        compactions.append(typename)
-        return real_compact(self, typename, state)
+    def recording_compact(self: ArrowMirror, typename: str, state: _TableState) -> None:
+        compacted.append(typename)
+        real_compact(self, typename, state)
 
-    monkeypatch.setattr(ArrowMirror, "_compact_type", spy)
+    monkeypatch.setattr(ArrowMirror, "_compact_type", recording_compact)
+    return compacted
+
+
+def test_bootstrap_suppresses_compaction_thrash(
+    commit_finds: Callable[[int], dc.Store], shop: MirrorShop, compaction_spy: list[str]
+) -> None:
+    """Given a store of 40 finds, whose many small batches would compact repeatedly
+    When a mirror is bootstrapped with batch=1 and max_segments=4
+    Then no type is compacted
+    """
+    store = commit_finds(40)
+
     with store.snapshot() as snap:
-        ArrowMirror.bootstrap(tmp_path / "boot", snap, batch=1, max_segments=4)
-    assert compactions == [], f"bootstrap compacted {compactions} — must suppress"
-    store.close()
+        shop.bootstrap("boot", snap, batch=1, max_segments=4)
+
+    assert compaction_spy == [], f"bootstrap compacted {compaction_spy} — must suppress"
 
 
 # -- analytics: "filter in datacrystal, aggregate in DuckDB" (#53) ----------------
@@ -632,120 +1355,145 @@ def test_bootstrap_suppresses_compaction_thrash(store_factory, tmp_path,
 # The documented recipe (GUIDE → Arrow mirrors → "Analytics at scale"): a
 # datacrystal-side bitmap query yields OIDs; DuckDB aggregates over the parquet
 # mirror restricted to those OIDs via ``ArrowMirror.OID_COLUMN``. These tests run
-# that exact path and assert the result equals a plain-Python oracle. DuckDB is a
-# dev dependency, not part of the [arrow] extra — each test importorskips it (so
-# the pyarrow-only tests above still run when it is absent, and the returned
-# module stays non-optional for the type checker).
+# that exact path. DuckDB is a dev dependency, not part of the [arrow] extra, so
+# each test requests the fixture that importorskips it (so the pyarrow-only tests
+# above still run when it is absent).
 
 
-def _cabinet(store_factory):
-    """A small cabinet of Finds: indexed grade, a mass measure, some Nones."""
-    store = store_factory()
-    finds = [
+@pytest.fixture
+def duckdb() -> ModuleType:
+    """Import duckdb, skipping the test when it is absent."""
+    return pytest.importorskip("duckdb", reason="pip install duckdb")
+
+
+@pytest.fixture
+def mirrored_cabinet(store: dc.Store, mirror: ArrowMirror) -> ArrowMirror:
+    """Commit seven finds: indexed grades A, B, C, a null grade, a null mass and a mass."""
+    store.root = [
         Find(label="azurite", mass_g=412.5, grade="A"),
         Find(label="malachite", mass_g=120.0, grade="A"),
         Find(label="pyrite", mass_g=66.0, grade="B"),
         Find(label="quartz", mass_g=300.0, grade="B"),
-        Find(label="fluorite", mass_g=None, grade="B"),   # null measure
+        Find(label="fluorite", mass_g=None, grade="B"),  # null measure
         Find(label="opal", mass_g=58.0, grade="C"),
-        Find(label="rubble", mass_g=9.0, grade=None),     # null group key
+        Find(label="rubble", mass_g=9.0, grade=None),  # null group key
     ]
-    return store, finds
-
-
-def test_groupby_aggregate_matches_python_oracle(store_factory, tmp_path) -> None:
-    """Pure-columnar path: total + average mass per grade, computed in DuckDB
-    over the whole mirror, equals a Python aggregation of the same rows."""
-    duckdb = pytest.importorskip("duckdb", reason="pip install duckdb")
-    store, finds = _cabinet(store_factory)
-    mirror = fresh_mirror(tmp_path)
-    store.attach(mirror)
-    store.root = finds
     store.commit()
+    return mirror
 
-    finds_tbl = mirror.table(Find)  # noqa: F841 — DuckDB replacement-scans it
+
+def test_groupby_aggregate_over_the_mirror_matches_the_known_totals(
+    duckdb: ModuleType, mirrored_cabinet: ArrowMirror
+) -> None:
+    """Given a cabinet of seven finds with a null measure and a null grade
+    When DuckDB aggregates count, total and mean mass per grade over the whole mirror
+    Then each grade carries its known figures and the null grade is left out
+    """
+    finds_tbl = mirrored_cabinet.table(Find)  # noqa: F841 — DuckDB replacement-scans it
+
     got = duckdb.query(
         "SELECT grade, count(*) AS n, sum(mass_g) AS total, avg(mass_g) AS mean "
         "FROM finds_tbl WHERE grade IS NOT NULL GROUP BY grade ORDER BY grade"
     ).fetchall()
 
-    oracle: dict[str, list[float]] = {}
-    for f in finds:
-        if f.grade is None:
-            continue
-        oracle.setdefault(f.grade, []).append(f.mass_g)  # type: ignore[arg-type]
-    expected = [
-        (
-            g,
-            len(ms),
-            sum(m for m in ms if m is not None),
-            (lambda nn: sum(nn) / len(nn) if nn else None)(
-                [m for m in ms if m is not None]
-            ),
-        )
-        for g, ms in sorted(oracle.items())
-    ]
-    assert got == expected
-    store.close()
-    mirror.close()
+    assert got == [("A", 2, 532.5, 266.25), ("B", 3, 366.0, 183.0), ("C", 1, 58.0, 58.0)]
 
 
-def test_oid_handoff_filter_then_aggregate(store_factory, tmp_path) -> None:
-    """The headline recipe: a datacrystal bitmap query (on the indexed grade)
-    yields OIDs; DuckDB sums the measure over ONLY those rows via OID_COLUMN —
-    equal to summing the same hits in Python (the slow ``pluck`` path)."""
-    duckdb = pytest.importorskip("duckdb", reason="pip install duckdb")
-    store, finds = _cabinet(store_factory)
-    mirror = fresh_mirror(tmp_path)
-    store.attach(mirror)
-    store.root = finds
-    store.commit()
+class GradeBHits(NamedTuple):
+    """The oids a datacrystal bitmap query found for grade B, and the snapshot tid of that query."""
 
-    F = dc.fields(Find)
-    # Bitmap filter in datacrystal, at the mirror's watermark, no hydration.
+    oids: list[int]
+    tid: int
+
+
+@pytest.fixture
+def grade_b_hits(store: dc.Store, mirrored_cabinet: ArrowMirror) -> GradeBHits:
+    """Query grade B through the bitmap index, without hydration, at the mirror's watermark."""
     with store.snapshot() as snap:
-        assert snap.tid == mirror.watermark
-        hit_oids = [v.oid for v in snap.query(F.grade == "B")]
+        views = snap.query(dc.fields(Find).grade == "B")  # pyrefly: ignore[bad-argument-type]
+        return GradeBHits(oids_of(views), snap.tid)
 
-    finds_tbl = mirror.table(Find)  # noqa: F841 — DuckDB replacement-scans it
+
+def test_bitmap_hits_come_from_the_mirrors_watermark(
+    grade_b_hits: GradeBHits, mirrored_cabinet: ArrowMirror
+) -> None:
+    """Given a datacrystal bitmap query on the indexed grade
+    When its snapshot tid is compared with the mirror's watermark
+    Then they are equal
+    """
+    assert grade_b_hits.tid == mirrored_cabinet.watermark
+
+
+def test_bitmap_filter_restricts_the_handoff_to_the_grade_b_hits(grade_b_hits: GradeBHits) -> None:
+    """Given a cabinet of seven finds of which three are grade B
+    When the bitmap query on grade B yields OIDs
+    Then there are three, not the whole extent
+    """
+    assert len(grade_b_hits.oids) == 3
+
+
+def test_duckdb_sums_the_measure_over_only_the_handed_off_oids(
+    duckdb: ModuleType, grade_b_hits: GradeBHits, mirrored_cabinet: ArrowMirror
+) -> None:
+    """Given the OIDs of the grade B finds from a datacrystal bitmap query
+    When DuckDB sums the measure over those rows via OID_COLUMN
+    Then the total is 366.0
+    """
+    finds_tbl = mirrored_cabinet.table(Find)  # noqa: F841 — DuckDB replacement-scans it
+
     (total,) = duckdb.execute(
         f"SELECT sum(mass_g) FROM finds_tbl WHERE {ArrowMirror.OID_COLUMN} IN "
         "(SELECT * FROM UNNEST(?))",
-        [hit_oids],
+        [grade_b_hits.oids],
     ).fetchone()
 
-    # Python oracle: the pluck()+sum path #53 is replacing.
-    py_total = sum(v for v in store.pluck(F.grade == "B", "mass_g") if v is not None)
-    assert total == py_total == 366.0
-    # the handoff really restricted the scan to the bitmap hits, not the extent
-    assert len(hit_oids) == 3
-    store.close()
-    mirror.close()
+    assert total == 366.0
 
 
-def test_parquet_dir_read_after_compact(store_factory, tmp_path) -> None:
-    """After ``compact()`` the per-type ``parquet_dir()`` is plain parquet —
-    DuckDB ``read_parquet`` over it (off the owner thread) equals ``table()``."""
-    duckdb = pytest.importorskip("duckdb", reason="pip install duckdb")
-    store, finds = _cabinet(store_factory)
-    mirror = fresh_mirror(tmp_path)
-    store.attach(mirror)
-    store.root = finds
-    store.commit()
-    store.detach(mirror)
-    mirror.compact()
+def test_pluck_path_sums_the_same_total_as_the_handoff(
+    store: dc.Store, mirrored_cabinet: ArrowMirror
+) -> None:
+    """Given a cabinet of seven finds of which three are grade B
+    When the slow pluck path sums the grade B masses in Python
+    Then the total is 366.0, the figure the DuckDB handoff must equal
+    """
+    masses = store.pluck(dc.fields(Find).grade == "B", "mass_g")  # pyrefly: ignore[bad-argument-type]
 
-    directory = mirror.parquet_dir(Find)
+    assert sum(mass for mass in masses if mass is not None) == 366.0
+
+
+@pytest.fixture
+def compacted_cabinet(store: dc.Store, mirrored_cabinet: ArrowMirror) -> ArrowMirror:
+    """Detach the cabinet mirror and compact it to plain parquet."""
+    store.detach(mirrored_cabinet)
+    mirrored_cabinet.compact()
+    return mirrored_cabinet
+
+
+def test_compacted_mirror_has_a_parquet_directory(compacted_cabinet: ArrowMirror) -> None:
+    """Given a compacted cabinet mirror
+    When the Find parquet_dir is asked for
+    Then it is a directory
+    """
+    directory = compacted_cabinet.parquet_dir(Find)
+
     assert directory.is_dir()
-    glob = str(directory / "*.parquet").replace("'", "''")
-    # compact() leaves one fold-free file, tombstones already dropped, so a raw
-    # read over the directory is the exact live set (count + measure sum).
-    (n, total) = duckdb.execute(
+
+
+def test_duckdb_reads_the_compacted_directory_as_the_exact_live_set(
+    duckdb: ModuleType, compacted_cabinet: ArrowMirror
+) -> None:
+    """Given a compacted cabinet mirror, one fold-free file with tombstones already dropped
+    When DuckDB read_parquet reads the directory off the owner thread
+    Then it counts seven finds with a mass total of 965.5
+    """
+    glob = str(compacted_cabinet.parquet_dir(Find) / "*.parquet").replace("'", "''")
+
+    (count, total) = duckdb.execute(
         f"SELECT count(*), sum(mass_g) FROM read_parquet('{glob}')"
     ).fetchone()
-    assert n == len(finds)
-    assert total == sum(f.mass_g for f in finds if f.mass_g is not None)
-    mirror.close()
+
+    assert (count, total) == (7, 965.5)
 
 
 # -- Decimal (#184) ----------------------------------------------------------------
@@ -753,82 +1501,142 @@ def test_parquet_dir_read_after_compact(store_factory, tmp_path) -> None:
 
 @dc.entity
 class Valuation:
+    """A specimen valuation with an exact decimal price."""
+
     specimen: str
     price: Decimal | None = None
 
 
-def test_decimal_field_mirrors_as_an_arrow_decimal_column(tmp_path, store_factory) -> None:
-    store = store_factory()
-    mirror = fresh_mirror(tmp_path)
-    store.attach(mirror)
-    store.root = [Valuation(specimen="a", price=Decimal("72.46")),
-                  Valuation(specimen="b", price=Decimal("-0.30")),
-                  Valuation(specimen="c", price=None)]
+@dc.entity
+class ValuationLot:
+    """A specimen valuation lot with exact decimal parts."""
+
+    specimen: str
+    parts: list[Decimal] | None = None
+
+
+def test_decimal_field_mirrors_as_an_arrow_decimal_column(
+    store: dc.Store, mirror: ArrowMirror
+) -> None:
+    """Given valuations with Decimal prices
+    When the Valuation table is read
+    Then the price column is an Arrow decimal
+    """
+    store.root = [Valuation(specimen="a", price=Decimal("72.46"))]
     store.commit()
 
     table = mirror.table(Valuation)
-    assert pa.types.is_decimal(table.schema.field("price").type)
-    by_number = {r["specimen"]: r["price"] for r in table.to_pylist()}
-    assert by_number == {"a": Decimal("72.46"), "b": Decimal("-0.30"), "c": None}
-    store.close()
-    mirror.close()
+
+    assert pa_types.is_decimal(table.schema.field("price").type)
 
 
-def test_decimal_column_widens_across_segments_without_losing_digits(
-        tmp_path, store_factory) -> None:
-    store = store_factory()
-    mirror = fresh_mirror(tmp_path)
-    store.attach(mirror)
+def test_decimal_prices_keep_their_digits_and_nulls(store: dc.Store, mirror: ArrowMirror) -> None:
+    """Given valuations of 72.46, -0.30 and no price
+    When the Valuation table is read
+    Then each specimen carries its exact Decimal or None
+    """
+    store.root = [
+        Valuation(specimen="a", price=Decimal("72.46")),
+        Valuation(specimen="b", price=Decimal("-0.30")),
+        Valuation(specimen="c", price=None),
+    ]
+    store.commit()
+
+    price_by_specimen = by_column(mirror.table(Valuation), "specimen", "price")
+
+    assert price_by_specimen == {"a": Decimal("72.46"), "b": Decimal("-0.30"), "c": None}
+
+
+@pytest.fixture
+def widened_prices(store: dc.Store, mirror: ArrowMirror) -> dict:
+    """Commit a 1.5 price, then a 26-digit price that widens the column; return the prices."""
     first = Valuation(specimen="a", price=Decimal("1.5"))
     store.root = [first]
     store.commit()
     store.root = [first, Valuation(specimen="b", price=Decimal("12345678901234567890.123456"))]
     store.commit()
+    return by_column(mirror.table(Valuation), "specimen", "price")
 
-    by_number = {r["specimen"]: r["price"] for r in mirror.table(Valuation).to_pylist()}
-    assert by_number["a"] == Decimal("1.5")
-    assert by_number["b"] == Decimal("12345678901234567890.123456")
-    store.close()
-    mirror.close()
+
+def test_widened_decimal_column_keeps_the_early_price(widened_prices: dict) -> None:
+    """Given a decimal column widened by a later segment
+    When the early price is read back
+    Then it is still 1.5
+    """
+    assert widened_prices["a"] == Decimal("1.5")
+
+
+def test_widened_decimal_column_keeps_every_digit_of_the_wide_price(widened_prices: dict) -> None:
+    """Given a decimal column widened by a later segment
+    When the wide price is read back
+    Then every digit survives
+    """
+    assert widened_prices["b"] == Decimal("12345678901234567890.123456")
 
 
 def test_decimal_beyond_arrow_precision_falls_back_to_exact_text(
-        tmp_path, store_factory) -> None:
-    store = store_factory()
-    mirror = fresh_mirror(tmp_path)
-    store.attach(mirror)
+    store: dc.Store, mirror: ArrowMirror
+) -> None:
+    """Given a price with 41 significant digits, beyond Arrow's decimal precision
+    When the Valuation row is read and its fallback decoded
+    Then the exact Decimal is restored
+    """
     too_wide = Decimal("1." + "1" * 40)
     store.root = [Valuation(specimen="w", price=too_wide)]
     store.commit()
 
     row = rows(mirror, Valuation)[0]
+
     assert decode_fallback(row["price"]) == too_wide
-    store.close()
-    mirror.close()
 
 
-@dc.entity
-class ValuationLot:
-    specimen: str
-    parts: list[Decimal] | None = None
-
-
-def test_decimal_list_column_widens_across_segments_without_losing_digits(
-        tmp_path, store_factory) -> None:
-    store = store_factory()
-    mirror = fresh_mirror(tmp_path)
-    store.attach(mirror)
+@pytest.fixture
+def widened_lot_table(store: dc.Store, mirror: ArrowMirror) -> pa.Table:
+    """Commit a 1.5 part, then a 26-digit part that widens the list column; return the table."""
     first = ValuationLot(specimen="a", parts=[Decimal("1.5")])
     store.root = [first]
     store.commit()
-    store.root = [first, ValuationLot(specimen="b", parts=[Decimal("12345678901234567890.123456")])]
+    store.root = [
+        first,
+        ValuationLot(specimen="b", parts=[Decimal("12345678901234567890.123456")]),
+    ]
     store.commit()
+    return mirror.table(ValuationLot)
 
-    table = mirror.table(ValuationLot)
-    by_number = {r["specimen"]: r["parts"] for r in table.to_pylist()}
-    assert pa.types.is_list(table.schema.field("parts").type)
-    assert pa.types.is_decimal(table.schema.field("parts").type.value_type)
-    assert by_number["a"] == [Decimal("1.5")]
-    assert by_number["b"] == [Decimal("12345678901234567890.123456")]
-    store.close()
-    mirror.close()
+
+def test_decimal_list_column_stays_a_list(widened_lot_table: pa.Table) -> None:
+    """Given a decimal list column widened by a later segment
+    When its schema is read
+    Then parts is a list
+    """
+    assert pa_types.is_list(widened_lot_table.schema.field("parts").type)
+
+
+def test_decimal_list_column_keeps_decimal_values(widened_lot_table: pa.Table) -> None:
+    """Given a decimal list column widened by a later segment
+    When its schema is read
+    Then the list values are decimals
+    """
+    assert pa_types.is_decimal(widened_lot_table.schema.field("parts").type.value_type)
+
+
+def test_widened_decimal_list_keeps_the_early_part(widened_lot_table: pa.Table) -> None:
+    """Given a decimal list column widened by a later segment
+    When the early row is read back
+    Then its part is still 1.5
+    """
+    parts_by_specimen = by_column(widened_lot_table, "specimen", "parts")
+
+    assert parts_by_specimen["a"] == [Decimal("1.5")]
+
+
+def test_widened_decimal_list_keeps_every_digit_of_the_wide_part(
+    widened_lot_table: pa.Table,
+) -> None:
+    """Given a decimal list column widened by a later segment
+    When the wide row is read back
+    Then every digit survives
+    """
+    parts_by_specimen = by_column(widened_lot_table, "specimen", "parts")
+
+    assert parts_by_specimen["b"] == [Decimal("12345678901234567890.123456")]
