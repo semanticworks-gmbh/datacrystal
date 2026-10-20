@@ -25,16 +25,16 @@ Gates that switch on in a later wave say so by issue: tests (ANN, D, PT, FBT001)
 ### readable-tests
 - **Rule:** A test names its behaviour and outcome, reads Given / When / Then, is straight-line code — no `if`, `for`, `while`, `try` or lambda in a test, no comprehension outside an `assert` — calls the system and asserts in its own body with the values stated, one fact per assert, through the public API, any fixture function-scoped — except a session-scoped process handle that only a function-scoped fixture requests — no `sleep()`; a helper builds data only; `parametrize` rows hold plain values only.
 - **Applies to:** every test; `benchmarks/test_pr_gates.py` joins in #190. The domain is the mineral cabinet only. An engine test runs on both backends through `store_factory` (`tests/conftest.py`), and memory and sqlite behave identically.
-- **Enforced by:** ci — the `test-rules` job in `.github/workflows/ci.yml` runs `scripts/testrules.py` on every `tests/**/test_*.py` a PR changes and fails on a finding (`benchmarks/test_pr_gates.py` joins in #190); review for what it cannot see — a name that lies, a Then the asserts skip, a helper that acts without asserting, a mock that hides the behaviour; ruff `PT` and `FBT001` join in #190; `scripts/mutation_check.py` is run by hand on #190's branch before merge and in CI from #193, and lists mutants the baseline killed that survive after #190 rewrites the tests.
+- **Enforced by:** ci — the `test-rules` job in `.github/workflows/ci.yml` runs `scripts/testrules.py` on every `tests/**/test_*.py` a PR changes and fails on a finding (`benchmarks/test_pr_gates.py` joins in #190); review for what it cannot see — a name that lies, a Then the asserts skip, a helper that acts without asserting, a mock that hides the behaviour; ruff `PT` and `FBT001` join in #190; #190 is checked by hand against the mutation baseline on the unmerged branch `mutation/baseline-v0.10.0` (no mutant the old tests killed may survive the new ones), and #193 adds a mutation check per PR.
 - **Example:** none until #190 produces the first clean module.
 - **Source:** tetrahedron decision 568, copied 2026-10-20 (#186) — the rules after *Software Engineering at Google* ch. 11–13 and Testing on the Toilet, Beck's Test Desiderata, Meszaros' test smells.
 - **Exceptions:** every test existing on 2026-10-20 (`scripts/testrules.py` finds 1,710 in `tests/`), until #190 rewrites them; a PR that changes a test module must leave that module clean.
 
 ### structured-logging
-- **Rule:** The library never configures logging — no handler, level or formatter, no `logging.basicConfig`; it never logs a secret or a direct identifier; there is no `print()` in `src/`, and CLI output lives in `scripts/`. If a module logs at all, it does so through `logging.getLogger(__name__)` with a fixed past-tense event name and the data as `extra` fields, never interpolated.
+- **Rule:** The library logs through the standard library only: `logging.getLogger(__name__)` under `datacrystal.*`, a `NullHandler` on `datacrystal` and nothing else — no handler, level, formatter or `basicConfig`, since the app chooses its logging framework; the message is a fixed snake_case event in the past tense, the data in `extra=` fields, never interpolated; no entity field value, secret or identifier in a record, only oids, type names, counts and reason codes; a warning (`warnings.warn`) is for a caller's mistake, a log record for an operational event, never both; no `print()` in `src/`, CLI output lives in `scripts/`.
 - **Applies to:** `src/`; a script for its diagnostics, not its output.
-- **Enforced by:** review — the PR reviewer checks new log calls and `print()` calls, until #191 selects ruff `T20` for `src/`; cannot see: a secret inside a field. Nothing in `src/` logs today.
-- **Source:** tetrahedron decision 553, copied 2026-10-20 (#186), in library form: structlog and `configure_logging` are for apps, not for a library.
+- **Enforced by:** review — the PR reviewer checks new log calls, warnings and `print()` calls, until #191 selects ruff `T20` for `src/`; cannot see: user data inside a field. Nothing in `src/` logs today; #195 adds the first events.
+- **Source:** tetrahedron decision 553, copied 2026-10-20 (#186), in library form: core dependencies stay `{msgspec, pyroaring}` (invariant 2), so no structlog; an app on structlog renders the `extra` fields through its stdlib bridge (`ProcessorFormatter` with `ExtraAdder`).
 - **Exceptions:** the contract vector generator `src/datacrystal/contract/vectors/_generate.py` prints, until #191 moves it to `scripts/`.
 
 ### english-only
@@ -42,6 +42,13 @@ Gates that switch on in a later wave say so by issue: tests (ANN, D, PT, FBT001)
 - **Applies to:** `src/`, `tests/`, `docs/`, `README.md`, `AGENTS.md`, `CHANGELOG.md`.
 - **Enforced by:** review — the PR reviewer checks new identifiers, comments and docs; cannot see: German already in the code.
 - **Source:** tetrahedron standard english-only (founder directive, #502), copied 2026-10-20 (#186).
+
+### teaching-docs
+- **Rule:** A docs page teaches one thing: it opens with one sentence on what the reader can do after it, then one runnable mineral-cabinet example, then only what the example cannot show; no filler or marketing words and no history, which goes to `CHANGELOG.md` or an ADR; one sentence per line. The README keeps a fixed shape — name and one sentence, status, quickstart in at most five commands, usage, extras, development gates, links — under 150 lines.
+- **Applies to:** `README.md`, `docs/tutorial.md`, `docs/how-to/`, `docs/explanation.md`, `docs/GUIDE.md`, `llms.txt`; `docs/reference.md` stays complete and dry (the drift guard) and only takes one sentence per line; `docs/design/` holds records and is out of scope.
+- **Enforced by:** ci — the fitness gates run the README quickstart twice and check internal doc links; review for the rest — the PR reviewer reads every changed page against the rule; #196 rewrites the pages and adds a one-sentence-per-line check on changed Markdown; cannot see: whether a page teaches.
+- **Source:** datacrystal's own (owner, 2026-10-20, #186), after tetrahedron decision 554 (project-readme) and its one-sentence-per-line convention.
+- **Exceptions:** every page as of 2026-10-20 (README 186 lines, hard-wrapped at 100), until #196.
 
 ### python-layout
 - **Rule:** The code lives in `src/datacrystal/`, the tests in `tests/`, helper scripts as self-contained PEP 723 scripts in `scripts/`; `examples/`, `benchmarks/` and `evals/` hold runnable demos, perf gates and proving grounds.
@@ -54,4 +61,3 @@ Gates that switch on in a later wave say so by issue: tests (ANN, D, PT, FBT001)
 - **spec-by-example** — no `tests/spec/` modules: datacrystal is a library whose rules are already pinned by the fitness gates and the contract vectors, with no founder-approved domain examples to freeze.
 - **settings-module** — the library reads no environment; configuration is passed to `Store.open`.
 - **health-endpoints** — datacrystal is not a server app; `datacrystal[web]` ships routers, not a service.
-- **project-readme** — the README is the package's PyPI page and quickstart, held by the docs guardrails in `tests/fitness/`.
