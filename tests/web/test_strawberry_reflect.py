@@ -28,7 +28,6 @@ import datacrystal as dc
 from datacrystal._snapshot import EntityView, Ref
 from datacrystal.web import StrawberryReflector, reflect, reflect_strawberry_type
 
-
 # --- a self-contained slice of the mineral cabinet (reference + frozen) -------
 
 

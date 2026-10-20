@@ -23,14 +23,10 @@ The web extra ships ``pydantic`` + ``strawberry``; importorskip so the bare suit
 stays green without it (mirrors ``tests/extras/`` for the fts/arrow extras).
 """
 
-# A ``create_model`` DTO is a dynamically built type, so pyright cannot see its
-# reflected fields (``dto.qid``) — the same untypeable situation the magic-query
-# tests carry a pragma for.
-# pyright: reportAttributeAccessIssue=false
-
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterable
 from dataclasses import field
 from typing import Annotated, Any
 
@@ -53,25 +49,30 @@ from datacrystal.web import (
     to_pydantic,
 )
 
-
 # --- a list-adjacency slice of the mineral cabinet (mirrors Collector.favorites) ---
 
 
 @dc.entity
 class Mineral:
+    """A mineral species."""
+
     qid: Annotated[str, dc.Unique]
     name: str
 
 
 @dc.entity
 class Collector:
+    """A collector with a lazy one-to-many adjacency to minerals."""
+
     name: Annotated[str, dc.Unique]
-    favorites: list[dc.Lazy[Mineral]] = field(default_factory=list)  # lazy adjacency
+    favorites: list[dc.Lazy[Mineral]] = field(default_factory=list)
 
 
-def _schema_exposing(gql_type: Any, value: Any) -> strawberry.Schema:
-    """A one-field ``Query`` whose ``root`` returns ``value`` behind ``gql_type``
-    — the #99 consumer pattern (``strawberry.field`` + ``create_type``)."""
+# --- data-building helpers ------------------------------------------------------
+
+
+def _schema_exposing(gql_type: object, value: object) -> strawberry.Schema:
+    """Build a one-field ``Query`` whose ``root`` returns ``value`` behind ``gql_type``."""
 
     def root() -> object:
         return value
@@ -80,294 +81,343 @@ def _schema_exposing(gql_type: Any, value: Any) -> strawberry.Schema:
     return strawberry.Schema(query=create_type("Query", [root_field]))
 
 
-def _execute(schema: strawberry.Schema, query: str, snap: Snapshot) -> Any:
-    return asyncio.run(schema.execute(query, context_value=snapshot_context(snap)))
-
-
 def _field_names(gql_type: type) -> set[str]:
-    return {f.name for f in gql_type.__strawberry_definition__.fields}
+    return {f.name for f in gql_type.__strawberry_definition__.fields}  # type: ignore[attr-defined]
+
+
+def _minerals(first: int, count: int) -> list[Mineral]:
+    """Build ``count`` minerals Q<first>.. named M<first>.."""
+    return [Mineral(qid=f"Q{i}", name=f"M{i}") for i in range(first, first + count)]
+
+
+def _collector(name: str, minerals: list[Mineral]) -> Collector:
+    """Build a collector whose favorites are lazy handles on ``minerals``."""
+    return Collector(name=name, favorites=[dc.Lazy.of(m) for m in minerals])
+
+
+def _oid(entity: object) -> int:
+    """Return the OID of a committed entity."""
+    oid = oid_of(entity)
+    if oid is None:
+        raise ValueError(f"{entity!r} has no OID, it was never committed")
+    return oid
+
+
+def _oids_of(entities: list[Mineral]) -> list[int]:
+    return [_oid(entity) for entity in entities]
+
+
+def _live_minerals(store: dc.Store, count: int) -> list[Mineral]:
+    """Read ``count`` committed minerals back from the store by qid."""
+    found = [store.get(Mineral, qid=f"Q{i}") for i in range(count)]
+    return [mineral for mineral in found if mineral is not None]
+
+
+def _views_of(snap: Snapshot, oids: list[int]) -> list[Any]:
+    return [snap.get(oid) for oid in oids]
+
+
+def _spy_on_get_many(snap: Snapshot) -> list[int]:
+    """Make ``snap.get_many`` record the key count of each batch into the returned list."""
+    batches: list[int] = []
+    real_get_many = snap.get_many
+
+    def spy(refs: Iterable[int]) -> list[EntityView | None]:
+        keys = list(refs)
+        batches.append(len(keys))
+        return real_get_many(keys)
+
+    snap.get_many = spy  # type: ignore[method-assign]
+    return batches
 
 
 # === GraphQL: list relation ====================================================
 
 
 def test_list_ref_reflects_as_a_list_of_object_edges() -> None:
-    """``favorites`` (a ``list[Lazy[Mineral]]``) becomes a GraphQL ``list`` of
-    Mineral edges — NOT a single collapsed Mineral object. The list is non-null
-    (empty → ``[]``); elements are nullable so a dangling edge can be ``null``."""
-    reflector = StrawberryReflector()
-    gql = reflector.reflect(Collector)
-    assert _field_names(gql) == {"name", "favorites"}
+    """Given the Collector reflected to a Strawberry type
+    When its schema is printed as SDL
+    Then the reflected fields are name and favorites
+    And favorites is a non-null list of nullable Mineral edges
+    And a Mineral object type is declared
+    """
+    gql = StrawberryReflector().reflect(Collector)
 
     sdl = _schema_exposing(gql, EntityView(0, "x:Collector", {})).as_str()
-    # A list of (nullable) Mineral edges, the list itself non-null.
+
+    assert _field_names(gql) == {"name", "favorites"}
     assert "favorites: [Mineral]!" in sdl
     assert "type Mineral {" in sdl
 
 
-def test_list_ref_resolves_off_a_real_snapshot(store_factory) -> None:
-    """End-to-end: a Collector with three favorite minerals resolves the whole
-    adjacency list off a frozen snapshot through the DataLoader."""
-    store = store_factory()
-    try:
-        ms = [store.store(Mineral(qid=f"Q{i}", name=f"M{i}")) for i in range(3)]
-        store.commit()
-        minerals = [store.get_many([o])[0] for o in ms]
-        col = Collector(name="C1", favorites=[dc.Lazy.of(m) for m in minerals])
-        oid = store.store(col)
-        store.commit()
+def test_list_ref_resolves_off_a_real_snapshot(store: dc.Store) -> None:
+    """Given a collector with three favorite minerals
+    When the query reads the collector's favorites through a snapshot
+    Then the query returns no errors
+    And the data holds the collector with all three favorites in order
+    """
+    minerals = _minerals(0, 3)
+    collector = _collector("C1", minerals)
+    store.root = [collector, *minerals]
+    store.commit()
+    gql = StrawberryReflector().reflect(Collector)
 
-        gql = StrawberryReflector().reflect(Collector)
-        with store.snapshot() as snap:
-            view = snap.get(oid)
-            schema = _schema_exposing(gql, view)
-            result = _execute(schema, "{ root { name favorites { qid name } } }", snap)
-            assert result.errors is None
-            assert result.data == {
-                "root": {
-                    "name": "C1",
-                    "favorites": [
-                        {"qid": "Q0", "name": "M0"},
-                        {"qid": "Q1", "name": "M1"},
-                        {"qid": "Q2", "name": "M2"},
-                    ],
-                }
-            }
-    finally:
-        store.close()
+    with store.snapshot() as snap:
+        schema = _schema_exposing(gql, snap.get(_oid(collector)))
+        query = "{ root { name favorites { qid name } } }"
 
+        result = asyncio.run(schema.execute(query, context_value=snapshot_context(snap)))
 
-def test_empty_list_ref_resolves_to_empty_list_without_a_load(store_factory) -> None:
-    """An empty adjacency list resolves to ``[]`` and never touches the loader —
-    no edges to follow, no store read."""
-    store = store_factory()
-    try:
-        oid = store.store(Collector(name="C-empty"))  # favorites=[]
-        store.commit()
-
-        gql = StrawberryReflector().reflect(Collector)
-        with store.snapshot() as snap:
-            view = snap.get(oid)
-            batches: list[int] = []
-            real_get_many = snap.get_many
-
-            def spy(refs: Any) -> Any:
-                keys = list(refs)
-                batches.append(len(keys))
-                return real_get_many(keys)
-
-            snap.get_many = spy  # type: ignore[method-assign]
-
-            schema = _schema_exposing(gql, view)
-            result = _execute(schema, "{ root { name favorites { qid } } }", snap)
-            assert result.errors is None
-            assert result.data == {"root": {"name": "C-empty", "favorites": []}}
-            assert batches == []  # no edge → loader never asked
-    finally:
-        store.close()
+    assert result.errors is None
+    assert result.data == {
+        "root": {
+            "name": "C1",
+            "favorites": [
+                {"qid": "Q0", "name": "M0"},
+                {"qid": "Q1", "name": "M1"},
+                {"qid": "Q2", "name": "M2"},
+            ],
+        }
+    }
 
 
-def test_dangling_list_element_resolves_to_null_not_an_error(store_factory) -> None:
-    """A deleted favorite (v0.x unchecked deletes, ADR-003) rides ``get_many``'s
-    None-on-miss: that slot is GraphQL ``null``, the surviving edges resolve, and
-    there is no 500 — the list edge inherits the scalar edge's dangling tolerance."""
-    store = store_factory()
-    try:
-        a = Mineral(qid="QA", name="Alive")
-        d = Mineral(qid="QD", name="Doomed")
-        store.store(a)
-        store.store(d)
-        col = Collector(name="C-dangle", favorites=[dc.Lazy.of(a), dc.Lazy.of(d)])
-        oid = store.store(col)
-        store.commit()
-        store.delete(d)  # the second edge now dangles
-        store.commit()
+def test_empty_list_ref_resolves_to_empty_list(store: dc.Store) -> None:
+    """Given a collector with no favorites
+    When the query reads the collector's favorites
+    Then the query returns no errors
+    And favorites is an empty list
+    """
+    collector = Collector(name="C-empty")
+    store.root = collector
+    store.commit()
+    gql = StrawberryReflector().reflect(Collector)
 
-        gql = StrawberryReflector().reflect(Collector)
-        with store.snapshot() as snap:
-            view = snap.get(oid)
-            schema = _schema_exposing(gql, view)
-            result = _execute(schema, "{ root { name favorites { qid name } } }", snap)
-            assert result.errors is None
-            assert result.data == {
-                "root": {
-                    "name": "C-dangle",
-                    "favorites": [{"qid": "QA", "name": "Alive"}, None],
-                }
-            }
-    finally:
-        store.close()
+    with store.snapshot() as snap:
+        schema = _schema_exposing(gql, snap.get(_oid(collector)))
+        query = "{ root { name favorites { qid } } }"
+
+        result = asyncio.run(schema.execute(query, context_value=snapshot_context(snap)))
+
+    assert result.errors is None
+    assert result.data == {"root": {"name": "C-empty", "favorites": []}}
 
 
-def test_sibling_lists_batch_into_one_get_many(store_factory) -> None:
-    """Two collectors each with a list of favorites, queried as siblings in one
-    list field, resolve EVERY edge across BOTH lists in a single
-    ``Snapshot.get_many`` — the per-request DataLoader coalesces across lists, so
-    nesting costs O(depth), never O(nodes). This is the N+1 killer at list level."""
-    store = store_factory()
-    try:
-        ms = [store.store(Mineral(qid=f"Q{i}", name=f"M{i}")) for i in range(4)]
-        store.commit()
-        minerals = [store.get_many([o])[0] for o in ms]
-        c1 = Collector(name="C1", favorites=[dc.Lazy.of(minerals[0]), dc.Lazy.of(minerals[1])])
-        c2 = Collector(name="C2", favorites=[dc.Lazy.of(minerals[2]), dc.Lazy.of(minerals[3])])
-        oids = [store.store(c1), store.store(c2)]
-        store.commit()
+def test_empty_list_ref_never_asks_the_loader(store: dc.Store) -> None:
+    """Given a collector with no favorites and a spy on get_many
+    When the query reads the collector's favorites
+    Then get_many was never called
+    """
+    collector = Collector(name="C-empty")
+    store.root = collector
+    store.commit()
+    gql = StrawberryReflector().reflect(Collector)
 
-        gql = StrawberryReflector().reflect(Collector)
-        with store.snapshot() as snap:
-            views = [snap.get(o) for o in oids]
-            batches: list[int] = []
-            real_get_many = snap.get_many
+    with store.snapshot() as snap:
+        batches = _spy_on_get_many(snap)
+        schema = _schema_exposing(gql, snap.get(_oid(collector)))
+        query = "{ root { name favorites { qid } } }"
 
-            def spy(refs: Any) -> Any:
-                keys = list(refs)
-                batches.append(len(keys))
-                return real_get_many(keys)
+        asyncio.run(schema.execute(query, context_value=snapshot_context(snap)))
 
-            snap.get_many = spy  # type: ignore[method-assign]
+    assert batches == []
 
-            schema = _schema_exposing(list[gql], views)
-            result = _execute(schema, "{ root { name favorites { qid } } }", snap)
-            assert result.errors is None
-            # Four edges across two sibling lists in ONE get_many — not one per list.
-            assert batches == [4]
-    finally:
-        store.close()
+
+def test_dangling_list_element_resolves_to_null_not_an_error(store: dc.Store) -> None:
+    """Given a collector whose second favorite was deleted
+    When the query reads the collector's favorites
+    Then the query returns no errors
+    And the surviving favorite resolves
+    And the deleted favorite's slot is null
+    """
+    alive = Mineral(qid="QA", name="Alive")
+    doomed = Mineral(qid="QD", name="Doomed")
+    collector = _collector("C-dangle", [alive, doomed])
+    store.root = [collector, alive, doomed]
+    store.commit()
+    store.delete(doomed)
+    store.commit()
+    gql = StrawberryReflector().reflect(Collector)
+
+    with store.snapshot() as snap:
+        schema = _schema_exposing(gql, snap.get(_oid(collector)))
+        query = "{ root { name favorites { qid name } } }"
+
+        result = asyncio.run(schema.execute(query, context_value=snapshot_context(snap)))
+
+    assert result.errors is None
+    assert result.data == {
+        "root": {"name": "C-dangle", "favorites": [{"qid": "QA", "name": "Alive"}, None]}
+    }
+
+
+def test_sibling_lists_batch_into_one_get_many(store: dc.Store) -> None:
+    """Given two collectors with two favorites each and a spy on get_many
+    When one list query reads both collectors' favorites
+    Then get_many ran once with all four edges
+    """
+    minerals = _minerals(0, 4)
+    c1 = _collector("C1", minerals[:2])
+    c2 = _collector("C2", minerals[2:])
+    store.root = [c1, c2, *minerals]
+    store.commit()
+    gql = StrawberryReflector().reflect(Collector)
+
+    with store.snapshot() as snap:
+        batches = _spy_on_get_many(snap)
+        schema = _schema_exposing(list[gql], _views_of(snap, [_oid(c1), _oid(c2)]))
+        query = "{ root { name favorites { qid } } }"
+
+        result = asyncio.run(schema.execute(query, context_value=snapshot_context(snap)))
+
+    assert result.errors is None
+    assert batches == [4]
 
 
 # === REST out: entity_model / to_pydantic ======================================
 
 
 def test_boundary_annotation_is_list_of_int_not_collapsed_int() -> None:
-    """``favorites`` crosses the REST edge as ``list[int]`` (a list of edge OIDs),
-    not a single collapsed ``int`` — the request DTO transports the whole
-    one-to-many relationship."""
+    """Given the Collector's boundary model
+    When its JSON schema is read
+    Then favorites is an array
+    And its items are integers
+    """
     schema = entity_model(Collector).model_json_schema()
+
     fav = schema["properties"]["favorites"]
+
     assert fav["type"] == "array"
     assert fav["items"] == {"type": "integer"}
 
 
-def test_to_pydantic_projects_a_list_edge_as_list_of_oids(store_factory) -> None:
-    """A committed Collector projects its adjacency to a ``list[int]`` of the
-    favorite minerals' OIDs (refs cross as OIDs, never live objects)."""
-    store = store_factory()
-    try:
-        ms = [Mineral(qid=f"Q{i}", name=f"M{i}") for i in range(3)]
-        col = Collector(name="C1", favorites=[dc.Lazy.of(m) for m in ms])
-        store.root = [col, *ms]
-        store.commit()
+def test_to_pydantic_projects_a_list_edge_as_list_of_oids(store: dc.Store) -> None:
+    """Given a committed collector with three favorite minerals
+    When to_pydantic projects the collector
+    Then favorites is the list of the minerals' OIDs
+    """
+    minerals = _minerals(0, 3)
+    collector = _collector("C1", minerals)
+    store.root = [collector, *minerals]
+    store.commit()
 
-        dto = to_pydantic(col)
-        assert dto.favorites == [oid_of(m) for m in ms]
-    finally:
-        store.close()
+    dto = to_pydantic(collector)
 
-
-def test_to_pydantic_projects_an_empty_list_edge_as_empty_list(store_factory) -> None:
-    store = store_factory()
-    try:
-        col = Collector(name="C-empty")
-        store.root = col
-        store.commit()
-        dto = to_pydantic(col)
-        assert dto.favorites == []
-    finally:
-        store.close()
+    assert dto.favorites == _oids_of(minerals)  # pyrefly: ignore[missing-attribute]
 
 
-def test_to_pydantic_projects_a_list_edge_off_a_view(store_factory) -> None:
-    """The snapshot-view input path projects the same ``list[int]`` (the view's
-    tuple of Ref tokens decays to a list of OIDs)."""
-    store = store_factory()
-    try:
-        ms = [Mineral(qid=f"Q{i}", name=f"M{i}") for i in range(2)]
-        col = Collector(name="C-view", favorites=[dc.Lazy.of(m) for m in ms])
-        store.root = [col, *ms]
-        store.commit()
-        with store.snapshot() as snap:
-            view = snap.get(oid_of(col))
-            dto = to_pydantic(view)
-        assert dto.favorites == [oid_of(m) for m in ms]
-    finally:
-        store.close()
+def test_to_pydantic_projects_an_empty_list_edge_as_empty_list(store: dc.Store) -> None:
+    """Given a committed collector with no favorites
+    When to_pydantic projects the collector
+    Then favorites is an empty list
+    """
+    collector = Collector(name="C-empty")
+    store.root = collector
+    store.commit()
+
+    dto = to_pydantic(collector)
+
+    assert dto.favorites == []  # pyrefly: ignore[missing-attribute]
+
+
+def test_to_pydantic_projects_a_list_edge_off_a_view(store: dc.Store) -> None:
+    """Given a committed collector with two favorite minerals read as a snapshot view
+    When to_pydantic projects the view
+    Then favorites is the list of the minerals' OIDs
+    """
+    minerals = _minerals(0, 2)
+    collector = _collector("C-view", minerals)
+    store.root = [collector, *minerals]
+    store.commit()
+
+    with store.snapshot() as snap:
+        dto = to_pydantic(snap.get(_oid(collector)))
+
+    assert dto.favorites == _oids_of(minerals)  # pyrefly: ignore[missing-attribute]
 
 
 # === REST in: from_pydantic ====================================================
 
 
-def test_from_pydantic_keeps_list_oids_without_store(store_factory) -> None:
-    """No store passed: a ``list[int]`` edge stays a list of raw OIDs — the honest
-    no-hydrate default that never silently touches storage."""
-    store = store_factory()
-    try:
-        ms = [Mineral(qid=f"Q{i}", name=f"M{i}") for i in range(3)]
-        store.root = ms
-        store.commit()
-        oids = [oid_of(m) for m in ms]
+def test_from_pydantic_keeps_list_oids_without_store(store: dc.Store) -> None:
+    """Given a DTO whose favorites hold three mineral OIDs
+    When from_pydantic rebuilds the collector without a store
+    Then favorites stay the raw OIDs
+    """
+    minerals = _minerals(0, 3)
+    store.root = minerals
+    store.commit()
+    dto = entity_model(Collector).model_validate(
+        {"name": "C1", "favorites": _oids_of(minerals)}
+    )
 
-        dto = entity_model(Collector).model_validate({"name": "C1", "favorites": oids})
-        rebuilt = from_pydantic(dto, Collector)
-        assert list(rebuilt.favorites) == oids  # raw OIDs preserved
-    finally:
-        store.close()
+    rebuilt = from_pydantic(dto, Collector)
 
-
-def test_from_pydantic_resolves_list_oids_with_store(store_factory) -> None:
-    """With ``store=``: every OID in the list resolves to its live Mineral on the
-    owner thread and is rewrapped as ``Lazy.of`` (the lazy-adjacency field shape)
-    — and the reconstructed Collector commits cleanly."""
-    store = store_factory()
-    try:
-        ms = [Mineral(qid=f"Q{i}", name=f"M{i}") for i in range(3)]
-        store.root = ms
-        store.commit()
-        live = [store.get(Mineral, qid=f"Q{i}") for i in range(3)]
-        oids = [oid_of(m) for m in live]
-
-        dto = entity_model(Collector).model_validate({"name": "C2", "favorites": oids})
-        rebuilt = from_pydantic(dto, Collector, store=store)
-        assert all(isinstance(h, dc.Lazy) for h in rebuilt.favorites)
-        # Each handle resolved to the live entity by identity, resident (no load).
-        assert [h.peek() for h in rebuilt.favorites] == live
-
-        store.upsert(rebuilt)
-        store.commit()
-        assert oid_of(rebuilt) is not None
-        fetched = store.get(Collector, name="C2")
-        assert [f.get().qid for f in fetched.favorites] == ["Q0", "Q1", "Q2"]
-    finally:
-        store.close()
+    assert list(rebuilt.favorites) == _oids_of(minerals)
 
 
-def test_from_pydantic_resolves_empty_list_with_store(store_factory) -> None:
-    """An empty list edge resolves to an empty list even with a store — no OIDs to
-    fetch, no spurious round-trip."""
-    store = store_factory()
-    try:
-        store.root = Mineral(qid="Q0", name="M0")  # something to commit
-        store.commit()
-        dto = entity_model(Collector).model_validate({"name": "C-empty", "favorites": []})
-        rebuilt = from_pydantic(dto, Collector, store=store)
-        assert list(rebuilt.favorites) == []
-    finally:
-        store.close()
+def test_from_pydantic_resolves_list_oids_with_store(store: dc.Store) -> None:
+    """Given a DTO whose favorites hold three committed minerals' OIDs
+    When from_pydantic rebuilds the collector with store=
+    Then every favorite is a Lazy
+    And each Lazy peeks the live mineral, resident without a load
+    """
+    store.root = _minerals(0, 3)
+    store.commit()
+    live = _live_minerals(store, 3)
+    dto = entity_model(Collector).model_validate({"name": "C2", "favorites": _oids_of(live)})
+
+    rebuilt = from_pydantic(dto, Collector, store=store)
+
+    assert all(isinstance(h, dc.Lazy) for h in rebuilt.favorites)
+    assert [h.peek() for h in rebuilt.favorites] == live
 
 
-def test_round_trips_through_to_and_from_pydantic(store_factory) -> None:
-    """The full REST round-trip: project a committed Collector to a DTO, rebuild a
-    STATE_NEW Collector, resolve its edges against the store — the adjacency
-    survives end to end."""
-    store = store_factory()
-    try:
-        ms = [Mineral(qid=f"Q{i}", name=f"M{i}") for i in range(2)]
-        col = Collector(name="C-rt", favorites=[dc.Lazy.of(m) for m in ms])
-        store.root = [col, *ms]
-        store.commit()
+def test_resolved_collector_commits_and_reads_back_its_favorites(store: dc.Store) -> None:
+    """Given a collector rebuilt with store= from a DTO of three mineral OIDs
+    When it is upserted and committed
+    Then it earned an OID
+    And a fresh get reads its favorites as Q0, Q1, Q2
+    """
+    store.root = _minerals(0, 3)
+    store.commit()
+    live = _live_minerals(store, 3)
+    dto = entity_model(Collector).model_validate({"name": "C2", "favorites": _oids_of(live)})
+    rebuilt = from_pydantic(dto, Collector, store=store)
 
-        dto = to_pydantic(col)
-        rebuilt = from_pydantic(dto, Collector, store=store)
-        assert [h.peek().qid for h in rebuilt.favorites] == ["Q0", "Q1"]
-    finally:
-        store.close()
+    store.upsert(rebuilt)
+    store.commit()
+
+    fetched = store.get(Collector, name="C2")
+    assert oid_of(rebuilt) is not None
+    assert fetched is not None
+    assert [f.get().qid for f in fetched.favorites] == ["Q0", "Q1", "Q2"]
+
+
+def test_from_pydantic_resolves_empty_list_with_store(store: dc.Store) -> None:
+    """Given a DTO with an empty favorites list and a store holding a mineral
+    When from_pydantic rebuilds the collector with store=
+    Then favorites is an empty list
+    """
+    store.root = Mineral(qid="Q0", name="M0")
+    store.commit()
+    dto = entity_model(Collector).model_validate({"name": "C-empty", "favorites": []})
+
+    rebuilt = from_pydantic(dto, Collector, store=store)
+
+    assert list(rebuilt.favorites) == []
+
+
+def test_round_trips_through_to_and_from_pydantic(store: dc.Store) -> None:
+    """Given a committed collector with two favorite minerals projected by to_pydantic
+    When from_pydantic rebuilds it with store=
+    Then the favorites resolve to Q0 and Q1
+    """
+    minerals = _minerals(0, 2)
+    collector = _collector("C-rt", minerals)
+    store.root = [collector, *minerals]
+    store.commit()
+    dto = to_pydantic(collector)
+
+    rebuilt = from_pydantic(dto, Collector, store=store)
+
+    assert [h.peek().qid for h in rebuilt.favorites] == ["Q0", "Q1"]
