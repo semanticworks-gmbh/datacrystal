@@ -1,0 +1,37 @@
+# Adopted from tetrahedron's ruff.toml (#186). A rule group is selected once it is at 0 on the paths
+# it covers; a group not yet clean is left out here, and the issue named beside it switches it on.
+# Run unpinned: `uvx ruff check .` (a new release's findings show at once).
+line-length = 100
+src = ["src", "tests"]
+
+[lint]
+preview = true
+explicit-preview-rules = true
+select = [
+    "E4", "E7", "E9", "F", # ruff's long-standing default set, named so a wider default cannot widen it
+    # self-documenting-code: the google docstring rules that are at 0 in src/
+    "D100", "D101", "D103", "D104", "D106", "D200", "D201", "D202", "D206", "D207", "D208",
+    "D209", "D210", "D211", "D212", "D214", "D300", "D301", "D402", "D405", "D410", "D411",
+    "D412", "D414", "D416", "D417", "D418", "D419",
+    "W505", "PLR0916", # docstring and comment line length (max-doc-length below), too many boolean terms
+    # typed-python: ANN401 (Any) is left out until #192
+    "ANN001", "ANN002", "ANN003", "ANN201", "ANN202", "ANN204", "ANN205", "ANN206",
+]
+# Not selected yet: D102, D105, D107, D403, D415, D401 (docstring form) and T20 (print in src/): #191;
+# C901, PLR2004, ANN401 in src/: #192; PT, FBT001 and ANN, D in tests/: #190.
+# D205 stays off as in tetrahedron (the summary may run into the first paragraph).
+
+[lint.per-file-ignores]
+# Test modules take their docstring, annotation and print rules in #190 (scripts/test_*.py is one).
+"tests/**" = ["D", "ANN"]
+"scripts/test_*.py" = ["D", "ANN"]
+# Not library code: on-demand proving grounds, runnable examples and benchmarks.
+"examples/**" = ["D"]
+"benchmarks/**" = ["D", "ANN"]  # its test_pr_gates.py is a test module: ANN with the tests, #190
+"evals/**" = ["D", "ANN"]
+
+[lint.pydocstyle]
+convention = "google"
+
+[lint.pycodestyle]
+max-doc-length = 100

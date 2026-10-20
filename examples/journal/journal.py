@@ -112,7 +112,7 @@ def scene_catalog_events(store: dc.Store, azurite: Specimen) -> None:
     azurite.event_oids.append(store.store(event))  # tracked in-place append
     store.commit()
     try:
-        event.note = "rewrite history"  # pyright: ignore[reportAttributeAccessIssue]  # the demo PROVES the frozen raise
+        event.note = "rewrite history"  # pyrefly: ignore[read-only]  # the demo PROVES the frozen raise
     except dc.FrozenEntityError:
         print("frozen event: mutation refused (append-only provenance)")
 
@@ -129,9 +129,10 @@ def scene_attachments(store: dc.Store, journal: Journal) -> None:
     """Lazy[T] attachments load on demand and preserve identity."""
     entry = journal.entries[0]
     first = entry.attachments[0].get()
-    assert first is store.get(Specimen, catalog_no=first.catalog_no)  # identity
+    assert first is not None
     print(f"entry {entry.entry_no!r} attaches {first.mineral_name} "
           f"({first.catalog_no}) — lazy-loaded, identity preserved")
+    assert first is store.get(Specimen, catalog_no=first.catalog_no)  # identity
 
 
 def scene_indexed_query(store: dc.Store) -> None:

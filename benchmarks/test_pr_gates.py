@@ -200,6 +200,7 @@ def _timed_deltas(store: dc.Store, prefix: str) -> list[float]:
     """Commit 12 one-specimen deltas, timing each commit (the consumer is
     already attached)."""
     anchor = store.get(_gen.Mineral, qid="QM0000")
+    assert anchor is not None
     times: list[float] = []
     for i in range(12):
         store.store(_gen.Specimen(
@@ -411,19 +412,19 @@ def test_read_fence_discovery_overhead(tmp_path) -> None:
     # Equal candidate counts ⇒ the ratio is pure fence overhead, not a different
     # amount of query work (a non-root owner reads all its own protected rows).
     with prot_store.snapshot(principal=owner) as ps, plain_store.snapshot() as us:
-        n_prot, n_plain = ps.count(prot_pred), us.count(plain_pred)  # pyright: ignore[reportArgumentType]
+        n_prot, n_plain = ps.count(prot_pred), us.count(plain_pred)  # pyrefly: ignore[bad-argument-type]  # magic-query predicate is untypeable by design
     assert n_prot == n_plain > 0, f"predicate shape drifted: {n_prot} vs {n_plain}"
 
     def filtered_run() -> None:
         # the protected, principal-bound discovery path: snapshot compiles the
         # readable set, intersects it before the window (ADR-008 W4)
         with prot_store.snapshot(principal=owner) as snap:
-            snap.query(prot_pred)  # pyright: ignore[reportArgumentType]
+            snap.query(prot_pred)  # pyrefly: ignore[bad-argument-type]  # magic-query predicate is untypeable by design
 
     def unfiltered_run() -> None:
         # the unprotected twin: no fence, snapshot open + query only
         with plain_store.snapshot() as snap:
-            snap.query(plain_pred)  # pyright: ignore[reportArgumentType]
+            snap.query(plain_pred)  # pyrefly: ignore[bad-argument-type]  # magic-query predicate is untypeable by design
 
     t_filtered = time_it(filtered_run, rounds=5)
     t_unfiltered = time_it(unfiltered_run, rounds=5)
