@@ -1243,7 +1243,7 @@ and reach for `.bytes()` / streamed `store.open_blob()` as documented in
 
 The streamed-write form assigns a `dc.BlobSource` (or `dc.blob_from_path(...)`) to a field typed
 `bytes`, which a checker flags `[assignment]`. The **workaround** is a `# type: ignore[assignment]`
-on that line (or a per-file `# pyright: reportArgumentType=false` in code that writes many).
+on that line (or a per-line `# pyrefly: ignore[bad-argument-type]` in code that writes many).
 Pyrefly spells the line form `# pyrefly: ignore[bad-assignment]`:
 
 ```python

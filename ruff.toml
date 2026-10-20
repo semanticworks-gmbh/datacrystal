@@ -16,20 +16,29 @@ select = [
     "W505", "PLR0916", # docstring and comment line length (max-doc-length below), too many boolean terms
     # typed-python: ANN401 (Any) is left out until #192
     "ANN001", "ANN002", "ANN003", "ANN201", "ANN202", "ANN204", "ANN205", "ANN206",
+    "D", "D401", "ANN", # the target set; the ignores below hold the paths that are not at 0 yet
+    "PT", "FBT001", # readable-tests, tests only (ignored elsewhere below)
 ]
 # Ruff's current default set (E4, E7, E9, F) is selected explicitly above; #191 switches ruff's own default set on (322 findings, mostly autofix).
 # Not selected yet: D102, D105, D107, D403, D415, D401 (docstring form) and T20 (print in src/): #191;
-# C901, PLR2004, ANN401 in src/: #192; PT, FBT001 and ANN, D in tests/: #190.
+# C901, PLR2004, ANN401 in src/: #192.
 # D205 stays off as in tetrahedron (the summary may run into the first paragraph).
 
+# D205 stays off as in tetrahedron (the summary may run into the first paragraph).
+extend-ignore = ["D205"]
+
 [lint.per-file-ignores]
-# Test modules take their docstring, annotation and print rules in #190 (scripts/test_*.py is one).
-"tests/**" = ["D", "ANN"]
-"scripts/test_*.py" = ["D", "ANN"]
-# Not library code: on-demand proving grounds, runnable examples and benchmarks.
+# Ruff cannot select a rule for some files only, so the test rules are ignored everywhere else.
+"!{tests/**,scripts/test_*.py,benchmarks/test_*.py,**/conftest.py}" = ["PT", "FBT001"]
+# Not library code: on-demand proving grounds and runnable examples.
 "examples/**" = ["D"]
-"benchmarks/**" = ["D", "ANN"]  # its test_pr_gates.py is a test module: ANN with the tests, #190
+"benchmarks/**" = ["D", "ANN"]
 "evals/**" = ["D", "ANN"]
+# Test modules (same ignores as semantic-studio): a fixture, helper or test double is named for what it does,
+# so a docstring would restate it (D103, D107); a Given / When / Then line ends without a period (D415, readable-tests).
+"{tests/**,scripts/test_*.py,benchmarks/test_*.py}" = ["D103", "D107", "D415"]
+# Outside the tests the groups below are not at 0 yet: #191 (docstring form) and #192 (Any) switch them on.
+"{src/**,examples/**,scripts/**,evals/**,benchmarks/**}" = ["D102", "D105", "D107", "D401", "D403", "D415", "ANN401"]
 
 [lint.pydocstyle]
 convention = "google"

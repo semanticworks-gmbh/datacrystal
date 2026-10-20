@@ -17,8 +17,7 @@ bump) — **never bump versions by hand** (a fitness gate enforces every mirror 
 uv sync --all-extras                 # env (Python 3.14 via .python-version; extras for their tests)
 uv run pytest -q                     # full suite incl. fitness gates + SIGKILL crash test
 uvx ruff check .                     # lint, config in ruff.toml (line length 100)
-uv run pyrefly check                 # types on src, examples, benchmarks — 0 errors, CI-gated
-uvx pyright tests                    # tests only, standard mode, until #190 (magic-query pragmas)
+uv run pyrefly check                 # types on src, examples, benchmarks, tests — 0 errors, CI-gated
 uv run scripts/test_testrules.py     # the testrules self-tests
 uv run scripts/testrules.py <test_*.py>  # readable-tests check; CI runs it on the test modules a PR changes
 uv run python examples/minerals/demo.py    # run TWICE — second run must find the first run's data
@@ -135,8 +134,8 @@ shebangs — `rm -rf .venv && uv sync`.
 ## Style & gotchas
 
 - **The rules are in [`STANDARDS.md`](STANDARDS.md)** (self-documenting-code, typed-python, readable-tests, structured-logging, english-only, python-layout); cite them by slug.
-- A rule's gate switches on in the wave named there: #190 tests, #191 docstring form and `print` in `src/`, #192 `Any`, complexity, magic values.
-- The magic class-attribute query syntax (`Mineral.mohs >= 6`) is untypeable by design: use `dc.fields(Mineral)` in typed code, per-file pragmas only in tests that deliberately exercise the magic path.
+- A rule's gate switches on in the wave named there: #191 docstring form and `print` in `src/`, #192 `Any`, complexity, magic values.
+- The magic class-attribute query syntax (`Mineral.mohs >= 6`) is untypeable by design: use `dc.fields(Mineral)` in typed code, a Pyrefly suppression with its reason only in tests that deliberately exercise the magic path.
 - Never add `# noqa` to `src/`; a Pyrefly suppression is one line with its reason.
 - Docstrings explain *why* and cite the design doc that ratified the behavior (self-documenting-code).
 - Commit/PR style: small logical commits; CI runs on PRs and pushes to main.
