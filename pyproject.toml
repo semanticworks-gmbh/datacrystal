@@ -42,6 +42,7 @@ dev = [
     "duckdb>=1.5.3",
     "httpx>=0.28",
     "hypothesis>=6.155.2",
+    "mutmut>=3.8.0",
     "pytest>=9.0.3",
     "ruff>=0.15.16",
     "uvicorn>=0.34",
@@ -95,6 +96,15 @@ convention = "google"
 "examples/**" = ["D"]
 "benchmarks/**" = ["D"]
 "evals/**" = ["D"]
+
+[tool.mutmut]
+source_paths = ["src/datacrystal/"]
+# tests leave global state (the entity registry); a fork per mutant from a clean server keeps runs independent
+process_isolation = "forkserver"
+pytest_add_cli_args_test_selection = ["tests/"]
+also_copy = ["mutation", "tests", "docs", "scripts", "examples", "benchmarks", "evals", "assets", "typings", "README.md", "CHANGELOG.md", "CONTRIBUTING.md", "AGENTS.md", "CLAUDE.md", "llms.txt", "LICENSE", ".python-version"]
+# trampolines add `import mutmut...` to src/, which the engine-free gate rightly rejects
+pytest_add_cli_args = ["-p", "no:cacheprovider", "-p", "mutation.mutmut_order", "--deselect", "tests/fitness/test_contract_engine_free.py::test_contract_package_imports_no_engine"]
 
 [tool.pyright]
 venvPath = "."
