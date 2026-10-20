@@ -25,9 +25,9 @@ datacrystal targets **Python 3.14** (pinned via `.python-version`) and uses
 ```bash
 uv sync --all-extras          # environment, incl. the [fts]/[arrow]/[web] extras for their tests
 uv run pytest -q              # full suite, incl. the fitness gates + the SIGKILL crash test
-uv run ruff check .           # lint (line length 100)
-uvx pyright src tests examples benchmarks   # type check, standard mode — 0 errors
-uvx pyright -p pyrightconfig.strict.json    # strict mode, library src/ only — 0 errors
+uvx ruff check .              # lint, config in ruff.toml (line length 100)
+uv run pyrefly check          # types on src, examples, benchmarks — 0 errors
+uvx pyright tests             # tests only, standard mode, until #190
 ```
 
 The README quickstart and `examples/minerals/demo.py` must each run **twice** from a clean
@@ -36,7 +36,7 @@ directory — the second run must find the first run's data.
 ## Pull requests
 
 - **Small, logical commits**, one concern each.
-- Keep the gates green: `ruff`, `pytest`, and both `pyright` modes must pass.
+- Keep the gates green: `ruff`, `pyrefly`, `pytest` and `pyright tests` must pass; the rules are in [STANDARDS.md](STANDARDS.md).
 - Engine behavior is tested against **both backends** (memory and SQLite) via the
   `store_factory` fixture — they must behave identically.
 - **Documentation honesty rule:** document only what exists. A feature that isn't built yet is
