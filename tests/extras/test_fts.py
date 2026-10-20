@@ -9,22 +9,31 @@ Engine tests run over both backends via ``store_factory`` (conftest).
 from __future__ import annotations
 
 import itertools
-from typing import Annotated
+import unicodedata
+from collections.abc import Callable, Iterator, Mapping
+from pathlib import Path
+from typing import Annotated, NamedTuple
 
 import pytest
 
 pytest.importorskip("snowballstemmer", reason="datacrystal[fts] extra not installed")
 
 import datacrystal as dc
+from datacrystal._entity import oid_of, type_info
+from datacrystal._snapshot import Snapshot
+from datacrystal._storage.memory import MemoryBackend
 from datacrystal.contract.applier import DeltaGapError
 from datacrystal.fts import FtsConfigError, FullTextIndex
 from datacrystal.testing import STREAM_TYPENAME, check_delta_consumer
 
 _ids = itertools.count()
+FullTextMap = Mapping[str, Mapping[str, str | None]]
 
 
 @dc.entity
 class Gemstone:
+    """A gemstone with German notes and an English description."""
+
     qid: Annotated[str, dc.Unique]
     name: str
     notes: Annotated[str | None, dc.FullText(language="de")] = None
@@ -33,193 +42,476 @@ class Gemstone:
 
 @dc.entity
 class Vendor:
+    """A vendor whose motto is indexed bare: fold-only, no stemming."""
+
     name: str
-    motto: Annotated[str | None, dc.FullText] = None  # bare: fold-only, no stemming
+    motto: Annotated[str | None, dc.FullText] = None
 
 
 GEM_FULLTEXT = {
     "tests.extras.test_fts:Gemstone": {"notes": "de", "description": "en"},
     "tests.extras.test_fts:Vendor": {"motto": None},
 }
+GEM_TYPENAME = type_info(Gemstone).typename
+VENDOR_TYPENAME = "tests.extras.test_fts:Vendor"
 
 
-def _gem_typename() -> str:
-    from datacrystal._entity import type_info
-
-    return type_info(Gemstone).typename
-
-
-def fresh_index(tmp_path, **kwargs) -> FullTextIndex:
-    return FullTextIndex(tmp_path / f"sidecar-{next(_ids)}.fts", **kwargs)
+def content_probe(idx: FullTextIndex) -> object:
+    """Return the derived state for the conformance kit: every stored doc row."""
+    return sorted(tuple(row) for row in idx._conn.execute("SELECT rowid, * FROM docs"))
 
 
-def content_probe(idx: FullTextIndex):
-    """Derived state for the conformance kit: every stored doc row."""
-    return sorted(
-        tuple(row) for row in idx._conn.execute("SELECT rowid, * FROM docs")
-    )
+def committed_oid(entity: object) -> int:
+    """Return the oid of a committed entity."""
+    oid = oid_of(entity)
+    if oid is None:
+        raise LookupError("entity was not committed")
+    return oid
+
+
+class IndexShop:
+    """Opens full-text indexes under one directory and closes every one of them afterwards."""
+
+    def __init__(self, directory: Path) -> None:
+        """Remember the directory the indexes live in."""
+        self.directory = directory
+        self.opened: list[FullTextIndex] = []
+
+    def open(self, name: str | None = None, fulltext: FullTextMap | None = None) -> FullTextIndex:
+        """Open an index file by name, or a fresh one, over the given or the registry config."""
+        index = FullTextIndex(self.directory / (name or f"sidecar-{next(_ids)}.fts"), fulltext=fulltext)
+        self.opened.append(index)
+        return index
+
+    def bootstrap(
+        self, name: str, snapshot: Snapshot, fulltext: FullTextMap | None = None
+    ) -> FullTextIndex:
+        """Build an index file from a snapshot."""
+        index = FullTextIndex.bootstrap(self.directory / name, snapshot, fulltext=fulltext)
+        self.opened.append(index)
+        return index
+
+    def close_all(self) -> None:
+        """Close every index this shop opened."""
+        for index in self.opened:
+            index.close()
+
+
+@pytest.fixture
+def shop(tmp_path: Path) -> Iterator[IndexShop]:
+    """Provide an index shop under tmp_path and close its indexes afterwards."""
+    index_shop = IndexShop(tmp_path)
+    yield index_shop
+    index_shop.close_all()
+
+
+@pytest.fixture
+def stream_index_factory(shop: IndexShop) -> Callable[[], FullTextIndex]:
+    """Return a factory for fresh indexes over the conformance-kit stream type."""
+
+    def build() -> FullTextIndex:
+        return shop.open(fulltext={STREAM_TYPENAME: {"notes": "en"}})
+
+    return build
 
 
 # -- conformance: the kit certifies the consumer obligations -------------------
 
 
-def test_conformance_kit_certifies_fulltext_index(tmp_path) -> None:
-    ran = check_delta_consumer(
-        lambda: fresh_index(tmp_path, fulltext={STREAM_TYPENAME: {"notes": "en"}}),
-        content=content_probe,
-    )
-    # the content-dependent sections (prior un-index, delete totality) ran
+def test_conformance_kit_runs_the_prior_unindex_section_for_the_fulltext_index(
+    stream_index_factory: Callable[[], FullTextIndex],
+) -> None:
+    """Given the full-text index over the kit's stream type
+    When the conformance kit certifies it
+    Then the content-dependent prior un-index section ran
+    """
+    ran = check_delta_consumer(stream_index_factory, content=content_probe)
+
     assert any("prior" in label for label in ran)
+
+
+def test_conformance_kit_runs_the_delete_section_for_the_fulltext_index(
+    stream_index_factory: Callable[[], FullTextIndex],
+) -> None:
+    """Given the full-text index over the kit's stream type
+    When the conformance kit certifies it
+    Then the content-dependent delete totality section ran
+    """
+    ran = check_delta_consumer(stream_index_factory, content=content_probe)
+
     assert any("delete" in label for label in ran)
 
 
 # -- end-to-end over both backends ---------------------------------------------
 
 
-def test_stemmed_search_end_to_end(store_factory, tmp_path) -> None:
-    store = store_factory()
-    idx = fresh_index(tmp_path, fulltext=GEM_FULLTEXT)
+@pytest.fixture
+def indexed_quartz_and_azurite(store: dc.Store, shop: IndexShop) -> FullTextIndex:
+    """Commit a German-and-English quartz and azurite into a store with an index attached."""
+    idx = shop.open(fulltext=GEM_FULLTEXT)
     store.attach(idx)
     store.root = [
-        Gemstone(qid="Q1", name="quartz",
-                 notes="Die Kristalle glänzen im Licht",
-                 description="The crystals form hexagonal prisms"),
-        Gemstone(qid="Q2", name="azurite",
-                 notes="tiefblaue Stufe aus Tsumeb",
-                 description="deep blue druzy crusts"),
+        Gemstone(
+            qid="Q1",
+            name="quartz",
+            notes="Die Kristalle glänzen im Licht",
+            description="The crystals form hexagonal prisms",
+        ),
+        Gemstone(
+            qid="Q2",
+            name="azurite",
+            notes="tiefblaue Stufe aus Tsumeb",
+            description="deep blue druzy crusts",
+        ),
     ]
     store.commit()
+    return idx
 
-    # German stemming: singular query finds the plural document text
-    hits = idx.search("Kristall")
-    assert [h.oid for h in hits] and hits[0].typename == _gem_typename()
+
+def test_german_stemming_finds_the_plural_for_a_singular_query(
+    indexed_quartz_and_azurite: FullTextIndex,
+) -> None:
+    """Given quartz whose German notes say Kristalle
+    When the index is searched for the singular Kristall
+    Then exactly one document is found
+    """
+    hits = indexed_quartz_and_azurite.search("Kristall")
+
+    assert len(hits) == 1
+
+
+def test_stemmed_hit_names_the_gemstone_type(indexed_quartz_and_azurite: FullTextIndex) -> None:
+    """Given quartz whose German notes say Kristalle
+    When the index is searched for the singular Kristall
+    Then the first hit is of the Gemstone type
+    """
+    hits = indexed_quartz_and_azurite.search("Kristall")
+
+    assert hits[0].typename == GEM_TYPENAME
+
+
+def test_stemmed_hit_snippet_shows_the_original_surface_form(
+    indexed_quartz_and_azurite: FullTextIndex,
+) -> None:
+    """Given quartz whose German notes say Kristalle
+    When the index is searched for the singular Kristall
+    Then the notes snippet contains Kristalle
+    """
+    hits = indexed_quartz_and_azurite.search("Kristall")
+
     assert "Kristalle" in (hits[0].snippets.get("notes") or "")
 
-    # English stemming on the other field
-    assert idx.search("crystal")  # matches "crystals" via the en stem column
 
-    # ranking: an exact surface form outranks a stem-only match
-    exact = idx.search("Kristalle")
-    assert exact and exact[0].score >= hits[0].score
+def test_english_stemming_finds_the_plural_for_a_singular_query(
+    indexed_quartz_and_azurite: FullTextIndex,
+) -> None:
+    """Given quartz whose English description says crystals
+    When the index is searched for the singular crystal
+    Then a document is found through the English stem column
+    """
+    hits = indexed_quartz_and_azurite.search("crystal")
 
-    # no match
-    assert idx.search("Vulkan") == []
-    store.close()
-    idx.close()
+    assert hits != []
 
 
-def test_update_and_delete_unindex(store_factory, tmp_path) -> None:
-    store = store_factory()
-    idx = fresh_index(tmp_path, fulltext=GEM_FULLTEXT)
+def test_exact_surface_form_outranks_a_stem_only_match(
+    indexed_quartz_and_azurite: FullTextIndex,
+) -> None:
+    """Given quartz whose German notes say Kristalle
+    When the index is searched for the exact Kristalle and for the stem-only Kristall
+    Then the exact form scores at least as high
+    """
+    stem_hits = indexed_quartz_and_azurite.search("Kristall")
+    exact_hits = indexed_quartz_and_azurite.search("Kristalle")
+
+    assert exact_hits[0].score >= stem_hits[0].score
+
+
+def test_search_for_an_absent_word_finds_nothing(indexed_quartz_and_azurite: FullTextIndex) -> None:
+    """Given two indexed gemstones that never mention a volcano
+    When the index is searched for Vulkan
+    Then nothing is found
+    """
+    hits = indexed_quartz_and_azurite.search("Vulkan")
+
+    assert hits == []
+
+
+@pytest.fixture
+def indexed_milky_quartz(store: dc.Store, shop: IndexShop) -> tuple[Gemstone, FullTextIndex]:
+    """Commit a quartz with milchige Kristalle into a store with an index attached."""
+    idx = shop.open(fulltext=GEM_FULLTEXT)
     store.attach(idx)
     gem = Gemstone(qid="Q1", name="quartz", notes="milchige Kristalle")
     store.root = [gem]
     store.commit()
-    assert idx.search("Kristall")
+    return gem, idx
 
+
+def test_committed_prose_is_found_by_its_stem(
+    indexed_milky_quartz: tuple[Gemstone, FullTextIndex],
+) -> None:
+    """Given a committed quartz with milchige Kristalle
+    When the index is searched for Kristall
+    Then a document is found
+    """
+    _, idx = indexed_milky_quartz
+
+    hits = idx.search("Kristall")
+
+    assert hits != []
+
+
+def test_update_unindexes_the_old_terms(
+    store: dc.Store, indexed_milky_quartz: tuple[Gemstone, FullTextIndex]
+) -> None:
+    """Given a committed quartz with milchige Kristalle
+    When its notes are replaced and committed
+    Then the old term Kristall finds nothing
+    """
+    gem, idx = indexed_milky_quartz
+    gem.notes = "klare Spitzen ohne Einschlüsse"
+
+    store.commit()
+
+    assert idx.search("Kristall") == []
+
+
+def test_update_indexes_the_new_terms_by_their_german_stem(
+    store: dc.Store, indexed_milky_quartz: tuple[Gemstone, FullTextIndex]
+) -> None:
+    """Given a committed quartz with milchige Kristalle
+    When its notes are replaced by prose with Einschlüsse and committed
+    Then the stem Einschluss finds a document
+    """
+    gem, idx = indexed_milky_quartz
+    gem.notes = "klare Spitzen ohne Einschlüsse"
+
+    store.commit()
+
+    assert idx.search("Einschluss") != []
+
+
+def test_delete_tombstone_removes_the_document(
+    store: dc.Store, indexed_milky_quartz: tuple[Gemstone, FullTextIndex]
+) -> None:
+    """Given a quartz whose notes were replaced by prose with Einschlüsse
+    When the quartz is deleted and committed
+    Then the stem Einschluss finds nothing
+    """
+    gem, idx = indexed_milky_quartz
     gem.notes = "klare Spitzen ohne Einschlüsse"
     store.commit()
-    assert idx.search("Kristall") == []          # old terms un-indexed
-    assert idx.search("Einschluss")              # new terms indexed (de stem)
-
     store.delete(gem)
     store.root = []
+
     store.commit()
-    assert idx.search("Einschluss") == []        # tombstone removed the doc
-    store.close()
-    idx.close()
+
+    assert idx.search("Einschluss") == []
 
 
-def test_phrase_and_type_filter(store_factory, tmp_path) -> None:
-    store = store_factory()
-    idx = fresh_index(tmp_path, fulltext=GEM_FULLTEXT)
+@pytest.fixture
+def blue_gem_and_vendor(store: dc.Store, shop: IndexShop) -> FullTextIndex:
+    """Commit a gemstone and a vendor that both mention blue into a store with an index."""
+    idx = shop.open(fulltext=GEM_FULLTEXT)
     store.attach(idx)
     store.root = [
         Gemstone(qid="Q1", name="quartz", description="deep blue crusts"),
         Vendor(name="Minerals AG", motto="deep respect for blue stones"),
     ]
     store.commit()
-
-    both = idx.search("blue")
-    assert {h.typename for h in both} == {
-        _gem_typename(), "tests.extras.test_fts:Vendor"
-    }
-    only_gem = idx.search("blue", cls=Gemstone)
-    assert {h.typename for h in only_gem} == {_gem_typename()}
-
-    # quoted phrases stay phrases: this word order never occurs
-    assert idx.search('"blue deep"') == []
-    assert idx.search('"deep blue"')
-    store.close()
-    idx.close()
+    return idx
 
 
-def test_multi_term_ranked_search_is_or_by_default(store_factory, tmp_path) -> None:
-    """#54 karen-sparck-jones rule — a natural-language query must not require
-    EVERY term in one document (AND collapses recall). Default ``match="any"``
-    OR-s the terms so BM25 ranks the union; a doc matching SOME terms still
-    surfaces (and a fully-matching doc outranks it). ``match="all"`` keeps the
-    precise-filter AND for the cases that want it.
+def test_search_spans_every_indexed_type(blue_gem_and_vendor: FullTextIndex) -> None:
+    """Given a gemstone and a vendor that both mention blue
+    When the index is searched for blue
+    Then the hits are of both types
     """
-    store = store_factory()
-    idx = fresh_index(tmp_path, fulltext=GEM_FULLTEXT)
+    hits = blue_gem_and_vendor.search("blue")
+
+    assert {hit.typename for hit in hits} == {GEM_TYPENAME, VENDOR_TYPENAME}
+
+
+def test_type_filter_restricts_the_hits_to_one_type(blue_gem_and_vendor: FullTextIndex) -> None:
+    """Given a gemstone and a vendor that both mention blue
+    When the index is searched for blue with cls=Gemstone
+    Then the hits are of the Gemstone type alone
+    """
+    hits = blue_gem_and_vendor.search("blue", cls=Gemstone)
+
+    assert {hit.typename for hit in hits} == {GEM_TYPENAME}
+
+
+def test_quoted_phrase_in_the_wrong_word_order_finds_nothing(
+    blue_gem_and_vendor: FullTextIndex,
+) -> None:
+    """Given prose that says deep blue and never blue deep
+    When the index is searched for the quoted phrase "blue deep"
+    Then nothing is found
+    """
+    hits = blue_gem_and_vendor.search('"blue deep"')
+
+    assert hits == []
+
+
+def test_quoted_phrase_in_the_right_word_order_is_found(blue_gem_and_vendor: FullTextIndex) -> None:
+    """Given prose that says deep blue
+    When the index is searched for the quoted phrase "deep blue"
+    Then a document is found
+    """
+    hits = blue_gem_and_vendor.search('"deep blue"')
+
+    assert hits != []
+
+
+class StatinWorld(NamedTuple):
+    """The three-document corpus of the multi-term tests, with the qid of every oid."""
+
+    index: FullTextIndex
+    qid_by_oid: dict[int, str]
+
+
+@pytest.fixture
+def statin_world(store: dc.Store, shop: IndexShop) -> StatinWorld:
+    """Commit a full-match, a one-term-match and an off-topic document with an index attached."""
+    idx = shop.open(fulltext=GEM_FULLTEXT)
     store.attach(idx)
-    store.root = [
-        # matches ALL three query terms ("statin drugs cancer")
-        Gemstone(qid="Q1", name="full",
-                 description="statin drugs may influence cancer risk"),
-        # matches only ONE term ("cancer") — must still be retrievable
-        Gemstone(qid="Q2", name="partial",
-                 description="dietary fibre and cancer prevention"),
-        # matches NONE — must never appear
-        Gemstone(qid="Q3", name="off-topic",
-                 description="hexagonal prisms in clear quartz"),
-    ]
+    full = Gemstone(
+        qid="Q1", name="full", description="statin drugs may influence cancer risk"
+    )
+    partial = Gemstone(qid="Q2", name="partial", description="dietary fibre and cancer prevention")
+    off_topic = Gemstone(qid="Q3", name="off-topic", description="hexagonal prisms in clear quartz")
+    store.root = [full, partial, off_topic]
     store.commit()
-
-    # search "statin drugs cancer" → expect BOTH the full and partial docs
-    # (Y in top-N), the full match ranked first.
-    any_hits = idx.search("statin drugs cancer")
-    any_qids = [store.get_many([h.oid])[0].qid for h in any_hits]
-    assert len(any_hits) == 2, "OR default must retrieve the partial-match doc"
-    assert any_qids[0] == "Q1", "the all-terms doc must rank above the one-term doc"
-    assert set(any_qids) == {"Q1", "Q2"}  # the no-term doc Q3 is absent
-
-    # match="all" requires every term: only the full doc, partial drops out.
-    all_hits = idx.search("statin drugs cancer", match="all")
-    assert {store.get_many([h.oid])[0].qid for h in all_hits} == {"Q1"}
-
-    # a query where NO doc has all terms returns nothing under "all" but the
-    # union under "any" (the recall-collapse the issue is about).
-    assert idx.search("statin fibre quartz", match="all") == []
-    assert idx.search("statin fibre quartz")  # any: union is non-empty
-
-    # a quoted phrase stays ONE unit under BOTH modes — the term-join must
-    # never split a phrase into AND-of-words (karen-sparck-jones review #3):
-    # "cancer risk" is adjacent only in Q1, so even match="all" finds it,
-    # while the reversed order occurs nowhere.
-    assert {store.get_many([h.oid])[0].qid
-            for h in idx.search('"cancer risk"', match="all")} == {"Q1"}
-    assert idx.search('"risk cancer"', match="all") == []
-
-    # an invalid mode is loud, not silently misinterpreted.
-    with pytest.raises(ValueError):
-        idx.search("statin", match="both")
-    store.close()
-    idx.close()
+    qid_by_oid = {committed_oid(gem): gem.qid for gem in (full, partial, off_topic)}
+    return StatinWorld(idx, qid_by_oid)
 
 
-def test_bare_fulltext_is_fold_only(store_factory, tmp_path) -> None:
-    store = store_factory()
-    idx = fresh_index(tmp_path, fulltext=GEM_FULLTEXT)
+def test_multi_term_search_retrieves_the_partial_match_by_default(statin_world: StatinWorld) -> None:
+    """Given a document with all of statin drugs cancer and one with only cancer
+    When the index is searched for "statin drugs cancer" with the default match
+    Then both documents are retrieved
+    """
+    hits = statin_world.index.search("statin drugs cancer")
+
+    assert len(hits) == 2, "OR default must retrieve the partial-match doc"
+
+
+def test_multi_term_search_ranks_the_all_terms_document_first(statin_world: StatinWorld) -> None:
+    """Given a document with all of statin drugs cancer and one with only cancer
+    When the index is searched for "statin drugs cancer" with the default match
+    Then the all-terms document ranks above the one-term document
+    """
+    hits = statin_world.index.search("statin drugs cancer")
+
+    assert statin_world.qid_by_oid[hits[0].oid] == "Q1"
+
+
+def test_multi_term_search_never_retrieves_the_off_topic_document(
+    statin_world: StatinWorld,
+) -> None:
+    """Given a document with none of the terms statin drugs cancer
+    When the index is searched for "statin drugs cancer" with the default match
+    Then only the full and the partial document are retrieved
+    """
+    hits = statin_world.index.search("statin drugs cancer")
+
+    assert {statin_world.qid_by_oid[hit.oid] for hit in hits} == {"Q1", "Q2"}
+
+
+def test_match_all_requires_every_term(statin_world: StatinWorld) -> None:
+    """Given a document with all of statin drugs cancer and one with only cancer
+    When the index is searched for "statin drugs cancer" with match="all"
+    Then only the full document is retrieved
+    """
+    hits = statin_world.index.search("statin drugs cancer", match="all")
+
+    assert {statin_world.qid_by_oid[hit.oid] for hit in hits} == {"Q1"}
+
+
+def test_match_all_finds_nothing_when_no_document_has_every_term(statin_world: StatinWorld) -> None:
+    """Given no document that has all of statin, fibre and quartz
+    When the index is searched for "statin fibre quartz" with match="all"
+    Then nothing is found
+    """
+    hits = statin_world.index.search("statin fibre quartz", match="all")
+
+    assert hits == []
+
+
+def test_match_any_returns_the_union_when_no_document_has_every_term(
+    statin_world: StatinWorld,
+) -> None:
+    """Given no document that has all of statin, fibre and quartz
+    When the index is searched for "statin fibre quartz" with the default match
+    Then the union of the partial matches is non-empty
+    """
+    hits = statin_world.index.search("statin fibre quartz")
+
+    assert hits != []
+
+
+def test_quoted_phrase_stays_one_unit_under_match_all(statin_world: StatinWorld) -> None:
+    """Given "cancer risk" adjacent only in the full document
+    When the index is searched for the quoted phrase "cancer risk" with match="all"
+    Then only the full document is retrieved
+    """
+    hits = statin_world.index.search('"cancer risk"', match="all")
+
+    assert {statin_world.qid_by_oid[hit.oid] for hit in hits} == {"Q1"}
+
+
+def test_reversed_quoted_phrase_finds_nothing_under_match_all(statin_world: StatinWorld) -> None:
+    """Given "cancer risk" adjacent only in the full document
+    When the index is searched for the reversed phrase "risk cancer" with match="all"
+    Then nothing is found
+    """
+    hits = statin_world.index.search('"risk cancer"', match="all")
+
+    assert hits == []
+
+
+def test_invalid_match_mode_is_refused_loudly(statin_world: StatinWorld) -> None:
+    """Given an index over the statin corpus
+    When it is searched with match="both"
+    Then the mode is refused with ValueError, not silently misinterpreted
+    """
+    with pytest.raises(ValueError, match="match"):
+        statin_world.index.search("statin", match="both")
+
+
+@pytest.fixture
+def indexed_vendor(store: dc.Store, shop: IndexShop) -> FullTextIndex:
+    """Commit a vendor whose bare motto is Glänzende Steine into a store with an index."""
+    idx = shop.open(fulltext=GEM_FULLTEXT)
     store.attach(idx)
     store.root = [Vendor(name="AG", motto="Glänzende Steine")]
     store.commit()
-    assert idx.search("glänzende")        # diacritic + case folding works
-    assert idx.search("GLANZENDE")        # both sides folded
-    assert idx.search("Stein") == []      # but NO stemming on a bare field
-    store.close()
-    idx.close()
+    return idx
+
+
+@pytest.mark.parametrize("query", ["glänzende", "GLANZENDE"])
+def test_bare_fulltext_folds_diacritics_and_case_on_both_sides(
+    query: str, indexed_vendor: FullTextIndex
+) -> None:
+    """Given a bare dc.FullText motto Glänzende Steine
+    When the index is searched for a differently cased or accented form
+    Then the document is found
+    """
+    hits = indexed_vendor.search(query)
+
+    assert hits != []
+
+
+def test_bare_fulltext_does_not_stem(indexed_vendor: FullTextIndex) -> None:
+    """Given a bare dc.FullText motto Glänzende Steine
+    When the index is searched for the stem-only Stein
+    Then nothing is found
+    """
+    hits = indexed_vendor.search("Stein")
+
+    assert hits == []
 
 
 # -- linguistics regressions (2026-06-12 adversarial review) --------------------
@@ -227,288 +519,495 @@ def test_bare_fulltext_is_fold_only(store_factory, tmp_path) -> None:
 
 @dc.entity
 class Icon:
+    """An icon with a bare caption and a Russian legend."""
+
     label: str
-    caption: Annotated[str | None, dc.FullText] = None           # bare
+    caption: Annotated[str | None, dc.FullText] = None
     legend: Annotated[str | None, dc.FullText(language="ru")] = None
 
 
 ICON_FULLTEXT = {"tests.extras.test_fts:Icon": {"caption": None, "legend": "ru"}}
 
 
-def test_bare_fields_match_non_latin_verbatim(store_factory, tmp_path) -> None:
-    """The exact (f_) column is Python-fold-normalized like the query, so
-    Cyrillic/compat forms match verbatim — the review's critical finding:
-    a raw-text exact column is unicode61-tokenized and silently unmatchable
-    for ё/й, m², ligatures."""
-    store = store_factory()
-    idx = fresh_index(tmp_path, fulltext=ICON_FULLTEXT)
+@pytest.fixture
+def indexed_icons(store: dc.Store, shop: IndexShop) -> FullTextIndex:
+    """Commit two icons with non-Latin and compatibility-form captions, with an index attached."""
+    idx = shop.open(fulltext=ICON_FULLTEXT)
     store.attach(idx)
     store.root = [
         Icon(label="i1", caption="ёлка синий красный"),
         Icon(label="i2", caption="3 m² with ﬁne luster"),
     ]
     store.commit()
-    assert idx.search("ёлка")          # verbatim Cyrillic
-    assert idx.search("елка")          # folded form too
-    assert idx.search("синий")
-    assert idx.search("m²")            # NFKD compat: m² ≡ m2
-    assert idx.search("m2")
-    assert idx.search("ﬁne") and idx.search("fine")  # ligature folds
-    store.close()
-    idx.close()
+    return idx
 
 
-def test_russian_stemming_conflates_inflections(store_factory, tmp_path) -> None:
-    """Stem-first-fold-after: 'красный'/'красная' both stem to 'красн' —
-    folding before stemming destroys the й/ё the suffix tables need."""
-    store = store_factory()
-    idx = fresh_index(tmp_path, fulltext=ICON_FULLTEXT)
+@pytest.mark.parametrize("query", ["ёлка", "елка", "синий", "m²", "m2", "ﬁne", "fine"])
+def test_bare_field_matches_non_latin_and_compat_forms_verbatim(
+    query: str, indexed_icons: FullTextIndex
+) -> None:
+    """Given bare captions with Cyrillic ё and й, m² and the ligature ﬁ
+    When the index is searched for the verbatim or the folded form
+    Then a document is found, as the exact column is Python-fold-normalized like the query
+    """
+    hits = indexed_icons.search(query)
+
+    assert hits != []
+
+
+@pytest.fixture
+def indexed_red_icons(store: dc.Store, shop: IndexShop) -> FullTextIndex:
+    """Commit two icons with inflected Russian legends, with an index attached."""
+    idx = shop.open(fulltext=ICON_FULLTEXT)
     store.attach(idx)
     store.root = [
         Icon(label="i1", legend="красная ёлка"),
         Icon(label="i2", legend="красный кристалл"),
     ]
     store.commit()
-    for query in ("красный", "красная", "красное"):
-        assert len(idx.search(query)) == 2, f"query {query!r} must find both docs"
-    store.close()
-    idx.close()
+    return idx
 
 
-def test_nfd_document_text_highlights(store_factory, tmp_path) -> None:
-    """Decomposed (NFD) input must index, match, and highlight exactly like
-    its composed form — snippets render in NFC."""
-    import unicodedata
+@pytest.mark.parametrize("query", ["красный", "красная", "красное"])
+def test_russian_stemming_conflates_inflections(query: str, indexed_red_icons: FullTextIndex) -> None:
+    """Given the legends красная ёлка and красный кристалл, stemmed before they are folded
+    When the index is searched for one inflection of красн
+    Then both documents are found
+    """
+    hits = indexed_red_icons.search(query)
 
-    store = store_factory()
-    idx = fresh_index(tmp_path, fulltext=ICON_FULLTEXT)
+    assert len(hits) == 2, f"query {query!r} must find both docs"
+
+
+def test_nfd_document_text_highlights_like_its_composed_form(
+    store: dc.Store, shop: IndexShop
+) -> None:
+    """Given a caption indexed from decomposed (NFD) text
+    When the index is searched for the composed word glänzende
+    Then the snippet marks the word in NFC
+    """
+    idx = shop.open(fulltext=ICON_FULLTEXT)
     store.attach(idx)
-    nfd = unicodedata.normalize("NFD", "glänzende Würfel")
-    store.root = [Icon(label="i1", caption=nfd)]
+    store.root = [Icon(label="i1", caption=unicodedata.normalize("NFD", "glänzende Würfel"))]
     store.commit()
-    hits = idx.search("glänzende")
-    assert hits and "[glänzende]" in (hits[0].snippets.get("caption") or "")
-    store.close()
-    idx.close()
+
+    [hit] = idx.search("glänzende")
+
+    assert "[glänzende]" in (hit.snippets.get("caption") or "")
 
 
-def test_phrase_highlight_marks_only_adjacent_runs(store_factory,
-                                                   tmp_path) -> None:
-    store = store_factory()
-    idx = fresh_index(tmp_path, fulltext=GEM_FULLTEXT)
+@pytest.fixture
+def indexed_deep_blue(store: dc.Store, shop: IndexShop) -> FullTextIndex:
+    """Commit one description with scattered and adjacent deep and blue, with an index."""
+    idx = shop.open(fulltext=GEM_FULLTEXT)
     store.attach(idx)
-    store.root = [Gemstone(qid="Q1", name="azurite",
-                           description="deep water, blue sky, deep blue crusts")]
+    store.root = [
+        Gemstone(
+            qid="Q1", name="azurite", description="deep water, blue sky, deep blue crusts"
+        )
+    ]
     store.commit()
-    [hit] = idx.search('"deep blue"')
-    snippet = hit.snippets["description"]
-    assert "[deep] [blue] crusts" in snippet
-    assert "[deep] water" not in snippet     # non-adjacent 'deep' unmarked
-    assert "[blue] sky" not in snippet       # non-adjacent 'blue' unmarked
-    store.close()
-    idx.close()
+    return idx
 
 
-def test_query_operators_cannot_inject(store_factory, tmp_path) -> None:
-    """FTS5 operators arriving as user input are inert text, never syntax."""
-    store = store_factory()
-    idx = fresh_index(tmp_path, fulltext=GEM_FULLTEXT)
+def test_phrase_highlight_marks_the_adjacent_run(indexed_deep_blue: FullTextIndex) -> None:
+    """Given a description with scattered and adjacent deep and blue
+    When the index is searched for the quoted phrase "deep blue"
+    Then the adjacent run is marked
+    """
+    [hit] = indexed_deep_blue.search('"deep blue"')
+
+    assert "[deep] [blue] crusts" in hit.snippets["description"]
+
+
+def test_phrase_highlight_leaves_a_non_adjacent_deep_unmarked(
+    indexed_deep_blue: FullTextIndex,
+) -> None:
+    """Given a description with scattered and adjacent deep and blue
+    When the index is searched for the quoted phrase "deep blue"
+    Then the non-adjacent deep stays unmarked
+    """
+    [hit] = indexed_deep_blue.search('"deep blue"')
+
+    assert "[deep] water" not in hit.snippets["description"]
+
+
+def test_phrase_highlight_leaves_a_non_adjacent_blue_unmarked(
+    indexed_deep_blue: FullTextIndex,
+) -> None:
+    """Given a description with scattered and adjacent deep and blue
+    When the index is searched for the quoted phrase "deep blue"
+    Then the non-adjacent blue stays unmarked
+    """
+    [hit] = indexed_deep_blue.search('"deep blue"')
+
+    assert "[blue] sky" not in hit.snippets["description"]
+
+
+@pytest.mark.parametrize(
+    "evil",
+    [
+        'kristalle"',
+        "NEAR(a b)",
+        "f_notes : x",
+        '" OR rowid:1',
+        "kristalle*",
+        "^kristalle",
+        "NOT kristalle",
+        "(((",
+        '""',
+    ],
+)
+def test_fts5_operators_in_a_query_are_inert_text(
+    evil: str, store: dc.Store, shop: IndexShop
+) -> None:
+    """Given an index over milchige Kristalle
+    When a query made of FTS5 operator syntax is searched
+    Then it returns a hit list instead of raising, as terms are quoted, not parsed
+    """
+    idx = shop.open(fulltext=GEM_FULLTEXT)
     store.attach(idx)
     store.root = [Gemstone(qid="Q1", name="quartz", notes="milchige Kristalle")]
     store.commit()
-    for evil in ('kristalle"', 'NEAR(a b)', 'f_notes : x', '" OR rowid:1',
-                 "kristalle*", "^kristalle", "NOT kristalle", "(((", '""'):
-        idx.search(evil)  # must not raise — terms are quoted, not parsed
-    assert idx.search("AND OR NOT") == [] or True   # bare operators: inert
-    store.close()
-    idx.close()
+
+    hits = idx.search(evil)
+
+    assert isinstance(hits, list)
 
 
-def test_abugida_languages_refused_loudly(tmp_path) -> None:
-    for lang in ("hi", "hindi", "tamil", "nepali"):
-        with pytest.raises(FtsConfigError):
-            FullTextIndex(tmp_path / f"{lang}.fts", fulltext={"T": {"x": lang}})
+@pytest.mark.parametrize("language", ["hi", "hindi", "tamil", "nepali"])
+def test_abugida_language_is_refused_loudly(language: str, shop: IndexShop) -> None:
+    """Given an abugida language that Snowball cannot stem
+    When an index is configured with it
+    Then the configuration is refused
+    """
+    with pytest.raises(FtsConfigError):
+        shop.open(fulltext={"T": {"x": language}})
 
 
 # -- bootstrap + staleness (spec §5: deltas are not retained) -------------------
 
 
-def test_bootstrap_mid_life_equals_rebuild(store_factory, tmp_path) -> None:
-    """Attach to a lived-in store via snapshot bootstrap; afterwards the
-    incrementally maintained index must equal a from-scratch rebuild
-    (fitness #13: rebuild ≡ incremental)."""
-    store = store_factory()
+def test_bootstrap_indexes_the_history_before_attach(
+    store: dc.Store, shop: IndexShop
+) -> None:
+    """Given a lived-in store whose quartz has milchige Kristalle
+    When an index is bootstrapped from a snapshot
+    Then the pre-attach history is searchable
+    """
+    store.root = [Gemstone(qid="Q1", name="quartz", notes="milchige Kristalle")]
+    store.commit()
+
+    with store.snapshot() as snap:
+        idx = shop.bootstrap("boot.fts", snap, fulltext=GEM_FULLTEXT)
+
+    assert idx.search("Kristall") != []
+
+
+@pytest.fixture
+def incremental_index(store: dc.Store, shop: IndexShop) -> FullTextIndex:
+    """Bootstrap an index on a lived-in store, attach it and commit an update and an addition."""
     gem = Gemstone(qid="Q1", name="quartz", notes="milchige Kristalle")
     store.root = [gem]
     store.commit()
-
     with store.snapshot() as snap:
-        idx = FullTextIndex.bootstrap(
-            tmp_path / "boot.fts", snap, fulltext=GEM_FULLTEXT
-        )
+        idx = shop.bootstrap("boot.fts", snap, fulltext=GEM_FULLTEXT)
     store.attach(idx)
-    assert idx.search("Kristall")  # bootstrap indexed pre-attach history
-
     gem.notes = "tiefblaue Stufe"
-    store.root = list(store.root) + [
-        Gemstone(qid="Q2", name="azurite", description="blue crusts")
-    ]
+    store.root = [*store.root, Gemstone(qid="Q2", name="azurite", description="blue crusts")]
     store.commit()
+    return idx
 
+
+def test_incremental_index_equals_a_rebuild_from_scratch(
+    store: dc.Store, shop: IndexShop, incremental_index: FullTextIndex
+) -> None:
+    """Given an index maintained incrementally after a bootstrap
+    When the store is rebuilt into a second index from a snapshot (fitness #13)
+    Then both indexes hold the same rows
+    """
     with store.snapshot() as snap:
-        rebuilt = FullTextIndex.bootstrap(
-            tmp_path / "rebuilt.fts", snap, fulltext=GEM_FULLTEXT
-        )
-    assert content_probe(idx) == content_probe(rebuilt)
-    assert idx.watermark == rebuilt.watermark
-    store.close()
-    idx.close()
-    rebuilt.close()
+        rebuilt = shop.bootstrap("rebuilt.fts", snap, fulltext=GEM_FULLTEXT)
+
+    assert content_probe(incremental_index) == content_probe(rebuilt)
 
 
-def test_stale_sidecar_refused_on_attach(store_factory, tmp_path) -> None:
-    store = store_factory()
-    path = tmp_path / "stale.fts"
-    idx = FullTextIndex(path, fulltext=GEM_FULLTEXT)
+def test_incremental_index_ends_at_the_rebuilt_watermark(
+    store: dc.Store, shop: IndexShop, incremental_index: FullTextIndex
+) -> None:
+    """Given an index maintained incrementally after a bootstrap
+    When the store is rebuilt into a second index from a snapshot (fitness #13)
+    Then both indexes stand at the same watermark
+    """
+    with store.snapshot() as snap:
+        rebuilt = shop.bootstrap("rebuilt.fts", snap, fulltext=GEM_FULLTEXT)
+
+    assert incremental_index.watermark == rebuilt.watermark
+
+
+@pytest.fixture
+def store_ahead_of_closed_index(store: dc.Store, shop: IndexShop) -> dc.Store:
+    """Index one commit, detach and close the index, then commit a second one it misses."""
+    idx = shop.open("stale.fts", fulltext=GEM_FULLTEXT)
     store.attach(idx)
     store.root = [Gemstone(qid="Q1", name="quartz", notes="Kristalle")]
     store.commit()
     store.detach(idx)
     idx.close()
+    store.root = [*store.root, Gemstone(qid="Q2", name="calcite")]
+    store.commit()
+    return store
 
-    store.root = list(store.root) + [Gemstone(qid="Q2", name="calcite")]
-    store.commit()  # the sidecar misses this delta
 
-    reopened = FullTextIndex(path, fulltext=GEM_FULLTEXT)
+def test_stale_sidecar_reopens_at_its_old_watermark(
+    store_ahead_of_closed_index: dc.Store, shop: IndexShop
+) -> None:
+    """Given an index that missed the store's second delta
+    When it is reopened
+    Then its watermark is still 1
+    """
+    reopened = shop.open("stale.fts", fulltext=GEM_FULLTEXT)
+
     assert reopened.watermark == 1
+
+
+def test_stale_sidecar_is_refused_on_attach(
+    store_ahead_of_closed_index: dc.Store, shop: IndexShop
+) -> None:
+    """Given an index that missed the store's second delta, which is not retained
+    When it is attached
+    Then the attach is refused as a gap, to be rebuilt
+    """
+    reopened = shop.open("stale.fts", fulltext=GEM_FULLTEXT)
+
     with pytest.raises(DeltaGapError):
-        store.attach(reopened)  # behind + not retained → rebuild required
-    reopened.close()
-    store.close()
+        store_ahead_of_closed_index.attach(reopened)
 
 
-def test_persistence_across_reopen(store_factory, tmp_path) -> None:
-    store = store_factory()
-    path = tmp_path / "persist.fts"
-    idx = FullTextIndex(path, fulltext=GEM_FULLTEXT)
+@pytest.fixture
+def closed_index_watermark(store: dc.Store, shop: IndexShop) -> int:
+    """Index one commit, detach and close the index, and return its watermark."""
+    idx = shop.open("persist.fts", fulltext=GEM_FULLTEXT)
     store.attach(idx)
     store.root = [Gemstone(qid="Q1", name="quartz", notes="Kristalle")]
     store.commit()
     watermark = idx.watermark
     store.detach(idx)
     idx.close()
-
-    reopened = FullTextIndex(path, fulltext=GEM_FULLTEXT)
-    assert reopened.watermark == watermark
-    assert reopened.search("Kristall")  # index content survived the reopen
-    store.attach(reopened)              # watermark == store.last_tid: accepted
-    store.close()
-    reopened.close()
+    return watermark
 
 
-def test_config_drift_is_refused(tmp_path) -> None:
-    path = tmp_path / "drift.fts"
-    FullTextIndex(path, fulltext=GEM_FULLTEXT).close()
-    other = {"tests.extras.test_fts:Gemstone": {"notes": "en"}}  # de → en
+def test_reopened_index_keeps_its_watermark(closed_index_watermark: int, shop: IndexShop) -> None:
+    """Given an index closed after one commit
+    When it is reopened
+    Then its watermark is the one it had when closed
+    """
+    reopened = shop.open("persist.fts", fulltext=GEM_FULLTEXT)
+
+    assert reopened.watermark == closed_index_watermark
+
+
+def test_reopened_index_keeps_its_content(closed_index_watermark: int, shop: IndexShop) -> None:
+    """Given an index closed after one commit
+    When it is reopened and searched for Kristall
+    Then the content survived the reopen
+    """
+    reopened = shop.open("persist.fts", fulltext=GEM_FULLTEXT)
+
+    hits = reopened.search("Kristall")
+
+    assert hits != []
+
+
+def test_reopened_index_is_accepted_at_the_store_watermark_and_follows_on(
+    store: dc.Store, closed_index_watermark: int, shop: IndexShop
+) -> None:
+    """Given an index reopened at the store's last transaction id
+    When it is attached and a further gemstone is committed
+    Then the new gemstone is searchable
+    """
+    reopened = shop.open("persist.fts", fulltext=GEM_FULLTEXT)
+    store.attach(reopened)
+    store.root = [*store.root, Gemstone(qid="Q2", name="calcite", notes="Spitzen")]
+
+    store.commit()
+
+    assert reopened.search("Spitze") != []
+
+
+def test_config_drift_is_refused(shop: IndexShop) -> None:
+    """Given an index file created with German notes
+    When it is reopened with notes configured as English
+    Then the drift is refused
+    """
+    shop.open("drift.fts", fulltext=GEM_FULLTEXT)
+
     with pytest.raises(FtsConfigError):
-        FullTextIndex(path, fulltext=other)
+        shop.open("drift.fts", fulltext={"tests.extras.test_fts:Gemstone": {"notes": "en"}})
 
 
-def test_unknown_language_is_refused(tmp_path) -> None:
+def test_unknown_language_is_refused(shop: IndexShop) -> None:
+    """Given a language code Snowball does not know
+    When an index is configured with it
+    Then the configuration is refused
+    """
     with pytest.raises(FtsConfigError):
-        FullTextIndex(tmp_path / "x.fts", fulltext={"T": {"notes": "xx"}})
+        shop.open(fulltext={"T": {"notes": "xx"}})
 
 
 def test_registry_derived_config_indexes_fulltext_entities(
-    store_factory, tmp_path
+    store: dc.Store, shop: IndexShop
 ) -> None:
-    """The zero-config path: FullTextIndex(path) reads dc.FullText markers
-    straight from the @entity registry (declaration lives in code, like
-    dc.Index). The registry also carries a protected dc.FullText class (Secret,
-    below), so the zero-config index covers a protected class and search() must
-    be fenced — a root snapshot filters nothing and confirms Gemstone indexed."""
-    from datacrystal._entity import type_info
-
-    store = store_factory()
-    idx = fresh_index(tmp_path)  # no fulltext= map
+    """Given a zero-config index that reads dc.FullText markers from the @entity registry
+    When a root snapshot searches Kristall within Gemstone
+    Then the hit is of the Gemstone type
+    """
+    idx = shop.open()
     store.attach(idx)
     store.root = [Gemstone(qid="Q1", name="quartz", notes="glänzende Kristalle")]
     store.commit()
+
     with store.snapshot(principal=ROOT) as snap:
         hits = idx.search("Kristall", cls=Gemstone, snapshot=snap)
-        assert [h.typename for h in hits] == [type_info(Gemstone).typename]
-    store.close()
-    idx.close()
+
+    assert [hit.typename for hit in hits] == [GEM_TYPENAME]
 
 
 # -- failure honesty -------------------------------------------------------------
 
 
-def test_failing_apply_rolls_back_and_detaches(store_factory, tmp_path,
-                                               monkeypatch) -> None:
-    """A consumer that raises mid-apply must leave NO partial sidecar state
-    (its transaction rolls back) and the store must detach it loudly and
-    stay healthy (pipeline doctrine: never hold writes hostage)."""
-    store = store_factory()
-    idx = fresh_index(tmp_path, fulltext=GEM_FULLTEXT)
+def explode(*_args: object, **_kwargs: object) -> None:
+    """Fail like a full sidecar disk."""
+    raise RuntimeError("sidecar disk full")
+
+
+@pytest.fixture
+def indexed_one_gem(store: dc.Store, shop: IndexShop) -> FullTextIndex:
+    """Commit one gemstone into a store with an index attached."""
+    idx = shop.open(fulltext=GEM_FULLTEXT)
     store.attach(idx)
     store.root = [Gemstone(qid="Q1", name="quartz", notes="Kristalle")]
     store.commit()
-    before_content = content_probe(idx)
-    before_watermark = idx.watermark
+    return idx
 
-    original = idx._insert_doc
 
-    def explode(*_args, **_kwargs):
-        raise RuntimeError("sidecar disk full")
+@pytest.fixture
+def content_before_failure(indexed_one_gem: FullTextIndex) -> object:
+    """Return the index rows before a failing commit."""
+    return content_probe(indexed_one_gem)
 
-    monkeypatch.setattr(idx, "_insert_doc", explode)
-    gem2 = Gemstone(qid="Q2", name="azurite", notes="tiefblau")
-    store.root = list(store.root) + [gem2]
+
+@pytest.fixture
+def failing_inserts(indexed_one_gem: FullTextIndex, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the index raise while inserting a document."""
+    monkeypatch.setattr(indexed_one_gem, "_insert_doc", explode)
+
+
+@pytest.fixture
+def failed_commit(
+    store: dc.Store, indexed_one_gem: FullTextIndex, content_before_failure: object, failing_inserts: None
+) -> FullTextIndex:
+    """Commit a second gemstone while the index fails mid-apply, and return the index."""
+    store.root = [*store.root, Gemstone(qid="Q2", name="azurite", notes="tiefblau")]
     with pytest.warns(dc.ConsumerDetachedWarning):
-        store.commit()  # commit succeeds; consumer detached
+        store.commit()
+    return indexed_one_gem
 
-    monkeypatch.setattr(idx, "_insert_doc", original)
-    assert content_probe(idx) == before_content      # rollback was whole
-    assert idx.watermark == before_watermark
-    assert store.count(Gemstone) == 2                # the store is healthy
 
+def test_failing_consumer_is_detached_with_a_warning_while_the_commit_succeeds(
+    store: dc.Store, indexed_one_gem: FullTextIndex, failing_inserts: None
+) -> None:
+    """Given an index whose document insert raises mid-apply
+    When a second gemstone is committed
+    Then the commit succeeds and warns that the consumer was detached
+    """
+    store.root = [*store.root, Gemstone(qid="Q2", name="azurite", notes="tiefblau")]
+
+    with pytest.warns(dc.ConsumerDetachedWarning):
+        store.commit()
+
+
+def test_failing_apply_rolls_the_sidecar_content_back_whole(
+    failed_commit: FullTextIndex, content_before_failure: object
+) -> None:
+    """Given an index that failed mid-apply of a second gemstone
+    When its rows are read
+    Then they equal the rows before the failing commit
+    """
+    assert content_probe(failed_commit) == content_before_failure
+
+
+def test_failing_apply_leaves_the_sidecar_watermark_untouched(
+    failed_commit: FullTextIndex,
+) -> None:
+    """Given an index that failed mid-apply of its second delta
+    When its watermark is read
+    Then it is still 1
+    """
+    assert failed_commit.watermark == 1
+
+
+def test_store_stays_healthy_after_a_consumer_failed(
+    store: dc.Store, failed_commit: FullTextIndex
+) -> None:
+    """Given an index that failed mid-apply and was detached
+    When the store counts its gemstones
+    Then both committed gemstones are there
+    """
+    counted = store.count(Gemstone)
+
+    assert counted == 2
+
+
+def test_failed_sidecar_cannot_silently_rejoin(store: dc.Store, failed_commit: FullTextIndex) -> None:
+    """Given an index that failed mid-apply and is now behind the store
+    When it is attached again
+    Then the attach is refused as a gap: rebuild, do not silently rejoin
+    """
     with pytest.raises(DeltaGapError):
-        store.attach(idx)  # now behind: must rebuild, not silently rejoin
-    store.close()
-    idx.close()
+        store.attach(failed_commit)
 
 
-def test_apply_is_o_delta_not_o_corpus(tmp_path) -> None:
-    """Fitness #9 shape: the statement count of one fixed-size delta must
-    not grow with the corpus (10 docs vs 100 docs). Two independent stores
-    (op counts are backend-independent — the memory backend suffices)."""
-    from datacrystal._storage.memory import MemoryBackend
+@pytest.fixture
+def indexed_corpus(shop: IndexShop) -> Iterator[Callable[[int], tuple[dc.Store, FullTextIndex]]]:
+    """Return a factory for a committed, indexed in-memory corpus; close the stores after."""
+    stores: list[dc.Store] = []
 
-    counts: list[int] = []
-    for corpus in (10, 100):
-        store = dc.Store._from_backend(MemoryBackend())
-        idx = fresh_index(tmp_path, fulltext=GEM_FULLTEXT)
-        store.attach(idx)
-        store.root = [
-            Gemstone(qid=f"Q{corpus}-{i}", name=f"g{i}", notes=f"Stufe {i}")
-            for i in range(corpus)
+    def build(size: int) -> tuple[dc.Store, FullTextIndex]:
+        corpus_store = dc.Store._from_backend(MemoryBackend())
+        stores.append(corpus_store)
+        idx = shop.open(fulltext=GEM_FULLTEXT)
+        corpus_store.attach(idx)
+        corpus_store.root = [
+            Gemstone(qid=f"Q{size}-{i}", name=f"g{i}", notes=f"Stufe {i}") for i in range(size)
         ]
-        store.commit()
-        gem = Gemstone(qid=f"Qx-{corpus}", name="probe", notes="Kristalle")
-        store.root = list(store.root) + [gem]
-        store.commit()
-        counts.append(idx.statements)
-        store.close()
-        idx.close()
-    assert counts[0] == counts[1], (
-        f"statements per fixed delta grew with corpus size: {counts}"
-    )
+        corpus_store.commit()
+        return corpus_store, idx
+
+    yield build
+    for corpus_store in stores:
+        corpus_store.close()
+
+
+def test_apply_cost_does_not_grow_with_the_corpus(
+    indexed_corpus: Callable[[int], tuple[dc.Store, FullTextIndex]],
+) -> None:
+    """Given two independent stores indexing 10 and 100 gemstones
+    When one fixed-size gemstone is committed into each
+    Then the sidecar runs the same number of statements for both (fitness #9)
+    """
+    small_store, small_index = indexed_corpus(10)
+    large_store, large_index = indexed_corpus(100)
+    small_store.root = [*small_store.root, Gemstone(qid="Qx-10", name="probe", notes="Kristalle")]
+    large_store.root = [*large_store.root, Gemstone(qid="Qx-100", name="probe", notes="Kristalle")]
+
+    small_store.commit()
+    large_store.commit()
+
+    assert large_index.statements == small_index.statements
 
 
 # -- W4-5: FTS post-filter over protected classes (ADR-008 R13) ----------------
-
-from datacrystal._entity import oid_of  # noqa: E402
 
 TEAM = 5
 OWNER = dc.Principal(uid=2, memberships={TEAM: dc.CURATOR})
@@ -519,6 +1018,8 @@ ROOT = dc.root_principal(1)
 
 @dc.entity(protected=True)
 class Secret:
+    """A protected record with an indexed English body."""
+
     label: Annotated[str, dc.Unique]
     body: Annotated[str | None, dc.FullText(language="en")] = None
 
@@ -526,9 +1027,18 @@ class Secret:
 SECRET_FULLTEXT = {"tests.extras.test_fts:Secret": {"body": "en"}}
 
 
-def _attach_secrets(store, idx) -> tuple[int, int]:
-    """One team-shared secret (member-readable) + one owner-only secret, both
-    matching 'crystal'. Returns (shared_oid, secret_oid)."""
+class SecretsWorld(NamedTuple):
+    """An index over two crystal secrets: one team-shared, one owner-only."""
+
+    index: FullTextIndex
+    shared_oid: int
+    secret_oid: int
+
+
+@pytest.fixture
+def secrets_world(store: dc.Store, shop: IndexShop) -> SecretsWorld:
+    """Commit one member-readable and one owner-only secret, both matching crystal."""
+    idx = shop.open(fulltext=SECRET_FULLTEXT)
     store.attach(idx)
     with store.acting_as(OWNER):
         shared = Secret(label="shared", body="the crystal lattice diagram")
@@ -537,138 +1047,240 @@ def _attach_secrets(store, idx) -> tuple[int, int]:
         secret = Secret(label="secret", body="the crystal vault combination")
         store.store(secret)
         store.commit()
-    shared_oid, secret_oid = oid_of(shared), oid_of(secret)
-    assert shared_oid is not None and secret_oid is not None
-    return shared_oid, secret_oid
+    return SecretsWorld(idx, committed_oid(shared), committed_oid(secret))
 
 
-def test_no_snapshot_over_protected_raises(tmp_path) -> None:
-    """Fail-closed backward-compat (R12 doctrine): an index covering a protected
-    class refuses an unfenced search rather than reading with full visibility."""
-    idx = fresh_index(tmp_path, fulltext=SECRET_FULLTEXT)
+def test_search_without_a_snapshot_over_a_protected_class_is_refused(shop: IndexShop) -> None:
+    """Given an index covering a protected class
+    When it is searched with no snapshot
+    Then the search is refused (R12), rather than read with full visibility
+    """
+    idx = shop.open(fulltext=SECRET_FULLTEXT)
+
     with pytest.raises(dc.ReadDeniedError):
-        idx.search("crystal")  # no snapshot + protected coverage → refused
-    idx.close()
+        idx.search("crystal")
 
 
-def test_no_snapshot_over_unprotected_is_unchanged(store_factory, tmp_path) -> None:
-    """An index covering ONLY unprotected classes stays byte-identical to
-    pre-W4: snapshot=None does not raise and renders snippets from the sidecar."""
-    store = store_factory()
-    idx = fresh_index(tmp_path, fulltext=GEM_FULLTEXT)
+@pytest.fixture
+def indexed_gem_without_protection(store: dc.Store, shop: IndexShop) -> FullTextIndex:
+    """Commit one gemstone into a store whose index covers only unprotected classes."""
+    idx = shop.open(fulltext=GEM_FULLTEXT)
     store.attach(idx)
     store.root = [Gemstone(qid="Q1", name="quartz", notes="milchige Kristalle")]
     store.commit()
-    hits = idx.search("Kristall")  # no snapshot, no raise
-    assert [h.oid for h in hits]
+    return idx
+
+
+def test_search_without_a_snapshot_over_unprotected_classes_still_finds_the_hit(
+    indexed_gem_without_protection: FullTextIndex,
+) -> None:
+    """Given an index covering only unprotected classes
+    When it is searched with no snapshot
+    Then it does not raise and finds the document
+    """
+    hits = indexed_gem_without_protection.search("Kristall")
+
+    assert len(hits) == 1
+
+
+def test_search_without_a_snapshot_over_unprotected_classes_renders_sidecar_snippets(
+    indexed_gem_without_protection: FullTextIndex,
+) -> None:
+    """Given an index covering only unprotected classes
+    When it is searched with no snapshot
+    Then the snippet is rendered from the sidecar
+    """
+    hits = indexed_gem_without_protection.search("Kristall")
+
     assert "Kristalle" in (hits[0].snippets.get("notes") or "")
-    store.close()
-    idx.close()
 
 
-def test_post_filter_drops_denied_hits_and_root_sees_all(store_factory,
-                                                         tmp_path) -> None:
-    store = store_factory()
-    idx = fresh_index(tmp_path, fulltext=SECRET_FULLTEXT)
-    shared_oid, secret_oid = _attach_secrets(store, idx)
+def test_post_filter_leaves_a_team_member_only_the_shared_hit(
+    store: dc.Store, secrets_world: SecretsWorld
+) -> None:
+    """Given a team-shared and an owner-only secret that both match crystal
+    When a team member searches through a snapshot
+    Then only the shared secret is a hit
+    """
     with store.snapshot(principal=MEMBER) as snap:
-        assert {h.oid for h in idx.search("crystal", snapshot=snap)} == {shared_oid}
+        hits = secrets_world.index.search("crystal", snapshot=snap)
+
+    assert {hit.oid for hit in hits} == {secrets_world.shared_oid}
+
+
+def test_post_filter_leaves_an_outsider_no_hit(store: dc.Store, secrets_world: SecretsWorld) -> None:
+    """Given a team-shared and an owner-only secret that both match crystal
+    When an outsider searches through a snapshot
+    Then no hit is left
+    """
     with store.snapshot(principal=OUTSIDER) as snap:
-        assert idx.search("crystal", snapshot=snap) == []   # sees neither
+        hits = secrets_world.index.search("crystal", snapshot=snap)
+
+    assert hits == []
+
+
+def test_post_filter_leaves_root_both_hits(store: dc.Store, secrets_world: SecretsWorld) -> None:
+    """Given a team-shared and an owner-only secret that both match crystal
+    When root searches through a snapshot
+    Then both secrets are hits, as root filters nothing
+    """
     with store.snapshot(principal=ROOT) as snap:
-        assert {h.oid for h in idx.search("crystal", snapshot=snap)} == {
-            shared_oid, secret_oid
-        }                                                    # root filters nothing
-    store.close()
-    idx.close()
+        hits = secrets_world.index.search("crystal", snapshot=snap)
+
+    assert {hit.oid for hit in hits} == {secrets_world.shared_oid, secrets_world.secret_oid}
 
 
-def test_snippets_never_leak_denied_text(store_factory, tmp_path) -> None:
-    """A dropped row's stored plaintext must never reach a SearchHit; a
-    survivor's snippet renders from the snapshot's own view text."""
-    store = store_factory()
-    idx = fresh_index(tmp_path, fulltext=SECRET_FULLTEXT)
-    shared_oid, _secret_oid = _attach_secrets(store, idx)
+def test_snippets_render_the_survivor_and_never_the_denied_text(
+    store: dc.Store, secrets_world: SecretsWorld
+) -> None:
+    """Given a team-shared and an owner-only secret that both match crystal
+    When a team member searches through a snapshot
+    Then exactly one hit survives, the shared secret
+    And its snippet renders the survivor's own text
+    And the denied row's text never appears
+    """
     with store.snapshot(principal=MEMBER) as snap:
-        hits = idx.search("crystal", snapshot=snap)
-        assert len(hits) == 1 and hits[0].oid == shared_oid
-        text = " ".join(hits[0].snippets.values())
-        assert "lattice" in text     # survivor's own text is rendered
-        assert "vault" not in text   # the denied row's text never appears
-    store.close()
-    idx.close()
+        hits = secrets_world.index.search("crystal", snapshot=snap)
+
+    assert len(hits) == 1
+    assert hits[0].oid == secrets_world.shared_oid
+    assert "lattice" in " ".join(hits[0].snippets.values())
+    assert "vault" not in " ".join(hits[0].snippets.values())
 
 
-def test_over_fetch_fills_to_limit_past_denied_top_hits(store_factory,
-                                                        tmp_path) -> None:
-    """BM25+LIMIT under-returns after filtering: a run of high-ranked DENIED
-    hits must not starve the page — geometric over-fetch widens until the one
-    lower-ranked readable hit fills limit=1."""
-    store = store_factory()
-    idx = fresh_index(tmp_path, fulltext=SECRET_FULLTEXT)
+class CrowdedSecrets(NamedTuple):
+    """An index over many top-ranked owner-only secrets and one lower-ranked shared one."""
+
+    index: FullTextIndex
+    shared_oid: int
+
+
+@pytest.fixture
+def crowded_secrets(store: dc.Store, shop: IndexShop) -> CrowdedSecrets:
+    """Commit 8 short owner-only secrets above one longer team-shared secret."""
+    idx = shop.open(fulltext=SECRET_FULLTEXT)
     store.attach(idx)
     with store.acting_as(OWNER):
-        # 8 short owner-only docs (just the term ⇒ rank high), all denied to MEMBER
         for i in range(8):
             store.store(Secret(label=f"d{i}", body="crystal"))
-        # one readable doc, longer ⇒ ranks BELOW the 8 denied top hits
-        shared = Secret(label="shared",
-                        body="crystal " + " ".join(f"w{j}" for j in range(40)))
+        shared = Secret(label="shared", body="crystal " + " ".join(f"w{j}" for j in range(40)))
         store.store(shared)
         dc.share(shared, TEAM, read=dc.AGENT, write=dc.CURATOR)
         store.commit()
-    shared_oid = oid_of(shared)
+    return CrowdedSecrets(idx, committed_oid(shared))
+
+
+def test_over_fetch_fills_the_page_past_denied_top_hits(
+    store: dc.Store, crowded_secrets: CrowdedSecrets
+) -> None:
+    """Given 8 denied hits ranked above the one readable hit
+    When a team member searches with limit=1
+    Then the readable hit fills the page, as the over-fetch widens past the denied window
+    """
     with store.snapshot(principal=MEMBER) as snap:
-        # initial 4×limit window is entirely denied; over-fetch must widen.
-        hits = idx.search("crystal", snapshot=snap, limit=1)
-        assert [h.oid for h in hits] == [shared_oid]
-    store.close()
-    idx.close()
+        hits = crowded_secrets.index.search("crystal", snapshot=snap, limit=1)
+
+    assert [hit.oid for hit in hits] == [crowded_secrets.shared_oid]
 
 
-def test_scan_cap_bounds_an_all_denied_search(store_factory, tmp_path) -> None:
-    """An all-denied principal examines at most scan_cap candidates — never a
-    full-table walk."""
-    store = store_factory()
-    idx = fresh_index(tmp_path, fulltext=SECRET_FULLTEXT)
+class GetManySpy:
+    """Wraps a snapshot's get_many and records every ref it was asked for."""
+
+    def __init__(self, real: Callable[..., list]) -> None:
+        """Wrap the real get_many."""
+        self.real = real
+        self.seen: list[int] = []
+
+    def __call__(self, refs: list[int]) -> list:
+        """Record the refs and delegate."""
+        batch = list(refs)
+        self.seen.extend(batch)
+        return self.real(batch)
+
+
+@pytest.fixture
+def fifty_denied_secrets(store: dc.Store, shop: IndexShop) -> FullTextIndex:
+    """Commit 50 owner-only secrets that all match crystal."""
+    idx = shop.open(fulltext=SECRET_FULLTEXT)
     store.attach(idx)
     with store.acting_as(OWNER):
         for i in range(50):
             store.store(Secret(label=f"d{i}", body="crystal"))
         store.commit()
+    return idx
+
+
+@pytest.fixture
+def spied_outsider_snapshot(store: dc.Store) -> Iterator[tuple[Snapshot, GetManySpy]]:
+    """Open an outsider's snapshot whose get_many is spied on."""
     with store.snapshot(principal=OUTSIDER) as snap:
-        seen: list[int] = []
-        real = snap.get_many
-
-        def counting(refs):
-            batch = list(refs)
-            seen.extend(batch)
-            return real(batch)
-
-        snap.get_many = counting  # Snapshot is intentionally un-slotted
-        hits = idx.search("crystal", snapshot=snap, scan_cap=10, limit=5)
-        assert hits == []               # outsider reads none of the 50
-        assert 0 < len(seen) <= 10      # bounded by scan_cap, not the 50-row table
-    store.close()
-    idx.close()
+        spy = GetManySpy(snap.get_many)
+        snap.get_many = spy  # pyrefly: ignore[bad-assignment]
+        yield snap, spy
 
 
-def test_protected_bootstrap_needs_root(store_factory, tmp_path) -> None:
-    """A mirror bootstrap over a protected class requires a root-bound snapshot
-    (a non-root snapshot would build a silently partial mirror)."""
-    store = store_factory()
+def test_all_denied_search_returns_no_hit(
+    fifty_denied_secrets: FullTextIndex, spied_outsider_snapshot: tuple[Snapshot, GetManySpy]
+) -> None:
+    """Given 50 secrets an outsider may not read
+    When the outsider searches crystal with scan_cap=10 and limit=5
+    Then no hit is returned
+    """
+    snap, _ = spied_outsider_snapshot
+
+    hits = fifty_denied_secrets.search("crystal", snapshot=snap, scan_cap=10, limit=5)
+
+    assert hits == []
+
+
+def test_scan_cap_bounds_the_candidates_an_all_denied_search_examines(
+    fifty_denied_secrets: FullTextIndex, spied_outsider_snapshot: tuple[Snapshot, GetManySpy]
+) -> None:
+    """Given 50 secrets an outsider may not read
+    When the outsider searches crystal with scan_cap=10 and limit=5
+    Then at most 10 candidates were examined, not the 50-row table
+    And at least one was examined
+    """
+    snap, spy = spied_outsider_snapshot
+
+    fifty_denied_secrets.search("crystal", snapshot=snap, scan_cap=10, limit=5)
+
+    assert len(spy.seen) <= 10
+    assert len(spy.seen) > 0
+
+
+@pytest.fixture
+def two_committed_secrets(store: dc.Store) -> None:
+    """Commit two owner-only secrets that both match crystal."""
     with store.acting_as(OWNER):
         store.store(Secret(label="s1", body="crystal one"))
         store.store(Secret(label="s2", body="crystal vault two"))
         store.commit()
-    with store.snapshot(principal=OWNER) as snap:
-        with pytest.raises(dc.ReadDeniedError):
-            FullTextIndex.bootstrap(tmp_path / "b.fts", snap, fulltext=SECRET_FULLTEXT)
+
+
+@pytest.mark.usefixtures("two_committed_secrets")
+def test_protected_bootstrap_from_a_non_root_snapshot_is_refused(
+    store: dc.Store, shop: IndexShop
+) -> None:
+    """Given two committed secrets of a protected class
+    When an index is bootstrapped from the owner's non-root snapshot
+    Then it is refused, as it would build a silently partial mirror
+    """
+    with store.snapshot(principal=OWNER) as snap, pytest.raises(dc.ReadDeniedError):
+        shop.bootstrap("b.fts", snap, fulltext=SECRET_FULLTEXT)
+
+
+@pytest.mark.usefixtures("two_committed_secrets")
+def test_protected_bootstrap_from_a_root_snapshot_mirrors_every_secret(
+    store: dc.Store, shop: IndexShop
+) -> None:
+    """Given two committed secrets of a protected class
+    When an index is bootstrapped from a root snapshot and searched through another
+    Then both secrets are hits
+    """
     with store.snapshot(principal=ROOT) as snap:
-        idx = FullTextIndex.bootstrap(
-            tmp_path / "b2.fts", snap, fulltext=SECRET_FULLTEXT
-        )
+        idx = shop.bootstrap("b2.fts", snap, fulltext=SECRET_FULLTEXT)
     with store.snapshot(principal=ROOT) as snap:
-        assert len(idx.search("crystal", snapshot=snap)) == 2  # full mirror
-    idx.close()
-    store.close()
+        hits = idx.search("crystal", snapshot=snap)
+
+    assert len(hits) == 2
