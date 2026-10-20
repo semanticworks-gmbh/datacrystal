@@ -10,16 +10,18 @@ earlier load would hand the real instance to every later principal that
 derefs the same handle). This file proves the MECHANISM with a hand-built
 protected corpus; the full multi-principal × surface matrix is W3-5.
 """
-# pyright: reportPrivateUsage=false, reportAttributeAccessIssue=false
 
 from __future__ import annotations
 
-from typing import Annotated
+from collections.abc import Callable
+from typing import Annotated, cast
 
 import pytest
 
 import datacrystal as dc
 from datacrystal._entity import oid_of, type_info
+
+StoreFactory = Callable[[], dc.Store]
 
 TEAM = 5
 OWNER = dc.Principal(uid=2, memberships={TEAM: dc.CURATOR})
@@ -29,67 +31,181 @@ ROOT = dc.Principal(uid=99, memberships={dc.WORLD: dc.EXECUTIVE})
 
 @dc.entity(protected=True)
 class Dossier:
+    """A protected dossier that may link to another."""
+
     label: Annotated[str, dc.Unique]
     note: str = ""
-    linked: dc.Lazy["Dossier"] | None = None
+    linked: dc.Lazy[Dossier] | None = None
 
 
 @dc.entity
 class Plain:
+    """An unprotected record."""
+
     label: Annotated[str, dc.Unique]
 
 
 @dc.entity
 class PlainHolder:
+    """An unprotected holder of a lazy handle onto a plain record."""
+
     label: Annotated[str, dc.Unique]
     linked: dc.Lazy[Plain] | None = None
 
 
-def _owner_only(store, label: str) -> Dossier:
-    """A birth-default (owner-only, groups=∅) record — inert to everyone
-    but its owner and root, by construction (ADR-008 R6)."""
+@dc.entity
+class Vault:
+    """Unprotected parent holding a protected child through a USER ``Lazy.of`` handle.
+
+    The cross-principal shared-graph shape the Fable review exploited: the handle keeps its
+    cached ``_obj`` and is reachable by any principal that reaches the live parent.
+    """
+
+    label: Annotated[str, dc.Unique]
+    secret: dc.Lazy[Dossier] | None = None
+
+
+def _oid(entity: object) -> int:
+    return cast("int", oid_of(entity))
+
+
+def _owner_only(store: dc.Store, label: str) -> Dossier:
+    """Commit a birth-default record (owner-only, no groups), inert to all but owner and root."""
     with store.acting_as(OWNER):
-        d = Dossier(label=label)
-        store.store(d)
+        dossier = Dossier(label=label)
+        store.store(dossier)
         store.commit()
-    return d
+    return dossier
+
+
+def _commit_linked_pair(
+    store_factory: StoreFactory, parent_label: str, target_label: str
+) -> None:
+    """Commit a parent dossier linking to a target dossier, then close the store."""
+    store = store_factory()
+    with store.acting_as(OWNER):
+        target = Dossier(label=target_label)
+        store.store(target)
+        parent = Dossier(label=parent_label)
+        parent.linked = dc.Lazy.of(target)
+        store.store(parent)
+        store.commit()
+    store.close()
+
+
+def _commit_readable_hidden_and_deleted(store_factory: StoreFactory) -> tuple[int, int, int]:
+    """Commit a readable, a hidden and a deleted dossier; close the store and return their OIDs."""
+    store = store_factory()
+    with store.acting_as(OWNER):
+        readable = Dossier(label="readable")
+        readable_oid = store.store(readable)
+        dc.share(readable, TEAM, read=dc.VIEWER, write=dc.VIEWER)
+        hidden_oid = store.store(Dossier(label="hidden"))
+        doomed = Dossier(label="doomed")
+        doomed_oid = store.store(doomed)
+        store.commit()
+    with store.acting_as(OWNER):
+        store.delete(doomed)
+        store.commit()
+    store.close()
+    return readable_oid, hidden_oid, doomed_oid
+
+
+@pytest.fixture
+def twin(store: dc.Store) -> Dossier:
+    """Return the redacted twin an outsider gets for an owner-only dossier."""
+    dossier = _owner_only(store, "net")
+    with store.acting_as(OUTSIDER):
+        return store._load_oid_deref(_oid(dossier))
 
 
 # --- twin shape (R14 variant (a)) --------------------------------------------
 
 
 class TestTwinShape:
-    def test_isinstance_both_ways_and_falsy_and_typename(self, store):
-        d = _owner_only(store, "shape-1")
-        oid = oid_of(d)
+    """What a redacted twin is and what it refuses."""
+
+    def test_twin_is_an_instance_of_the_protected_class(self, store: dc.Store) -> None:
+        """Given an owner-only dossier
+        When an outsider derefs its OID
+        Then the result is an instance of Dossier
+        """
+        dossier = _owner_only(store, "shape-1")
         with store.acting_as(OUTSIDER):
-            twin = store._load_oid_deref(oid)
+            twin = store._load_oid_deref(_oid(dossier))
         assert isinstance(twin, Dossier)
+
+    def test_twin_is_an_instance_of_redacted(self, store: dc.Store) -> None:
+        """Given an owner-only dossier
+        When an outsider derefs its OID
+        Then the result is an instance of dc.Redacted
+        """
+        dossier = _owner_only(store, "shape-1")
+        with store.acting_as(OUTSIDER):
+            twin = store._load_oid_deref(_oid(dossier))
         assert isinstance(twin, dc.Redacted)
+
+    def test_twin_is_falsy(self, store: dc.Store) -> None:
+        """Given an owner-only dossier
+        When an outsider derefs its OID
+        Then the result is falsy
+        """
+        dossier = _owner_only(store, "shape-1")
+        with store.acting_as(OUTSIDER):
+            twin = store._load_oid_deref(_oid(dossier))
         assert bool(twin) is False
+
+    def test_twin_keeps_the_typename_readable(self, store: dc.Store) -> None:
+        """Given an owner-only dossier
+        When an outsider derefs its OID
+        Then the twin's typename is Dossier's
+        """
+        dossier = _owner_only(store, "shape-1")
+        with store.acting_as(OUTSIDER):
+            twin = store._load_oid_deref(_oid(dossier))
         assert twin.typename == type_info(Dossier).typename
 
-    def test_data_field_read_raises_read_denied(self, store):
-        d = _owner_only(store, "shape-2")
+    def test_reading_a_data_field_raises_read_denied(self, store: dc.Store) -> None:
+        """Given the twin of an owner-only dossier
+        When its note is read
+        Then the read raises ReadDeniedError
+        """
+        dossier = _owner_only(store, "shape-2")
         with store.acting_as(OUTSIDER):
-            twin = store._load_oid_deref(oid_of(d))
+            twin = store._load_oid_deref(_oid(dossier))
         with pytest.raises(dc.ReadDeniedError):
             _ = twin.note
+
+    def test_reading_the_unique_key_raises_read_denied(self, store: dc.Store) -> None:
+        """Given the twin of an owner-only dossier
+        When its label is read
+        Then the read raises ReadDeniedError
+        """
+        dossier = _owner_only(store, "shape-2")
+        with store.acting_as(OUTSIDER):
+            twin = store._load_oid_deref(_oid(dossier))
         with pytest.raises(dc.ReadDeniedError):
             _ = twin.label
 
-    def test_dc_permissions_raises_too(self, store):
-        # Labels of an unreadable record are themselves a leak.
-        d = _owner_only(store, "shape-3")
+    def test_reading_dc_permissions_raises_read_denied(self, store: dc.Store) -> None:
+        """Given the twin of an owner-only dossier
+        When its dc_permissions are read
+        Then the read raises ReadDeniedError, the labels of an unreadable record being a leak
+        """
+        dossier = _owner_only(store, "shape-3")
         with store.acting_as(OUTSIDER):
-            twin = store._load_oid_deref(oid_of(d))
+            twin = store._load_oid_deref(_oid(dossier))
         with pytest.raises(dc.ReadDeniedError):
             _ = twin.dc_permissions
 
-    def test_repr_never_raises(self, store):
-        d = _owner_only(store, "shape-4")
+    def test_repr_never_raises(self, store: dc.Store) -> None:
+        """Given the twin of an owner-only dossier
+        When it is rendered with repr
+        Then the text names Redacted
+        """
+        dossier = _owner_only(store, "shape-4")
         with store.acting_as(OUTSIDER):
-            twin = store._load_oid_deref(oid_of(d))
+            twin = store._load_oid_deref(_oid(dossier))
         assert "Redacted" in repr(twin)
 
 
@@ -97,45 +213,55 @@ class TestTwinShape:
 
 
 class TestNeverCommittable:
-    def _twin(self, store) -> Dossier:
-        d = _owner_only(store, "net")
-        with store.acting_as(OUTSIDER):
-            return store._load_oid_deref(oid_of(d))
+    """A twin can be neither stored, marked, deleted, upserted nor shared."""
 
-    def test_store_raises(self, store):
-        twin = self._twin(store)
+    def test_storing_a_twin_raises_read_denied(self, store: dc.Store, twin: Dossier) -> None:
+        """Given the twin of an owner-only dossier
+        When it is stored
+        Then store raises ReadDeniedError
+        """
         with pytest.raises(dc.ReadDeniedError):
             store.store(twin)
 
-    def test_mark_dirty_raises(self, store):
-        twin = self._twin(store)
+    def test_marking_a_twin_dirty_raises_read_denied(self, store: dc.Store, twin: Dossier) -> None:
+        """Given the twin of an owner-only dossier
+        When it is marked dirty
+        Then mark_dirty raises ReadDeniedError
+        """
         with pytest.raises(dc.ReadDeniedError):
             store.mark_dirty(twin)
 
-    def test_delete_raises(self, store):
-        twin = self._twin(store)
+    def test_deleting_a_twin_raises_read_denied(self, store: dc.Store, twin: Dossier) -> None:
+        """Given the twin of an owner-only dossier
+        When it is deleted
+        Then delete raises ReadDeniedError
+        """
         with pytest.raises(dc.ReadDeniedError):
             store.delete(twin)
 
-    def test_upsert_raises(self, store):
-        twin = self._twin(store)
+    def test_upserting_a_twin_raises_read_denied(self, store: dc.Store, twin: Dossier) -> None:
+        """Given the twin of an owner-only dossier
+        When it is upserted
+        Then upsert raises ReadDeniedError
+        """
         with pytest.raises(dc.ReadDeniedError):
             store.upsert(twin)
 
-    def test_share_raises_via_the_twins_own_setattr(self, store):
-        # No dedicated store-side code: share() stages through normal
-        # attribute assignment, and the twin's __setattr__ always raises —
-        # the twin closes this path by construction, not by a special check.
-        twin = self._twin(store)
+    def test_share_raises_via_the_twins_own_setattr(self, twin: Dossier) -> None:
+        """Given the twin of an owner-only dossier
+        When it is shared with the team
+        Then share raises ReadDeniedError, the twin's __setattr__ always raising
+        """
         with pytest.raises(dc.ReadDeniedError):
             dc.share(twin, TEAM, read=dc.VIEWER, write=dc.VIEWER)
 
-    def test_smuggled_into_a_field_is_caught_at_p1_discovery(self, store):
-        # A twin discovered through another entity's field (an eager Any-typed
-        # position, or a Lazy.of(twin) container) is caught by the
-        # _register_graph loop top, not by _walk_value's R11 check (that
-        # check exempts Redacted so THIS more specific error can fire).
-        twin = self._twin(store)
+    def test_twin_smuggled_into_a_field_is_caught_at_p1_discovery(
+        self, store: dc.Store, twin: Dossier
+    ) -> None:
+        """Given the twin of an owner-only dossier wrapped in Lazy.of on a new holder
+        When the holder is stored
+        Then store raises ReadDeniedError from the graph discovery, not the R11 walk
+        """
         with store.acting_as(OWNER):
             holder = Dossier(label="holder-for-smuggled")
             holder.linked = dc.Lazy.of(twin)
@@ -143,249 +269,359 @@ class TestNeverCommittable:
                 store.store(holder)
 
 
-def test_twin_never_registered(store_factory):
-    s = store_factory()
-    with s.acting_as(OWNER):
-        hidden = Dossier(label="never-registered")
-        s.store(hidden)
-        s.commit()
-    oid = oid_of(hidden)
-    s.close()
-
-    s2 = store_factory()
-    with s2.acting_as(OUTSIDER):
-        twin = s2._load_oid_deref(oid)
-    assert isinstance(twin, dc.Redacted)
-    assert s2._registry.get(oid) is None  # the denied deref registered NOTHING
-    s2.close()
+def test_twin_never_registered(store_factory: StoreFactory) -> None:
+    """Given a reopened store where nobody has loaded an owner-only dossier
+    When an outsider derefs its OID
+    Then the result is a twin
+    And the identity registry holds nothing for the OID
+    """
+    with store_factory() as first, first.acting_as(OWNER):
+        hidden_oid = first.store(Dossier(label="never-registered"))
+        first.commit()
+    with store_factory() as reopened:
+        with reopened.acting_as(OUTSIDER):
+            twin = reopened._load_oid_deref(hidden_oid)
+        assert isinstance(twin, dc.Redacted)
+        assert reopened._registry.get(hidden_oid) is None
 
 
 # --- _load_oid_deref: three distinguishable outcomes -------------------------
 
 
-def test_three_outcomes_real_twin_dangling(store_factory):
-    s = store_factory()
-    with s.acting_as(OWNER):
-        readable = Dossier(label="readable")
-        s.store(readable)
-        dc.share(readable, TEAM, read=dc.VIEWER, write=dc.VIEWER)
-        hidden = Dossier(label="hidden")  # owner-only, unshared
-        s.store(hidden)
-        doomed = Dossier(label="doomed")
-        s.store(doomed)
-        s.commit()
-    readable_oid, hidden_oid, doomed_oid = (
-        oid_of(readable), oid_of(hidden), oid_of(doomed))
-    with s.acting_as(OWNER):
-        s.delete(doomed)
-        s.commit()
-    s.close()
-
-    s2 = store_factory()
-    with s2.acting_as(OUTSIDER):
-        real = s2._load_oid_deref(readable_oid)
-        assert not isinstance(real, dc.Redacted)
-        assert real.label == "readable"
-
-        twin = s2._load_oid_deref(hidden_oid)
-        assert isinstance(twin, dc.Redacted)
-
-        with pytest.raises(dc.DanglingRefError):
-            s2._load_oid_deref(doomed_oid)
-    s2.close()
+def test_readable_dossier_derefs_to_the_real_instance(store_factory: StoreFactory) -> None:
+    """Given a reopened store with a dossier shared with the team
+    When an outsider on the team derefs its OID
+    Then the result is the real dossier, not a twin
+    And it carries its label
+    """
+    readable_oid, _hidden_oid, _doomed_oid = _commit_readable_hidden_and_deleted(store_factory)
+    with store_factory() as reopened, reopened.acting_as(OUTSIDER):
+        real = reopened._load_oid_deref(readable_oid)
+    assert not isinstance(real, dc.Redacted)
+    assert real.label == "readable"
 
 
-def test_root_bypasses_the_checkpoint(store_factory):
-    s = store_factory()
-    hidden = _owner_only(s, "root-sees-all")
-    oid = oid_of(hidden)
-    with s.acting_as(ROOT):
-        seen = s._load_oid_deref(oid)
+def test_hidden_dossier_derefs_to_a_twin(store_factory: StoreFactory) -> None:
+    """Given a reopened store with an owner-only dossier
+    When an outsider derefs its OID
+    Then the result is a twin
+    """
+    _readable_oid, hidden_oid, _doomed_oid = _commit_readable_hidden_and_deleted(store_factory)
+    with store_factory() as reopened, reopened.acting_as(OUTSIDER):
+        twin = reopened._load_oid_deref(hidden_oid)
+    assert isinstance(twin, dc.Redacted)
+
+
+def test_deleted_dossier_deref_raises_dangling(store_factory: StoreFactory) -> None:
+    """Given a reopened store where a dossier was deleted
+    When an outsider derefs its OID
+    Then the deref raises DanglingRefError
+    """
+    _readable_oid, _hidden_oid, doomed_oid = _commit_readable_hidden_and_deleted(store_factory)
+    with (
+        store_factory() as reopened,
+        reopened.acting_as(OUTSIDER),
+        pytest.raises(dc.DanglingRefError),
+    ):
+        reopened._load_oid_deref(doomed_oid)
+
+
+def test_root_bypasses_the_checkpoint(store: dc.Store) -> None:
+    """Given an owner-only dossier
+    When root derefs its OID
+    Then the result is the real dossier, not a twin
+    And it carries its label
+    """
+    hidden = _owner_only(store, "root-sees-all")
+    with store.acting_as(ROOT):
+        seen = store._load_oid_deref(_oid(hidden))
     assert not isinstance(seen, dc.Redacted)
     assert seen.label == "root-sees-all"
-    s.close()
 
 
 # --- invariant 6: only twins are exempt, readable identity stays intact -----
 
 
-def test_denied_then_readable_deref_yields_the_same_registered_instance(store):
-    d = _owner_only(store, "poison")
-    oid = oid_of(d)
-
+def test_denied_deref_leaves_the_registered_instance_in_the_registry(store: dc.Store) -> None:
+    """Given an owner-only dossier registered live
+    When an outsider derefs its OID
+    Then the outsider gets a twin
+    And the registry still holds the real dossier
+    """
+    dossier = _owner_only(store, "poison")
     with store.acting_as(OUTSIDER):
-        twin = store._load_oid_deref(oid)
-        assert isinstance(twin, dc.Redacted)
+        twin = store._load_oid_deref(_oid(dossier))
+    assert isinstance(twin, dc.Redacted)
+    assert store._registry.get(_oid(dossier)) is dossier
 
-    assert store._registry.get(oid) is d  # untouched by the denied deref
 
+def test_owner_deref_after_a_denied_deref_yields_the_same_instance(store: dc.Store) -> None:
+    """Given an owner-only dossier an outsider already derefed into a twin
+    When the owner derefs its OID
+    Then the owner gets the identical live instance, never re-materialized or poisoned
+    """
+    dossier = _owner_only(store, "poison")
+    with store.acting_as(OUTSIDER):
+        store._load_oid_deref(_oid(dossier))
     with store.acting_as(OWNER):
-        real_again = store._load_oid_deref(oid)
-    assert real_again is d  # same identity — never re-materialized, never poisoned
+        real_again = store._load_oid_deref(_oid(dossier))
+    assert real_again is dossier
 
 
 # --- Lazy.get() re-checks across acting_as scopes (landmine 2) --------------
 
 
-def test_lazy_get_never_leaks_the_real_instance_across_principals(store_factory):
-    s = store_factory()
-    with s.acting_as(OWNER):
-        target = Dossier(label="linked-target")
-        s.store(target)
-        parent = Dossier(label="parent-with-link")
-        parent.linked = dc.Lazy.of(target)
-        s.store(parent)
-        s.commit()
-    s.close()
-
-    s2 = store_factory()
-    with s2.acting_as(OWNER):               # she is the owner (ADR-008 read fence)
-        parent2 = s2.get(Dossier, label="parent-with-link")
-    handle = parent2.linked
-    assert handle is not None
-
-    with s2.acting_as(OWNER):
-        loaded = handle.get()  # curator loads: the real instance
+def test_lazy_get_loads_the_real_instance_for_the_owner(store_factory: StoreFactory) -> None:
+    """Given a reopened store and a Lazy handle onto an owner-only target
+    When the owner calls get on the handle
+    Then the real target comes back, not a twin
+    And it carries its label
+    """
+    _commit_linked_pair(store_factory, "parent-with-link", "linked-target")
+    with store_factory() as reopened, reopened.acting_as(OWNER):
+        handle = reopened.query(dc.fields(Dossier).label == "parent-with-link")[0].linked
+        loaded = handle.get()
     assert not isinstance(loaded, dc.Redacted)
     assert loaded.label == "linked-target"
-    assert handle.peek() is None  # protected: never cached on the handle
 
-    with s2.acting_as(OUTSIDER):
-        denied = handle.get()  # agent scope derefs the SAME handle
+
+def test_lazy_get_never_caches_a_protected_target_on_the_handle(
+    store_factory: StoreFactory,
+) -> None:
+    """Given a Lazy handle onto an owner-only target the owner already loaded
+    When the handle is peeked
+    Then peek returns None
+    """
+    _commit_linked_pair(store_factory, "parent-with-link", "linked-target")
+    with store_factory() as reopened, reopened.acting_as(OWNER):
+        handle = reopened.query(dc.fields(Dossier).label == "parent-with-link")[0].linked
+        handle.get()
+        peeked = handle.peek()
+    assert peeked is None
+
+
+def test_lazy_get_for_an_outsider_on_the_same_handle_yields_a_twin(
+    store_factory: StoreFactory,
+) -> None:
+    """Given a Lazy handle onto an owner-only target the owner already loaded
+    When an outsider calls get on the same handle
+    Then the outsider gets a twin
+    """
+    _commit_linked_pair(store_factory, "parent-with-link", "linked-target")
+    with store_factory() as reopened:
+        with reopened.acting_as(OWNER):
+            handle = reopened.query(dc.fields(Dossier).label == "parent-with-link")[0].linked
+            handle.get()
+        with reopened.acting_as(OUTSIDER):
+            denied = handle.get()
     assert isinstance(denied, dc.Redacted)
-    assert handle.peek() is None  # still never cached
 
-    with s2.acting_as(OWNER):
-        again = handle.get()  # back to owner: real, SAME identity — no re-materialization
+
+def test_lazy_get_for_an_outsider_still_caches_nothing(store_factory: StoreFactory) -> None:
+    """Given a Lazy handle onto an owner-only target an outsider just derefed into a twin
+    When the handle is peeked
+    Then peek returns None
+    """
+    _commit_linked_pair(store_factory, "parent-with-link", "linked-target")
+    with store_factory() as reopened:
+        with reopened.acting_as(OWNER):
+            handle = reopened.query(dc.fields(Dossier).label == "parent-with-link")[0].linked
+            handle.get()
+        with reopened.acting_as(OUTSIDER):
+            handle.get()
+        peeked = handle.peek()
+    assert peeked is None
+
+
+def test_owner_lazy_get_after_an_outsider_deref_returns_the_same_instance(
+    store_factory: StoreFactory,
+) -> None:
+    """Given a Lazy handle the owner loaded and an outsider then derefed
+    When the owner calls get on the handle again
+    Then the owner gets the identical instance, with no re-materialization
+    """
+    _commit_linked_pair(store_factory, "parent-with-link", "linked-target")
+    with store_factory() as reopened:
+        with reopened.acting_as(OWNER):
+            handle = reopened.query(dc.fields(Dossier).label == "parent-with-link")[0].linked
+            loaded = handle.get()
+        with reopened.acting_as(OUTSIDER):
+            handle.get()
+        with reopened.acting_as(OWNER):
+            again = handle.get()
     assert again is loaded
-    s2.close()
 
 
-def test_resolve_never_prehydrates_a_protected_handle_on_a_registry_hit(store_factory):
-    # _resolve's registry-hit optimization (Lazy._loaded) must SKIP protected
-    # targets — a pre-loaded handle embedded in a freshly-hydrated SHARED
-    # parent would be a cross-principal cache before anyone even called
-    # .get() (the companion edit to the Lazy.get() fix, same landmine).
-    s = store_factory()
-    with s.acting_as(OWNER):
-        target = Dossier(label="prehydrate-target")
-        s.store(target)
-        parent = Dossier(label="prehydrate-parent")
-        parent.linked = dc.Lazy.of(target)
-        s.store(parent)
-        s.commit()
-    s.close()
-
-    s2 = store_factory()
-    with s2.acting_as(OWNER):               # she is the owner (ADR-008 read fence)
-        _ = s2.get(Dossier, label="prehydrate-target")  # registers the TARGET first
-        parent2 = s2.get(Dossier, label="prehydrate-parent")  # hydrates via a registry HIT
-    assert parent2.linked is not None
-    assert parent2.linked.peek() is None  # NOT pre-loaded, despite the registry hit
-    s2.close()
+def test_resolve_never_prehydrates_a_protected_handle_on_a_registry_hit(
+    store_factory: StoreFactory,
+) -> None:
+    """Given a parent hydrated after its owner-only target is already in the registry
+    When the parent's Lazy handle is peeked
+    Then peek returns None, the handle not pre-loaded despite the registry hit
+    """
+    _commit_linked_pair(store_factory, "prehydrate-parent", "prehydrate-target")
+    with store_factory() as reopened, reopened.acting_as(OWNER):
+        reopened.get(Dossier, label="prehydrate-target")
+        parent = reopened.query(dc.fields(Dossier).label == "prehydrate-parent")[0]
+        peeked = parent.linked.peek()
+    assert peeked is None
 
 
-def test_lazy_get_unprotected_target_still_caches(store_factory):
-    # Contrast case: an UNPROTECTED Lazy target caches exactly as before —
-    # the protected exemption must not degrade the unprotected fast path.
-    s = store_factory()
-    target = Plain(label="open-target")
-    s.store(target)
-    holder = PlainHolder(label="open-holder")
-    holder.linked = dc.Lazy.of(target)
-    s.store(holder)
-    s.commit()
-    s.close()
-
-    s2 = store_factory()
-    holder2 = s2.get(PlainHolder, label="open-holder")
-    handle = holder2.linked
-    assert handle is not None
-    first = handle.get()
-    assert handle.peek() is first  # cached
-    second = handle.get()
-    assert second is first  # same cached instance, no re-derivation
-    s2.close()
+def test_lazy_get_on_an_unprotected_target_still_caches(store_factory: StoreFactory) -> None:
+    """Given a reopened store and a Lazy handle onto an unprotected target
+    When get is called on the handle twice
+    Then peek returns the first instance
+    And the second get returns that same instance
+    """
+    with store_factory() as first:
+        target = Plain(label="open-target")
+        first.store(target)
+        holder = PlainHolder(label="open-holder")
+        holder.linked = dc.Lazy.of(target)
+        first.store(holder)
+        first.commit()
+    with store_factory() as reopened:
+        handle = reopened.query(PlainHolder)[0].linked
+        first_get = handle.get()
+        peeked = handle.peek()
+        second_get = handle.get()
+    assert peeked is first_get
+    assert second_get is first_get
 
 
 # --- Fable read-fence review follow-ups: peek()/__repr__ + pre-commit deref ---
 
 
-@dc.entity
-class Vault:
-    """Unprotected parent holding a protected child through a USER ``Lazy.of``
-    handle — the cross-principal shared-graph shape the Fable review exploited
-    (the handle keeps its cached ``_obj`` and is reachable by any principal that
-    reaches the live parent)."""
-
-    label: Annotated[str, dc.Unique]
-    secret: dc.Lazy[Dossier] | None = None
-
-
-def test_peek_returns_none_for_a_protected_target(store):
-    # peek() is a cheap, principal-free inspection: it must never expose a
-    # protected target's real instance (Fable finding A — .get() alone was
-    # guarded, .peek()/__repr__ leaked). It fences uniformly (even for the
-    # owner); .get() is the way in.
+def test_peek_returns_none_for_a_protected_target(store: dc.Store) -> None:
+    """Given a stored vault holding a user Lazy.of handle onto a protected dossier
+    When the handle is peeked
+    Then peek returns None, uniformly fenced even for the owner
+    """
+    secret = dc.Lazy.of(Dossier(label="d", note="classified"))
     with store.acting_as(OWNER):
-        v = Vault(label="v", secret=dc.Lazy.of(Dossier(label="d", note="classified")))
-        store.store(v)
+        store.store(Vault(label="v", secret=secret))
         store.commit()
-    sec = v.secret
-    assert sec is not None
-    assert sec.peek() is None                          # fenced
+    assert secret.peek() is None
+
+
+def test_get_is_the_way_in_to_a_protected_target(store: dc.Store) -> None:
+    """Given a stored vault holding a user Lazy.of handle onto a protected dossier
+    When the owner calls get on the handle
+    Then the owner reads the dossier's note
+    """
+    secret = dc.Lazy.of(Dossier(label="d", note="classified"))
     with store.acting_as(OWNER):
-        assert sec.get().note == "classified"          # .get() is the checkpoint
-    # An UNPROTECTED target still peeks normally (byte-identical behaviour).
-    with store.acting_as(OWNER):
-        p = PlainHolder(label="ph", linked=dc.Lazy.of(Plain(label="pl")))
-        store.store(p)
+        store.store(Vault(label="v", secret=secret))
         store.commit()
-    assert p.linked is not None and p.linked.peek() is not None
+        note = secret.get().note
+    assert note == "classified"
 
 
-def test_repr_of_a_protected_handle_hides_fields(store):
+def test_peek_still_serves_an_unprotected_target(store: dc.Store) -> None:
+    """Given a stored holder with a user Lazy.of handle onto an unprotected record
+    When the handle is peeked
+    Then peek returns the record
+    """
+    linked = dc.Lazy.of(Plain(label="pl"))
     with store.acting_as(OWNER):
-        v = Vault(label="v", secret=dc.Lazy.of(Dossier(label="d", note="XYZZY")))
-        store.store(v)
+        store.store(PlainHolder(label="ph", linked=linked))
         store.commit()
-    r = repr(v.secret)
-    assert "protected" in r          # names the state, not the data
-    assert "XYZZY" not in r          # no field content
-    assert "_dc_owner" not in r      # no label columns
+    assert linked.peek() is not None
 
 
-def test_cross_principal_peek_and_get_leak_is_closed(store):
-    # A curator's user Lazy.of(protected) handle in a shared live parent must
-    # not serve the real instance to a later acting_as(outsider) scope — via
-    # peek() OR get() (Fable leak #2 + #3).
+def test_repr_of_a_protected_handle_names_the_state_not_the_data(store: dc.Store) -> None:
+    """Given a stored vault holding a Lazy.of handle onto a dossier with the note XYZZY
+    When the handle is rendered with repr
+    Then the text says protected
+    And it shows no field content
+    And it shows no label columns
+    """
+    secret = dc.Lazy.of(Dossier(label="d", note="XYZZY"))
     with store.acting_as(OWNER):
-        v = Vault(label="v", secret=dc.Lazy.of(Dossier(label="d", note="secret")))
-        store.store(v)
+        store.store(Vault(label="v", secret=secret))
         store.commit()
-    sec = v.secret
-    assert sec is not None
+    rendered = repr(secret)
+    assert "protected" in rendered
+    assert "XYZZY" not in rendered
+    assert "_dc_owner" not in rendered
+
+
+def test_peek_by_an_outsider_scope_returns_none(store: dc.Store) -> None:
+    """Given a curator's Lazy.of handle onto a protected dossier in a shared live parent
+    When an outsider scope peeks the handle
+    Then peek returns None (Fable leak #2)
+    """
+    secret = dc.Lazy.of(Dossier(label="d", note="secret"))
+    with store.acting_as(OWNER):
+        store.store(Vault(label="v", secret=secret))
+        store.commit()
     with store.acting_as(OUTSIDER):
-        assert sec.peek() is None                      # peek fenced
-        got = sec.get()
-        assert isinstance(got, dc.Redacted)            # get → twin
-        with pytest.raises(dc.ReadDeniedError):
-            _ = got.note
+        peeked = secret.peek()
+    assert peeked is None
 
 
-def test_owner_derefs_own_uncommitted_protected_target(store):
-    # Over-fence regression (Fable finding B): the owner must be able to deref
-    # its OWN just-stored, uncommitted protected entity — the fix judges live
-    # birth labels in the pre-commit window instead of raising DanglingRefError.
-    # An outsider in that same window still gets a twin.
+def test_get_by_an_outsider_scope_returns_a_twin(store: dc.Store) -> None:
+    """Given a curator's Lazy.of handle onto a protected dossier in a shared live parent
+    When an outsider scope calls get on the handle
+    Then it gets a twin (Fable leak #3)
+    """
+    secret = dc.Lazy.of(Dossier(label="d", note="secret"))
     with store.acting_as(OWNER):
-        v = Vault(label="v", secret=dc.Lazy.of(Dossier(label="d", note="wip")))
-        store.store(v)                                 # stored, NOT yet committed
-        sec = v.secret
-        assert sec is not None
-        assert sec.get().note == "wip"                 # owner reads own in-flight work
-        with store.acting_as(OUTSIDER):
-            assert isinstance(sec.get(), dc.Redacted)  # outsider still fenced
+        store.store(Vault(label="v", secret=secret))
         store.commit()
+    with store.acting_as(OUTSIDER):
+        got = secret.get()
+    assert isinstance(got, dc.Redacted)
+
+
+def test_twin_from_an_outsider_get_refuses_the_note(store: dc.Store) -> None:
+    """Given the twin an outsider got from a curator's Lazy.of handle
+    When its note is read
+    Then the read raises ReadDeniedError
+    """
+    secret = dc.Lazy.of(Dossier(label="d", note="secret"))
     with store.acting_as(OWNER):
-        assert sec.get().note == "wip"                 # still readable post-commit
+        store.store(Vault(label="v", secret=secret))
+        store.commit()
+    with store.acting_as(OUTSIDER):
+        got = secret.get()
+    with pytest.raises(dc.ReadDeniedError):
+        _ = got.note
+
+
+def test_owner_derefs_own_uncommitted_protected_target(store: dc.Store) -> None:
+    """Given a vault with a new protected dossier, stored but not yet committed
+    When the owner calls get on the handle
+    Then the owner reads the in-flight note, not a DanglingRefError (Fable finding B)
+    """
+    secret = dc.Lazy.of(Dossier(label="d", note="wip"))
+    with store.acting_as(OWNER):
+        store.store(Vault(label="v", secret=secret))
+        note = secret.get().note
+    assert note == "wip"
+
+
+def test_outsider_gets_a_twin_for_an_uncommitted_protected_target(store: dc.Store) -> None:
+    """Given a vault with a new protected dossier, stored but not yet committed
+    When an outsider calls get on the handle in that window
+    Then it gets a twin
+    """
+    secret = dc.Lazy.of(Dossier(label="d", note="wip"))
+    with store.acting_as(OWNER):
+        store.store(Vault(label="v", secret=secret))
+        with store.acting_as(OUTSIDER):
+            got = secret.get()
+    assert isinstance(got, dc.Redacted)
+
+
+def test_owner_still_reads_the_target_after_the_commit(store: dc.Store) -> None:
+    """Given a vault with a new protected dossier, stored and then committed
+    When the owner calls get on the handle
+    Then the owner still reads the note
+    """
+    secret = dc.Lazy.of(Dossier(label="d", note="wip"))
+    with store.acting_as(OWNER):
+        store.store(Vault(label="v", secret=secret))
+        store.commit()
+        note = secret.get().note
+    assert note == "wip"
