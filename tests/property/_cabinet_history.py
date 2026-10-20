@@ -6,7 +6,7 @@ Small domains, so collisions, misses and None all actually happen.
 from __future__ import annotations
 
 import operator
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -130,7 +130,7 @@ class CabinetHistory:
 
 
 @contextmanager
-def replayed(ops: list[tuple[Any, ...]]) -> Iterator[CabinetHistory]:
+def replayed(ops: list[tuple[Any, ...]]) -> Generator[CabinetHistory]:
     """Replay a script on a memory-backed store, commit, yield it with its oracle rows."""
     store = dc.Store._from_backend(MemoryBackend())
     live: dict[str, Any] = {}  # sid -> canonical live entity
