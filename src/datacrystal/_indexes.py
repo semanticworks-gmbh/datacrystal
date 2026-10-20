@@ -82,6 +82,11 @@ def _sorted_run(field: str, keys: Iterable[Any]) -> list[Any]:
             "the same convention (aware, e.g. datetime.now(timezone.utc), is "
             "recommended)"
         ) from exc
+    except _decimal.InvalidOperation as exc:
+        raise ValueError(
+            f"{field} is a SortedIndex field and cannot hold Decimal NaN: NaN is not "
+            "orderable (use None for 'no value')"
+        ) from exc
 
 
 @dataclasses.dataclass(frozen=True, slots=True)

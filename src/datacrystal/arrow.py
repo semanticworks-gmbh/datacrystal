@@ -75,13 +75,13 @@ from datacrystal._permissions import PERM_FIELDS, is_root
 from datacrystal._records import (
     DATE_EXT_CODE,
     NAIVE_DATETIME_EXT_CODE,
-    decimal_ext,
     REF_EXT_CODE,
     TIME_EXT_CODE,
     _ext_hook,  # pyright: ignore[reportPrivateUsage]  # codec primitive, parquet mirror
     _OID_STRUCT,  # pyright: ignore[reportPrivateUsage]  # codec primitive, parquet mirror
     RefToken,
     decode_payload,
+    decimal_ext,
 )
 from datacrystal._snapshot import Ref
 from datacrystal.contract.applier import (
