@@ -195,7 +195,7 @@ def test_read_floor_range_plans_as_an_indexed_lookup(store: dc.Store) -> None:
     """
     _commit_specimens_with_read_floors(store)
     with store.acting_as(CURATOR_ANNA):
-        plan = store.explain(F._dc_read_floor <= dc.AGENT)  # pyrefly: ignore[missing-attribute]
+        plan = store.explain(F._dc_read_floor <= dc.AGENT)
     assert plan.indexed
 
 
@@ -206,7 +206,7 @@ def test_read_floor_range_plan_has_no_residual_scan(store: dc.Store) -> None:
     """
     _commit_specimens_with_read_floors(store)
     with store.acting_as(CURATOR_ANNA):
-        plan = store.explain(F._dc_read_floor <= dc.AGENT)  # pyrefly: ignore[missing-attribute]
+        plan = store.explain(F._dc_read_floor <= dc.AGENT)
     assert plan.residual is None
 
 
@@ -217,7 +217,7 @@ def test_read_floor_range_query_returns_the_lower_floors(store: dc.Store) -> Non
     """
     _commit_specimens_with_read_floors(store)
     with store.acting_as(CURATOR_ANNA):
-        found = store.query(F._dc_read_floor <= dc.AGENT)  # pyrefly: ignore[missing-attribute]
+        found = store.query(F._dc_read_floor <= dc.AGENT)
     assert {specimen.label for specimen in found} == {"S0", "S1"}
 
 
@@ -228,7 +228,7 @@ def test_snapshot_read_floor_range_query_returns_the_lower_floors(store: dc.Stor
     """
     _commit_specimens_with_read_floors(store)
     snapshot = store.snapshot(principal=CURATOR_ANNA)
-    found = snapshot.query(F._dc_read_floor <= dc.AGENT)  # pyrefly: ignore[missing-attribute]
+    found = snapshot.query(F._dc_read_floor <= dc.AGENT)
     assert {specimen.label for specimen in found} == {"S0", "S1"}
 
 
@@ -255,7 +255,7 @@ def test_dc_permissions_view_is_frozen() -> None:
     specimen = Specimen(label="pyrite-04")
     view = specimen.dc_permissions  # pyrefly: ignore[missing-attribute]
     with pytest.raises(dataclasses.FrozenInstanceError):
-        view.owner = 9  # pyrefly: ignore[read-only]  # frozen-by-design probe
+        view.owner = 9  # frozen-by-design probe
 
 
 def test_dc_permissions_view_taken_earlier_ignores_later_group_changes() -> None:
@@ -467,7 +467,7 @@ def test_frozen_protected_event_reads_back_with_the_stamped_owner(
     with store_factory() as reopened, reopened.acting_as(CURATOR_ANNA):
         back = reopened.get(SealedEvent, seq=1)
     assert back is not None
-    assert back.dc_permissions.owner == 2  # pyrefly: ignore[missing-attribute]
+    assert back.dc_permissions.owner == 2
 
 
 def test_frozen_protected_event_reads_back_with_a_viewer_write_floor(
@@ -481,7 +481,7 @@ def test_frozen_protected_event_reads_back_with_a_viewer_write_floor(
     with store_factory() as reopened, reopened.acting_as(CURATOR_ANNA):
         back = reopened.get(SealedEvent, seq=1)
     assert back is not None
-    assert back.dc_permissions.write_floor == dc.VIEWER  # pyrefly: ignore[missing-attribute]
+    assert back.dc_permissions.write_floor == dc.VIEWER
 
 
 def test_frozen_protected_event_refuses_a_field_assignment(

@@ -335,7 +335,7 @@ class TestRaisingPathsStageNothing:
         Then protect raises NotAnEntityError
         """
         with pytest.raises(NotAnEntityError):
-            dc.protect(object(), write=dc.ADMIN)  # pyrefly: ignore[bad-argument-type]
+            dc.protect(object(), write=dc.ADMIN)
 
     def test_protecting_a_deleted_record_raises(self, store: dc.Store) -> None:
         """Given a contact deleted in the current transaction
