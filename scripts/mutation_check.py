@@ -3,7 +3,7 @@
 # requires-python = ">=3.14"
 # dependencies = []
 # ///
-"""List mutants the v0.10.0 tests killed (mutation/baseline-killed.txt) that are not killed now (#189).
+"""List mutants the v0.10.0 tests killed (mutation/baseline-killed.txt) that survive now (#189).
 
 Run `uv run mutmut run` first; this reads `uv run mutmut results --all true`.
 Exit 1 if any baseline-killed mutant is not killed now.
