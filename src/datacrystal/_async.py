@@ -108,7 +108,7 @@ class AsyncStore:
     def get(self, cls: type, **unique_key: object) -> Any | None:  # noqa: ANN401 - public return mirrors Store.get
         return self._store.get(cls, **unique_key)
 
-    def get_many(self, refs: Iterable[Any] | type, /, **unique_key: object) -> list[Any]:
+    def get_many(self, refs: Iterable[Any] | type, /, **unique_key: Iterable[object]) -> list[Any]:
         return self._store.get_many(refs, **unique_key)
 
     def query(self, cond: Condition) -> list[Any]:

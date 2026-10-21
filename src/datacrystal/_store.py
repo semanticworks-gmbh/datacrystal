@@ -128,6 +128,7 @@ from datacrystal._storage.protocol import (
 from datacrystal.contract.applier import DeltaGapError
 
 if TYPE_CHECKING:
+    from datacrystal._follower import HttpClient
     from datacrystal._storage.lock import LeaseLock  # imported lazily at runtime (see Store.open)
 
 # Exact-type membership for the hydration fast path (decode produces exact
@@ -635,7 +636,7 @@ class Store:
         *,
         api_key: str | None = None,
         path: str | Path | None = None,
-        client: object | None = None,
+        client: HttpClient | None = None,
     ) -> Store:
         """Open a read replica synced from a coordinator's federation endpoint.
 

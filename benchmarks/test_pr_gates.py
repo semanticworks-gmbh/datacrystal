@@ -28,7 +28,9 @@ from benchmarks.conftest import (
     gate,
     time_it,
 )
+from datacrystal._pipeline import DeltaConsumer
 from datacrystal._records import decode_payload
+from datacrystal._snapshot import Snapshot
 
 
 def _decode_loop_floor(keys: list[str]) -> Callable[[], None]:
@@ -248,7 +250,7 @@ def _delta_scaling(
     return median(apply_times(big)) / median(apply_times(small))
 
 
-def _counting_consumer(snap: Any) -> Any:
+def _counting_consumer(snap: Snapshot) -> DeltaConsumer:
     from datacrystal.testing import CountingConsumer
 
     return CountingConsumer.bootstrap(snap)
@@ -261,7 +263,7 @@ def _extra_consumer_factory(extra: str, tmp_path: Path) -> Callable[[Any], Any]:
         pytest.importorskip("snowballstemmer")
         from datacrystal.fts import FullTextIndex
 
-        def make_fts(snap: Any) -> Any:
+        def make_fts(snap: Snapshot) -> DeltaConsumer:
             idx = FullTextIndex.bootstrap(
                 tmp_path / f"fts-{next(counter)}.fts", snap,
                 fulltext={"benchmarks._gen:Specimen": {"specimen_no": None}},
@@ -275,7 +277,7 @@ def _extra_consumer_factory(extra: str, tmp_path: Path) -> Callable[[Any], Any]:
     pytest.importorskip("pyarrow")
     from datacrystal.arrow import ArrowMirror
 
-    def make_arrow(snap: Any) -> Any:
+    def make_arrow(snap: Snapshot) -> DeltaConsumer:
         return ArrowMirror.bootstrap(
             tmp_path / f"arrow-{next(counter)}.mirror", snap, only=[_gen.Specimen],
         )
