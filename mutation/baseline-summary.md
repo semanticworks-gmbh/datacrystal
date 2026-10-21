@@ -1,8 +1,9 @@
 # Mutation baseline (#189)
 
 Mutants of `src/datacrystal/` at v0.10.0 (86d6b21) against the v0.10.0 tests, mutmut 3.8.0, 8 CPUs.
-Killed names: `baseline-killed.txt`; check with `scripts/mutation_check.py`.
-Expires with #192, deleted by #193.
+The killed names (`mutation/baseline-killed.txt`) and their check (`scripts/mutation_check.py`) live on the branch `mutation/baseline-v0.10.0`, never merged, deleted once #190 merges.
+#190's rewritten tests kill all 9,224 baseline-killed mutants that ran to an end; the other 40 (`count`, `get_many`, `pluck`) time out under a full run and die when run alone.
+This summary stays as the record; #193's run on the cleaned code replaces it.
 
 ## Run
 
@@ -69,3 +70,51 @@ About 0.3 % of the kills, roughly 30 of 9264, may be flaky.
 | datacrystal.web._reflect | 81 | 62 | 19 | 0 | 0 | 0 | 0 | 0 |
 | datacrystal.web._strawberry | 170 | 141 | 29 | 0 | 0 | 0 | 0 | 0 |
 | **total** | **12589** | **9264** | **2875** | **23** | **285** | **136** | **0** | **6** |
+
+## Score
+
+- Strict, killed / checked: 9264 / 12583 = 73.6 %.
+- Mutation score, Stryker's count (timeout and the SIGKILL at the wall limit count as detected): 9572 / 12583 = 76.1 %.
+- Covered score, mutants a test reaches only (PIT's test strength): 9572 / 12447 = 76.9 %.
+- Bands, Stryker's default thresholds: green at 80 % and above, amber from 60 %, red below — overall amber.
+- The score is a thermometer, never a gate: it compares only with itself (same mutmut, config and code), equivalent mutants among the survivors push the true value up, and subsumed mutants bias it (Papadakis 2016); the working unit is a survivor on a changed line, triaged in review (#193).
+
+| module | mutants | score | band |
+|---|---|---|---|
+| datacrystal.contract.vectors._generate | 41 | 0.0 % | red |
+| datacrystal.web | 12 | 0.0 % | red |
+| datacrystal._async | 76 | 53.9 % | red |
+| datacrystal._containers | 169 | 60.4 % | amber |
+| datacrystal._redacted | 76 | 65.8 % | amber |
+| datacrystal.web._federation | 314 | 66.2 % | amber |
+| datacrystal._follower | 565 | 66.4 % | amber |
+| datacrystal._state | 32 | 68.8 % | amber |
+| datacrystal.web._pydantic | 327 | 70.0 % | amber |
+| datacrystal.testing | 624 | 70.4 % | amber |
+| datacrystal._lazy | 190 | 71.1 % | amber |
+| datacrystal.deltalog | 367 | 72.5 % | amber |
+| datacrystal.arrow | 1072 | 73.1 % | amber |
+| datacrystal.fts | 852 | 73.6 % | amber |
+| datacrystal._snapshot | 915 | 73.9 % | amber |
+| datacrystal._permissions | 140 | 74.3 % | amber |
+| datacrystal._entity | 668 | 75.6 % | amber |
+| datacrystal.web._reflect | 81 | 76.5 % | amber |
+| datacrystal._storage.sqlite | 514 | 78.4 % | amber |
+| datacrystal._store | 3257 | 79.0 % | amber |
+| datacrystal._storage.lock | 140 | 79.3 % | amber |
+| datacrystal.contract.applier | 103 | 80.6 % | green |
+| datacrystal._conditions | 378 | 81.7 % | green |
+| datacrystal.web._strawberry | 170 | 82.9 % | green |
+| datacrystal._ids | 18 | 83.3 % | green |
+| datacrystal.web._app | 169 | 83.4 % | green |
+| datacrystal._records | 221 | 84.2 % | green |
+| datacrystal._indexes | 859 | 89.1 % | green |
+| datacrystal._storage.memory | 107 | 90.7 % | green |
+| datacrystal | 11 | 90.9 % | green |
+| datacrystal._index_cache | 58 | 93.1 % | green |
+| datacrystal._actors | 8 | 100.0 % | green |
+| datacrystal._errors | 4 | 100.0 % | green |
+| datacrystal._pipeline | 44 | 100.0 % | green |
+| datacrystal._registry | 7 | 100.0 % | green |
+
+`contract.vectors._generate` is a script without tests, moved out of `src/` in #191; `web/__init__` is a lazy re-export.
