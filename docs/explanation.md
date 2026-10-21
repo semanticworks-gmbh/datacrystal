@@ -1,289 +1,160 @@
 # Explanation: how datacrystal thinks
 
-This page is the *why* behind the design — the mental model that makes the API in
-[reference.md](reference.md) feel inevitable rather than arbitrary. It is discursive on purpose:
-no API tables here, and where a decision was *ratified* in a design document this page links out to
-it rather than restating it.
+After this page you can predict what stays in memory and what a query costs, and you know where to read about deletes, permissions and followers.
+
+```python
+from typing import Annotated
+
+import datacrystal as dc
+
+@dc.entity
+class Locality:
+    qid: Annotated[str, dc.Unique]
+    name: str
+
+@dc.entity
+class Mineral:
+    qid: Annotated[str, dc.Unique]
+    name: str
+    crystal_system: Annotated[str, dc.Index]
+    mohs: float | None = None
+    type_locality: dc.Lazy[Locality] | None = None
+
+store = dc.Store.open("cabinet.store")
+if store.root is None:
+    tsumeb = Locality(qid="Q571997", name="Tsumeb Mine")
+    store.root = {"minerals": [
+        Mineral(qid="Q193563", name="azurite", crystal_system="monoclinic", mohs=3.5,
+                type_locality=dc.Lazy.of(tsumeb)),
+        Mineral(qid="Q190063", name="malachite", crystal_system="monoclinic", mohs=3.8,
+                type_locality=dc.Lazy.of(tsumeb)),
+        Mineral(qid="Q43010", name="quartz", crystal_system="trigonal", mohs=7.0),
+    ]}
+    store.commit()
+
+azurite, malachite, _ = store.root["minerals"]
+print(azurite.type_locality.get() is malachite.type_locality.get())
+print(store.root["minerals"][0] is store.get(Mineral, qid="Q193563"))
+print(store.explain(Mineral.crystal_system == "monoclinic"))
+print(store.explain(Mineral.mohs >= 3.6))
+print(store.count(Mineral.mohs >= 3.6), store.pluck(Mineral, "name", limit=2))
+
+locality = store.get(Locality, qid="Q571997")
+print([m.name for m in store.incoming(locality)])
+store.close()
+```
 
 - [Identity and memory](#identity-and-memory)
 - [Query semantics: the planner, the residual, and the candidate set](#query-semantics-the-planner-the-residual-and-the-candidate-set)
 - [Why deletes are unchecked in v0.x](#why-deletes-are-unchecked-in-v0x)
 - [Permissions: read floors, write floors, and the masked deref](#permissions-read-floors-write-floors-and-the-masked-deref)
 - [Why followers are real local stores (the fractal contract)](#why-followers-are-real-local-stores-the-fractal-contract)
-- [The design philosophy](#the-design-philosophy)
+- [Design consequences](#design-consequences)
 
 ## Identity and memory
 
-The defining promise of datacrystal is that **your live objects are the database** — and that only
-works if identity is rock-solid. There is exactly **one live instance per stored object**: every
-path to an entity yields the same Python object, cycles included (`a.peer.peer is a`), and that
-identity holds for as long as the object is alive and survives a restart (`a.friend is b` again
-after a reopen). This is the registry contract: an OID resolves to one in-memory instance, always.
+There is exactly one live instance per stored object, so every path to an entity yields the same Python object, cycles included, and that holds across a restart.
+What keeps an object alive is what pins its identity, so the two are one question.
 
-Identity and memory are the same question seen from two sides, because *what keeps an object alive*
-is *what pins its identity*:
+- The graph reachable from `store.root` is pinned: it stays in memory and identity-stable.
+- Everything else, such as query results and lazily loaded subgraphs, is garbage-collected once you drop it and rehydrates under the same OID on next access.
+  That is how a dataset larger than RAM works: keep it off the pinned root.
+- `dc.Lazy[T]` is the explicit cut point where pinning, loading and memory stop.
+  It is a type in your model, not a heuristic, so the memory boundary is visible in your code.
+  A `list[dc.Lazy[T]]` is an adjacency list whose edges hydrate one `.get()` at a time.
+- Put eager references on the hot path and `dc.Lazy` on cold edges; the eager part is your memory budget, about 600 B per object.
+  `lazy_timeout=` demotes idle handles, and there is no hard per-store cap; for analytics-style scans use the [Arrow mirror](how-to/analytics.md).
 
-- **The root-reachable graph is pinned.** `store.root` is a strong anchor; everything reachable
-  from it stays in RAM and identity-stable, no reference of your own required (`store.root is
-  store.root` always holds).
-- **Everything else is collectable.** Entities **not** reachable from the root — query results,
-  lazily loaded subgraphs — are garbage-collected as soon as you drop them, and rehydrate
-  transparently (same OID → same instance) on next access. This is what lets a dataset larger than
-  RAM work: keep it *off* the pinned root, and memory is bounded by what you currently hold plus
-  your query results, not by the dataset.
-
-`dc.Lazy[T]` is the **explicit cut point** where pinning, loading, and memory all stop. That it is
-explicit — a type you write in your model, not a heuristic the engine guesses — is the whole design:
-you draw the memory boundary, and the boundary is visible in your code. A `list[dc.Lazy[T]]` is an
-adjacency list whose edges each hydrate one `.get()` at a time; a `dc.Lazy` on a cold edge of an
-otherwise-eager hot path is how you say "this part lives on disk until I ask."
-
-The rule of thumb for big datasets follows directly: structure the hot path as eager references and
-put `dc.Lazy` on the cold edges; the eager part is your RAM budget (~600 B/object envelope). When
-even loaded lazy references should not linger, `lazy_timeout=` demotes idle handles back to
-unloaded — the next `.get()` reloads them, identity preserved. There is deliberately **no** hard
-per-store memory cap and **no** RSS-quota demotion in v0.1 (psutil stays out of core); for
-analytics-style scans the honest answer is the Arrow mirror tier, not the object graph.
-
-The recipes that put this to work — streaming ingest, the three patterns for bounded memory,
-parallel ingest under owner confinement — are in
-[the ingest-and-memory how-to](how-to/ingest-and-memory.md). The mechanics of *how* a reference
-becomes an OID and back (swizzling, no pickle) are in the
-[reference glossary](reference.md#glossary). The concurrency contract that makes single-owner
-identity safe is [ADR-001](design/ADR-001-concurrency-contract.md).
+Recipes: [ingest and memory](how-to/ingest-and-memory.md).
+How a reference becomes an OID: the [glossary](reference.md#glossary).
+The concurrency contract behind single-owner identity: [ADR-001](design/ADR-001-concurrency-contract.md).
 
 ## Query semantics: the planner, the residual, and the candidate set
 
-datacrystal's query engine is **rule-based and never grows an optimizer** — and that is a feature,
-not a limitation. The promise is *predictable beats fast-but-mysterious*: you can always read, with
-`explain()`, exactly why a query costs what it costs, and nothing second-guesses you. When you
-genuinely want a cost-based optimizer, you hand the Arrow mirror to DuckDB; that tier owns clever
-(see [the analytics how-to](how-to/analytics.md)).
+The query engine is rule-based and never grows an optimizer, so `explain()` tells you in advance why a query costs what it costs.
+When you want a cost-based optimizer, hand the Arrow mirror to DuckDB ([analytics](how-to/analytics.md)).
 
-The model has three moving parts:
+- The candidate set is the OIDs a query narrows to first.
+  `==` or `.in_()` on a `dc.Index` field, or a range on a `dc.SortedIndex` field, produces it from a roaring bitmap or a sorted slice without touching a record; a bare class or a non-indexed predicate has the whole extent.
+- The residual is the part the indexes cannot answer, such as `>=` on an unsorted field, `!=` or `.contains()` on a non-indexed field.
+  It is a Python filter over the decoded candidates.
+- The plan is the split `explain()` reports, and `query()` hydrates at most `plan.candidates` entities, so the plan is the cost model.
+- `count()` and `pluck()` decode records without building entities, so even their full-scan form costs decode time and no entity memory.
+- A bare `order_by` plus `limit` on a `SortedIndex` field beats a `>= sentinel` for top-N because it windows lazily to about `offset + limit` rows, while the sentinel considers every match as a candidate ([recipe](how-to/querying-and-paging.md)).
+- The `SortedIndex` range slice is the third deterministic planning rule ([ADR-004](design/ADR-004-sorted-range-index.md)).
+  Indexes may be cached on disk but are never authoritative ([ADR-005](design/ADR-005-index-cache.md)).
 
-- **The candidate set.** A query first narrows to a set of *candidate* OIDs. An indexed equality —
-  `==` or `.in_()` on a `dc.Index` field, or a range on a `dc.SortedIndex` field — produces the
-  candidate set straight from a roaring bitmap (or a sorted-index slice), touching **no records**.
-  A bare class or a non-indexed predicate has the whole **extent** as its candidate set.
-- **The residual.** The part of the condition the indexes can't answer is the *residual* — a plain
-  Python filter evaluated over the candidate set by decoding those candidates. `>=` on a
-  non-`SortedIndex` field, `!=`, a `.contains()` on a non-indexed field: all residual. A query with
-  a residual must hydrate (or decode) its candidates to evaluate it.
-- **The plan.** `explain()` reports exactly this split: what answers from bitmaps, what evaluates
-  as residual, and over how many candidates. `query()` hydrates **at most** `plan.candidates`
-  entities — so the plan *is* the cost model, readable in advance.
-
-Two consequences fall out, and they explain API shapes that would otherwise look like quirks:
-
-**Why `count()`/`pluck()` are separate from `query()`.** A residual `query()` over a non-indexed
-predicate hydrates the whole extent — on a million-object class, a full table scan with a matching
-RAM spike. But "how many?" and "just this column" do not need live objects. `count()` and `pluck()`
-work at the **decode level**: they decode records to read fields or count matches without ever
-constructing entities, so even their full-scan form costs decode time, not an entity-RAM spike.
-They are the cheap reads precisely because they refuse to build the expensive thing.
-
-**Why a bare `order_by` + `limit` beats a `>= sentinel` for top-N.** Both forms are correct and
-return the same rows; the difference is purely the *candidate-set size*. A bare `order_by` on a
-`SortedIndex` field orders straight from the sorted run and windows lazily — it materializes only
-about `offset + limit` rows, so its cost is O(limit), flat as the class grows. A `>= sentinel`
-predicate narrows the candidate set to *every match* first (then windows the same lazy way), so its
-cost grows with the match count. Neither "scans records" or "sorts everything" — both stream from
-the index; the sentinel form just considers a bigger candidate set. (NULLs sort last in both
-directions, so unrecorded rows fall to the tail and are skipped for free once the window fills.) The
-recipe and the `explain()` tell are in
-[the querying-and-paging how-to](how-to/querying-and-paging.md#recipe-paging-the-newesttop-n-by-an-indexed-field).
-
-The third planning rule — the `dc.SortedIndex` range slice — was added in
-[ADR-004](design/ADR-004-sorted-range-index.md), deliberately as a *third deterministic rule*, not
-the first step toward an optimizer. The index cache that lets these indexes survive a reopen without
-re-scanning is [ADR-005](design/ADR-005-index-cache.md); it amends invariant 11 (indexes may be
-cached on disk, but are never authoritative). The exact contract of every operator and the
-two-rule/three-rule planner lives in [the Reading API reference](reference.md#reading-api).
+Contract: [Reading API](reference.md#reading-api).
 
 ## Why deletes are unchecked in v0.x
 
-`store.delete()` does **not** check whether other records still reference the entity you are
-deleting. This is a deliberate, ratified choice ([ADR-003](design/ADR-003-delete-semantics.md)), not
-an unfinished feature — and understanding *why* explains the whole shape of the delete API.
+`store.delete()` does not check whether other records still reference the entity ([ADR-003](design/ADR-003-delete-semantics.md)).
+A checked delete needs a reverse-reference index, and the policy on top of it (refuse if referenced, or cascade) is the v1 work.
 
-Checked delete (refuse-if-referenced, or cascade) requires a **reverse-reference index**: to know
-whether anyone points at an OID you must be able to ask "who points at this?" cheaply. That index is
-real work with its own correctness surface, and it is the standing Golden Ticket on the roadmap
-(item 8, the v1 reverse-reference index). Rather than ship a half-built referential-integrity story,
-v0.x makes the contract honest and *loud*:
+- A delete physically removes the record, and following a stale reference (eager hydration, `Lazy.get()`, `get_many`, a snapshot `get`) raises `DanglingRefError` at follow time, never a silent `None`.
+- `strict_deletes=True` raises at the offending `commit()`, naming the referrers, before a TID is allocated.
+  `debug=True` runs the same check but only warns and commits.
+- `store.incoming()` already is the reverse-reference index in read-only form, and a deleted target keeps its postings, so `incoming(dead)` lists exactly the referrers a checked delete would act on.
 
-- A delete physically removes the record; following a now-stale reference (eager hydration,
-  `Lazy.get()`, `get_many`, a snapshot `get`) raises `DanglingRefError` — **at follow time, never a
-  silent `None`.** A loud failure you can trace beats a quiet wrong answer.
-- For development, two bridges turn that deferred failure into an immediate one:
-  `strict_deletes=True` **raises** at the offending `commit()` (naming the referrers, before the TID
-  is allocated so the commit sequence stays gapless and retryable); `debug=True` runs the same check
-  but only **warns** and commits anyway, so a bulk re-import is not bricked by one dangling edge.
-- The reverse-reference index already *exists* in read-only form as `store.incoming()` — and a
-  deleted target keeps its postings, so `incoming(dead)` enumerates exactly the referrers a checked
-  delete would act on. The seam for checked delete is built; the policy on top of it is the v1 work.
-
-So the unchecked default is not "we forgot referential integrity" — it is "we refuse to fake it, and
-here are the loud signals and dev-time bridges until the real index lands." The full follow-time
-semantics and the bridges are in [the Deleting reference](reference.md#deleting); the
-commit-time-vs-follow-time guarantees are in
-[Transactional guarantees → Consistency](reference.md#transactional-guarantees-acid).
+Contract: [Deleting](reference.md#deleting), [Transactional guarantees](reference.md#transactional-guarantees-acid).
 
 ## Permissions: read floors, write floors, and the masked deref
 
-datacrystal's native permissions ([ADR-008](design/ADR-008-permissions-contract.md)) resolve a
-tension every embedded, single-writer store hits eventually: agents write curated records next to
-hand-entered ones, personal data sits next to team data, and there is no separate policy engine to
-defer to. The model is deliberately 1970s, not novel machinery — four small indexed columns on a
-`protected=True` record (`owner`, `groups`, `read_floor`, `write_floor`), a `dc.Principal` carrying
-a level per group, and two integer comparisons decide everything (the full mechanics are in
-[Protecting records](reference.md#protecting-records-protectedtrue)):
+Native permissions ([ADR-008](design/ADR-008-permissions-contract.md)) let agents write curated records next to hand-entered ones with no separate policy engine.
+A `protected=True` record carries four small indexed columns (`owner`, `groups`, `read_floor`, `write_floor`), a `dc.Principal` carries a level per group, and two integer comparisons decide everything ([mechanics](reference.md#protecting-records-protectedtrue)).
 
-- **The read check is Bell–LaPadula** (1973, "no read up"): you may read a record only if your
-  authority towards it — the highest level you hold in any group the record is shared with —
-  clears the record's read floor.
-- **The write check is Biba** ("no write up" on integrity, read here as "no write below the
-  floor"): you may change a record — its content *or its own labels* — only if your authority
-  clears the write floor. Crucially, **the write floor binds everyone, including the owner** — no
-  exemption. That asymmetry is the curation guarantee: once a curator ratchets a record's floor up,
-  the agent that created it can never overwrite it again, ever.
-
-Fifty years of audit literature, one integer comparison each. Three things the model deliberately
-is **not**, each a real feature cut for a reason: not field-level (in-record sensitivity is
-expressed by decomposing into entities, not per-field ACLs); not read-time sub-graph inheritance
-(a child inherits its container's labels once, at *write* time, and labels stay stable afterwards
-— classical MLS calls this **tranquility**, and it is exactly what keeps a record's labels
-auditable instead of a moving target that depends on which parent you walked in from); not a
-relationship graph (no Zanzibar/SpiceDB policy language — four fields, two comparisons, no
-graph to evaluate).
+- The read check is Bell–LaPadula, "no read up": you may read a record only if the highest level you hold in any group it is shared with clears its read floor.
+- The write check is Biba, "no write below the floor": you may change a record, content or labels, only if your authority clears its write floor.
+  The write floor binds everyone including the owner, so once a curator raises a floor, the agent that created the record can never overwrite it.
+- It is not field-level (decompose into entities instead), not read-time sub-graph inheritance (a child inherits its container's labels once at write time, which classical MLS calls tranquility and which keeps labels auditable), and not a relationship graph.
 
 ### Mask on deref, filter on discovery
 
-Two kinds of read surface need two different failure shapes, and conflating them is how permission
-systems leak existence by accident:
+- Discovery surfaces (`query`, `query_iter`, `get`, `get_many(cls, key=...)`, `count`, `pluck`, `explain`, `incoming`) answer "what is out there".
+  A denied row is absent, indistinguishable from one that never existed, and none of them raises, because a count that visibly dropped would itself leak existence.
+- Deref surfaces (`Lazy.get()`, `get_many` over OIDs or handles you hold) answer "resolve what I point at".
+  You already know it exists, so a denial returns a `dc.Redacted` twin: `isinstance` holds and traversal never raises, and only using the data raises `ReadDeniedError`.
+- Masking is the default so that tightening permissions does not change call sites; the cost is that nothing marks a possible stub except the `isinstance(x, dc.Redacted)` check you make before using a record you did not just discover.
 
-- **Discovery surfaces** — `query`, `query_iter`, `get`, `get_many(cls, key=...)`, `count`,
-  `pluck`, `explain`, `incoming` — answer "what is out there." A denied row is silently **absent**,
-  indistinguishable from a row that never existed. This is the part that is easy to get wrong in
-  the small: a `count()` that visibly dropped the moment a principal without standing ran it would
-  itself be a leak (counts leak existence) — so every discovery surface filters, and none of them
-  ever raises on a denial.
-- **Deref surfaces** — a `Lazy[T]` handle's `.get()`, `get_many(iterable)` over OIDs/refs/handles
-  you already hold — answer "resolve the thing I am already pointing at." You already know it
-  exists (you are holding a reference to it), so denial here is not a discovery leak, and
-  `dc.Redacted` (ADR-008 R14) is the shape that follows from that: `isinstance(x, TheEntityClass)`
-  still holds, traversal never raises, and only *using* the redacted result — reading a field,
-  `dc_permissions`, trying to commit it — raises `ReadDeniedError`. Traversal graceful, use loud: a
-  silently empty value quietly feeding a pipeline would be worse than a named exception.
+### One predicate on every surface
 
-The masked path is zero-call-site-churn by design — the owner's own framing was not wanting "to
-change all my access code everywhere because I introduced some stricter permissions," so masking
-is the default, not an opt-in flag. The cost of that default is that masking is *implicit*: nothing
-at a call site marks "this may be a stub" except the `isinstance(x, dc.Redacted)` check you're
-expected to make before using something you didn't just discover through a query.
-
-### The sieve property
-
-*One forgotten call site and the concept is a sieve* — the reason this cannot be a convenience
-bolted onto a few obvious surfaces. SQLite and DuckDB have no native answer to row-level
-permissions and push the problem to the application; Postgres row-level security, evaluated
-*inside* the engine rather than at each call site, is the precedent datacrystal follows instead.
-Every read surface enforces the identical predicate — `readable_bitmap()`/`can_read_row()`, the
-readable-set compiler, compiled once and applied the same way whether a surface answers from a
-bitmap, a decode-level scan, or a single registry hit. The proof that this actually holds together
-end to end — not just surface by surface — takes the property literally: one protected record, run
-through *every* live-store read surface in a single loop
-(`tests/unit/test_read_fence_sieve.py`), so a future surface that forgets to call the compiler
-fails there, by construction, instead of three PRs later when someone notices data where it
-shouldn't be.
+Every read surface applies the same predicate, `readable_bitmap()` and `can_read_row()`, compiled once and used whether the surface answers from a bitmap, a decode-level scan or a registry hit, as Postgres row-level security does inside the engine.
+`tests/unit/test_read_fence_sieve.py` runs one protected record through every live-store surface, so a surface that forgets the compiler fails there.
 
 ### This is not cryptography
 
-Labels are metadata the engine enforces — not encryption — and datacrystal never pretends
-otherwise. An embedded, single-writer store cannot defend against hostile same-process code or
-direct access to its `.store` file and sidecars; that is out of scope, stated with the same
-honesty this page states every other guarantee (see [the design philosophy](#the-design-philosophy)
-below). What native permissions *do* buy: confused-deputy protection (an agent cannot accidentally
-see or overwrite a record it has no standing on), correct multi-principal behavior across every
-existing surface (the web extra, followers, background agents), and a native, stamped audit trail
-— every commit records *who*, in the delta log (see
-[the commit-delta pipeline](reference.md#the-commit-delta-pipeline)).
+Labels are metadata the engine enforces, not encryption, and an embedded single-writer store cannot defend against hostile same-process code or direct access to its files.
+What they buy is confused-deputy protection, correct multi-principal behavior on every existing surface (web, followers, background agents) and a stamped audit trail, since every commit records who in the delta log.
+Root is a deliberate, stamped break-glass: `EXECUTIVE` in the `WORLD` group.
 
-The fence is **enforcement in-band, not a cryptographic perimeter.** The engine reads the label and
-answers the read; there is no key, and root is a deliberate, *stamped* break-glass — a principal
-holding `EXECUTIVE` in the `WORLD` group sees and can fix everything, and every root action is still
-recorded under its uid in the delta log (visible, never silent). As of W4 the read floor is live on
-every **per-record** read surface — the live store, snapshots, the `datacrystal[web]` REST/GraphQL
-tier, `datacrystal[fts]` ranked hits, and blobs — proved end-to-end by one protected record run
-through the whole matrix in `tests/extras/test_read_fence_capstone.py`.
-
-But **a mirror of protected data is protected data**, and the fence is a per-row check, not a spell
-over bytes: any surface that emits a **full plaintext copy** carries that plaintext regardless of the
-floor. The `datacrystal[fts]` sidecar's SQLite tables, the `datacrystal[arrow]` mirror's parquet
-segments, the retained delta log, and the federation `/v1/deltas` change-feed each hold the records
-they mirror in the clear on disk. These are protected not by the row floor but by **placement** —
-they are built or streamed under the audited store root, inside the same filesystem perimeter that
-already governs the `.store` file — plus **root-binding** where a copy is bootstrapped in-process
-(`Snapshot._stream` and the mirror bootstraps require a root snapshot for a protected class, so a
-non-root reader can never build even a *partial* copy). The honesty notes live with each surface
-([Snapshots](reference.md#snapshots), [the permissions how-to](how-to/permissions.md#what-the-fence-does-and-does-not-cover),
-[the search how-to](how-to/search.md)). Treat the labels as an internal contract your own
-application code respects by construction, not a perimeter — the perimeter is still whatever
-controls access to the store's files.
+A mirror of protected data is protected data: the `datacrystal[fts]` sidecar, the `datacrystal[arrow]` mirror, the retained delta log and the federation `/v1/deltas` feed hold their records in the clear.
+They are guarded by placement under the store root and by root-binding (`Snapshot._stream` and the mirror bootstraps require a root snapshot for a protected class), not by the row floor.
+Details with each surface: [Snapshots](reference.md#snapshots), [permissions how-to](how-to/permissions.md#what-the-fence-does-and-does-not-cover), [search how-to](how-to/search.md).
 
 ## Why followers are real local stores (the fractal contract)
 
-datacrystal is single-writer by design — so how does it reach the edge without becoming the
-multi-writer system it explicitly is *not*? Through the **fractal** shape ratified in
-[VISION.md](design/VISION.md): every node is *the same datacrystal*. A follower
-(`Store.follower(url)`) is not a thin client or a cache in front of a remote database — it is a
-**real local store** that bootstraps by replaying the coordinator's COMMIT-DELTA-v2 stream and then
-reads at full local speed, no per-call round-trips. The coordinator is just an ordinary single-writer
-store with its change-feed served over HTTP; "coordinator" is a *role*, not a different kind of store.
+A follower (`Store.follower(url)`) is not a thin client or a cache in front of a remote database; it is a real local store that replays the coordinator's COMMIT-DELTA-v2 stream and then reads at local speed ([VISION.md](design/VISION.md)).
+The coordinator is an ordinary single-writer store with its change-feed served over HTTP, so "coordinator" is a role.
 
-That is why the read/write API is **identical** on a single node and a follower, and why
-`store.committing()` is the same code in both places. The one thing a distributed setting genuinely
-adds — that a write can lose a race — is surfaced **honestly** (an OCC `ConflictError`, re-read and
-retry, never last-writer-wins) rather than hidden behind a remote-call-looks-local illusion (the
-classic distributed-objects trap). A follower *contributes* by the ordinary `upsert` + `commit`,
-fanned into the single writer; conflicts are detected and retried against fresh state, never silently
-merged. And the shape composes — a node can be a follower of one coordinator and a coordinator for
-its own followers, self-similar all the way up. The single-writer rationale is
-[SCALING.md](design/SCALING.md); the wire contract is
-[FEDERATION-WIRE-v1](design/FEDERATION-WIRE-v1.md).
+- The read and write API is identical on a single node and a follower, and `store.committing()` is the same code in both.
+- The one thing distribution adds, that a write can lose a race, surfaces as an OCC `ConflictError` that you re-read and retry, never last-writer-wins and never a remote call disguised as a local one.
+- A follower contributes through `upsert` and `commit`, fanned into the single writer.
+- The shape composes: a node can follow one coordinator and coordinate its own followers.
 
-## The design philosophy
+How to: [federation](how-to/federation.md).
+Rationale: [SCALING.md](design/SCALING.md), [FEDERATION-WIRE-v1](design/FEDERATION-WIRE-v1.md).
 
-datacrystal exists because every other persistence path makes you *translate*: an ORM flattens your
-graph into tables, JSON throws away your types, pickle trusts arbitrary code on load. The thesis,
-ratified in [VISION.md](design/VISION.md), is that **your data should follow your code — no
-raindances**: your `models.py` is just typed dataclasses, and the only infrastructure is a place to
-put bytes. A few principles flow from that and recur throughout the API:
+## Design consequences
 
-- **No translation layer.** Slots-dataclasses are the canonical form; records are msgspec msgpack,
-  and decoding is *structurally incapable* of executing code (no pickle, ever — invariant 1). There
-  is no schema file to drift out of sync because schema, indexes, and search config live *in the
-  type* via `Annotated[...]`.
-- **No session, no `save()`.** You mutate Python objects and `commit()`. Dirty tracking (including
-  in-place `list`/`dict` mutation) is transparent. This is a direct consequence of the
-  live-objects-are-the-database thesis: if there were a session and a `save()`, the objects would
-  not really *be* the database — they would be a cache in front of one.
-- **Predictable beats fast-but-mysterious.** The rule-based planner above; the explicit `dc.Lazy`
-  cut point instead of a guessing pre-fetcher; durability as a *triad you pick* with an explicit
-  loss window per setting rather than a vague "it's durable" promise. You can always reason about
-  cost and about what survives a crash.
-- **Honest scope.** datacrystal is single-writer (owner-confined + a process lease) by design, and
-  scales **within** one process and **out** to many readers via snapshots, not across writer
-  processes ([SCALING.md](design/SCALING.md)). It does not wear a blanket "ACID compliant" badge —
-  it states each per-letter guarantee exactly as strongly as a cited test or setting backs it
-  (see [Transactional guarantees](reference.md#transactional-guarantees-acid)). Features that do not
-  exist are marked planned, never described as if real.
-- **Derived data is rebuildable, never authoritative.** Indexes, the reverse-reference index, the
-  FTS sidecar, the Arrow mirror — all are rebuildable from the records, watermark-validated, and may
-  be cached on disk but are never the source of truth (invariant 11, amended by
-  [ADR-005](design/ADR-005-index-cache.md)). The records win, always.
+The thesis is that your data follows your code ([VISION.md](design/VISION.md)); these are what it fixes in the engine.
 
-Scope authority — what is in, punted, and never — lives in [ROADMAP.md](design/ROADMAP.md); the
-engineering standards (the architectural fitness functions, the perf-gate principles) are in
-[KICKOFF.md](design/KICKOFF.md). This page is the narrative; those are the rulings.
+- No translation layer: slots dataclasses are the canonical form, records are msgspec msgpack, and decoding cannot execute code (no pickle, invariant 1).
+  Schema, indexes and search config live in the type through `Annotated[...]`, so there is no schema file to drift.
+- No session and no `save()`: you mutate objects and `commit()`, with transparent dirty tracking including in-place `list` and `dict` mutation.
+  With a session, the objects would be a cache in front of the database instead of the database.
+- Predictable costs: the rule-based planner, the explicit `dc.Lazy` cut point instead of a pre-fetcher, and durability as a triad you pick, each with a stated loss window.
+- Scope: single-writer by design (owner-confined plus a process lease), scaling within one process and out to many readers through snapshots ([SCALING.md](design/SCALING.md)).
+  Each ACID letter is stated as strongly as a cited test or setting backs it ([Transactional guarantees](reference.md#transactional-guarantees-acid)), and a feature that does not exist is marked planned.
+- Derived data is rebuildable, never authoritative: indexes, the reverse-reference index, the FTS sidecar and the Arrow mirror are watermark-validated and rebuilt from the records (invariant 11, amended by [ADR-005](design/ADR-005-index-cache.md)).
+
+Scope authority is [ROADMAP.md](design/ROADMAP.md), and the engineering standards are in [KICKOFF.md](design/KICKOFF.md).
