@@ -85,7 +85,7 @@ def gate(name: str, value: float, threshold: float, *, unit: str = "×") -> None
 
 
 @pytest.fixture(scope="session")
-def big_store(tmp_path_factory) -> Iterator[dc.Store]:
+def big_store(tmp_path_factory: pytest.TempPathFactory) -> Iterator[dc.Store]:
     """The shared @{SPECIMENS} cabinet (sqlite, built once per session)."""
     path = tmp_path_factory.mktemp("bench") / "big.store"
     store = dc.Store.open(path)
@@ -96,7 +96,7 @@ def big_store(tmp_path_factory) -> Iterator[dc.Store]:
 
 
 @pytest.fixture(scope="session")
-def small_store(tmp_path_factory) -> Iterator[dc.Store]:
+def small_store(tmp_path_factory: pytest.TempPathFactory) -> Iterator[dc.Store]:
     """The same shape at a tenth the extent (scale-ratio gates)."""
     path = tmp_path_factory.mktemp("bench") / "small.store"
     store = dc.Store.open(path)

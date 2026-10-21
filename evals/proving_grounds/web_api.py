@@ -286,7 +286,7 @@ def build_app(store: dc.Store) -> tuple[FastAPI, dict[str, Any]]:
         snap: Annotated[Snapshot, Depends(read_snapshot)],
         namespace: str | None = None,
         limit: int = 50,
-    ):
+    ) -> list[TermPublic]:
         target = Term.namespace == namespace if namespace else Term
         views = snap.query(target, limit=limit)
         # model_validate validates one DTO per row off the EntityView — the REST

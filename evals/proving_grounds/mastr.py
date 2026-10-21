@@ -39,10 +39,10 @@ import shutil
 import sys
 import time
 import xml.etree.ElementTree as ET
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import field
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 import datacrystal as dc
 
@@ -206,7 +206,7 @@ def main() -> None:
     # --- QUERY COST-LADDER (the SOR/metadata persona's whole surface) --------
     F = dc.fields(SolarUnit)
 
-    def timed(fn):  # returns (result, seconds)
+    def timed[R](fn: Callable[[], R]) -> tuple[R, float]:  # (result, seconds)
         t0 = time.perf_counter()
         r = fn()
         return r, time.perf_counter() - t0
@@ -258,7 +258,7 @@ def main() -> None:
     builds: list[int] = []
     real_build = _idx.build_class_indexes
 
-    def _counting_build(*a, **k):
+    def _counting_build(*a: Any, **k: Any) -> Any:
         builds.append(1)
         return real_build(*a, **k)
 
