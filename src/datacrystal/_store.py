@@ -934,7 +934,7 @@ class Store:
         return None
 
     # Commit: _p1_capture (validate, TID, flip state clean, build delta), _run_p2 (backend I/O,
-    # _p2_rollback on failure), _p3_finalize (indexes, fingerprints, last_tid), _deliver (consumers).
+    # _p2_rollback on failure), _p3_finalize (indexes, fingerprints, last_tid), _deliver.
     def commit(self) -> int | None:
         """Atomically persist all buffered changes; return the new TID, or ``None`` if none.
 
