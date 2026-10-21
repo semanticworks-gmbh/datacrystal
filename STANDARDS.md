@@ -4,7 +4,7 @@ Rules that bind every change to datacrystal, each short enough to check a diff a
 Copied from tetrahedron's `architecture/standards/STANDARDS.md` on 2026-10-20 (#186) and owned here from now on: a change goes through a PR on this file, not through tetrahedron.
 Cite a rule by its slug.
 
-Gates that switch on in a later wave say so by issue: ANN401, C901, PLR2004 in `src/` in #192.
+#192 switched on ANN401 (`Any`), C901 and PLR2004 on every path, PLR2004 except in tests, and named BLE001, TRY004, UP007, B008, PYI034 and RUF100 in `ruff.toml`.
 #191 switched on D401, the docstring form (D102, D105, D107, D403, D415), T20 and ruff's own default rule set in `src/`, with E4, E7, E9 and F still named in `ruff.toml` and ruff pinned in CI; only the five-body-line docstring limit stays with review, since ruff has no rule for it.
 
 ### self-documenting-code
@@ -15,9 +15,13 @@ Gates that switch on in a later wave say so by issue: ANN401, C901, PLR2004 in `
 - **Source:** tetrahedron decision 542, copied 2026-10-20 (#186).
 
 ### typed-python
-- **Rule:** Every function and method is fully annotated (ruff `ANN`) and the project passes Pyrefly at zero errors; CI blocks on both. A suppression is a line-level `# pyrefly: ignore[<code>]` with its reason, never file-wide in `src/`. A ruff `# noqa: <code> - <reason>` in `src/` is line-level too and allowed only where the rule contradicts a documented contract (BLE001, TRY004, UP007 today).
+- **Rule:** Every function and method is fully annotated (ruff `ANN`) and the project passes Pyrefly at zero errors; CI blocks on both. A suppression is a line-level `# pyrefly: ignore[<code>]` with its reason, never file-wide in `src/`. A ruff `# noqa: <code> - <reason>` in `src/` is line-level too and allowed only where the rule contradicts a documented contract (BLE001, TRY004, UP007) or for a public return that is dynamic by design (ANN401).
 - **Applies to:** `src/`, `examples/`, `benchmarks/`; `tests/`.
-- **Enforced by:** ci — `uv run pyrefly check` at 0 on `src`, `examples`, `benchmarks`, `tests`; `uvx ruff check .` selects ANN001–ANN003 and ANN2xx for `src`, `examples` and `scripts`, ANN401 (`Any`) from #192 and ANN for `tests`, `benchmarks` and `evals`; cannot see: an `Any` that hides a real type, a suppression without a reason.
+- **Enforced by:** ci.
+  `uv run pyrefly check` at 0 on `src`, `examples`, `benchmarks`, `tests`.
+  `uvx ruff check .` selects ANN, with ANN401 (`Any`) at 0 on every path.
+  `scripts/check_suppressions.py` (self-test `scripts/test_check_suppressions.py`) fails a `noqa` in `src/` other than BLE001, TRY004, UP007 or ANN401, a blanket `noqa`, and a `noqa` or `pyrefly: ignore[...]` without ` - <reason>`.
+  Cannot see: an `Any` that hides a real type, a reason that does not hold.
 - **Example:** `src/datacrystal/web/_pydantic.py` (the one `bad-return` suppression, with its reason)
 - **Source:** tetrahedron decision 552, copied 2026-10-20 (#186); pyright leaves `src/` CI here.
 

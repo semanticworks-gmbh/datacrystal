@@ -2299,7 +2299,7 @@ class Store:
                 if fresh and ti.protected:
                     self._stamp_perm_labels(current, container)
                 self._queue_field_entities(current, ti, queue)
-        return oid_of(obj)  # pyrefly: ignore[bad-return]  # the walk above stamped obj, so it has an oid
+        return oid_of(obj)  # pyrefly: ignore[bad-return] - the walk above stamped obj, so it has an oid
 
     def _adopt_unregistered(self, entity: object) -> int:
         """Give a never-stored entity its OID, stamp it and buffer it as NEW; return the OID."""

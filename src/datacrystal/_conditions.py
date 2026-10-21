@@ -379,10 +379,10 @@ class FieldExpr:
         self.cls = cls
         self.name = name
 
-    def __eq__(self, value: object) -> Pred:  # pyrefly: ignore[bad-override]  # builds a predicate, not a bool
+    def __eq__(self, value: object) -> Pred:  # pyrefly: ignore[bad-override] - builds a predicate, not a bool
         return Pred(self.cls, self.name, "==", value)
 
-    def __ne__(self, value: object) -> Pred:  # pyrefly: ignore[bad-override]  # builds a predicate, not a bool
+    def __ne__(self, value: object) -> Pred:  # pyrefly: ignore[bad-override] - builds a predicate, not a bool
         return Pred(self.cls, self.name, "!=", value)
 
     def __lt__(self, value: object) -> Pred:
