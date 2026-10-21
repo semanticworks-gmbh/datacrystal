@@ -70,12 +70,10 @@ class UniqueViolationError(DataCrystalError):
 class SchemaMismatchError(DataCrystalError):
     """A persisted record cannot be mapped onto the live class.
 
-    Additive schema evolution is automatic — fields added *with a default*
-    are filled on load, removed fields are ignored. This error means
-    something beyond that: a new field without a default, a Unique field
-    added with a non-None default, or a damaged type dictionary. A rename is
-    remove+add (the old values are dropped); explicit data migrations are
-    post-v0.1 work.
+    Additive evolution (new fields with a default, removed fields) is automatic.
+    This error means more: a new field without a default, a Unique field added with a non-None
+    default, or a damaged type dictionary.
+    A rename is remove plus add; explicit data migrations are post-v0.1.
     """
 
 
@@ -91,20 +89,12 @@ class SchemaSkewError(DataCrystalError):
 
 
 class ConflictError(DataCrystalError):
-    """A federated contribution conflicts with the coordinator's current state.
+    """A federated contribution conflicts with the coordinator's current state (FEDERATION-WIRE-v1).
 
-    The ``/v1/submit`` OCC guard (ROADMAP item 21, [FEDERATION-WIRE-v1]): the
-    base token a follower read no longer matches the coordinator's current
-    payload for that natural key — the entity moved since it was read (or a
-    presence mismatch: ``base`` was given for an absent key, or omitted for a
-    present one). The whole submission is rejected (fail-closed, HTTP 409);
-    re-read the entity and retry. **Detect-and-reject, never last-writer-wins.**
-
-    Carries the conflict envelope fields the LOCKED contract promises so the
-    coordinator's 409 body is ``{error, key, expected_base, actual_base}`` and a
-    client can drive its re-read: ``key`` is the natural-key value that
-    conflicted, ``expected_base`` the token the follower carried, ``actual_base``
-    the coordinator's current payload hash (``None`` ⇔ the key is absent).
+    The ``/v1/submit`` OCC guard rejects the whole submission (HTTP 409) when the base token is
+    stale; re-read and retry.
+    Detect-and-reject, never last-writer-wins.
+    Carries ``key``, ``expected_base`` and ``actual_base`` (``None`` means the key is absent).
     """
 
     def __init__(
@@ -138,14 +128,12 @@ class CorruptRecordError(DataCrystalError):
 
 
 class MixedTemporalIndexError(DataCrystalError):
-    """A SortedIndex datetime field holds both timezone-naive and timezone-aware
-    values (#106 / ADR-004 §4).
+    """A SortedIndex datetime field holds both timezone-naive and timezone-aware values (#106,
+    ADR-004 section 4).
 
-    Aware datetimes order by their UTC instant; naive datetimes carry no offset.
-    Python refuses to compare the two, so a sorted run that mixed them would raise
-    a bare ``TypeError`` deep in ``bisect``/``insort``. datacrystal rejects the mix
-    loudly at insert/build instead — pick one convention per field (store every
-    timestamp aware, e.g. ``datetime.now(timezone.utc)``, is the recommendation).
+    Python cannot compare the two, so the mix is rejected at insert or build instead of raising a
+    bare ``TypeError`` in ``bisect``.
+    Pick one convention per field; storing every timestamp aware is recommended.
     """
 
 
@@ -186,14 +174,10 @@ class UnknownActorError(DataCrystalError):
 
 
 class SponsorRequiredError(DataCrystalError):
-    """``store.acting_as(uid)`` resolved a non-human actor whose sponsor gate
-    fails: no sponsor named, or the named sponsor does not resolve to a
-    registered **human** actor.
+    """``store.acting_as(uid)`` resolved a non-human actor whose sponsor gate fails.
 
-    The sponsor gate (epic #168): every technical user names a natural
-    person who answers for it — accountability diffuses in groups, and
-    incident response needs a person to call (the EU AI Act Art. 26(2)
-    human-oversight designation). Set ``Actor.sponsor`` to a human's uid.
+    Either no sponsor is named, or the named sponsor is not a registered human actor.
+    Set ``Actor.sponsor`` to a human's uid (ADR-008, epic #168).
     """
 
 
@@ -210,42 +194,31 @@ class UncommittedActorError(DataCrystalError):
 class WriteDeniedError(DataCrystalError):
     """A write to a protected record was denied (ADR-008 R10).
 
-    Raised in commit P1 **before the TID is allocated** — the sequence stays
-    gapless (invariant 5) and every buffered change stays intact: ``discard()``
-    or fix the labels/identity and re-commit. Covers all denial classes:
-    a buffered write (content, label change, or delete) below the target's
-    current write floor, a floor set above the setter's own authority (the
-    R8 ceiling, incl. sharing into a group without standing), and creating
-    a protected record as the anonymous principal (R6 — a record nobody
-    owns must not exist). Denial is deterministic — ``committing()`` never
-    retries it (unlike :class:`ConflictError`).
+    Raised in commit P1 before the TID is allocated, so the sequence stays gapless and buffered
+    changes stay intact: ``discard()`` or fix and re-commit.
+    Covers a write below the write floor, a floor above the setter's own authority (R8), and
+    creating a protected record anonymously (R6).
+    Denial is deterministic, so ``committing()`` never retries it (unlike :class:`ConflictError`).
     """
 
 
 class ReadDeniedError(DataCrystalError):
-    """Redacted data was USED (ADR-008 R14): a data-field read on a
-    ``dc.Redacted`` twin, or an attempt to mutate/commit one.
+    """Redacted data was used (ADR-008 R14): a field read on a ``dc.Redacted`` twin, or an attempt
+    to mutate or commit one.
 
-    Traversal never raises this — deref of a denied-but-existing protected
-    record returns the twin gracefully (R14 variant (a): the redacted-twin
-    default, no flag); this fires only when the redacted data is actually
-    *used* — a data-field (or ``dc_permissions``) read, or any write
-    entrypoint, since a twin is never committable. The message carries only
-    the typename — never a title or value, which would themselves leak.
-    Distinguish from :class:`DanglingRefError`: denied-but-existing (this)
-    vs no-record-at-all (that).
+    Traversal never raises this; only a data-field or ``dc_permissions`` read, or a write
+    entrypoint, does.
+    The message carries only the typename, since a title or value would itself leak.
+    Unlike :class:`DanglingRefError`, the record exists but is denied.
     """
 
 
 class ConsumerDetachedWarning(UserWarning):
     """An attached delta consumer raised during delivery and was detached.
 
-    The commit it choked on is durable and the store is healthy — sidecars
-    are rebuildable derived data (invariant 11), so a broken consumer never
-    holds writes hostage. Its watermark now lags the store; ``attach()``
-    refuses it until it rebuilds (e.g. from ``store.snapshot()``). See
-    COMMIT-DELTA-v1 §5: deltas are not retained, missed history cannot be
-    re-fetched from the engine.
+    The commit is durable and the store healthy; sidecars are rebuildable (invariant 11).
+    Its watermark now lags, and ``attach()`` refuses it until it rebuilds, because deltas are not
+    retained (COMMIT-DELTA-v1 section 5).
     """
 
 
@@ -271,12 +244,10 @@ class UntrackedMutationWarning(UserWarning):
 
 
 class DanglingDeleteWarning(UserWarning):
-    """``debug=True`` committed a delete that left a *surviving* record still
-    pointing at the just-deleted OID — a dangle that ADR-003 makes loud only
-    later, at dereference (``DanglingRefError``). The dev net turns that spooky
-    deferred failure into an at-the-delete diagnostic, naming the referrers it
-    found via the reverse-reference index (``incoming(dead)``, #110). The commit
-    proceeds (unchecked deletes are uniform, ADR-003); ``strict_deletes=True``
-    promotes this to a raised ``DanglingRefError`` instead. This is the dev-time
-    bridge until v1 checked-deletes/cascades land — NOT referential integrity.
+    """``debug=True`` committed a delete that left a surviving record pointing at the deleted OID.
+
+    ADR-003 only raises at dereference; this names the referrers found via ``incoming(dead)`` (#110)
+    at the delete.
+    The commit proceeds, and ``strict_deletes=True`` raises ``DanglingRefError`` instead.
+    A dev-time bridge until checked deletes land, not referential integrity.
     """

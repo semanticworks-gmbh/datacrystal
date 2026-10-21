@@ -1,18 +1,10 @@
 """The record-label side of native permissions (epic #168, W2; ADR-008).
 
-What a record *carries*. The concept study fixes the vocabulary pair: a
-``Principal`` (:mod:`datacrystal._actors`) is the subject — who acts;
-:class:`Permissions` are what a protected record carries — owner, groups,
-and the two floors. ``@entity(protected=True)`` injects the four lib-managed
-columns; this module is their public face.
-
-A LEAF module at import time (no module-level datacrystal imports, like
-``_state``): ``_entity.py`` needs the ladder constants for the injected
-column defaults, and ``_actors.py`` imports ``_entity`` — so the constants
-live here and ``_actors`` re-exports them (the public ``dc.*`` surface is
-unchanged, ADR-008 batch-1 R3). The label VERBS below import the engine
-lazily inside their bodies (the ``_state.py`` precedent) — by the time a
-verb can run, every module is initialized.
+A ``Principal`` (:mod:`datacrystal._actors`) is who acts; :class:`Permissions` is what a protected
+record carries.
+A leaf module at import time: ``_entity`` needs the ladder constants and ``_actors`` imports
+``_entity``, so the constants live here.
+The label verbs import the engine lazily inside their bodies (the ``_state`` precedent).
 """
 
 from __future__ import annotations
@@ -27,10 +19,11 @@ if TYPE_CHECKING:
 WORLD = 0
 """The world group id: every principal implicitly holds ``{WORLD: VIEWER}``."""
 
-# The ladder — levels within a shared group, spaced by 100 so levels can be
-# inserted without renumbering. NO_STANDING is not a grantable level: it is
-# the *absence* of any shared group, kept distinct from VIEWER so floors stay
-# readable ("read_floor=VIEWER" means "any member may view").
+# The ladder (ADR-008 R3), spaced by 100 so levels can be inserted without renumbering.
+# AGENT sits below AUTOMATION on purpose: an LLM agent is the least predictable writer, and
+# competence is not clearance.
+# NO_STANDING is the absence of a shared group, not a grantable level, so "read_floor=VIEWER" still
+# means "any member".
 NO_STANDING = -1
 VIEWER = 0
 AGENT = 100
@@ -40,24 +33,15 @@ CURATOR = 400
 ADMIN = 500
 EXECUTIVE = 600
 
-# The four lib-managed columns @entity(protected=True) injects, in schema
-# order (ADR-008 Context). The `_dc_` prefix is RESERVED on every entity
-# class — note the deliberate overload: PersistentList/PersistentDict carry
-# an unrelated `_dc_owner` slot (the owning-entity backref, _containers.py);
-# the decorator guard keeps user fields out of the namespace either way.
+# The four lib-managed columns @entity(protected=True) injects, in schema order (ADR-008 Context).
+# The `_dc_` prefix is reserved on every entity class; PersistentList/PersistentDict reuse
+# `_dc_owner` for an unrelated backref.
 PERM_FIELDS = ("_dc_owner", "_dc_groups", "_dc_read_floor", "_dc_write_floor")
 
 
-# The R7 LEGACY fill (ADR-008): what a record persisted BEFORE its class
-# turned protected decodes as — read-as-before (every principal implicitly
-# holds {WORLD: VIEWER}), writes fenced at the top (ADMIN held in WORLD =
-# a store-wide administrator) until someone relabels. DELIBERATELY different
-# from the R6 birth defaults on the injected columns (owner=0/∅/VIEWER/VIEWER):
-# birth labels are stamped at store() time, so the dataclass defaults never
-# reach disk — this fill fires only for pre-protection records, detected by
-# the persisted field list lacking the _dc_* names. ONE constant, three
-# consumers (live hydration plan, snapshot decode, index build) — agreement
-# by construction; the W2-5 gate's prior-label decode reuses it too.
+# The R7 legacy fill (ADR-008): the labels of a record persisted before its class turned protected.
+# Deliberately unlike the R6 birth defaults; one constant so hydration, snapshot decode, index build
+# and the gate agree.
 PERM_LEGACY_FILLS: dict[str, Callable[[], Any]] = {
     "_dc_owner": lambda: 0,          # nobody — and uid 0 never matches (R7a)
     "_dc_groups": lambda: [WORLD],
@@ -68,17 +52,12 @@ PERM_LEGACY_FILLS: dict[str, Callable[[], Any]] = {
 
 @dataclass(frozen=True, slots=True)
 class Permissions:
-    """A protected record's security label, as one frozen view.
+    """A protected record's security label, as one frozen view (read it via
+    ``record.dc_permissions``).
 
-    Read it via the injected ``record.dc_permissions`` property — ``owner``
-    is the registering principal's uid (0 = nobody, the R7a sentinel: uid 0
-    is the anonymous principal and can never own), ``groups`` the compartments
-    the record is shared into, and the floors the minimum authority to read /
-    write within those groups (ADR-008; the checks land with the W2-5 commit
-    gate and the W3/W4 read fences).
-
-    ``groups`` is a tuple — a point-in-time copy, never the record's live
-    (mutable, owner-bound) list.
+    ``owner`` is the registering uid (0 means nobody, the R7a sentinel), ``groups`` the compartments
+    it is shared into, and the floors the minimum authority to read or write.
+    ``groups`` is a point-in-time tuple copy, never the record's live list.
     """
 
     owner: int
@@ -91,12 +70,12 @@ class Permissions:
 
 
 def _staged(rec: Any) -> Any:
-    """Validate ``rec`` is a live, mutable, protected entity — the shared
-    verb preamble. Raises BEFORE any mutation, so a refused verb stages
-    nothing (atomicity); the verbs themselves perform ZERO authority checks
-    — enforcement is the commit gate's job (W2-5), against the *committing*
-    principal, so stage-now-reject-at-commit (the maker–checker flow) works
-    and a verb never checks the wrong identity.
+    """Validate that ``rec`` is a live, mutable, protected entity, the shared preamble of the label
+    verbs.
+
+    Raises before any mutation, so a refused verb stages nothing.
+    The verbs perform no authority check: the commit gate checks the committing principal
+    (maker-checker flow).
     """
     from datacrystal._entity import is_entity, type_info
     from datacrystal._errors import FrozenEntityError
@@ -127,6 +106,7 @@ def _staged(rec: Any) -> Any:
 
 
 def _check_level(name: str, level: Any) -> None:
+    """Raise if ``level`` is not a grantable ladder level."""
     if type(level) is not int:
         raise TypeError(f"{name} must be an int ladder level, got {level!r}")
     if level < VIEWER:
@@ -137,30 +117,20 @@ def _check_level(name: str, level: Any) -> None:
 
 
 def _check_group(group: Any) -> None:
+    """Raise if ``group`` is not an int group id."""
     if type(group) is not int:
         raise TypeError(f"group must be an int group id, got {group!r}")
 
 
 def share(rec: Any, group: int, *, read: int, write: int) -> None:
-    """Share ``rec`` into ``group`` and set the record's floors — explicit
-    keyword levels REQUIRED, there are no silent default grants (ADR-008
-    R6). Floors are per-record, not per-group: ``read``/``write`` set the
-    record-wide floors alongside the (idempotent) group add.
+    """Share ``rec`` into ``group`` and set the record-wide floors; both levels are required (R6).
 
-    Staging only: the change rides normal dirty-tracking and commits with
-    everything else; whether YOU may set these floors is decided by the
-    commit gate against the committing principal (floor ≤ own authority,
-    R8 — ``[planned — W2-5]`` until the gate lands in this same wave).
+    Staging only: the commit gate decides whether you may set these floors (ADR-008 R8).
 
     Raises:
-        TypeError: ``rec``'s class is not ``protected=True``, or ``group``/
-            a level is not an int (omitting ``read=``/``write=`` is a
-            TypeError from Python itself — by design).
-        ValueError: a level below ``VIEWER`` (``NO_STANDING`` is not
-            grantable).
-        FrozenEntityError: ``rec`` is ``frozen=True`` — labels are fixed at
-            registration.
-        DeletedEntityError: ``rec`` was deleted (via the write hook).
+        TypeError: not a protected entity, or ``group`` or a level is not an int.
+        ValueError: a level below ``VIEWER``.
+        FrozenEntityError: ``rec`` is ``frozen=True`` (``DeletedEntityError`` if deleted).
     """
     _staged(rec)
     _check_group(group)
@@ -174,14 +144,9 @@ def share(rec: Any, group: int, *, read: int, write: int) -> None:
 
 
 def unshare(rec: Any, group: int) -> None:
-    """Remove ``group`` from ``rec``'s groups. Absent group = no-op that
-    does NOT buffer a spurious write (the ``set.discard`` idiom). Floors are
-    untouched — clearing a floor is ``protect()``'s job.
+    """Remove ``group`` from ``rec``'s groups; an absent group is a no-op that buffers no write.
 
-    Raises:
-        TypeError: not a protected entity, or ``group`` is not an int.
-        FrozenEntityError: ``rec`` is ``frozen=True``.
-        DeletedEntityError: ``rec`` was deleted (via the write hook).
+    Floors are untouched; use :func:`protect`.
     """
     _staged(rec)
     _check_group(group)
@@ -191,16 +156,8 @@ def unshare(rec: Any, group: int) -> None:
 
 
 def protect(rec: Any, *, read: int | None = None, write: int | None = None) -> None:
-    """Set ``rec``'s read and/or write floor — floors only, never groups.
-    At least one keyword is required (no-silent-grants, the R6 intent
-    extended to ``protect()``).
-
-    Raises:
-        TypeError: not a protected entity, no keyword given, or a level is
-            not an int.
-        ValueError: a level below ``VIEWER``.
-        FrozenEntityError: ``rec`` is ``frozen=True``.
-        DeletedEntityError: ``rec`` was deleted (via the write hook).
+    """Set ``rec``'s read and/or write floor, never its groups; at least one keyword is required
+    (R6).
     """
     _staged(rec)
     if read is None and write is None:
@@ -222,39 +179,27 @@ def protect(rec: Any, *, read: int | None = None, write: int | None = None) -> N
 
 
 def level(p: Any, g: int) -> int:
-    """The level ``p`` holds in group ``g`` — with the implicit world
-    membership made normative: every principal holds at least ``VIEWER`` in
-    ``WORLD``, even ``Principal(uid=0, memberships={})`` (ADR-008).
+    """Return the level ``p`` holds in group ``g``; every principal holds at least ``VIEWER`` in
+    ``WORLD`` (ADR-008).
     """
     return p.memberships.get(g, VIEWER if g == WORLD else NO_STANDING)
 
 
 def is_owner(p: Any, owner: int) -> bool:
-    """uid 0 IS the anonymous principal, so 0 can never be an owner:
-    ``_dc_owner == 0`` means *nobody* (R7) and matches no session (R7a) —
-    without this, anonymous would own every legacy record in the store.
+    """Return whether ``p`` owns a record with ``owner``; uid 0 is anonymous, so ``_dc_owner == 0``
+    means nobody (R7a).
     """
     return p.uid != 0 and owner == p.uid
 
 
 def authority_towards(p: Any, owner: int, groups: Iterable[int]) -> int:
-    """Highest level ``p`` holds in any group the record is shared with;
-    the owner of an UNSHARED record acts at their personal-best level on it
-    (ADR-008 — what lets an owner write and ratchet a draft nobody else can
-    see at all). Pure over plain values: the commit gate calls it on decoded
-    prior tuples, the ceiling check on staged values, and W3's readable-set
-    compiler calls it per snapshot row — one predicate, several callers.
+    """Return the highest level ``p`` holds in any group the record is shared with.
 
-    The owner boost is gated on ``not levels`` (the record has no groups) on
-    purpose (F3 fix, ADR-008 amendment 2026-07-16). Once a record is shared,
-    authority towards it must come THROUGH a group it is shared into — the
-    owner's personal-best level in some *unrelated* compartment must not clear
-    a curated record's write floor, or the curation guarantee ("an agent can
-    never overwrite a curated record, even one it created") is false. Reads are
-    unaffected: :func:`can_read_row` short-circuits on the owner clause before
-    ever reaching here, so the boost never touched the read path. Testing
-    ``not levels`` rather than ``not groups`` is robust to a one-shot iterable
-    ``groups`` (the comprehension is the only place it is consumed).
+    The owner of an unshared record acts at their personal-best level (ADR-008, F3 amendment
+    2026-07-16).
+    The boost tests ``not levels``, not ``not groups``, so a one-shot iterable is consumed once.
+    Pure over plain values: shared by the commit gate, the ceiling check and the readable-set
+    compiler.
     """
     levels = [level(p, g) for g in groups]
     if is_owner(p, owner) and not levels:
@@ -263,27 +208,20 @@ def authority_towards(p: Any, owner: int, groups: Iterable[int]) -> int:
 
 
 def is_root(p: Any) -> bool:
-    """Break-glass (R9): EXECUTIVE held explicitly in WORLD = store root —
-    every permission check passes, incl. on owner-only records; every root
-    action still lands stamped in the delta log (visible, never silent).
-    ``uid != 0`` is the defensive R7a closure: the anonymous principal can
-    never be root, whatever memberships someone hands it.
+    """Return whether ``p`` is the store root: EXECUTIVE held in WORLD, the audited break-glass
+    (R9).
+
+    ``uid != 0`` keeps the anonymous principal from ever being root (R7a).
     """
     return p.uid != 0 and p.memberships.get(WORLD, VIEWER) >= EXECUTIVE
 
 
 def can_read_row(p: Any, owner: int, groups: Iterable[int], read_floor: int) -> bool:
-    """The ADR-008 ``can_read`` predicate over decoded label values (W3-1) —
-    pure, constructs no entity, touches no registry (the same decode-level
-    doctrine as ``count()``/``pluck()``). Root (R9) is the ONE bypass,
-    checked here so every decode-level caller is uniform;
-    :func:`datacrystal._indexes.readable_bitmap` is the bitmap-compiler twin
-    of this same rule — one predicate, two shapes.
+    """Return the ADR-008 ``can_read`` predicate over decoded label values (W3-1).
 
-    Note the owner clause is the first disjunct, exactly like ``can_read`` in
-    the ADR: ownership alone grants a read regardless of ``authority_towards``
-    — the personal-best boost inside ``authority_towards`` matters only for
-    the *write* ceiling (R8), not here.
+    Pure, builds no entity and touches no registry; root (R9) is the one bypass.
+    :func:`datacrystal._indexes.readable_bitmap` is its bitmap-compiler twin.
+    The owner clause comes first, so ownership alone grants a read.
     """
     if is_root(p):
         return True
