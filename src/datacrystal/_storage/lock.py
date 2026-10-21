@@ -3,7 +3,7 @@
 ``used.lock`` holds ``{pid, token, ts}``; a daemon thread refreshes ``ts``.
 A fresh lock makes a second opener fail with ``StoreLockedError``; a stale lock is taken over.
 A refresher that finds another owner flags the lease lost, so the next commit raises
-``LeaseLostError``.
+``LeaseLostError``; why a lock at all: ADR-001, "Implementation notes".
 TTL and clock are injectable, so the lock suite needs no real-time sleeps (fitness function #8).
 """
 

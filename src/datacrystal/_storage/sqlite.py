@@ -1,7 +1,7 @@
 """SQLite-as-blob-store: the durable v0.x backend (ROADMAP item 2).
 
 Records are opaque msgpack blobs; SQLite's journal gives crash atomicity (KICKOFF risk 4).
-``durability`` is the KICKOFF M2 fsync triad (kill -9 loses nothing under any policy):
+``durability`` is the fsync triad (docs/design/DESIGN.md, "Durability policy"):
 ``"commit"`` is FULL plus fullfsync on macOS, so every acked commit survives power loss;
 ``"interval"`` (default) is WAL group-commit, losing at most the commits since the last checkpoint
 on OS crash; ``"never"`` is for scratch stores, where OS crash can corrupt the file.

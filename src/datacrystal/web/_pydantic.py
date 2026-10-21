@@ -39,7 +39,7 @@ def entity_model(cls: type, *, face: Face = "plain") -> type[pydantic.BaseModel]
 
     Faces: ``"plain"`` (the declared fields), ``"create"`` (a request body, ``{Name}Create``)
     and ``"public"`` (a ``response_model``, ``{Name}Public``, plus a required ``oid``).
-    The mapping rules are in ``docs/reference.md`` (the ``datacrystal.web`` reflection API).
+    The mapping rules and ``nested``/``face``: ``docs/reference.md``, "Behaviour notes".
     Reflection uses ``type_info``, because ``getattr(cls, field)`` returns a query ``FieldExpr``.
     """
     cached = _MODEL_CACHE.get((cls, face))

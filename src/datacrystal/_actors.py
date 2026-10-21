@@ -3,7 +3,7 @@
 A :class:`Principal` is the in-memory subject a session acts under, holding a level per group.
 Core only needs every commit stamped with one; datacrystal is never the identity provider.
 :class:`Actor` is the shipped registry entity, so grants ride the same delta stream as the data.
-Ladder constants and their rationale: ADR-008 R3.
+Ladder constants and their rationale: ADR-008 R3, "Ladder and Actor" notes.
 """
 
 from collections.abc import Mapping

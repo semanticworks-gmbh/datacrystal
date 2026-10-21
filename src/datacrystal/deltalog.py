@@ -4,7 +4,7 @@ A ``DeltaLog`` is a ``store.attach()`` consumer that appends every COMMIT-DELTA-
 byte, as length-prefixed frames to segment files named by an atomic ``manifest.json``.
 The manifest is fsynced after the segment bytes, so the durable watermark never lies.
 A log has one owner process; a :meth:`DeltaLog.bootstrap` log holds only changes since it joined.
-Storage model, crash recovery and replay completeness: docs/design/COMMIT-DELTA-v2.md, "DeltaLog".
+Storage model, crash recovery and replay completeness: docs/design/COMMIT-DELTA-v2.md, section 9.
 """
 
 from __future__ import annotations

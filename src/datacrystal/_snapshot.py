@@ -487,7 +487,7 @@ class Snapshot:
     Discovery surfaces (``query``, ``count``, ``all``, ``explain``, ``incoming``) intersect the
     principal's readable OIDs first; deref surfaces (``get``, ``get_many``, ``open_blob``) check
     ``can_read_row`` per row. Close it promptly: on sqlite it holds a WAL read transaction.
-    It is un-slotted on purpose: the ``datacrystal[web]`` DataLoader patches ``get_many`` on it.
+    Un-slotted on purpose (the web DataLoader patches ``get_many``): ADR-008, "Read surfaces".
     """
 
     def __init__(self, core: _SnapshotCore, principal: Principal) -> None:

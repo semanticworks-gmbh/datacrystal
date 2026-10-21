@@ -89,7 +89,10 @@ class Lazy[T]:
         # local import: _entity imports _lazy at module level, so a module-level
         # import here would cycle (the _state.py/_permissions.py precedent for
         # engine-lazy imports).
-        """Return the target, loading it from the store if needed."""
+        """Return the target, loading it from the store if needed.
+
+        A protected target is re-checked on every call: ADR-008, "R14 deref checkpoint".
+        """
         from datacrystal._entity import oid_of, type_info
 
         obj = self._obj

@@ -1367,6 +1367,78 @@ df = pd.DataFrame(store.pluck(Mineral, "qid", "name", "crystal_system"),
                   columns=["qid", "name", "system"])
 ```
 
+## Behaviour notes
+
+Contract details that used to live in docstrings, by API.
+
+### `Store.committing`
+
+The re-read lives inside the block, so a retry re-applies your intent to the winning value and is never last-writer-wins.
+Put the whole read-modify-write in the block and do not call `commit()` yourself; the `with` exit does.
+On a single-node store a commit cannot conflict, so the block runs once: identical code, behaviour follows the topology.
+`retries` is how many times to re-run on a conflict (`0` is one attempt that raises); the first attempt is not a retry.
+`WriteDeniedError` propagates unretried on the first attempt, since a denial is deterministic (ADR-008) and the same principal re-denies forever.
+
+```python
+for txn in store.committing(retries=5):
+    with txn:
+        m = store.get(Mineral, qid="Q1")
+        m.mohs = (m.mohs or 0) + 0.5
+```
+
+### `Store.open`
+
+- `durability`: `"commit"` fsyncs every commit (power-loss durable), `"interval"` (default) group-commits at WAL checkpoints (a process crash loses nothing, an OS crash may lose the last commits and never corrupts), `"never"` is for benchmarks and scratch stores.
+- `debug=True` re-encodes the live CLEAN entities on every commit and raises `UntrackedMutationWarning` for any that changed without the dirty hook firing; it costs O(live entities) per commit and arms the eager dangling-ref check in its warn mode.
+- `strict_deletes=True` raises `DanglingRefError` at the commit that deletes an OID a surviving record still points at; `debug=True` alone warns (`DanglingDeleteWarning`). The flagged set is `incoming(dead)` after the commit's index folds. This is a dev-time bridge (ADR-003), not checked deletes.
+- `lazy_timeout` (seconds) demotes loaded `Lazy` handles idle past the timeout; demotion runs on the owner only (sweeps piggyback on store calls, an owner-loop task under `aopen()`).
+- `cache_index` (default on, ADR-005) writes the built indexes to a sidecar on close and loads them at boot; a warm reopen skips the first-query rebuild (about 14x faster on a 6.2M store). The cache is never authoritative: a watermark mismatch or a stale, corrupt or newer sidecar silently rebuilds from the records.
+- `principal` is the config-trusted bootstrap identity, since someone must open the store that holds the `dc.Actor` registry. Omitted, the store acts as the anonymous principal (`uid=0`).
+- `NewerStoreError`: the on-disk format is newer than this build understands (invariant 9). `StoreLockedError`: for example a second `uvicorn` worker opening the same directory (invariant 10).
+
+### `Store.acting_as` and `Store.principal`
+
+A `Principal` is used as is, so ephemeral identities from verified auth claims are fine; datacrystal is never the identity provider.
+An `int` uid is resolved through the `Actor` registry and the sponsor gate runs in core: a non-human actor without a sponsor that resolves to a registered human actor raises `SponsorRequiredError`.
+Resolution reads the committed row only, so an Actor with buffered edits refuses loudly.
+Scopes nest and the innermost wins; on exit the previous identity returns in this task.
+Under `aopen()` the scope is contextvar-backed: a task spawned inside the scope inherits the identity for its lifetime, so spawn outside the scope or open a fresh `acting_as` in the child.
+`commit()` stamps the principal in effect when it runs, so writes buffered under A and committed under B stamp B.
+`principal` read from a foreign thread answers with that thread's view, which has no scopes and so reports the ambient identity.
+
+### `Store.upsert`
+
+On a match the existing live instance survives (identity is never broken) and only fields that changed are written, so re-importing an unchanged dataset buffers nothing and the commit is O(changed).
+It returns the canonical instance: the survivor, or `obj` when its key was unseen.
+Entities buffered through plain `store()` are not matched; a duplicate there stays a `UniqueViolationError` from `commit()`.
+`UniqueViolationError` also fires when `obj`'s key belongs to another entity and `obj` is itself registered; upsert a fresh instance or the canonical one.
+On a `protected=True` class the natural-key lookup is unfenced by design (ADR-008 W3-3), but the return is fenced (W4-6): a committed survivor the principal cannot `get()` raises `ReadDeniedError`.
+
+### Reading API: windows, order, streaming
+
+- `query(C)` hydrates every committed `C`, the same cost any non-indexed predicate pays, and is symmetric with `count()`, `pluck()` and `Snapshot.all()`.
+- `limit=` and `offset=` (#14) slice the candidate OIDs before hydration on a fully indexed query, so `query(C, limit=10)` loads 10 records; a residual predicate decodes to filter first and the window only trims the list. Order is ascending OID.
+- `order_by=(field, "asc"|"desc")` or a bare field (`EntityClass.f`, `dc.fields(C).f` or a name) sorts the whole match set before the window (#25): NULLs last, ties by ascending OID. An indexed field orders straight from the index (free for a `SortedIndex`, ADR-004); an un-indexed one decodes that field for every match.
+- On a `protected=True` class the candidates are intersected with the principal's readable OIDs before any window, order or hydration (ADR-008 R12), so a denied row never reaches the result.
+- `pluck(C, "name")` returns values and `pluck(cond, "a", "b")` tuples; references come back as `Ref` tokens for `get_many`. It windows like `query`, and the sort field need not be projected. `pluck(C, "_dc_owner")` stays legal because it reveals labels only of rows the caller can read.
+- `query_iter` yields the identical committed result set one chunk at a time with bounded memory, hydrating exactly as `query()` does, and reads committed state at iteration time. The owner guard is re-asserted on every pull, so a foreign thread or closed store stops the stream. The session principal is captured at call time, so a stream opened inside `acting_as(agent)` keeps `agent`'s view after the scope exits.
+
+### Migrating records
+
+`Store.migrate` hydrates each record persisted under an older lineage cid (through renames, glue and defaults) and re-commits it under the current-shape cid, so migrated values become real persisted columns and a glued or renamed field can then be indexed.
+It is additive (a new lineage row, never a blob mutation, invariant 8), owner-confined, crash-safe and TID-gapless because it rides the normal commit machine, and idempotent: a second run rewrites nothing.
+It commits in `batch`-sized chunks, so peak memory is bounded by the batch, and returns the number of records rewritten; a type with no live class is left untouched and `verify()` names it.
+`Store.verify` is read-only, never gated, and reports a bad record instead of raising, but the owner guard still applies.
+Write-denial behaviour is in ADR-008 ("Read surfaces").
+
+### Web reflection: `to_pydantic`
+
+`nested=N` opts in to bounded referent recursion; the default `0` turns every reference into its OID, which can never re-introduce N+1.
+With `nested=N` a reference whose referent is already resident (a live directly typed field, or a `Lazy` that `peek()` resolves) recurses into `to_pydantic(referent, nested=N-1)`; an unloaded `Lazy`, a snapshot `Ref` and any reference at depth 0 stay an OID. It never calls `.get()`, so it cannot force a load.
+A nested DTO sits in its `int`-typed reference slot through `model_construct`; the boundary annotation is frozen at `int` (#96).
+`face` selects the `entity_model` face (#98): `"plain"` (default), the input-shaped `"create"`, or the output-shaped `"public"`, which carries `oid` (`view.oid` for a snapshot view, the engine OID for a live entity) for `response_model=EntityPublic`.
+A `Redacted` source (ADR-008 W4-4) projects to `None`, never a DTO, because reading its fields raises `ReadDeniedError`; the check comes before the view branch since a `RedactedView` is also an `EntityView`. The return is annotated `BaseModel` because a twin only arrives from a deref surface, so callers that pass a deref result guard `isinstance(_, dc.Redacted)` first.
+
 ## See also
 
 - [Tutorial](tutorial.md) — a guided first session.

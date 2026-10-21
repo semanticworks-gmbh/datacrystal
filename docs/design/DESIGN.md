@@ -80,3 +80,52 @@ v0.1 'the loop works' (6-8 weeks, pure Python, zero hard deps beyond msgspec + p
 ## Open risks
 
 Ranked: (1) Dirty-tracking completeness — the #1 DX killer in both ancestors (EclipseStore silently loses in-place child mutations; ZODB's _p_changed tax drove users to ORMs). Mitigation: tri-state class-swap as default, PersistentList/Dict as default container types, msgspec-fingerprint commit diff as the safety net for unswappable types, eager-storer escape hatch, and a debug mode that fingerprints everything and WARNS on detected-but-untracked mutations. (2) Class-swap ghost novelty — zero-overhead is verified on 3.14 benchmarks but unproven at library scale (frozen dataclasses, layout-incompatible __slots__, C-extension types, metaclass conflicts). Mitigation: it is an optimization, never load-bearing — explicit Lazy[T] (EclipseStore's own chosen design) is the documented API and full fallback; spike in v0.1 week 1 with a kill criterion. (3) Memory footprint 3.5-4x Java (10M objects ≈ 1.4-1.7 GB; pydantic would be 4x worse). Mitigation: slots+msgspec.Struct canonical form, Lazy boundaries on large collections (the GigaMap lesson), Arrow-backed columnar storage for value-only collections, RSS-quota clearing, and honest documentation of the budget — never market 'billions of objects in RAM'. (4) Homegrown crash consistency — storage engines earn trust slowly and one corruption report kills adoption. Mitigation: port EclipseStore's battle-tested recovery design verbatim (log-before-action, truncate-on-boot) rather than inventing; add the fsync EclipseStore lacks; property-based torn-write/kill -9 fuzzing in CI from v0.1; 'mirror/index = rebuildable derived data' so only the core log must be perfect. (5) Dependency abandonment — Kuzu's Oct 2025 archival is the cautionary tale; usearch is single-vendor, sqlite-vec single-maintainer, pyroaring small. Mitigation: every index is rebuildable from the graph behind a backend protocol (swap cost = rebuild, not migration); defaults biased to stdlib (sqlite3/FTS5) and multi-vendor Rust/PyO3 projects (tantivy, oxigraph); pin + vendor escape hatches. (6) Write throughput vs durability — per-commit fsync costs milliseconds where EclipseStore 'wins' benchmarks by not syncing at all. Mitigation: explicit policy triad (per-commit/interval/never) with group commit, documented honestly; the sidecar watermark protocol already tolerates lagging indexes. (7) Name collision with pyrsistent — reputational/discoverability risk, cheap to fix now, expensive after launch. Mitigation: rename or reserve PyPI name + disambiguation before any public artifact. (8) Adoption in a dormant niche — ZODB's 205K/month says 'object DB' alone won't sell. Mitigation: lead with the wedges nothing else has — FastAPI/GraphQL-native persistence with batched lazy resolution, and zero-copy DuckDB/pandas views of live objects — and position as 'SQLite for object graphs + search', not 'a better ZODB'.
+
+## Record codec
+
+A persisted record is `(oid, cid, tid, payload, crc)`.
+The payload is the msgpack encoding of the entity's field values in schema order, with every entity reference, direct or wrapped in `Lazy`, swizzled to a msgpack extension value carrying the 8-byte OID.
+Swizzling is an explicit pre-pass over the value tree, not an `enc_hook`: msgspec encodes dataclasses natively, so a hook would never see an entity and would inline it as a map.
+The pre-pass also rejects the two silently lossy shapes, non-entity dataclasses and sets.
+There is no pickle anywhere, so decoding cannot execute code; a CRC32 per record guards against torn or corrupt blobs.
+Tuples round-trip as lists, because msgpack has no tuple type.
+Temporal values (format v2) fix naive datetimes that used to round-trip as ISO strings.
+A tz-aware `datetime` rides msgpack's standard timestamp extension, so the UTC instant survives but not the offset.
+A naive `datetime`, a `date` and a `time` get datacrystal extension codes carrying their ISO text, which `fromisoformat` restores exactly; the extension code is what keeps the type.
+
+## Read-path loading and identity
+
+Loading an entity materializes the transitive closure of its eager references with an explicit work-queue, the read-path twin of the iterative write path, so load depth is bounded by the heap and not the C stack (#29).
+`Lazy` references are not followed; they return handles, so the cut point of invariant 6 is untouched.
+Each shell is registered before its fields are filled, so a back-edge resolves to the in-progress shell instead of recursing.
+If any fill fails (a dangling eager reference, a schema mismatch), every shell that call registered is discarded, so a partial load never leaves a half-built object behind the one-instance-per-OID contract.
+A refresh rebuilds the index from the records; the watermark-stamped sidecar is only read at open and is never authoritative (invariant 11).
+
+## Full-text sidecar (`datacrystal.fts`)
+
+The index is derived data in its own SQLite file: rebuildable from `store.snapshot()` at any time, never inside the store's commit transaction, and applied O(delta) (COMMIT-DELTA-v1 section 5, invariant 11).
+Watermark, type lineage and document rows move in one sidecar transaction per delta, so a crash mid-apply rolls back whole and replay resumes from the persisted watermark.
+
+- **Three columns per prose field.** `f_<field>` holds the fold-normalized exact tokens, `s_<field>` the fold-normalized Snowball stems, both written and queried through the same Python normalization, so consistency holds by construction; `r_<field>` keeps the raw text UNINDEXED as the snippet source. Queries match `f_` and `s_`, and BM25 weights prefer exact (2.0 against 1.0).
+- **Stem first, fold after.** Snowball stemmers need the diacritics the fold removes (Russian `й` and `ё` steer the suffix tables), so tokens are stemmed in lowercase NFC form and the stems are folded, identically at index and query time.
+- **Stemming is index-time, in Python.** sqlite3 cannot load custom FTS5 tokenizers; a bare `dc.FullText` (no language) means fold-only exact matching.
+- **Documents are rows, rowid = OID.** OIDs are unique across types, so one table indexes every configured type; `typename` is a filterable stored column.
+- **Folding is memoized (#55).** Folding is a pure per-character NFKD pass and was the index-build hot spot; a bounded LRU keyed on the exact input token cannot change the output bytes, so fold/stem symmetry and relevance are untouched.
+
+The limits (unsegmented CJK, refused abugida scripts, owner confinement) are in `docs/how-to/search.md`.
+
+## Arrow mirror (`datacrystal.arrow`)
+
+`apply()` runs on the store's owner thread, where deltas are delivered; call `table()` there too and hand the returned immutable `pyarrow.Table` to any thread or engine.
+A mirror directory has one owner process: opening it twice concurrently is unsupported, because the open-time orphan sweep would treat the other instance's fresh segments as crash debris.
+The per-record read fence lives in the engine and snapshot tier, not here: once a row lands in a segment, anyone who can read the parquet directory reads it unfenced (ADR-008 R13).
+Protect the mirror directory with filesystem permissions befitting its most sensitive mirrored class, and treat compacted parquet as sensitive as the store.
+`bootstrap(batch=...)` is independent of `flush_every`, which configures the post-bootstrap delta batching and defaults to 1; chunking the bootstrap by it would write one segment per row.
+Compaction is suppressed during the bootstrap stream, so each type compacts at most once.
+Bootstrapping a store with protected classes requires a root handle and raises up front otherwise, so a mistaken non-root call never wipes an existing good mirror or leaves a half-written one.
+That is enforcement, not elevation: bootstrap never derives a root handle for the caller, because choosing root is the caller's audited act.
+
+## Durability policy of the SQLite backend
+
+`durability="commit"` is `synchronous=FULL` plus `fullfsync=ON` on macOS, whose `F_FULLFSYNC` floor of about 4 ms was measured in the feasibility study; honesty over speed.
+`durability="never"` is for benchmarks and scratch stores only; an OS crash or power loss can corrupt the file.

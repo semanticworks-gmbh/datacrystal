@@ -113,3 +113,11 @@ storage-representation decision, not an API flag.**
   `.bytes()`/`.size`/`.hash` + demotion · (5) streamed read `open_blob` over a read_view · (6) streamed
   write (zeroblob + incremental fill, size-known). Each slice is independently shippable; S3 (7) and the
   chunked layout are separate, deferred.
+
+## Implementation notes (added with #191)
+
+- **Sink.** The blob sink runs during encoding, before the TID is allocated, so it records `(oid, size, hash, data)` now and the stored blobs are stamped with the commit's TID once known; a blob descriptor carries no TID. Each `dc.Blob` field with a value is split out: its bytes go to the blobs table and the record keeps only a `BLOB_EXT` descriptor, with the blob OID drawn from the partitioned OID space (invariant 6).
+- **Hydration.** A `dc.Blob` field hydrates to a lazy `BlobHandle`, never raw bytes: `.size` and `.hash` are free from the descriptor, `.bytes()` fetches on first touch and demotes like `Lazy`. The owner OID is passed only for a protected owner (ADR-008 W4-3), so an unprotected owner stays byte-identical.
+- **Streaming read.** `open_blob` pulls only the spanned bytes, so peak memory is bounded by the read buffer. The stream rides a private snapshot-isolated read view (ADR-002) and may be read from another thread while the owner commits; close it promptly, since it pins a WAL read transaction. Resolving the field reads the live entity, so the call is owner-confined (open from a `snapshot()` view for a fully off-owner read). An uncommitted raw-bytes value streams from memory; an uncommitted `dc.BlobSource` raises `ValueError`, since its bytes are not resident.
+- **Equivalence.** Blob fields compare by content hash, so an upsert that re-supplies the identical blob is a no-op and an unchanged blob behind a reopened entity is never rewritten; a blob against `None` differs. A `dc.BlobSource` has no resident hash (re-reading it would defeat streaming), so an upsert supplying one always rewrites.
+- **Fingerprints (debug mode).** A fingerprint needs determinism, not durability: a live `bytes` value is descriptor-ized from its own bytes with `oid` pinned to 0, because fingerprints are only compared within one representation epoch. A blob-bearing entity is fingerprinted through that same epoch rather than its stored CRC, whose descriptor carries the real blob OID.

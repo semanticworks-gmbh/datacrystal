@@ -2,9 +2,8 @@
 
 Indexes are rebuildable derived data (ROADMAP item 4): built lazily per class, then folded in at
 P3 of each commit; they may be cached on disk (ADR-005) but never join the commit transaction.
-They are deliberately not a commit-delta consumer (decided at M4): that would force prior-payload
-reads on every commit, so each keeps its own ``oid → last-indexed-values`` memory (KICKOFF.md).
-OIDs live above 2**32, hence ``BitMap64``.
+Not a commit-delta consumer (decided at M4): each keeps its own ``oid → last-indexed-values``
+memory (COMMIT-DELTA-v2.md, section 8). OIDs live above 2**32, hence ``BitMap64``.
 """
 
 from __future__ import annotations
@@ -767,8 +766,8 @@ def readable_bitmap(p: Any, ci: ClassIndexes) -> BitMap64 | None:
     The bitmap twin of :func:`datacrystal._permissions.can_read_row`: owner postings, union
     per held membership the group postings whose read floor is at most that level.
     Only call it for a protected class (zero-cost invariant, #21).
-    Iterating just ``p``'s memberships plus the implicit ``WORLD`` one is exact, because any
-    other group has ``NO_STANDING``, below every floor.
+    Iterating just ``p``'s memberships plus the implicit ``WORLD`` one is exact (proof:
+    docs/design/ADR-008-permissions-contract.md, "Read surfaces").
     """
     if is_root(p):
         return None

@@ -3,8 +3,8 @@
 A record is ``(oid, cid, tid, payload, crc)``; the payload is the msgpack encoding of the
 field values in schema order, every entity reference swizzled to an extension carrying its OID.
 Swizzling is an explicit pre-pass, not an ``enc_hook`` (msgspec would inline an entity as a map).
-There is no pickle (DESIGN.md), so decoding cannot execute code; tuples round-trip as lists.
-Naive ``datetime``, ``date`` and ``time`` ride datacrystal ext codes; aware ones keep the instant.
+There is no pickle, so decoding cannot execute code; tuples become lists; naive temporal values
+ride datacrystal ext codes (docs/design/DESIGN.md, "Record codec").
 """
 
 from __future__ import annotations

@@ -3,8 +3,8 @@
 A COMMIT-DELTA-v2 consumer keeping one Arrow table per mirrored type, persisted as parquet segments
 under an atomic ``manifest.json``; ``compact()`` leaves a plain parquet datalake.
 A mirror of a protected class is plaintext on disk (ADR-008 R13), and a mirror directory has one
-owner process and one owner thread for ``apply()`` and ``table()``.
-Storage model and schema lattice: docs/how-to/analytics.md.
+owner process and one owner thread for ``apply()`` and ``table()`` (docs/design/DESIGN.md,
+"Arrow mirror"). Storage model and schema lattice: docs/how-to/analytics.md.
 """
 
 from __future__ import annotations

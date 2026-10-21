@@ -232,3 +232,25 @@ These were the genuine choices; ratified with the defaults below so the contract
 - /v1/submit response = {applied_tid, keys} where applied_tid = store.last_tid after commit (_store.py:464,1046) and keys = {natural_key_value: oid} read from the unique map ci.unique[key].get(value) after P3 fold (_store.py:1005,703-704). NEW OIDs are minted in P1 via next_oid() (_ids.py:55, _store.py:2056).
 - /v1/head = {tid: store.last_tid, format: 'datacrystal-delta', version: 1}; a follower fails closed before pulling if version exceeds what it supports.
 - A delta gap on /v1/deltas (after behind the oldest retained segment) is refused loudly (DeltaGapError, applier.py:108-112) and forces a from-zero re-bootstrap (replay(after_tid=0), deltalog.py:296) — guessing is forbidden.
+
+---
+
+## Implementation notes (added with #191; no change to the locked contract)
+
+### Threading: the routes are `async def`
+
+`head` and `deltas` are `async def` on purpose.
+They run on the event-loop thread, which is the store's owner thread (ADR-001), so reading the watermark and replaying are serialized with the inline `/v1/submit` commit.
+A sync handler would run in Starlette's threadpool, off the owner thread, where `DeltaLog.replay` would iterate lock-free segment state while a commit mutates it, silently yielding a short or repeated frame stream, which is a wire gap the contract forbids (#149).
+`replay` never awaits, so the loop cannot interleave a commit into it.
+Cost in v0: a large replay, notably a from-genesis `after=0` bootstrap, blocks the event loop for its duration; bootstrap is one-time per follower and history is bounded by DeltaLog retention, and chunked replay is a demand-driven follow-on.
+
+### Why a rejected batch discards
+
+A batch interleaves the OCC check and the upsert per op, so a rejected later op (OCC, schema skew, dangling ref) would leave the earlier ops' upserts buffered, and the next `/v1/submit` commit would flush them, making a 409-rejected contribution durable and replicated.
+The coordinator therefore calls `discard()` on the owner thread after a failed batch; the happy path commits and never discards.
+
+### Identity honesty (epic #168 W1)
+
+A contribution is a third party's write, and stamping it with the coordinator operator's ambient principal would put remote work under the operator's name in the permanent audit log.
+Until per-follower principals land (permissions phase 3), every contribution stamps anonymous (`actor=0`): "identity not known", never "the operator did this".

@@ -4,6 +4,7 @@ Owner-confined (ADR-001): foreign threads get ``WrongThreadError``. Commit is AD
 machine: P1 captures on the owner, P2 applies on the IO worker, P3 finalizes on the owner; a failed
 P2 reuses its TID, keeping the sequence gapless. Writes buffer until ``commit()``; the storer holds
 pending objects strongly and pins the root.
+Details: docs/design/ADR-001-concurrency-contract.md, "Implementation notes".
 """
 
 from __future__ import annotations
@@ -409,8 +410,8 @@ class Store:
         Synchronous and owner-thread (the v0 follower contract); only an ``open_follower`` store
         can sync. A live reference to a CLEAN entity read before a sync keeps stale values:
         re-query.
-        Raises ``DeltaGapError`` (resync from 0), and ``RuntimeError`` for a non-follower or
-        buffered writes.
+        Raises ``DeltaGapError`` (resync from 0), ``RuntimeError`` for a non-follower or buffered
+        writes. The OCC recovery loop: docs/design/COMMIT-DELTA-v2.md, section 8.
         """
         self._enter()
         if self._sync_fn is None:
@@ -441,6 +442,7 @@ class Store:
         stale write re-runs the block on fresh state (``discard``, ``sync``) up to ``retries``
         times, then raises ``ConflictError``. Never call :meth:`commit` inside;
         ``WriteDeniedError`` is not retried (ADR-008).
+        Details: docs/reference.md, "Behaviour notes".
         """
         self._enter()
         tries = 0
@@ -469,6 +471,7 @@ class Store:
         Commits are stamped with the committing principal's uid (COMMIT-DELTA-v2), not the
         buffering one. Under ``aopen()`` the scope is task-confined (contextvars). A foreign thread
         has no scopes and reads the ambient identity.
+        Details: docs/reference.md, "Behaviour notes".
         """
         stack = self._acting.get()
         return stack[-1] if stack else self._principal
@@ -481,6 +484,7 @@ class Store:
         committed ``dc.Actor`` registry, where a non-human needs a sponsor. Scopes nest; under
         ``aopen()`` a task spawned inside the scope inherits its identity.
         Raises ``UnknownActorError``, ``UncommittedActorError``, ``SponsorRequiredError``.
+        Details: docs/reference.md, "Behaviour notes".
         """
         self._enter()
         if isinstance(subject, Principal):
@@ -509,6 +513,7 @@ class Store:
         A non-human must name a sponsor that resolves to a committed human actor. Reads via
         :meth:`_get_by_key_unchecked`, not :meth:`get` (ADR-008 W3-3): a fenced lookup would raise
         ``UnknownActorError`` for a session that cannot yet read its own registry row.
+        See docs/design/ADR-008-permissions-contract.md, "R14 deref checkpoint".
         """
         actor = self._get_by_key_unchecked(Actor, "uid", uid)
         if actor is None:
@@ -553,7 +558,7 @@ class Store:
         ``durability`` is the fsync triad: ``"commit"``, ``"interval"`` (default), ``"never"``.
         ``debug`` fingerprints live entities per commit; ``strict_deletes`` is the ADR-003 check.
         ``cache_index`` writes the index sidecar (ADR-005); ``lazy_timeout`` demotes idle handles.
-        ``principal`` is the ambient identity (default ``uid=0``); see docs/reference.md.
+        ``principal`` is the ambient identity (default ``uid=0``); see reference.md, "Behaviour notes".
         """
         import sqlite3
 
@@ -885,6 +890,7 @@ class Store:
         The OCC base token of ``/v1/submit`` (#155, FEDERATION-WIRE-v1). It hashes the persisted
         bytes, not a re-encode of the live entity, whose lineage or defaults can diverge. Runs on
         the owner thread inside the ``submit`` fan-in.
+        See docs/design/COMMIT-DELTA-v2.md, section 8.
         """
         if self._cid_by_typename.get(ti.typename) is None:
             return None
@@ -957,6 +963,7 @@ class Store:
         (OCC). They go to ``_contribute_fn`` (``POST /v1/submit``); on success :meth:`sync` pulls
         the delta back. A reject raises ``ConflictError`` or ``SchemaSkewError`` with the buffers
         intact.
+        See docs/design/COMMIT-DELTA-v2.md, section 8.
         """
         assert self._contribute_fn is not None
         if self._deleted:  # /v1/submit is upsert-only (FEDERATION-WIRE-v1 §3) —
@@ -1265,6 +1272,7 @@ class Store:
         floor must be at most the committer's authority (R8). Root bypasses (R9), decided from the
         principal alone; root commits still stamp. Denial raises ``WriteDeniedError`` with the
         buffers intact; ``committing()`` never retries it.
+        See docs/design/ADR-008-permissions-contract.md, "Birth labels and the write fence".
         """
         p = self.principal
         if is_root(p):
@@ -1468,6 +1476,7 @@ class Store:
         ``strict_deletes=True`` raises, ``debug=True`` alone warns; it runs in P1 before the TID
         (invariant 5). The flagged set equals ``incoming(dead)`` after this commit's P3 folds:
         pre-commit referrers, reconciled with this commit's refs, minus co-deleted ones.
+        Reconstruction: docs/design/ADR-003-delete-semantics.md, "Dev-time bridge".
         """
         deleted_oids = {oid for oid, _, _ in deletes}
         rev = self._index.ensure_reverse()  # pre-commit map (forced built by P1)
@@ -1659,6 +1668,7 @@ class Store:
         so a consumer behind rebuilds from ``store.snapshot()``, and one ahead means a stale
         sidecar (fitness #13).
         Raises ``DeltaGapError`` for either mismatch and ``DataCrystalError`` if already attached.
+        See docs/design/COMMIT-DELTA-v2.md, section 8.
         """
         self._enter()
         watermark = consumer.watermark
@@ -2396,6 +2406,7 @@ class Store:
         ``_dc_owner`` is the acting principal's uid, never inherited (R6 provenance). Groups and
         both floors copy from the enqueuing protected container, else the inert R6 defaults stay.
         ``object.__setattr__`` is frozen-safe (mirrors ``_fill_entity``).
+        See docs/design/ADR-008-permissions-contract.md, "Birth labels and the write fence".
         """
         uid = self.principal.uid
         object.__setattr__(obj, "_dc_owner", uid)
@@ -2525,6 +2536,7 @@ class Store:
 
         A hydrated ``dc.Blob`` holds a ``BlobHandle`` whose descriptor is already stable. ``oid``
         is pinned to 0: fingerprints are only compared within one representation epoch.
+        See docs/design/ADR-007-blob-fields.md, "Implementation notes".
         """
         values = [getattr(obj, name) for name in ti.field_names]
         positions = self._blob_positions(ti)
@@ -2554,6 +2566,7 @@ class Store:
         unprotected owner costs nothing. It judges committed labels like the deref checkpoint (D1);
         root passes.
         Raises ``ReadDeniedError`` when the owning record is unreadable.
+        See docs/design/ADR-008-permissions-contract.md, "R14 deref checkpoint".
         """
         p = self.principal
         if is_root(p):
@@ -2718,6 +2731,7 @@ class Store:
         pre-grant itself. Unlike :meth:`_load_oid` (principal-free by design, R11) it serves deref
         surfaces only. A registry hit is checked too, so no principal sees an instance another one
         loaded.
+        See docs/design/ADR-008-permissions-contract.md, "R14 deref checkpoint".
         """
         self._guard()
         obj = self._registry.get(oid)
@@ -2778,6 +2792,7 @@ class Store:
         stack (#29); ``Lazy`` refs are not followed (invariant 6). Each shell is registered before
         its fields are filled, so a back-edge finds the in-progress shell. If any fill fails, every
         shell this call registered is discarded.
+        See docs/design/DESIGN.md, "Read-path loading and identity".
         """
         registered: list[int] = []
         fill_queue: deque[tuple[Any, StoredRecord]] = deque()

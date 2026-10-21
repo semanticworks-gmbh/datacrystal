@@ -134,3 +134,7 @@ commit's harvested outgoing refs, minus the co-deleted set — so prior-commit A
 same-commit NEW/DIRTY referrers are flagged, and a co-deleted referrer is not.
 The real fix (refuse/cascade) still waits for v1 checked deletes; this only makes
 the existing dangle loud earlier.
+
+The check runs at P1, where the reverse map (forced by `ensure_reverse` in the P1 capture, before the ref-harvest gate) still reflects the pre-commit watermark.
+It reconstructs the post-fold referrers per deleted OID: the pre-commit referrers, reconciled against this commit's harvested outgoing refs (a NEW or DIRTY referrer that now points at the dead OID is added, a DIRTY referrer that dropped the ref is removed), minus the co-deleted set, whose outgoing edges vanish.
+Unarmed, the harvest gate stays lazy and the reverse index stays unbuilt.
