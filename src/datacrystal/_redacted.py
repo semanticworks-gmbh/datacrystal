@@ -43,7 +43,7 @@ def twin_class(ti: TypeInfo) -> type:
         return cls
     denied = frozenset(ti.field_names) | {"dc_permissions"}
 
-    def _get(self: Any, name: str) -> Any:
+    def _get(self: object, name: str) -> object:
         if name in denied:
             raise ReadDeniedError(
                 f"this {ti.cls.__name__} is redacted for the current principal "
@@ -52,19 +52,19 @@ def twin_class(ti: TypeInfo) -> type:
             )
         return object.__getattribute__(self, name)
 
-    def _set(self: Any, name: str, value: Any) -> None:
+    def _set(self: object, name: str, value: object) -> None:
         raise ReadDeniedError(
             f"a redacted {ti.cls.__name__} is frozen and never committable "
             "(ADR-008 R14)"
         )
 
-    def _falsy(self: Any) -> bool:
+    def _falsy(self: object) -> bool:
         return False  # the study's falsy-stub semantics
 
-    def _typename(self: Any) -> str:
+    def _typename(self: object) -> str:
         return ti.typename
 
-    def _twin_repr(self: Any) -> str:
+    def _twin_repr(self: object) -> str:
         return f"<Redacted {ti.cls.__name__} oid={object.__getattribute__(self, '_dc_twin_oid')}>"
 
     namespace: dict[str, Any] = {
@@ -82,13 +82,13 @@ def twin_class(ti: TypeInfo) -> type:
     return cls
 
 
-def make_twin(ti: TypeInfo, oid: int) -> Any:
+def make_twin(ti: TypeInfo, oid: int) -> Redacted:
     """Build one redacted-twin instance for ``oid``; twins are never cached.
 
     ``object.__new__`` skips the entity ``__new__`` hook, so no engine slot is set and nothing can
     mistake a twin for a live record.
     Only ``_dc_twin_oid`` is stamped, because the twin's own ``__setattr__`` always raises.
     """
-    twin = cast("Any", object.__new__(twin_class(ti)))
+    twin = cast("Redacted", object.__new__(twin_class(ti)))
     object.__setattr__(twin, "_dc_twin_oid", oid)
     return twin
