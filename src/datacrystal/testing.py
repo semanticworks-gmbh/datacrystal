@@ -1,23 +1,10 @@
-"""``datacrystal.testing`` — the COMMIT-DELTA-v2 consumer conformance kit.
+"""The COMMIT-DELTA-v2 consumer conformance kit (KICKOFF M3).
 
-KICKOFF M3 deliverable: extension authors (FTS, vector, mirrors, replication
-followers, …) certify their delta consumers against the spec §4 obligations
-*before* shipping them. The kit is engine-free — it builds synthetic delta
-streams (mineral-cabinet flavored, one domain everywhere) and probes a
-consumer through nothing but its public ``watermark``/``apply()`` surface::
-
-    from datacrystal.testing import check_delta_consumer
-    check_delta_consumer(MySidecar, content=lambda c: c.indexed_state())
-
-``content`` is optional but strongly recommended: it must return an
-equality-comparable picture of the consumer's *derived state* (what it
-indexed/counted/mirrored — NOT its watermark). Only with it can the kit
-verify effect-freeness of idempotent skips and that updates/deletes
-un-index stale values using the deltas' ``prior`` payloads (spec §3).
-
+Authors certify a delta consumer against the spec section 4 obligations before shipping it.
+The kit is engine-free and probes only the public ``watermark`` and ``apply()``.
+``content`` returns a comparable picture of the derived state; it enables the effect-freeness
+checks.
 Every check raises ``AssertionError`` naming the violated spec section.
-``CountingConsumer`` is the canonical minimal consumer (KICKOFF's "toy
-counter") — it doubles as executable documentation of the obligations.
 """
 
 from __future__ import annotations
@@ -290,13 +277,14 @@ def check_delta_consumer(
 class CountingConsumer:
     """The toy counter (KICKOFF M3): live-record counts per typename.
 
-    Minimal but *fully obligated* — every spec §4 rule is implemented, which
-    is exactly the point: read this class as the executable answer to "what
-    must my consumer do?". It needs no ``prior`` payloads; consumers whose
-    derived state reflects record *values* (FTS, vector, mirrors) do.
+    Fully obligated: every spec section 4 rule is implemented, so it doubles as executable
+    documentation.
+    It needs no ``prior`` payloads; consumers whose state reflects record values (FTS, vector,
+    mirrors) do.
     """
 
     def __init__(self) -> None:
+        """Start empty at watermark 0."""
         self.watermark = 0
         self.counts: dict[str, int] = {}
         self._typename_by_cid: dict[int, str] = {}
@@ -304,11 +292,11 @@ class CountingConsumer:
 
     @classmethod
     def bootstrap(cls, snapshot: Any) -> CountingConsumer:
-        """Build a consumer that joins mid-stream: deltas only carry NEW
-        type rows (spec §2) and are never retained (§5), so a sidecar
-        attaching to a lived-in store takes its lineage, its initial
-        derived state, and its watermark from one ``store.snapshot()`` —
-        this is the canonical sidecar bootstrap recipe.
+        """Build a consumer that joins mid-stream from one ``store.snapshot()``, the canonical
+        sidecar bootstrap.
+
+        Deltas carry only new type rows (spec section 2) and are never retained (section 5), so
+        lineage, state and watermark come from the snapshot.
         """
         consumer = cls()
         consumer.watermark = snapshot.tid
@@ -321,6 +309,9 @@ class CountingConsumer:
         return consumer
 
     def apply(self, delta: dict[str, Any]) -> bool:
+        """Apply one delta and return whether it changed anything; a replayed tid is a no-op (spec
+        section 4).
+        """
         if delta.get("f") != FORMAT_MARKER:
             raise DeltaFormatError(f"not a datacrystal delta: f={delta.get('f')!r}")
         version = delta.get("v")
@@ -365,5 +356,5 @@ class CountingConsumer:
         return True
 
     def content(self) -> dict[str, int]:
-        """The derived state for ``check_delta_consumer(content=...)``."""
+        """Return the derived state for ``check_delta_consumer(content=...)``."""
         return {name: n for name, n in sorted(self.counts.items()) if n}

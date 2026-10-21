@@ -1,28 +1,9 @@
-"""datacrystal — your live objects, crystallized.
+"""datacrystal, your live objects crystallized: an embedded object-graph database for Python,
+inspired by EclipseStore.
 
-An embedded object-graph database for Python, inspired by EclipseStore:
-typed Python objects **are** the database — pickle-free, crash-safe, with
-bitmap-indexed queries built in.
-
-Quickstart::
-
-    from typing import Annotated
-    import datacrystal as dc
-
-    @dc.entity
-    class Mineral:
-        qid: Annotated[str, dc.Unique]
-        name: str
-        crystal_system: Annotated[str | None, dc.Index] = None
-
-    store = dc.Store.open("cabinet.store")
-    if store.root is None:
-        store.root = [Mineral(qid="Q43010", name="quartz", crystal_system="trigonal")]
-    store.commit()
-    hits = store.query(Mineral.crystal_system == "trigonal")
-    store.close()
-
-Design docs: docs/design/ in the repository (DESIGN.md, ROADMAP.md, ADR-001).
+Typed Python objects are the database: pickle-free, crash-safe, with bitmap-indexed queries built
+in.
+Quickstart: README.md; design docs: docs/design/ (DESIGN.md, ROADMAP.md, ADR-001).
 """
 
 from typing import TYPE_CHECKING

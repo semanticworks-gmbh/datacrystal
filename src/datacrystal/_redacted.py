@@ -1,14 +1,9 @@
-"""Redacted twins (ADR-008 R14 variant (a)): deref of a denied-but-existing
-protected record returns a per-class, frozen, field-empty stand-in —
-traversal is graceful, USING redacted data raises :class:`ReadDeniedError`.
-Twins are per-principal ephemera and NEVER enter the shared identity
-registry (the R14 ruled exception to invariant 6, declared here the way
-ADR-005 amended invariant 11).
+"""Redacted twins (ADR-008 R14 variant (a)).
 
-A LEAF-ish module: imports ``_entity`` and ``_errors`` ONLY. Nothing else
-imports this module except ``_store`` (the checkpoint, epic #168 W3-4) and
-the top-level package (the public ``dc.Redacted`` name) — so there is no
-cycle with ``_entity``/``_errors``.
+Dereferencing a denied-but-existing protected record returns a frozen, field-empty stand-in.
+Traversal is graceful; using redacted data raises :class:`ReadDeniedError`.
+Twins are per-principal ephemera and never enter the shared identity registry (R14).
+Imports ``_entity`` and ``_errors`` only.
 """
 
 from __future__ import annotations
@@ -20,12 +15,10 @@ from datacrystal._errors import ReadDeniedError
 
 
 class Redacted:
-    """Public marker base (``dc.Redacted``).
+    """Public marker base (``dc.Redacted``); ``isinstance(x, Redacted)`` tells callers to skip field
+    access.
 
-    ``isinstance(x, Redacted)`` is the one branch UI/pipeline code needs to
-    check before touching a deref result; ``isinstance(x, TheEntityClass)``
-    also holds (ADR-008 R14 variant (a)) — typed call sites keep their ``T``
-    with zero rewrite.
+    ``isinstance(x, TheEntityClass)`` also holds, so typed call sites keep their ``T``.
     """
 
     __slots__ = ()
@@ -37,22 +30,13 @@ _TWIN_CLS: dict[type, type] = {}
 
 
 def twin_class(ti: TypeInfo) -> type:
-    """The per-class redacted-twin TYPE for ``ti``'s entity class.
+    """Return the per-class redacted-twin type for ``ti``'s entity class, built once and cached.
 
-    Built once per real class, cached forever. The twin's MRO is
-    ``(RedactedX, Redacted, X, ...)``: ``isinstance`` holds both ways, and
-    ``type_info(twin)`` resolves through the inherited ``__dc_typeinfo__``
-    to ``X``'s own (protected) :class:`TypeInfo` — deliberately, since that
-    is what keeps a twin from ever being cached inside an engine ``Lazy``
-    handle (:meth:`~datacrystal._lazy.Lazy.get` checks ``.protected``).
-
-    Every persisted name — the data fields AND the four ``_dc_*`` label
-    columns (labels of an unreadable record are themselves a leak) plus the
-    ``dc_permissions`` view — is field-empty by construction: the parent's
-    slot descriptors exist but are never filled, and ``__getattribute__``
-    intercepts every one of those names BEFORE descriptor lookup fires.
-    Non-field names (``typename``, ``__class__``, ``_dc_twin_oid``,
-    dunders) pass through untouched.
+    The MRO is ``(RedactedX, Redacted, X, ...)``, so ``type_info(twin)`` is ``X``'s protected
+    :class:`TypeInfo`.
+    That keeps a twin out of any engine ``Lazy`` handle (:meth:`~datacrystal._lazy.Lazy.get` checks
+    ``.protected``).
+    ``__getattribute__`` intercepts every persisted name, labels and ``dc_permissions`` included.
     """
     cls = _TWIN_CLS.get(ti.cls)
     if cls is not None:
@@ -99,17 +83,11 @@ def twin_class(ti: TypeInfo) -> type:
 
 
 def make_twin(ti: TypeInfo, oid: int) -> Any:
-    """Build one redacted-twin INSTANCE for ``oid``.
+    """Build one redacted-twin instance for ``oid``; twins are never cached.
 
-    ``object.__new__`` bypasses the entity ``__new__`` hook (``_entity_new``)
-    entirely, so NO engine slot (``__dc_oid__``/``__dc_state__``/
-    ``__dc_store__``) is ever set — nothing in the engine can mistake a twin
-    for a live, registered record (``oid_of(twin)`` is ``None``,
-    ``state_of(twin)`` raises ``AttributeError``). Only ``_dc_twin_oid`` is
-    stamped, via one ``object.__setattr__`` (the twin's own ``__setattr__``
-    always raises). Twins are never cached — two derefs of the same denied
-    OID build two distinct twin objects (entity equality is identity-only
-    by design, and twins are ephemera; see ADR-008 R14 / W3-4).
+    ``object.__new__`` skips the entity ``__new__`` hook, so no engine slot is set and nothing can
+    mistake a twin for a live record.
+    Only ``_dc_twin_oid`` is stamped, because the twin's own ``__setattr__`` always raises.
     """
     twin = cast("Any", object.__new__(twin_class(ti)))
     object.__setattr__(twin, "_dc_twin_oid", oid)
