@@ -48,6 +48,7 @@ store.close()
   Deltas are not retained, so a consumer that is behind, or ahead after a restore from backup, rebuilds from a snapshot.
 - Updates carry the record's prior payload, so index-shaped consumers un-index old values without reading the store, and `store.delete()` emits tombstones through the same channel.
 - A consumer that raises is detached with a `ConsumerDetachedWarning`; the commit stays durable and the sidecar rebuilds and re-attaches.
+  Under `-W error` the warning raises out of `commit()` after the commit is durable, and consumers later in the attach order miss that delta.
 - To write a consumer, implement `dc.DeltaConsumer` (a `watermark` property plus `apply(delta)`) and certify it with `datacrystal.testing.check_delta_consumer(factory, content=...)`.
   `CountingConsumer` is the minimal reference, and [search](search.md) and [analytics](analytics.md) are the shipping examples.
 - `datacrystal.deltalog` is the consumer that ships with core, with no extra and no third-party dependency.
