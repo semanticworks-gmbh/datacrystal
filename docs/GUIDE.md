@@ -1,58 +1,56 @@
 # datacrystal documentation
 
-datacrystal is an embedded object-graph database for Python: your typed live objects **are** the
-database. Define dataclasses, mutate them, call `commit()` — datacrystal keeps the whole graph
-durable and queryable across restarts, same objects, same identities, same references. No ORM, no
-schema files, no `save()`, no pickle. This documents `0.7.0` (2026-06); the public API freezes at
-the v0.1.0 tag, and features that do not exist yet are always marked `[planned — …]`.
+After this page you can run a first store and find the page that teaches the next thing you need.
 
-The docs follow the [Diátaxis](https://diataxis.fr) split — four modes, each answering a different
-question. Start wherever your need is:
+```python
+from typing import Annotated
 
-## [Tutorial](tutorial.md) — learn by doing
+import datacrystal as dc
 
-A hand-held first session: install, define a tiny model, open a store, add data, commit, reopen and
-see it persisted, run a query, follow a lazy reference. Decision-free — just follow along.
+@dc.entity
+class Mineral:
+    qid: Annotated[str, dc.Unique]
+    name: str
+    crystal_system: Annotated[str, dc.Index]
 
-## How-to guides — get a specific job done
+with dc.Store.open("cabinet.store") as store:
+    if store.root is None:
+        store.root = {"seeded": True}
+        store.store(Mineral(qid="Q193563", name="azurite", crystal_system="monoclinic"))
+        store.commit()
+    print([m.name for m in store.query(Mineral.crystal_system == "monoclinic")])
+```
 
-Goal-oriented recipes with runnable snippets:
+Run it twice: the second run finds the data the first one committed.
 
-- [Query and page results](how-to/querying-and-paging.md) — limit/offset, `order_by`, top-N paging,
-  backlinks (`incoming()`).
-- [Ingest big data and keep memory bounded](how-to/ingest-and-memory.md) — streaming ingest,
-  `query_iter`, parallel ingest.
-- [Evolve your schema](how-to/schema-evolution.md) — `RenamedFrom`, `Glue`, `migrate`/`verify`,
-  deriving an indexed field.
-- [Store binary blobs](how-to/blobs.md) — `dc.Blob`, streamed read/write, when to use a `Blob`
-  entity.
-- [Restrict who can read a record](how-to/permissions.md) — `protected=True`, `dc.share`, the
-  masked deref (`dc.Redacted`), root break-glass.
-- [Deploy behind FastAPI and GraphQL](how-to/web-deployment.md) — `datacrystal[web]` reflection +
-  deployment doctrine.
-- [Run a coordinator + edge followers](how-to/federation.md) — `datacrystal[web]` federation:
-  `Store.follower`, local reads, `sync()` catch-up, contribute + `committing()` (the OCC retry loop).
-- [Full-text search](how-to/search.md) — `datacrystal[fts]`, FTS5 + Snowball stemming.
-- [Vector and hybrid search](how-to/vector-search.md) — bring-your-own embeddings, exact top-k,
-  RRF fusion with `datacrystal[fts]`.
-- [Analytics with Arrow mirrors](how-to/analytics.md) — `datacrystal[arrow]` + DuckDB.
-- [Snapshots, the commit stream, and the delta log](how-to/snapshots-and-delta-log.md).
+The pages follow the [Diátaxis](https://diataxis.fr) split, and a feature that does not exist yet is marked `[planned — …]`.
 
-## [Reference](reference.md) — look up the exact API
+## Tutorial
 
-Dry, complete, accurate: every method, option, guarantee, error, and the type-checker quirks. The
-authoritative description of the public surface.
+[Your first mineral cabinet](tutorial.md) defines a model, stores it, reopens it, queries it and follows a lazy reference.
 
-## [Explanation](explanation.md) — understand the why
+## How-to guides
 
-The mental model: identity and memory, the rule-based query planner and candidate sets, why deletes
-are unchecked, and the design philosophy.
+- [Query and page results](how-to/querying-and-paging.md): `limit`, `offset`, `order_by`, top-N and `incoming()`.
+- [Ingest big data and keep memory bounded](how-to/ingest-and-memory.md): free-floating entities, `query_iter` and parallel parsing.
+- [Evolve your schema](how-to/schema-evolution.md): `RenamedFrom`, `Glue`, `migrate` and `verify`.
+- [Store binary blobs](how-to/blobs.md): `dc.Blob`, streamed reads and writes.
+- [Restrict who can read a record](how-to/permissions.md): `protected=True`, `dc.share`, `dc.Redacted` and root.
+- [Serve a store over FastAPI and GraphQL](how-to/web-deployment.md): `datacrystal[web]` routes, reflection and request identity.
+- [Run a coordinator and edge followers](how-to/federation.md): `Store.follower`, `sync()` and `committing()`.
+- [Search prose fields](how-to/search.md): `datacrystal[fts]` with stemming and BM25.
+- [Search by vector and fuse rankings](how-to/vector-search.md): your embeddings, exact top-k and RRF.
+- [Run analytics on Arrow mirrors](how-to/analytics.md): `datacrystal[arrow]` and DuckDB.
+- [Read from any thread, follow the commit stream and keep an audit log](how-to/snapshots-and-delta-log.md): snapshots, consumers and `DeltaLog`.
+
+## Reference
+
+[Reference](reference.md) lists every method, option, guarantee and error, and the type-checker quirks.
+
+## Explanation
+
+[Explanation](explanation.md) covers identity and memory, the query planner, unchecked deletes, permissions, followers and the design philosophy.
 
 ## Design documents
 
-The ratified decisions behind all of the above live in [docs/design/](design/):
-[VISION.md](design/VISION.md) (the product "why"), [DESIGN.md](design/DESIGN.md) (architecture),
-[ROADMAP.md](design/ROADMAP.md) (scope authority), [KICKOFF.md](design/KICKOFF.md) (engineering
-standards), the [ADRs](design/) (contract decisions), [SCALING.md](design/SCALING.md), and the
-[sidecar read-fence pattern](design/SIDECAR-READ-FENCE.md) (how to permission-fence a new
-OID-addressed query sidecar like `datacrystal[vector]`).
+[docs/design/](design/) holds the decisions behind the pages above: [VISION.md](design/VISION.md), [DESIGN.md](design/DESIGN.md), [ROADMAP.md](design/ROADMAP.md) (scope authority), [KICKOFF.md](design/KICKOFF.md) (engineering standards), the [ADRs](design/), [SCALING.md](design/SCALING.md) and the [sidecar read-fence pattern](design/SIDECAR-READ-FENCE.md).
