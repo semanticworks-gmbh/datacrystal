@@ -22,6 +22,7 @@ from datacrystal._storage.memory import MemoryBackend
 from datacrystal._storage.protocol import (
     BootInfo,
     CommitBatch,
+    StorageBackend,
     StorageReadView,
     StoredBlob,
     StoredRecord,
@@ -34,7 +35,7 @@ StoreFactory = Callable[[], dc.Store]
 class _Recording:
     """Backend wrapper recording which thread runs each apply()."""
 
-    def __init__(self, inner: MemoryBackend) -> None:
+    def __init__(self, inner: StorageBackend) -> None:
         self._inner = inner
         self.apply_threads: list[int] = []
 
@@ -64,7 +65,7 @@ class _Recording:
 class _FailNTimes(_Recording):
     """Recording backend whose next `failures` apply() calls raise OSError."""
 
-    def __init__(self, inner: MemoryBackend, failures: int) -> None:
+    def __init__(self, inner: StorageBackend, failures: int) -> None:
         super().__init__(inner)
         self.failures = failures
 
