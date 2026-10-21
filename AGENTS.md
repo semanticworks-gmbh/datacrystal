@@ -22,6 +22,7 @@ uv run scripts/test_testrules.py     # the testrules self-tests
 uv run scripts/testrules.py <test_*.py>  # readable-tests check; CI runs it on the test modules a PR changes
 uv run python examples/minerals/demo.py    # run TWICE — second run must find the first run's data
 uv run pytest benchmarks -q -s       # KICKOFF §6 PR perf gates (warn-stage; DC_BENCH_STRICT=1 hardens)
+grep -rn --exclude-dir=research 'pattern' src tests docs   # search code and docs, skipping docs/research
 ```
 
 If `uv run pytest` fails with "No module named datacrystal" after the repo moved: stale venv
