@@ -7,8 +7,7 @@
 
 Usage: uv run scripts/check_suppressions.py [<dir-or-file>...]   (default: src)
 Ruff and pyrefly read the keywords in any letter case, so the check does too.
-A `# noqa` names its codes, only BLE001, TRY004, UP007 or ANN401, and ends in ` - <reason>`.
-A `# pyrefly: ignore[<code>]` ends in ` - <reason>`.
+A `# noqa` (BLE001, TRY004, UP007, ANN401) or `# pyrefly: ignore[<code>]` ends in ` - <reason>`.
 `type: ignore` and the file-wide `ruff: noqa`, `flake8: noqa`, `pyrefly: ignore-errors` are refused.
 Prints file:line and the problem per finding; exit 1 on any.
 """
