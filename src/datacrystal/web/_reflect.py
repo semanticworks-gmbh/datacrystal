@@ -31,14 +31,14 @@ class FieldDescriptor:
     spec: FieldSpec
 
 
-def _strip_annotated(hint: Any) -> Any:
+def _strip_annotated(hint: object) -> object:
     """Peel ``Annotated[...]`` wrappers down to the bare core type."""
     while get_origin(hint) is Annotated:
         hint = get_args(hint)[0]
     return hint
 
 
-def referenced_entities(core_type: Any) -> tuple[type, ...]:
+def referenced_entities(core_type: object) -> tuple[type, ...]:
     """Return the ``@entity`` classes a field's core type can point at (deduped, in order).
 
     Walks through ``Lazy[...]``, unions and containers: ``Lazy[Locality] | None`` yields
@@ -49,7 +49,7 @@ def referenced_entities(core_type: Any) -> tuple[type, ...]:
     return tuple(seen.values())
 
 
-def list_ref_target(core_type: Any) -> type | None:
+def list_ref_target(core_type: object) -> type | None:
     """Return the single ``@entity`` referent of a list-valued reference field, or ``None``.
 
     Covers ``list[Lazy[T]]`` and ``list[T]`` / ``tuple[T, ...]`` edges (story #103).
@@ -65,7 +65,7 @@ def list_ref_target(core_type: Any) -> type | None:
     return targets[0] if len(targets) == 1 else None
 
 
-def _collect_entities(hint: Any, seen: dict[int, type]) -> None:
+def _collect_entities(hint: object, seen: dict[int, type]) -> None:
     while get_origin(hint) is Annotated:
         hint = get_args(hint)[0]
     if isinstance(hint, EntityMeta):

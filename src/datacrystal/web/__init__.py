@@ -86,7 +86,7 @@ _LAZY: dict[str, str] = {
 }
 
 
-def __getattr__(name: str) -> Any:
+def __getattr__(name: str) -> Any:  # noqa: ANN401 - PEP 562 lazy attribute, any exported name
     """Import the submodule owning a strawberry- or fastapi-backed name on first access (PEP 562).
 
     A follower install (no strawberry/fastapi) can therefore import this package.
