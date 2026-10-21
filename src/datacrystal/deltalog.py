@@ -1,65 +1,10 @@
-"""``datacrystal.deltalog`` — a durable, replayable record of the commit
-stream (ROADMAP item 23, the first post-tag PR; promoted into early v0.x
-2026-06-12 for the metadata / systems-of-record persona).
+"""Durable, replayable record of the commit stream: the audit history (ROADMAP item 23).
 
-The watermark pipeline's third real consumer, and the one that finally
-gives the store an **audit history**: every acknowledged commit is one
-[COMMIT-DELTA-v2](../../docs/design/COMMIT-DELTA-v2.md) delta, and a
-``DeltaLog`` appends those deltas — byte-for-byte, in TID order — to an
-append-only file set. Replaying the log reconstructs the state at any past
-watermark (time-travel-by-replay), feeds a follower (the transport
-precondition for networked replication), and lets a downstream system see
-exactly *what changed, when*.
-
-The engine itself still never retains (COMMIT-DELTA-v1 §5 stands unchanged:
-"not retained by default … retention/replay across restarts is the
-consumer's business"). This module **is** that consumer — it rides
-``store.attach()`` like every sidecar and needs no engine change, no new
-contract version, and no third-party dependency (stdlib + msgspec only, so
-the core dep budget ``{msgspec, pyroaring}`` is untouched; this is a plain
-module, not a ``pip install`` extra).
-
-Storage model (an intentionally tiny append-only log, shaped on
-``datacrystal.arrow``'s LSM):
-
-* Each flush appends the buffered deltas as length-prefixed frames
-  (``>Q`` byte count + ``encode_delta`` bytes) to the **current segment**
-  file; the segment rolls to a fresh file once it passes
-  ``max_segment_bytes``.
-* ``manifest.json`` is the atomic commit point (temp file + ``os.replace``):
-  it names the durable watermark and exactly which segments are live, with
-  each segment's committed byte length. The manifest is fsynced strictly
-  *after* the segment bytes, so the durable watermark can never name bytes
-  that did not land (COMMIT-DELTA-v1 §4.3 — the watermark never lies).
-* A crash mid-flush leaves either an unnamed orphan segment (a roll that the
-  manifest never recorded) or trailing bytes past a named segment's
-  committed length (an append the manifest never recorded). The next open
-  sweeps the orphans and truncates the trailing bytes — so the on-disk log
-  is always an exact, gapless commit prefix.
-
-Durability vs the store: with the default ``flush_every=1`` the log is
-exactly as durable as the store (each delta is fsynced before its commit is
-acknowledged downstream). ``flush_every > N`` batches N deltas per fsync —
-the durable watermark then trails the live one by up to N-1 commits, and a
-crash inside that window means the log must be rebuilt (the engine refuses a
-behind-the-watermark re-attach; ``bootstrap()`` again).
-
-Replay completeness: a log that recorded from a **fresh store**
-(``watermark == 0`` at attach) holds the entire history — ``replay()`` plus
-the reference applier reproduce the exact committed state (see
-:meth:`DeltaLog.replayed_state`). A log that ``bootstrap()``-attached to a
-lived-in store records only the changes *since* it joined (deltas before the
-join were never retained, §5); its replay is the change-feed from the join
-watermark onward, which is the honest audit semantics — "what happened since
-we started logging". A periodic full-state checkpoint that would make a
-mid-life log self-contained is a deliberate later enhancement.
-
-Owner confinement: ``apply()`` runs on the store's owner thread (that is
-where deltas are delivered). Like the store file, a log directory has ONE
-owner process: opening it twice concurrently is unsupported (the open-time
-orphan sweep would treat the other instance's fresh segments as crash
-debris). ``replay()`` reads the same directory and is likewise an
-owner-thread call.
+A ``DeltaLog`` is a ``store.attach()`` consumer that appends every COMMIT-DELTA-v2 delta, byte for
+byte, as length-prefixed frames to segment files named by an atomic ``manifest.json``.
+The manifest is fsynced after the segment bytes, so the durable watermark never lies.
+A log has one owner process; a :meth:`DeltaLog.bootstrap` log holds only changes since it joined.
+Storage model, crash recovery and replay completeness: docs/design/COMMIT-DELTA-v2.md, "DeltaLog".
 """
 
 from __future__ import annotations
@@ -125,40 +70,20 @@ class _Segment:
 class DeltaLog:
     """A COMMIT-DELTA-v2 consumer that persists the delta stream.
 
-    Fresh store (records the whole history — fully replayable)::
-
-        log = DeltaLog("cabinet.deltalog")
-        store.attach(log)
-        ... store.commit() ...
-        for delta in log.replay():           # every committed delta, in order
-            ...
-
-    Lived-in store (deltas are not retained — spec §5)::
-
-        with store.snapshot() as snap:
-            log = DeltaLog.bootstrap("cabinet.deltalog", snap)
-        store.attach(log)                    # records changes from here on
-
-    ``flush_every`` batches N applied deltas per fsync+manifest commit
-    (default 1 = as durable as the store; see the module docstring on the
-    crash-window trade-off). ``max_segment_bytes`` rolls the current segment
-    to a fresh file once it passes that size. Both are operational tunables,
-    not content — reopening with different values simply takes effect.
-
-    ``bytes_flushed`` is a public diagnostic counter: bytes written by the
-    most recent flush — pin your own O(delta) gates on it (fitness #9 shape),
-    exactly like ``datacrystal.arrow``'s ``rows_flushed``.
-
-    Raises:
-        DeltaLogConfigError: ``flush_every`` is below 1, ``max_segment_bytes``
-            is too small for a single frame, or ``path`` holds a directory
-            that is not a datacrystal delta log or was written by a newer log
-            format than this build understands (the format-honesty stance).
+    On a fresh store it records the whole history; on a lived-in store use :meth:`bootstrap` (§5).
+    ``flush_every`` batches N deltas per fsync (1 = as durable as the store, see the module doc);
+    ``max_segment_bytes`` rolls the segment; reopening with other values takes effect.
+    ``bytes_flushed`` is the byte count of the last flush, for O(delta) gates (fitness #9).
     """
 
     def __init__(self, path: str | Path, *,
                  flush_every: int = 1,
                  max_segment_bytes: int = 8 * 1024 * 1024) -> None:
+        """Open or create the log directory at ``path``.
+
+        Raises DeltaLogConfigError for ``flush_every`` below 1, a ``max_segment_bytes`` too small
+        for one frame, or a directory that is no delta log or was written by another format.
+        """
         if flush_every < 1:
             raise DeltaLogConfigError("flush_every must be >= 1")
         if max_segment_bytes < _FRAME.size + 1:
@@ -220,18 +145,12 @@ class DeltaLog:
         )
 
     def apply(self, delta: dict[str, Any]) -> bool:
-        """Record one delta. Returns True when it advanced the watermark,
-        False on an idempotent skip (§4.2). Validates the §4 obligations and
-        rejects malformed/unknown-op deltas *before* buffering anything — a
-        refused delta leaves no trace (§4.4 shape).
+        """Record one delta; return False on an idempotent skip (§4.2), True when it advanced.
 
-        Raises:
-            DeltaFormatError: the map is not a datacrystal delta (wrong
-                format marker), its contract version is newer than this build
-                supports, or it carries an unknown op (a consumer must be
-                total over the op vocabulary, never guess — §3).
-            DeltaGapError: the delta's TID skips past the watermark — deltas
-                are not retained (§5), so rebuild via :meth:`bootstrap`.
+        Validation precedes buffering, so a refused delta leaves no trace.
+        Raises DeltaFormatError for a foreign marker, a version other than the current one or an
+        unknown op (a consumer is total over ops, §3), and DeltaGapError when the TID skips the
+        watermark (§5).
         """
         if delta.get("f") != FORMAT_MARKER:
             raise DeltaFormatError(f"not a datacrystal delta: f={delta.get('f')!r}")
@@ -282,16 +201,10 @@ class DeltaLog:
                   max_segment_bytes: int = 8 * 1024 * 1024) -> DeltaLog:
         """Start a log that joins a store mid-stream at ``snapshot.tid``.
 
-        Deltas before the join were never retained (§5), so the log records
-        only what happens *after* — but it pins its watermark to the snapshot
-        (so ``store.attach()`` accepts it without a gap) and keeps the
-        snapshot's type lineage (so a replay consumer can seed the pre-join
-        types). Any existing log at ``path`` is replaced.
-
-        Raises:
-            DeltaLogConfigError: ``flush_every`` or ``max_segment_bytes`` is
-                below its minimum. (Any existing directory at ``path`` is
-                replaced, so its prior contents are never validated here.)
+        Any log at ``path`` is replaced.
+        Earlier deltas were never retained (§5): the watermark is pinned to the snapshot and its
+        type lineage kept, so ``store.attach()`` sees no gap.
+        Raises DeltaLogConfigError for a ``flush_every`` or ``max_segment_bytes`` below its minimum.
         """
         target = Path(path)
         if target.exists():
@@ -327,15 +240,10 @@ class DeltaLog:
                 yield decode_delta(raw)
 
     def replayed_state(self) -> str:
-        """A deterministic digest of the state reconstructed by replaying the
-        whole log through the reference applier — the ``content`` probe for
-        ``datacrystal.testing.check_delta_consumer``, and the equality check
-        behind time-travel-by-replay.
+        """Return a deterministic digest of the state replayed through the reference applier.
 
-        Faithful for a from-zero log (it holds the complete history). For a
-        :meth:`bootstrap`-attached log it reflects post-join changes seeded at
-        the genesis watermark, not necessarily a full fold (pre-join state was
-        never retained).
+        This is the ``content`` probe of ``testing.check_delta_consumer``.
+        Faithful for a from-zero log; a :meth:`bootstrap` log reflects only post-join changes.
         """
         applier = ReferenceApplier()
         applier.watermark = self._genesis_tid
@@ -377,15 +285,19 @@ class DeltaLog:
         self._applies_since_flush = 0
 
     def close(self) -> None:
+        """Flush the buffered deltas."""
         self.flush()
 
     def __enter__(self) -> Self:
+        """Return the log itself."""
         return self
 
     def __exit__(self, *exc: object) -> None:
+        """Close the log."""
         self.close()
 
     def __repr__(self) -> str:
+        """Return the watermarks and segment count."""
         return (
             f"<datacrystal.deltalog.DeltaLog watermark={self._applied} "
             f"durable={self._watermark} segments={len(self._segments)}>"
