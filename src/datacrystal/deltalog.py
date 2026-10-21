@@ -68,8 +68,9 @@ import json
 import os
 import shutil
 import struct
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Self
 
 from datacrystal._errors import DataCrystalError
 from datacrystal.contract.applier import (
@@ -112,7 +113,7 @@ def _fsync_path(path: Path) -> None:
 class _Segment:
     """One append-only segment file's bookkeeping (the manifest's truth)."""
 
-    __slots__ = ("name", "first_tid", "last_tid", "nbytes")
+    __slots__ = ("first_tid", "last_tid", "name", "nbytes")
 
     def __init__(self, name: str, first_tid: int, last_tid: int, nbytes: int) -> None:
         self.name = name
@@ -278,7 +279,7 @@ class DeltaLog:
     @classmethod
     def bootstrap(cls, path: str | Path, snapshot: Any, *,
                   flush_every: int = 1,
-                  max_segment_bytes: int = 8 * 1024 * 1024) -> "DeltaLog":
+                  max_segment_bytes: int = 8 * 1024 * 1024) -> DeltaLog:
         """Start a log that joins a store mid-stream at ``snapshot.tid``.
 
         Deltas before the join were never retained (§5), so the log records
@@ -378,10 +379,10 @@ class DeltaLog:
     def close(self) -> None:
         self.flush()
 
-    def __enter__(self) -> "DeltaLog":
+    def __enter__(self) -> Self:
         return self
 
-    def __exit__(self, *exc: Any) -> None:
+    def __exit__(self, *exc: object) -> None:
         self.close()
 
     def __repr__(self) -> str:

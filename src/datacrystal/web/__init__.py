@@ -20,6 +20,9 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+# --- _pydantic: REST boundary (#96-#98) — needs only pydantic ------------------
+from datacrystal.web._pydantic import entity_model, from_pydantic, to_pydantic
+
 # The framework deps split by extra: ``_reflect`` is framework-free and
 # ``_pydantic`` needs only ``pydantic`` — both are present under the lightweight
 # ``datacrystal[follower]`` install, so they import **eagerly**. The
@@ -30,12 +33,8 @@ from typing import TYPE_CHECKING, Any
 # THIS package init) must not be forced to have strawberry/fastapi installed
 # (#153 peer-review fix; the follower-profile dep-isolation gate guards it). A
 # bare ``import datacrystal`` still never touches this package at all.
-
 # --- _reflect: shared TypeInfo → field-descriptor analysis (both targets) -----
 from datacrystal.web._reflect import FieldDescriptor, reflect
-
-# --- _pydantic: REST boundary (#96-#98) — needs only pydantic ------------------
-from datacrystal.web._pydantic import entity_model, from_pydantic, to_pydantic
 
 if TYPE_CHECKING:
     # Static visibility for the lazily-imported names (PEP 562 below) so pyright
@@ -125,7 +124,7 @@ def __dir__() -> list[str]:
     return sorted(__all__)
 
 
-__all__ = [
+__all__ = [  # noqa: RUF022 - grouped by source module, one comment per group
     # _reflect
     "FieldDescriptor",
     "reflect",

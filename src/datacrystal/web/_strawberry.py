@@ -129,7 +129,7 @@ class SnapshotLoader:
     consistent even while the owner thread keeps committing.
     """
 
-    __slots__ = ("snapshot", "loader")
+    __slots__ = ("loader", "snapshot")
 
     def __init__(self, snapshot: Snapshot) -> None:
         self.snapshot = snapshot
@@ -267,7 +267,7 @@ def _loader_from(info: Info[Any, Any]) -> SnapshotLoader:
     else:
         loader = getattr(context, LOADER_CONTEXT_KEY, None)
     if not isinstance(loader, SnapshotLoader):
-        raise RuntimeError(
+        raise RuntimeError(  # noqa: TRY004 - RuntimeError is the documented contract
             "GraphQL relation resolver found no per-request SnapshotLoader on "
             f"info.context[{LOADER_CONTEXT_KEY!r}] — execute the query with "
             "context_value=dc.web.snapshot_context(snapshot) (#100)"

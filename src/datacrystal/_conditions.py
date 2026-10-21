@@ -18,12 +18,11 @@ everything else runs as a residual Python predicate over the candidate set.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from itertools import islice
-from typing import Any, Iterable, TypeVar, cast
+from typing import Any, cast
 
 from datacrystal._errors import QueryError
-
-_T = TypeVar("_T")
 
 
 class Condition:
@@ -31,25 +30,25 @@ class Condition:
 
     __slots__ = ()
 
-    def __and__(self, other: "Condition") -> "Condition":
+    def __and__(self, other: Condition) -> Condition:
         _require_condition(other)
         return And(_flatten(And, self) + _flatten(And, other))
 
-    def __or__(self, other: "Condition") -> "Condition":
+    def __or__(self, other: Condition) -> Condition:
         _require_condition(other)
         return Or(_flatten(Or, self) + _flatten(Or, other))
 
-    def __invert__(self) -> "Condition":
+    def __invert__(self) -> Condition:
         return Not(self)
 
     # Reflected operands catch the classic mistake
     # ``Cls.field == "x" & (other)``: `&` binds tighter than `==`, so Python
     # evaluates `"x" & condition` and lands here.
-    def __rand__(self, other: object) -> "Condition":
+    def __rand__(self, other: object) -> Condition:
         _require_condition(other)
         raise AssertionError("unreachable")
 
-    def __ror__(self, other: object) -> "Condition":
+    def __ror__(self, other: object) -> Condition:
         _require_condition(other)
         raise AssertionError("unreachable")
 
@@ -232,7 +231,7 @@ def validate_window(limit: int | None, offset: int) -> None:
             raise ValueError(f"limit= must be >= 0, got {limit}")
 
 
-def apply_window(seq: list[_T], limit: int | None, offset: int) -> list[_T]:
+def apply_window[T](seq: list[T], limit: int | None, offset: int) -> list[T]:
     """Slice a result list to its ``(offset, limit)`` window. Result order is
     deterministic (ascending OID, preserved by ``get_many``), so a windowed read
     equals the unwindowed read sliced the same way (#14).
@@ -244,7 +243,7 @@ def apply_window(seq: list[_T], limit: int | None, offset: int) -> list[_T]:
     return seq
 
 
-def window_iter(candidate: Iterable[_T], limit: int | None, offset: int) -> list[_T]:
+def window_iter[T](candidate: Iterable[T], limit: int | None, offset: int) -> list[T]:
     """The ``(offset, limit)`` window taken **lazily** from a sorted candidate
     iterable (#51) — O(offset + limit), never materializing the whole candidate
     set. Same result and order as ``apply_window(list(candidate), limit, offset)``
@@ -334,7 +333,7 @@ class FieldProxy:
     def __init__(self, cls: type) -> None:
         self._cls = cls
 
-    def __getattr__(self, name: str) -> "FieldExpr":
+    def __getattr__(self, name: str) -> FieldExpr:
         cls = self._cls
         fieldset = type.__getattribute__(cls, "__dc_fieldset__")
         if name not in fieldset:
@@ -375,10 +374,10 @@ class FieldExpr:
         self.cls = cls
         self.name = name
 
-    def __eq__(self, value: Any) -> Pred:  # type: ignore[override]
+    def __eq__(self, value: object) -> Pred:  # type: ignore[override]
         return Pred(self.cls, self.name, "==", value)
 
-    def __ne__(self, value: Any) -> Pred:  # type: ignore[override]
+    def __ne__(self, value: object) -> Pred:  # type: ignore[override]
         return Pred(self.cls, self.name, "!=", value)
 
     def __lt__(self, value: Any) -> Pred:

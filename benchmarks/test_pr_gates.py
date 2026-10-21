@@ -31,7 +31,6 @@ from benchmarks.conftest import (
 from datacrystal._records import decode_payload
 
 
-
 def _decode_loop_floor(keys: list[str]) -> Callable[[], None]:
     @dataclasses.dataclass(slots=True)
     class PlainSpecimen:

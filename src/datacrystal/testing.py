@@ -22,7 +22,8 @@ counter") — it doubles as executable documentation of the obligations.
 
 from __future__ import annotations
 
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 import msgspec
 
@@ -34,10 +35,10 @@ from datacrystal.contract.applier import (
 )
 
 __all__ = [
+    "STREAM_FIELDS",
+    "STREAM_TYPENAME",
     "CountingConsumer",
     "check_delta_consumer",
-    "STREAM_TYPENAME",
-    "STREAM_FIELDS",
 ]
 
 # The kit's canonical type row — consumers that filter by typename/field
@@ -161,7 +162,7 @@ def check_delta_consumer(
     gap_refused = False
     try:
         consumer.apply(stream[2])  # tid 3 against watermark 1
-    except Exception:
+    except Exception:  # noqa: BLE001 - the contract only demands a raise, not a type
         gap_refused = True
     section("§4.4 gap refusal", gap_refused,
             "a delta skipping past the watermark MUST raise — history is missing")
@@ -189,7 +190,7 @@ def check_delta_consumer(
     version_refused = False
     try:
         consumer.apply(newer)
-    except Exception:
+    except Exception:  # noqa: BLE001 - the contract only demands a raise, not a type
         version_refused = True
     section("§4.5 version refusal", version_refused,
             "a delta with a newer contract version MUST raise")
@@ -205,7 +206,7 @@ def check_delta_consumer(
     older_refused = False
     try:
         consumer.apply(older)
-    except Exception:
+    except Exception:  # noqa: BLE001 - the contract only demands a raise, not a type
         older_refused = True
     section("§4.5 version refusal", older_refused,
             "a delta with an OLDER contract version MUST raise — pre-v2 "
@@ -229,7 +230,7 @@ def check_delta_consumer(
     op_refused = False
     try:
         consumer.apply(mutated)
-    except Exception:
+    except Exception:  # noqa: BLE001 - the contract only demands a raise, not a type
         op_refused = True
     section("§3 unknown op", op_refused, "an unknown op MUST raise, not be guessed")
     section("§3 unknown op", consumer.watermark == 1,
@@ -302,7 +303,7 @@ class CountingConsumer:
         self._typename_by_oid: dict[int, str] = {}
 
     @classmethod
-    def bootstrap(cls, snapshot: Any) -> "CountingConsumer":
+    def bootstrap(cls, snapshot: Any) -> CountingConsumer:
         """Build a consumer that joins mid-stream: deltas only carry NEW
         type rows (spec §2) and are never retained (§5), so a sidecar
         attaching to a lived-in store takes its lineage, its initial

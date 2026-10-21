@@ -25,10 +25,12 @@ commit, or discard-by-close).
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable, Iterable
 from concurrent.futures import Future
 from contextlib import AbstractContextManager
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from types import TracebackType
+from typing import Any, Self
 
 from datacrystal._actors import Principal
 from datacrystal._conditions import Condition
@@ -41,7 +43,7 @@ async def aopen(path: str | Path, *, durability: str = "interval",
                 lock_ttl: float = 10.0, debug: bool = False,
                 lazy_timeout: float | None = None,
                 cache_index: bool = True,
-                principal: Principal | None = None) -> "AsyncStore":
+                principal: Principal | None = None) -> AsyncStore:
     """Open a store bound to the running event loop.
 
     The boot scan runs on the loop thread (the store's owner must be the
@@ -201,7 +203,7 @@ class AsyncStore:
             raise
         return store._p3_finalize(capture)  # pyright: ignore[reportPrivateUsage]  # ADR-001: async commit drives the sync engine's three phases
 
-    def transaction(self) -> "_Transaction":
+    def transaction(self) -> _Transaction:
         """``async with store.transaction():`` — serialize this scope against
         every other transaction/commit and commit on clean exit.
         """
@@ -218,10 +220,10 @@ class AsyncStore:
             self._sweeper = None
         self._store.close()
 
-    async def __aenter__(self) -> "AsyncStore":
+    async def __aenter__(self) -> Self:
         return self
 
-    async def __aexit__(self, *exc: Any) -> None:
+    async def __aexit__(self, *exc: object) -> None:
         self.close()
 
     def __repr__(self) -> str:
@@ -238,7 +240,12 @@ class _Transaction:
         await self._astore._commit_lock.acquire()  # pyright: ignore[reportPrivateUsage]  # tightly-coupled same-module transaction helper
         return self._astore
 
-    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> bool:
         try:
             if exc_type is None:
                 await self._astore._commit_unlocked()  # pyright: ignore[reportPrivateUsage]  # tightly-coupled same-module transaction helper

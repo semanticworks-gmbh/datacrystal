@@ -23,8 +23,9 @@ from __future__ import annotations
 import threading
 import time
 import weakref
+from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator, cast
+from typing import Any, cast
 
 from datacrystal._errors import StoreClosedError
 
@@ -50,7 +51,7 @@ class Lazy[T]:
     the target is still live anywhere.
     """
 
-    __slots__ = ("_obj", "_oid", "_storeref", "_atime", "_clock", "__weakref__")
+    __slots__ = ("__weakref__", "_atime", "_clock", "_obj", "_oid", "_storeref")
 
     # Slot attribute types declared at class level (annotation-only, no value —
     # compatible with __slots__). Pins ``_obj`` to ``T | None`` so an engine
@@ -65,7 +66,7 @@ class Lazy[T]:
         raise TypeError("use Lazy.of(entity) to create a lazy reference")
 
     @classmethod
-    def of(cls, obj: T) -> "Lazy[T]":
+    def of(cls, obj: T) -> Lazy[T]:
         self = object.__new__(cls)
         self._obj = obj
         self._oid = None
@@ -75,7 +76,7 @@ class Lazy[T]:
         return self
 
     @classmethod
-    def _loaded(cls, obj: T, oid: int, store: Any) -> "Lazy[T]":
+    def _loaded(cls, obj: T, oid: int, store: Any) -> Lazy[T]:
         """Engine path: a hydrated handle whose target is already live
         (registry hit) — demotable, unlike a user-made ``Lazy.of``.
         """
@@ -85,7 +86,7 @@ class Lazy[T]:
         return self
 
     @classmethod
-    def _unloaded(cls, oid: int, store: Any) -> "Lazy[Any]":
+    def _unloaded(cls, oid: int, store: Any) -> Lazy[Any]:
         self = object.__new__(cls)
         self._obj = None
         self._oid = oid
@@ -232,8 +233,17 @@ class BlobHandle:
     ``Blob`` handle. The bytes are identical either way.
     """
 
-    __slots__ = ("_obj", "_oid", "_size", "_hash", "_storeref",
-                 "_owner_oid", "_atime", "_clock", "__weakref__")
+    __slots__ = (
+        "__weakref__",
+        "_atime",
+        "_clock",
+        "_hash",
+        "_obj",
+        "_oid",
+        "_owner_oid",
+        "_size",
+        "_storeref",
+    )
 
     # Mirror Lazy's slot annotations so the manager's duck-typed sweep
     # (_obj / _oid / _atime / _clock) operates on a Blob with no special-casing.
@@ -255,7 +265,7 @@ class BlobHandle:
 
     @classmethod
     def _bind(cls, blob_oid: int, size: int, hash: bytes, store: Any,
-              owner_oid: int | None = None) -> "BlobHandle":
+              owner_oid: int | None = None) -> BlobHandle:
         """Engine path: a handle for a decoded :class:`BlobToken`, bound to its
         store but with the bytes still on disk (fetched on first ``.bytes()``).
         ``owner_oid`` is set only for a PROTECTED owning record (ADR-008 W4-3);
@@ -364,7 +374,7 @@ class BlobSource:
     readable as itself — ADR-007 §3 asymmetry).
     """
 
-    __slots__ = ("size", "open_chunks")
+    __slots__ = ("open_chunks", "size")
 
     size: int
     open_chunks: Callable[[], Iterable[bytes]]

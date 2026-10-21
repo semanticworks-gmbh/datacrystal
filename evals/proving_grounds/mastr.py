@@ -39,9 +39,10 @@ import shutil
 import sys
 import time
 import xml.etree.ElementTree as ET
+from collections.abc import Iterator
 from dataclasses import field
 from pathlib import Path
-from typing import Annotated, Iterator
+from typing import Annotated
 
 import datacrystal as dc
 
@@ -257,7 +258,7 @@ def main() -> None:
     builds: list[int] = []
     real_build = _idx.build_class_indexes
 
-    def _counting_build(*a, **k):  # noqa: ANN001,ANN002,ANN003
+    def _counting_build(*a, **k):
         builds.append(1)
         return real_build(*a, **k)
 

@@ -19,7 +19,8 @@ a container, its owner cannot be collected out from under it.
 
 from __future__ import annotations
 
-from typing import Any, Iterable, Mapping, SupportsIndex, cast
+from collections.abc import Iterable, Mapping
+from typing import Any, Self, SupportsIndex, cast
 
 from datacrystal._errors import FrozenEntityError
 from datacrystal._state import touch
@@ -55,7 +56,7 @@ def _is_frozen_owner(owner: Any) -> bool:
 class PersistentList(list[Any]):
     """A list that marks its owning entity dirty on every mutation."""
 
-    __slots__ = ("_dc_owner", "_dc_frozen")
+    __slots__ = ("_dc_frozen", "_dc_owner")
 
     def __init__(self, iterable: Iterable[Any] = (), *, owner: Any = None) -> None:
         self._dc_owner = owner
@@ -120,11 +121,11 @@ class PersistentList(list[Any]):
         self._touch()
         super().__delitem__(index)
 
-    def __iadd__(self, other: Iterable[Any]) -> "PersistentList":
+    def __iadd__(self, other: Iterable[Any]) -> Self:
         self.extend(other)
         return self
 
-    def __imul__(self, count: SupportsIndex) -> "PersistentList":
+    def __imul__(self, count: SupportsIndex) -> Self:
         self._touch()
         super().__imul__(count)
         return self
@@ -133,7 +134,7 @@ class PersistentList(list[Any]):
 class PersistentDict(dict[Any, Any]):
     """A dict that marks its owning entity dirty on every mutation."""
 
-    __slots__ = ("_dc_owner", "_dc_frozen")
+    __slots__ = ("_dc_frozen", "_dc_owner")
 
     def __init__(self, mapping: Mapping[Any, Any] | Iterable[Any] = (),
                  *, owner: Any = None) -> None:
@@ -193,6 +194,6 @@ class PersistentDict(dict[Any, Any]):
         super().__setitem__(key, wrapped)
         return wrapped
 
-    def __ior__(self, other: Any) -> "PersistentDict":
+    def __ior__(self, other: Any) -> Self:
         self.update(other)
         return self

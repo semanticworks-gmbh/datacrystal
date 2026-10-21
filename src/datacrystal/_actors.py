@@ -29,10 +29,9 @@ session. Read floors stay unenforced until W3/W4 — documented, not
 pretended.
 """
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Annotated
-
-from collections.abc import Mapping
 
 from datacrystal._entity import Index, Unique, entity
 
@@ -47,24 +46,24 @@ from datacrystal._permissions import (  # re-exports, all listed in __all__
     CURATOR,
     EXECUTIVE,
     NO_STANDING,
-    WORLD,
     STAFF,
     VIEWER,
+    WORLD,
 )
 
 __all__ = [
-    "WORLD",
-    "NO_STANDING",
-    "VIEWER",
+    "ADMIN",
     "AGENT",
     "AUTOMATION",
-    "STAFF",
     "CURATOR",
-    "ADMIN",
     "EXECUTIVE",
+    "NO_STANDING",
+    "STAFF",
+    "VIEWER",
+    "WORLD",
+    "Actor",
     "Principal",
     "root_principal",
-    "Actor",
 ]
 
 

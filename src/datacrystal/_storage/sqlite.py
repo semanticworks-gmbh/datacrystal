@@ -25,8 +25,9 @@ import io
 import sqlite3
 import sys
 import zlib
+from collections.abc import Callable, Iterator
 from pathlib import Path
-from typing import Any, BinaryIO, Callable, Iterator, cast
+from typing import Any, BinaryIO, cast
 
 from datacrystal._errors import (
     CorruptRecordError,

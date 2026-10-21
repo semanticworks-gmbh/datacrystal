@@ -44,7 +44,7 @@ def is_cid(value: int) -> bool:
 class IdAllocator:
     """Hands out fresh OIDs/CIDs/TIDs; restored from persisted high-water marks."""
 
-    __slots__ = ("_next_oid", "_next_cid", "_next_tid")
+    __slots__ = ("_next_cid", "_next_oid", "_next_tid")
 
     def __init__(self, next_oid: int = OID_BASE, next_cid: int = CID_BASE,
                  next_tid: int = TID_BASE) -> None:

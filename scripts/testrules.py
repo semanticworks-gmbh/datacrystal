@@ -30,6 +30,7 @@ import ast
 import re
 import sys
 from dataclasses import dataclass
+from itertools import pairwise
 from pathlib import Path
 
 MAX_RULES, MAX_BULLETS, MIN_NAME_WORDS = 7, 5, 3
@@ -68,7 +69,7 @@ def tests_of(tree: ast.Module) -> list[ast.FunctionDef | ast.AsyncFunctionDef]:
 def is_spec_module(path: Path) -> bool:
     """Whether the file lives under tests/spec/."""
     parts = path.resolve().parts
-    return any(pair == ("tests", "spec") for pair in zip(parts, parts[1:]))
+    return any(pair == ("tests", "spec") for pair in pairwise(parts))
 
 
 def call_name(node: ast.AST) -> str:

@@ -49,10 +49,11 @@ import json
 import re
 import sqlite3
 import unicodedata
+from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Mapping
+from typing import TYPE_CHECKING, Any, Self
 
 from datacrystal._entity import TYPES_BY_NAME
 from datacrystal._errors import DataCrystalError, ReadDeniedError
@@ -77,7 +78,7 @@ except ImportError as exc:  # pragma: no cover — core-only installs
         "`pip install 'datacrystal[fts]'` (adds snowballstemmer)"
     ) from exc
 
-__all__ = ["FullTextIndex", "SearchHit", "FtsConfigError"]
+__all__ = ["FtsConfigError", "FullTextIndex", "SearchHit"]
 
 SIDECAR_FORMAT = "datacrystal-fts-sidecar"
 SIDECAR_VERSION = 1
@@ -361,9 +362,9 @@ class FullTextIndex:
     # -- bootstrap (the §5 mid-life attach recipe) -----------------------------
 
     @classmethod
-    def bootstrap(cls, path: str | Path, snapshot: "Snapshot", *,
+    def bootstrap(cls, path: str | Path, snapshot: Snapshot, *,
                   fulltext: Mapping[str, Mapping[str, str | None]] | None = None,
-                  ) -> "FullTextIndex":
+                  ) -> FullTextIndex:
         """(Re)build the index from one ``store.snapshot()`` — the canonical
         recipe for attaching to a store that already has history, and the
         rebuild path after a detach/staleness refusal. Any existing file at
@@ -427,7 +428,7 @@ class FullTextIndex:
 
     def search(self, query: str, *, cls: type | str | None = None,
                limit: int = 20, match: str = "any",
-               snapshot: "Snapshot | None" = None,
+               snapshot: Snapshot | None = None,
                scan_cap: int = 2000) -> list[SearchHit]:
         """BM25-ranked full-text matches for ``query``.
 
@@ -520,7 +521,7 @@ class FullTextIndex:
         return hits
 
     def _search_fenced(self, expression: str, typename: str | None,
-                       needles: _Needles, limit: int, snapshot: "Snapshot",
+                       needles: _Needles, limit: int, snapshot: Snapshot,
                        scan_cap: int) -> list[SearchHit]:
         """The R13 post-filter path. Collect ranked (oid, typename, rank) ONLY,
         resolve each through the snapshot's fenced ``get_many`` (dropping
@@ -546,7 +547,7 @@ class FullTextIndex:
             params.append(typename)
         sql += " ORDER BY r, rowid LIMIT ?"
 
-        survivors: list[tuple[int, str, float, "EntityView"]] = []
+        survivors: list[tuple[int, str, float, EntityView]] = []
         examined = 0            # ranked rows already classified across rounds
         window = max(limit, 1) * 4
         while True:
@@ -576,7 +577,7 @@ class FullTextIndex:
             for oid, hit_typename, rank, view in survivors[:limit]
         ]
 
-    def _snippets_from_view(self, view: "EntityView", typename: str,
+    def _snippets_from_view(self, view: EntityView, typename: str,
                             needles: _Needles) -> dict[str, str]:
         """Render highlighted snippets from a SURVIVING snapshot view's OWN
         field text (never the sidecar's stored ``r_`` copy) — so the excerpt is
@@ -601,10 +602,10 @@ class FullTextIndex:
     def close(self) -> None:
         self._conn.close()
 
-    def __enter__(self) -> "FullTextIndex":
+    def __enter__(self) -> Self:
         return self
 
-    def __exit__(self, *exc: Any) -> None:
+    def __exit__(self, *exc: object) -> None:
         self.close()
 
     def __repr__(self) -> str:

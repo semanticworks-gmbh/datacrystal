@@ -21,10 +21,11 @@ Engine-side guarantees (the consumer side lives in ``datacrystal/contract/``):
 
 from __future__ import annotations
 
-from typing import Any, Protocol, Sequence, runtime_checkable
+from collections.abc import Sequence
+from typing import Any, Protocol, runtime_checkable
 
-from datacrystal.contract.applier import CONTRACT_VERSION, FORMAT_MARKER
 from datacrystal._storage.protocol import StoredRecord
+from datacrystal.contract.applier import CONTRACT_VERSION, FORMAT_MARKER
 
 
 @runtime_checkable

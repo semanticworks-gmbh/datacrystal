@@ -88,7 +88,7 @@ class _PooledSnapshot:
     mutated only under the owning :class:`_SnapshotPool`'s lock.
     """
 
-    __slots__ = ("snapshot", "tid", "refs", "retired")
+    __slots__ = ("refs", "retired", "snapshot", "tid")
 
     def __init__(self, snapshot: Snapshot) -> None:
         self.snapshot = snapshot
@@ -121,7 +121,7 @@ class _SnapshotPool:
     lazily, under the snapshot's own lock outside this one).
     """
 
-    __slots__ = ("_store", "_lock", "_current")
+    __slots__ = ("_current", "_lock", "_store")
 
     def __init__(self, store: Store) -> None:
         self._store = store
@@ -230,7 +230,7 @@ class _StoreLifespan:
     ``__aexit__`` closes it — exactly the startup/shutdown FastAPI expects.
     """
 
-    __slots__ = ("_app", "_path", "_open_kwargs", "store")
+    __slots__ = ("_app", "_open_kwargs", "_path", "store")
 
     def __init__(self, app: FastAPI, path: Path, open_kwargs: dict[str, Any]) -> None:
         self._app = app
@@ -274,7 +274,7 @@ def get_store(request: Request) -> Store:
     """
     store = getattr(request.app.state, STORE_STATE_KEY, None)
     if not isinstance(store, Store):
-        raise RuntimeError(
+        raise RuntimeError(  # noqa: TRY004 - RuntimeError is the documented contract
             "no datacrystal store on app.state — build the app with "
             "FastAPI(lifespan=store_lifespan(path)) so the store is opened on "
             "startup (#92)"
@@ -359,7 +359,7 @@ def read_snapshot(
 async def submit_write(
     request: Request,
     principal: Principal | None = Depends(get_principal),
-) -> "_OwnerWriter":
+) -> _OwnerWriter:
     """Yield a callable that fans a mutation into the owner and returns committed.
 
     The **write** dependency: ``write: ... = Depends(submit_write)``. The route
@@ -389,7 +389,7 @@ class _OwnerWriter:
     typed method rather than an untyped lambda.
     """
 
-    __slots__ = ("_store", "_principal")
+    __slots__ = ("_principal", "_store")
 
     def __init__(self, store: Store, principal: Principal | None = None) -> None:
         self._store = store
@@ -431,7 +431,7 @@ SNAPSHOT_CONTEXT_KEY = "dc_snapshot"
 
 
 def graphql_context_getter(
-    snapshot: Snapshot = Depends(read_snapshot),  # noqa: B008 — FastAPI dep marker
+    snapshot: Snapshot = Depends(read_snapshot),
 ) -> Mapping[str, Any]:
     """Build a per-request GraphQL ``context`` of ``{snapshot, loader}`` (#92/#100).
 
@@ -463,7 +463,7 @@ def graphql_context_getter(
 def create_app(
     path: str | Path,
     *,
-    routers: "list[Any] | None" = None,
+    routers: list[Any] | None = None,
     **open_kwargs: Any,
 ) -> FastAPI:
     """A FastAPI app with the store lifespan wired — the one-call assembly (#92).

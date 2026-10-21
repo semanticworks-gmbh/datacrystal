@@ -19,8 +19,9 @@ from __future__ import annotations
 
 import threading
 import warnings
+from collections.abc import Iterable, Iterator, Mapping
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, BinaryIO, Iterable, Iterator, Mapping, cast
+from typing import TYPE_CHECKING, Any, BinaryIO, Self, cast
 
 from pyroaring import BitMap64, FrozenBitMap64
 
@@ -278,7 +279,7 @@ class SnapshotIndexes:
     while the owner commits.
     """
 
-    __slots__ = ("extent", "eq", "unique")
+    __slots__ = ("eq", "extent", "unique")
 
     def __init__(self, ci: ClassIndexes) -> None:
         self.extent: FrozenBitMap64 = FrozenBitMap64(ci.extent)
@@ -530,7 +531,7 @@ class Snapshot:
     keying ``_readable`` on the class, not the Principal.
     """
 
-    def __init__(self, core: _SnapshotCore, principal: "Principal") -> None:
+    def __init__(self, core: _SnapshotCore, principal: Principal) -> None:
         self._core = core
         self._principal = principal
         # Per-principal readable-bitmap cache, keyed by CLASS (never by the
@@ -538,7 +539,7 @@ class Snapshot:
         # handle has queried; None means root (skip the intersect).
         self._readable: dict[Any, BitMap64 | None] = {}
 
-    def for_principal(self, principal: "Principal") -> "Snapshot":
+    def for_principal(self, principal: Principal) -> Snapshot:
         """A sibling handle over the SAME shared core, bound to ``principal``
         (ADR-008 R15) — O(1): builds nothing, scans nothing, shares every
         materialized view / index / reverse posting with this handle. Each
@@ -550,7 +551,7 @@ class Snapshot:
     # -- surface ---------------------------------------------------------
 
     @property
-    def principal(self) -> "Principal":
+    def principal(self) -> Principal:
         """The acting principal this handle is bound to (immutable)."""
         return self._principal
 
@@ -616,7 +617,7 @@ class Snapshot:
             "the redacted-twin / None form"
         )
 
-    def get_many(self, refs: Iterable["EntityView | Ref | int"]) -> list["EntityView | None"]:
+    def get_many(self, refs: Iterable[EntityView | Ref | int]) -> list[EntityView | None]:
         """Batch-resolve OIDs to :class:`EntityView` DTOs in one storage
         round-trip per chunk — the DEREF seam for the ``datacrystal[web]``
         DataLoader (#94). Returns a ``list[EntityView | None]`` aligned 1:1
@@ -654,7 +655,7 @@ class Snapshot:
                 out.append(None)
         return out
 
-    def open_blob(self, view: "EntityView | Ref | int", field: str) -> BinaryIO:
+    def open_blob(self, view: EntityView | Ref | int, field: str) -> BinaryIO:
         """Open a committed ``dc.Blob`` field as a binary stream (ADR-007 §3),
         read-fenced (ADR-008 W4-3): a blob is readable only if its owning
         record is readable by this handle's principal. Resolving the owner runs
@@ -917,7 +918,7 @@ class Snapshot:
         matched = [view for view in views if view_cond.evaluate(view)]
         return apply_window(matched, limit, offset)
 
-    def explain(self, target: type | Condition) -> "QueryPlan":
+    def explain(self, target: type | Condition) -> QueryPlan:
         """The deterministic plan for ``target`` over this snapshot's indexes.
 
         On a ``protected=True`` class the reported ``candidates``/``extent``
@@ -940,7 +941,7 @@ class Snapshot:
             readable = self._readable_for(ti, ci) if ti.protected else None
             return explain_plan(ti.typename, ci, cond, readable=readable)
 
-    def incoming(self, target: "EntityView | Ref | int") -> list[EntityView]:
+    def incoming(self, target: EntityView | Ref | int) -> list[EntityView]:
         """Every committed entity that **references** ``target`` at this
         watermark — the snapshot twin of :meth:`Store.incoming`.
 
@@ -973,10 +974,10 @@ class Snapshot:
         """
         self._core.close()
 
-    def __enter__(self) -> "Snapshot":
+    def __enter__(self) -> Self:
         return self
 
-    def __exit__(self, *exc: Any) -> None:
+    def __exit__(self, *exc: object) -> None:
         self.close()
 
     def __repr__(self) -> str:

@@ -17,7 +17,8 @@ import gc
 import os
 import time
 import warnings
-from typing import Any, Callable, Iterator
+from collections.abc import Callable, Iterator
+from typing import Any
 
 import pytest
 
@@ -54,8 +55,7 @@ def time_it(fn: Callable[[], Any], *, rounds: int = 5) -> float:
             t0 = time.perf_counter()
             fn()
             elapsed = time.perf_counter() - t0
-            if elapsed < best:
-                best = elapsed
+            best = min(best, elapsed)
     finally:
         if was_enabled:
             gc.enable()

@@ -43,7 +43,7 @@ class Term:
     go_id: Annotated[str, dc.Unique]
     name: str
     namespace: Annotated[str | None, dc.Index] = None
-    parents: list[dc.Lazy["Term"]] = field(default_factory=list)  # is_a — lazy adjacency (#30)
+    parents: list[dc.Lazy[Term]] = field(default_factory=list)  # is_a — lazy adjacency (#30)
 
 
 def peak_rss_mb() -> float:

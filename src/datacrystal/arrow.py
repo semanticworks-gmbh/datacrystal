@@ -64,8 +64,9 @@ import json
 import os
 import re
 import shutil
+from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, cast
+from typing import Any, Self, cast
 
 import msgspec
 
@@ -73,15 +74,15 @@ from datacrystal._entity import TYPES_BY_NAME, type_info
 from datacrystal._errors import DataCrystalError, ReadDeniedError
 from datacrystal._permissions import PERM_FIELDS, is_root
 from datacrystal._records import (
+    _OID_STRUCT,  # pyright: ignore[reportPrivateUsage]  # codec primitive, parquet mirror
     DATE_EXT_CODE,
     NAIVE_DATETIME_EXT_CODE,
     REF_EXT_CODE,
     TIME_EXT_CODE,
-    _ext_hook,  # pyright: ignore[reportPrivateUsage]  # codec primitive, parquet mirror
-    _OID_STRUCT,  # pyright: ignore[reportPrivateUsage]  # codec primitive, parquet mirror
     RefToken,
-    decode_payload,
+    _ext_hook,  # pyright: ignore[reportPrivateUsage]  # codec primitive, parquet mirror
     decimal_ext,
+    decode_payload,
 )
 from datacrystal._snapshot import Ref
 from datacrystal.contract.applier import (
@@ -103,15 +104,15 @@ except ImportError as exc:  # pragma: no cover — core-only installs
 
 # Compute kernels are registered dynamically; pyarrow's bundled stubs do not
 # know them, so fetch by name (runtime-identical to pc.invert).
-_invert: Any = getattr(_pc, "invert")
+_invert: Any = getattr(_pc, "invert")  # noqa: B009 - pyarrow.compute builds it at runtime, no static attribute
 
 # ``pyarrow.parquet`` ships no ``.pyi`` (only untyped ``.py``), so its public
 # functions arrive partially-unknown; fetch by name (like _invert above) and
 # bind typed aliases matching the real runtime signatures (runtime-identical).
 _write_table = cast(
-    "Callable[[pa.Table, str | Path], None]", getattr(pq, "write_table")
+    "Callable[[pa.Table, str | Path], None]", pq.write_table
 )
-_read_table = cast("Callable[[str | Path], pa.Table]", getattr(pq, "read_table"))
+_read_table = cast("Callable[[str | Path], pa.Table]", pq.read_table)
 
 __all__ = ["ArrowMirror", "MirrorConfigError", "decode_fallback"]
 
@@ -353,7 +354,7 @@ def _fsync_path(path: Path) -> None:
 class _TableState:
     """Mutable bookkeeping for one mirrored type."""
 
-    __slots__ = ("columns", "segments", "next_segment")
+    __slots__ = ("columns", "next_segment", "segments")
 
     def __init__(self, columns: dict[str, str] | None = None,
                  segments: list[str] | None = None, next_segment: int = 1) -> None:
@@ -515,7 +516,7 @@ class ArrowMirror:
     def bootstrap(cls, path: str | Path, snapshot: Any, *,
                   only: Iterable[type | str] | None = None,
                   flush_every: int = 1, max_segments: int = 16,
-                  batch: int = 50_000) -> "ArrowMirror":
+                  batch: int = 50_000) -> ArrowMirror:
         """(Re)build the mirror from one ``store.snapshot()`` — the recipe
         for attaching to a store with history, and the rebuild path after a
         staleness refusal. Any existing directory at ``path`` is replaced.
@@ -717,10 +718,10 @@ class ArrowMirror:
     def close(self) -> None:
         self.flush()
 
-    def __enter__(self) -> "ArrowMirror":
+    def __enter__(self) -> Self:
         return self
 
-    def __exit__(self, *exc: Any) -> None:
+    def __exit__(self, *exc: object) -> None:
         self.close()
 
     def __repr__(self) -> str:

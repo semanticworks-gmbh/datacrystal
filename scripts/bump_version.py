@@ -40,7 +40,7 @@ MIRROR_FILES = (
 def read_version(root: Path) -> str:
     """The authoritative version: pyproject.toml's ``version = "X.Y.Z"``."""
     text = (root / "pyproject.toml").read_text()
-    m = re.search(r'^version = "([^"]+)"', text, re.M)
+    m = re.search(r'^version = "([^"]+)"', text, re.MULTILINE)
     if not m:
         sys.exit("could not find version in pyproject.toml")
     return m.group(1)
@@ -64,7 +64,7 @@ def next_version(current: str, bump: str) -> str:
 
 
 def _sub_exactly(pattern: str, repl: str, text: str, count: int, where: str) -> str:
-    new, n = re.subn(pattern, repl, text, flags=re.M)
+    new, n = re.subn(pattern, repl, text, flags=re.MULTILINE)
     if n != count:
         sys.exit(f"expected exactly {count} match(es) of {pattern!r} in {where}, found {n}")
     return new

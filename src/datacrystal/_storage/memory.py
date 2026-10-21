@@ -15,7 +15,8 @@ from __future__ import annotations
 import hashlib
 import io
 import threading
-from typing import BinaryIO, Callable, Iterator
+from collections.abc import Callable, Iterator
+from typing import BinaryIO
 
 from datacrystal._errors import DanglingRefError, NewerStoreError
 from datacrystal._ids import FORMAT_VERSION

@@ -17,7 +17,6 @@ from tests.integration._crash_harness import (
     app_command,
 )
 
-
 ACK_DEADLINE_SECONDS = 60.0
 
 

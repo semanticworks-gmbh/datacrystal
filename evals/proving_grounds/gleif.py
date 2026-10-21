@@ -42,8 +42,9 @@ import shutil
 import sys
 import time
 import zipfile
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Annotated, Iterator
+from typing import Annotated
 
 import datacrystal as dc
 from datacrystal._entity import oid_of
@@ -65,8 +66,8 @@ class LegalEntity:
     lei: Annotated[str, dc.Unique]                       # 20-char ISO 17442 key
     legal_name: str = ""                                 # from Level 1 (optional)
     jurisdiction: Annotated[str | None, dc.Index] = None  # ISO code (optional)
-    direct_parent: dc.Lazy["LegalEntity"] | None = None    # closest consolidating parent
-    ultimate_parent: dc.Lazy["LegalEntity"] | None = None  # top-of-tree parent
+    direct_parent: dc.Lazy[LegalEntity] | None = None    # closest consolidating parent
+    ultimate_parent: dc.Lazy[LegalEntity] | None = None  # top-of-tree parent
 
 
 def peak_rss_mb() -> float:
@@ -110,10 +111,8 @@ def stream_level1() -> Iterator[tuple[str, str, str | None]]:
     col = {name: i for i, name in enumerate(header)}
     li, ni = col["LEI"], col["Entity.LegalName"]
     ji = col.get("Entity.LegalJurisdiction")
-    n = 0
-    for row in rows:
+    for n, row in enumerate(rows, start=1):
         yield row[li], row[ni], (row[ji] if ji is not None else None)
-        n += 1
         if LEI2_CAP and n >= LEI2_CAP:
             return
 

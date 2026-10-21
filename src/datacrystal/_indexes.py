@@ -29,7 +29,8 @@ import dataclasses
 import datetime as _dt
 import decimal as _decimal
 from bisect import bisect_left, bisect_right, insort
-from typing import Any, Callable, Iterable, Iterator, cast
+from collections.abc import Callable, Iterable, Iterator
+from typing import Any, cast
 
 from pyroaring import BitMap64
 
@@ -40,7 +41,7 @@ from datacrystal._errors import (
     SchemaMismatchError,
     UniqueViolationError,
 )
-from datacrystal._permissions import PERM_LEGACY_FILLS, WORLD, VIEWER, is_root
+from datacrystal._permissions import PERM_LEGACY_FILLS, VIEWER, WORLD, is_root
 from datacrystal._records import RefToken, decode_payload
 from datacrystal._storage.protocol import StorageBackend, StoredRecord
 
@@ -126,7 +127,7 @@ class QueryPlan:
         return out
 
 
-def explain_plan(typename: str, ci: "ClassIndexes",
+def explain_plan(typename: str, ci: ClassIndexes,
                  cond: Condition | None,
                  readable: BitMap64 | None = None) -> QueryPlan:
     """Build the :class:`QueryPlan` for one (class extent, condition) pair —
@@ -159,9 +160,18 @@ def explain_plan(typename: str, ci: "ClassIndexes",
 class ClassIndexes:
     """All index structures for one entity class in one store."""
 
-    __slots__ = ("extent", "eq", "unique", "list_fields", "sorted_fields",
-                 "sorted_keys", "_building", "_last_values", "_unique_fields",
-                 "_needs_lv_rebuild")
+    __slots__ = (
+        "_building",
+        "_last_values",
+        "_needs_lv_rebuild",
+        "_unique_fields",
+        "eq",
+        "extent",
+        "list_fields",
+        "sorted_fields",
+        "sorted_keys",
+        "unique",
+    )
 
     def __init__(self, indexed_fields: list[str], unique_fields: list[str],
                  list_fields: list[str] | None = None,
@@ -363,7 +373,7 @@ class ClassIndexes:
         }
 
     @classmethod
-    def load(cls, blob: dict[str, Any], ti: TypeInfo) -> "ClassIndexes | None":
+    def load(cls, blob: dict[str, Any], ti: TypeInfo) -> ClassIndexes | None:
         """Rebuild from a cached ``dump()`` — but ONLY if the cached index
         surface still matches the live class's markers (else ``None`` → the
         caller rebuilds from records; the cache is never authoritative). The

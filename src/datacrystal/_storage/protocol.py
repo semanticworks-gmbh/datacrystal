@@ -16,8 +16,9 @@ protocol — that is the whole point of keeping it this small:
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
-from typing import BinaryIO, Callable, Iterable, Iterator, Protocol
+from typing import BinaryIO, Protocol
 
 
 @dataclass(frozen=True, slots=True)

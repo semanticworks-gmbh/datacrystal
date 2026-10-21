@@ -57,8 +57,9 @@ import shutil
 import sys
 import time
 import zipfile
+from collections.abc import Callable, Iterator
 from pathlib import Path
-from typing import Annotated, Any, Callable, Iterator
+from typing import Annotated, Any
 
 import datacrystal as dc
 
@@ -325,12 +326,12 @@ def sieve(store: dc.Store, hidden_oid: int, hidden_nr: str, public_nr: str,
         check("get_many(oid) -> Redacted twin", isinstance(twin, dc.Redacted))
         check("twin keeps its type", isinstance(twin, MarketActor))
         try:
-            getattr(twin, "firmenname")
+            _ = twin.firmenname
             check("field read on twin raises", False, "returned a value!")
         except dc.ReadDeniedError:
             check("field read on twin raises", True, "ReadDeniedError")
         try:
-            getattr(twin, "dc_permissions")
+            _ = twin.dc_permissions
             check("label read on twin raises", False, "returned a value!")
         except dc.ReadDeniedError:
             check("label read on twin raises", True, "ReadDeniedError")

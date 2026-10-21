@@ -90,7 +90,7 @@ class Specimen:
     mineral: dc.Lazy[Mineral]
     quality: Annotated[str, dc.Index]
     mass_g: float
-    acquired_from: "dc.Lazy[Specimen] | None" = None
+    acquired_from: dc.Lazy[Specimen] | None = None
 
 
 @dc.entity(protected=True)
@@ -105,7 +105,7 @@ class CuratedSpecimen:
     mineral: dc.Lazy[Mineral]
     quality: Annotated[str, dc.Index]
     mass_g: float
-    acquired_from: "dc.Lazy[CuratedSpecimen] | None" = None
+    acquired_from: dc.Lazy[CuratedSpecimen] | None = None
 
 
 @dc.entity(frozen=True)

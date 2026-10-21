@@ -37,12 +37,10 @@ import datetime as _dt
 import decimal as _decimal
 import types
 import weakref
+from collections.abc import Callable, Mapping
 from typing import (
     Annotated,
     Any,
-    Callable,
-    Mapping,
-    TypeVar,
     Union,
     cast,
     dataclass_transform,
@@ -99,7 +97,7 @@ class _FullText(_Marker):
         super().__init__("FullText")
         self.language = language
 
-    def __call__(self, *, language: str) -> "_FullText":
+    def __call__(self, *, language: str) -> _FullText:
         if not language:
             raise TypeError(
                 "FullText(language=...) takes a non-empty language code, e.g. "
@@ -216,8 +214,18 @@ class FieldSpec:
 class TypeInfo:
     """Engine-side metadata for one entity class."""
 
-    __slots__ = ("cls", "typename", "field_names", "frozen", "protected", "_specs",
-                 "_defaults", "_spec_by_name", "_has_entity_refs", "_data_field_names")
+    __slots__ = (
+        "_data_field_names",
+        "_defaults",
+        "_has_entity_refs",
+        "_spec_by_name",
+        "_specs",
+        "cls",
+        "field_names",
+        "frozen",
+        "protected",
+        "typename",
+    )
 
     def __init__(self, cls: type, typename: str, field_names: tuple[str, ...],
                  frozen: bool, protected: bool = False) -> None:
@@ -391,13 +399,13 @@ def _inject_perm_columns(cls: type, annotations: dict[str, Any]) -> None:
     prior record, never from a bitmap.
     """
     annotations["_dc_owner"] = Annotated[int, Index]
-    setattr(cls, "_dc_owner", dataclasses.field(default=0, init=False))
+    cls._dc_owner = dataclasses.field(default=0, init=False)
     annotations["_dc_groups"] = Annotated[list[int], Index]
-    setattr(cls, "_dc_groups", dataclasses.field(default_factory=list[int], init=False))
+    cls._dc_groups = dataclasses.field(default_factory=list[int], init=False)
     annotations["_dc_read_floor"] = Annotated[int, SortedIndex]
-    setattr(cls, "_dc_read_floor", dataclasses.field(default=VIEWER, init=False))
+    cls._dc_read_floor = dataclasses.field(default=VIEWER, init=False)
     annotations["_dc_write_floor"] = int
-    setattr(cls, "_dc_write_floor", dataclasses.field(default=VIEWER, init=False))
+    cls._dc_write_floor = dataclasses.field(default=VIEWER, init=False)
 
 
 def _permissions_view(self: Any) -> Permissions:
@@ -434,20 +442,17 @@ def _permissions_assign(self: Any, value: Any) -> None:
             f"dc_permissions must be assigned a dc.Permissions, got "
             f"{type(value).__name__}"
         )
-    setattr(self, "_dc_owner", value.owner)
-    setattr(self, "_dc_groups", list(value.groups))  # wraps owner-bound (copy)
-    setattr(self, "_dc_read_floor", value.read_floor)
-    setattr(self, "_dc_write_floor", value.write_floor)
-
-
-_TEntity = TypeVar("_TEntity")
+    self._dc_owner = value.owner
+    self._dc_groups = list(value.groups)  # wraps owner-bound (copy)
+    self._dc_read_floor = value.read_floor
+    self._dc_write_floor = value.write_floor
 
 
 @overload
-def entity(cls: type[_TEntity], /) -> type[_TEntity]: ...
+def entity[TEntity](cls: type[TEntity], /) -> type[TEntity]: ...
 @overload
-def entity(*, frozen: bool = False,
-           protected: bool = False) -> Callable[[type[_TEntity]], type[_TEntity]]: ...
+def entity[TEntity](*, frozen: bool = False,
+           protected: bool = False) -> Callable[[type[TEntity]], type[TEntity]]: ...
 
 
 @dataclass_transform(eq_default=False, field_specifiers=(dataclasses.field, dataclasses.Field))

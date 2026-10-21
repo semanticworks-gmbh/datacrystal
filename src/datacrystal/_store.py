@@ -32,13 +32,15 @@ import threading
 import time
 import warnings
 from collections import deque
+from collections.abc import Callable, Generator, Iterable, Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from contextvars import ContextVar
-from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from types import TracebackType
-from typing import Any, BinaryIO, Callable, Generator, Iterable, Iterator, cast
+from typing import Any, BinaryIO, Self, cast
 
+from datacrystal._actors import Actor, Principal
 from datacrystal._conditions import (
     And,
     Condition,
@@ -52,7 +54,6 @@ from datacrystal._conditions import (
     validate_window,
     window_iter,
 )
-from datacrystal._actors import Actor, Principal
 from datacrystal._containers import PersistentDict, PersistentList, wrap_value
 from datacrystal._entity import (
     TYPES_BY_NAME,
@@ -66,7 +67,6 @@ from datacrystal._entity import (
     state_of,
     type_info,
 )
-from datacrystal._state import STATE_CLEAN, STATE_DELETED, STATE_DIRTY, STATE_NEW
 from datacrystal._errors import (
     ConflictError,
     ConsumerDetachedWarning,
@@ -91,18 +91,7 @@ from datacrystal._errors import (
     WriteDeniedError,
     WrongThreadError,
 )
-from datacrystal._ids import FORMAT_VERSION, IdAllocator, OID_BASE, TID_BASE
-from datacrystal._permissions import (
-    NO_STANDING,
-    PERM_FIELDS,
-    PERM_LEGACY_FILLS,
-    VIEWER,
-    authority_towards,
-    can_read_row,
-    is_root,
-    level,
-)
-from datacrystal._redacted import Redacted, make_twin
+from datacrystal._ids import FORMAT_VERSION, OID_BASE, TID_BASE, IdAllocator
 from datacrystal._index_cache import IndexCache
 from datacrystal._indexes import (
     IndexManager,
@@ -113,18 +102,35 @@ from datacrystal._indexes import (
     windowed_index_order,
 )
 from datacrystal._lazy import BlobHandle, BlobSource, Lazy, LazyReferenceManager
+from datacrystal._permissions import (
+    NO_STANDING,
+    PERM_FIELDS,
+    PERM_LEGACY_FILLS,
+    VIEWER,
+    authority_towards,
+    can_read_row,
+    is_root,
+    level,
+)
 from datacrystal._pipeline import DeltaConsumer, build_delta
 from datacrystal._records import (
     BlobToken,
     RefToken,
-    crc as _crc,
     decode_payload,
     encode_payload,
     fingerprint_payload,
 )
+from datacrystal._records import (
+    crc as _crc,
+)
+from datacrystal._redacted import Redacted, make_twin
 from datacrystal._registry import ObjectRegistry
-from datacrystal._snapshot import Ref, Snapshot
-from datacrystal._snapshot import _SnapshotCore  # pyright: ignore[reportPrivateUsage]  # the per-watermark core ctor
+from datacrystal._snapshot import (
+    Ref,
+    Snapshot,
+    _SnapshotCore,  # pyright: ignore[reportPrivateUsage]  # the per-watermark core ctor
+)
+from datacrystal._state import STATE_CLEAN, STATE_DELETED, STATE_DIRTY, STATE_NEW
 from datacrystal._storage.protocol import (
     CommitBatch,
     StorageBackend,
@@ -160,8 +166,16 @@ class _Root:
 class _Capture:
     """Everything P1 hands to P2/P3 — and enough to compensate a failed P2."""
 
-    __slots__ = ("tid", "batch", "index_entries", "ref_entries", "flipped",
-                 "delta", "deletes", "blob_swaps")
+    __slots__ = (
+        "batch",
+        "blob_swaps",
+        "deletes",
+        "delta",
+        "flipped",
+        "index_entries",
+        "ref_entries",
+        "tid",
+    )
 
     def __init__(self, tid: int, batch: CommitBatch,
                  index_entries: list[tuple[int, TypeInfo, dict[str, Any]]],
@@ -202,7 +216,7 @@ class _CommitAttempt:
         self.conflict: ConflictError | None = None
         self.used = False
 
-    def __enter__(self) -> _CommitAttempt:
+    def __enter__(self) -> Self:
         self.used = True
         return self
 
@@ -663,7 +677,7 @@ class Store:
              lock_ttl: float = 10.0, debug: bool = False,
              strict_deletes: bool = False,
              lazy_timeout: float | None = None, cache_index: bool = True,
-             principal: Principal | None = None) -> "Store":
+             principal: Principal | None = None) -> Store:
         """Open (creating if needed) the store directory at ``path``.
 
         The directory holds ``data.sqlite`` and the single-writer lease file
@@ -731,7 +745,7 @@ class Store:
                 build understands; datacrystal refuses to open it rather
                 than misread it (invariant 9, format honesty).
         """
-        import sqlite3  # noqa: PLC0415 — stays lazy (dep-budget fitness #3)
+        import sqlite3
 
         from datacrystal._storage.lock import LeaseLock  # sqlite3/locking stay lazy
         from datacrystal._storage.sqlite import SqliteBackend
@@ -803,7 +817,7 @@ class Store:
                       strict_deletes: bool = False,
                       lazy_timeout: float | None = None,
                       lazy_clock: Callable[[], float] | None = None,
-                      principal: Principal | None = None) -> "Store":
+                      principal: Principal | None = None) -> Store:
         """Open over an explicit backend (tests; no lock file)."""
         return cls(backend, None, debug=debug, strict_deletes=strict_deletes,
                    lazy_timeout=lazy_timeout, lazy_clock=lazy_clock,
@@ -838,10 +852,10 @@ class Store:
         if self._lock is not None:
             self._lock.release()
 
-    def __enter__(self) -> "Store":
+    def __enter__(self) -> Self:
         return self
 
-    def __exit__(self, *exc: Any) -> None:
+    def __exit__(self, *exc: object) -> None:
         self.close()
 
     # -- public surface ------------------------------------------------------
@@ -1821,7 +1835,7 @@ class Store:
                         f"consumer applied tid {tid} but reports watermark "
                         f"{consumer.watermark} — it violates COMMIT-DELTA-v1 §4.3"
                     )
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - a raising consumer must never break a durable commit
                 self._consumers.remove(consumer)
                 warnings.warn(
                     ConsumerDetachedWarning(
@@ -1934,7 +1948,7 @@ class Store:
             try:
                 payload = self._fingerprint_payload(obj, ti)
                 changed = _crc(payload) != expected
-            except BaseException:
+            except BaseException:  # noqa: BLE001 - any failure to re-encode proves an untracked change
                 # It encoded fine when its fingerprint was taken, so the
                 # failure itself proves an untracked change (e.g. a brand-new
                 # entity attached via a bypass write). Rescue it: the commit
@@ -2033,7 +2047,7 @@ class Store:
         token = self._acting.set(())
         try:
             result = fn()
-        except BaseException as exc:
+        except BaseException as exc:  # noqa: BLE001 - every error, even a BaseException, is handed to the waiting future
             future.set_exception(exc)
             return
         finally:
@@ -2196,7 +2210,7 @@ class Store:
             # Uncommitted raw assignment: already whole in RAM, stream a copy.
             return io.BytesIO(bytes(value))
         if isinstance(value, BlobSource):
-            raise ValueError(
+            raise ValueError(  # noqa: TRY004 - ValueError is the documented contract
                 f"{ti.typename}.{field} holds an uncommitted dc.BlobSource — "
                 "commit() before opening a streamed-write blob for reading"
             )
@@ -3612,7 +3626,7 @@ class Store:
                 self._fingerprints[rec.oid] = _crc(
                     self._fingerprint_payload(obj, ti)
                 )
-            except BaseException:
+            except BaseException:  # noqa: BLE001 - a fingerprint that cannot be taken is simply not recorded
                 self._fingerprints.pop(rec.oid, None)
 
     def _resolve(self, value: Any, lazy: bool, owner: Any,

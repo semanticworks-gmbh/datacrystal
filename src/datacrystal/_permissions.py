@@ -17,8 +17,9 @@ verb can run, every module is initialized.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -57,7 +58,7 @@ PERM_FIELDS = ("_dc_owner", "_dc_groups", "_dc_read_floor", "_dc_write_floor")
 # the persisted field list lacking the _dc_* names. ONE constant, three
 # consumers (live hydration plan, snapshot decode, index build) — agreement
 # by construction; the W2-5 gate's prior-label decode reuses it too.
-PERM_LEGACY_FILLS: dict[str, "Callable[[], Any]"] = {
+PERM_LEGACY_FILLS: dict[str, Callable[[], Any]] = {
     "_dc_owner": lambda: 0,          # nobody — and uid 0 never matches (R7a)
     "_dc_groups": lambda: [WORLD],
     "_dc_read_floor": lambda: VIEWER,

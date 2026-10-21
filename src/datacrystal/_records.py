@@ -31,7 +31,8 @@ import datetime as _dt
 import decimal
 import struct
 import zlib
-from typing import Any, Callable, cast
+from collections.abc import Callable
+from typing import Any, cast
 
 import msgspec
 
@@ -91,7 +92,7 @@ class BlobToken:
     immutable: one OID, one content), mirroring ``RefToken``.
     """
 
-    __slots__ = ("blob_oid", "size", "hash")
+    __slots__ = ("blob_oid", "hash", "size")
 
     def __init__(self, blob_oid: int, size: int, hash: bytes) -> None:
         self.blob_oid = blob_oid

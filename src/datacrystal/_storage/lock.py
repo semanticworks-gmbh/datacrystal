@@ -24,8 +24,9 @@ import socket
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable, cast
+from typing import cast
 
 from datacrystal._errors import StoreLockedError
 

@@ -34,14 +34,14 @@ else:
         _Base = Exception
 
 __all__ = [
-    "FORMAT_MARKER",
     "CONTRACT_VERSION",
+    "FORMAT_MARKER",
     "REQUIRED_KEYS",
     "DeltaFormatError",
     "DeltaGapError",
-    "encode_delta",
-    "decode_delta",
     "ReferenceApplier",
+    "decode_delta",
+    "encode_delta",
 ]
 
 FORMAT_MARKER = "datacrystal-delta"
