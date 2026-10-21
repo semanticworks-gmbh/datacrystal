@@ -29,7 +29,7 @@ from datacrystal._conditions import (
     validate_window,
     window_iter,
 )
-from datacrystal._entity import TYPES_BY_NAME, is_entity, oid_of, type_info
+from datacrystal._entity import TYPES_BY_NAME, TypeInfo, is_entity, oid_of, type_info
 from datacrystal._errors import (
     DanglingRefError,
     DataCrystalError,
@@ -113,7 +113,7 @@ class EntityView:
     def fields(self) -> Mapping[str, Any]:
         return MappingProxyType(self._values)
 
-    def __getattr__(self, name: str) -> Any:
+    def __getattr__(self, name: str) -> Any:  # noqa: ANN401 - dynamic field access, the type is the entity's
         try:
             return self._values[name]
         except KeyError:
@@ -121,7 +121,7 @@ class EntityView:
                 f"{self._typename} snapshot view has no field {name!r}"
             ) from None
 
-    def __setattr__(self, name: str, value: Any) -> None:
+    def __setattr__(self, name: str, value: object) -> None:
         raise AttributeError(
             "snapshot views are read-only — mutate live entities on the owner "
             "thread (or ship a closure via store.submit())"
@@ -157,7 +157,7 @@ class RedactedView(Redacted, EntityView):
 
     __slots__ = ()
 
-    def __getattr__(self, name: str) -> Any:
+    def __getattr__(self, name: str) -> Any:  # noqa: ANN401 - overrides EntityView.__getattr__
         raise ReadDeniedError(
             f"this {self._typename} snapshot view is redacted for the current "
             "principal (ADR-008 R14): traversal is graceful, reading redacted "
@@ -174,12 +174,25 @@ class RedactedView(Redacted, EntityView):
         return f"<RedactedView {self._typename} oid={self._oid}>"
 
 
+def _typename_of(cls_or_typename: type | str) -> str:
+    """Resolve the ``all()`` argument to a persisted typename."""
+    if isinstance(cls_or_typename, str):
+        return cls_or_typename
+    # runtime guard: callers may pass non-type/str (test all(42)); annotation advisory
+    if isinstance(cls_or_typename, type):
+        return type_info(cls_or_typename).typename  # loud if not @entity
+    raise TypeError(
+        f"all() takes an @entity class or a typename string, "
+        f"got {cls_or_typename!r}"
+    )
+
+
 def _redacted_view(oid: int, typename: str) -> RedactedView:
     """Build a field-empty redacted twin for ``oid``, so every data access raises."""
     return RedactedView(oid, typename, {})
 
 
-def _freeze(value: Any) -> Any:
+def _freeze(value: object) -> object:
     """Turn a decoded payload value into an immutable snapshot value."""
     if isinstance(value, RefToken):
         return Ref(value.oid)
@@ -192,7 +205,7 @@ def _freeze(value: Any) -> Any:
     return value
 
 
-def _view_value(value: Any) -> Any:
+def _view_value(value: object) -> object:
     """Map a predicate value onto the snapshot representation: entities and
     Lazy handles become :class:`Ref` tokens, lists the tuples ``_freeze``
     makes of them — so conditions written against live objects evaluate
@@ -333,7 +346,7 @@ class _SnapshotCore:
 
     # -- shared derived state (caller holds the lock) ----------------------
 
-    def class_indexes(self, ti: Any) -> ClassIndexes:
+    def class_indexes(self, ti: TypeInfo) -> ClassIndexes:
         """Return the snapshot-local mutable indexes for one class, the planner's working form."""
         ci = self.indexes.get(ti.cls)
         if ci is None:
@@ -414,7 +427,7 @@ class _SnapshotCore:
         self.load_missing(oids, tolerant=True)
         return [self.cache.get(oid) for oid in oids]
 
-    def warn_unseen(self, ti: Any) -> None:
+    def warn_unseen(self, ti: TypeInfo) -> None:
         warnings.warn(
             UnseenTypeWarning(
                 f"this snapshot has no committed records of {ti.cls.__name__} "
@@ -527,7 +540,7 @@ class Snapshot:
         return self._core.types
 
     @property
-    def root(self) -> Any:
+    def root(self) -> Any:  # noqa: ANN401 - public return, the root value is dynamic
         """The committed root value (refs as :class:`Ref`, containers frozen), or ``None``.
 
         Raises :class:`ReadDeniedError` if the root record is unreadable by this principal.
@@ -631,7 +644,7 @@ class Snapshot:
         )
 
     def all(self, cls_or_typename: type | str, *, limit: int | None = None,
-            offset: int = 0, order_by: Any = None) -> list[EntityView]:
+            offset: int = 0, order_by: object = None) -> list[EntityView]:
         """Return every committed entity of one type across its lineage; old shapes decode by name.
 
         ``limit``/``offset`` window the result (#14); ``order_by=(field, 'asc'|'desc')`` sorts the
@@ -640,16 +653,7 @@ class Snapshot:
         A ``_dc_*`` typename without a live class raises ``ReadDeniedError`` for non-root (W4-5).
         """
         validate_window(limit, offset)
-        if isinstance(cls_or_typename, str):
-            typename = cls_or_typename
-        # runtime guard: callers may pass non-type/str (test all(42)); annotation advisory
-        elif isinstance(cls_or_typename, type):
-            typename = type_info(cls_or_typename).typename  # loud if not @entity
-        else:
-            raise TypeError(
-                f"all() takes an @entity class or a typename string, "
-                f"got {cls_or_typename!r}"
-            )
+        typename = _typename_of(cls_or_typename)
         core = self._core
         ti = TYPES_BY_NAME.get(typename)
         if ti is None and not is_root(self._principal) \
@@ -660,37 +664,50 @@ class Snapshot:
                 "enforce them — fail closed for a non-root principal (ADR-008 W4-5)"
             )
         if order_by is not None:
-            if ti is None:
-                raise QueryError(
-                    f"all(order_by=...) needs the live @entity class for "
-                    f"{typename!r} to name the sort field"
-                )
-            ofield, descending = parse_order_by(order_by, ti)
-            with core.lock:
-                core.guard()
-                ci = core.class_indexes(ti)
-                extent = ci.extent
-                if ti.protected:
-                    rb = self._readable_for(ti, ci)
-                    if rb is not None:
-                        extent = ci.extent & rb
-                if ofield in ci.eq:
-                    window = windowed_index_order(ci, extent, ofield,
-                                                  descending, limit, offset)
-                    return core.views_for(window)
-                views = core.views_for(list(extent))
-            return apply_window(_order_views(views, ofield, descending), limit, offset)
+            return self._all_ordered(typename, ti, order_by, limit, offset)
         if ti is not None and ti.protected:
-            # protected fast path: route the extent through readable & window,
-            # never the raw scan_type stream (a denied row must not pin a slot).
-            with core.lock:
-                core.guard()
-                ci = core.class_indexes(ti)
+            return self._all_protected(ti, limit, offset)
+        return self._all_streamed(typename, limit, offset)
+
+    def _all_ordered(self, typename: str, ti: TypeInfo | None, order_by: object,
+                     limit: int | None, offset: int) -> list[EntityView]:
+        if ti is None:
+            raise QueryError(
+                f"all(order_by=...) needs the live @entity class for "
+                f"{typename!r} to name the sort field"
+            )
+        core = self._core
+        ofield, descending = parse_order_by(order_by, ti)
+        with core.lock:
+            core.guard()
+            ci = core.class_indexes(ti)
+            extent = ci.extent
+            if ti.protected:
                 rb = self._readable_for(ti, ci)
-                candidate = ci.extent if rb is None else (ci.extent & rb)
-                return core.views_for(window_iter(candidate, limit, offset))
+                if rb is not None:
+                    extent = ci.extent & rb
+            if ofield in ci.eq:
+                window = windowed_index_order(ci, extent, ofield,
+                                              descending, limit, offset)
+                return core.views_for(window)
+            views = core.views_for(list(extent))
+        return apply_window(_order_views(views, ofield, descending), limit, offset)
+
+    def _all_protected(self, ti: TypeInfo, limit: int | None, offset: int) -> list[EntityView]:
+        # protected fast path: route the extent through readable & window,
+        # never the raw scan_type stream (a denied row must not pin a slot).
+        core = self._core
+        with core.lock:
+            core.guard()
+            ci = core.class_indexes(ti)
+            rb = self._readable_for(ti, ci)
+            candidate = ci.extent if rb is None else (ci.extent & rb)
+            return core.views_for(window_iter(candidate, limit, offset))
+
+    def _all_streamed(self, typename: str, limit: int | None, offset: int) -> list[EntityView]:
         # unprotected / no-live-class-unlabelled: the original streaming fast
         # path — zero cost, no index build, no readable compile.
+        core = self._core
         stop = None if limit is None else offset + limit
         out: list[EntityView] = []
         with core.lock:
@@ -764,7 +781,7 @@ class Snapshot:
             )
 
     def query(self, target: type | Condition, *, limit: int | None = None,
-              offset: int = 0, order_by: Any = None) -> list[EntityView]:
+              offset: int = 0, order_by: object = None) -> list[EntityView]:
         """Return the :class:`EntityView` DTOs matching a Condition, or the full extent of a class.
 
         On a ``protected=True`` class the candidates are intersected with the readable OIDs
@@ -876,7 +893,7 @@ class Snapshot:
 
     # -- internals ---------------------------------------------------------
 
-    def _readable_for(self, ti: Any, ci: ClassIndexes) -> BitMap64 | None:
+    def _readable_for(self, ti: TypeInfo, ci: ClassIndexes) -> BitMap64 | None:
         """Return this handle's readable-OID bitmap for a PROTECTED class, None for root.
 
         Callers guard on ``ti.protected`` (zero-cost invariant). It is compiled once per class and
