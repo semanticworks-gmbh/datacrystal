@@ -445,6 +445,7 @@ These are the reasons the code carried as comments before they were trimmed.
 - AGENT sits below AUTOMATION deliberately: an LLM agent is the least predictable writer, and competence is not clearance.
 - `NO_STANDING` is not a grantable level; it is the absence of any shared group, kept distinct from `VIEWER` so a floor of `VIEWER` reads "any member may view".
 - Read fences are enforced (`_redacted`, `Lazy.get`, `can_read_row`), and `Actor` is born `protected=True`.
+- `Actor.sponsor` is a natural person's uid and is required for every non-human actor, enforced in core by `acting_as()`: accountability diffuses in groups, and incident response needs a person.
 - The R7 legacy fill comes from one shared constant used by every decode site, never the R6 birth defaults, which would read legacy write floors as `VIEWER` (world-writable) and invert R7.
 
 ### Birth labels and the write fence (R6, R8, R10)

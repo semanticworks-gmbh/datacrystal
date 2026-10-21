@@ -1,6 +1,6 @@
-"""datacrystal, your live objects crystallized: an embedded object-graph database for Python,
-inspired by EclipseStore.
+"""Embed an object-graph database in Python: datacrystal crystallizes your live objects.
 
+Inspired by EclipseStore.
 Typed Python objects are the database: pickle-free, crash-safe, with bitmap-indexed queries built
 in.
 Quickstart: README.md; design docs: docs/design/ (DESIGN.md, ROADMAP.md, ADR-001).

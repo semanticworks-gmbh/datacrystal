@@ -314,9 +314,9 @@ class BlobSource:
 
 
 def blob_from_path(path: str | Path, *, chunk_size: int = 1 << 20) -> BlobSource:
-    """Return a :class:`BlobSource` reading a file in ``chunk_size`` blocks (default 1 MiB), the
-    PDF-archival recipe (ADR-007 section 4).
+    """Return a :class:`BlobSource` reading a file in ``chunk_size`` blocks (default 1 MiB).
 
+    This is the PDF-archival recipe (ADR-007 section 4).
     The size is taken at call time, and the file is re-opened for each of the two read passes, so it
     must stay unchanged across the commit.
     """

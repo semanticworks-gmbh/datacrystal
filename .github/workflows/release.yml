@@ -72,7 +72,7 @@ jobs:
           fi
 
       - name: Gate — lint (ruff)
-        run: uvx ruff check .
+        run: uvx ruff@0.17.1 check .
 
       - name: Gate — types (Pyrefly — src, examples, benchmarks, tests)
         run: uv run pyrefly check

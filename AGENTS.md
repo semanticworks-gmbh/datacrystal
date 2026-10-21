@@ -16,7 +16,7 @@ bump) — **never bump versions by hand** (a fitness gate enforces every mirror 
 ```
 uv sync --all-extras                 # env (Python 3.14 via .python-version; extras for their tests)
 uv run pytest -q                     # full suite incl. fitness gates + SIGKILL crash test
-uvx ruff check .                     # lint, config in ruff.toml (line length 100)
+uvx ruff@0.17.1 check .                     # lint, config in ruff.toml (line length 100)
 uv run pyrefly check                 # types on src, examples, benchmarks, tests — 0 errors, CI-gated
 uv run scripts/test_testrules.py     # the testrules self-tests
 uv run scripts/testrules.py <test_*.py>  # readable-tests check; CI runs it on the test modules a PR changes
@@ -136,7 +136,7 @@ shebangs — `rm -rf .venv && uv sync`.
 - **The rules are in [`STANDARDS.md`](STANDARDS.md)** (self-documenting-code, typed-python, readable-tests, structured-logging, english-only, python-layout); cite them by slug.
 - A rule's gate switches on in the wave named there: #191 docstring form and `print` in `src/`, #192 `Any`, complexity, magic values.
 - The magic class-attribute query syntax (`Mineral.mohs >= 6`) is untypeable by design: use `dc.fields(Mineral)` in typed code, a Pyrefly suppression with its reason only in tests that deliberately exercise the magic path.
-- Never add `# noqa` to `src/`; a Pyrefly suppression is one line with its reason.
+- A Pyrefly suppression is one line with its reason; a `# noqa: <code> - <reason>` in `src/` is allowed only where the ruff rule contradicts a documented contract (BLE001 on a deliberate broad `except`, TRY004 on a documented exception type), never as a blanket.
 - Docstrings explain *why* and cite the design doc that ratified the behavior (self-documenting-code).
 - Commit/PR style: small logical commits; CI runs on PRs and pushes to main.
 - **Working with Sven**: on a genuine scope fork, ask 1–3 sharp questions first (he wants to be

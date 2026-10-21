@@ -1766,8 +1766,9 @@ class Store:
     def get(self, cls: type, **unique_key: Any) -> Any | None:
         """Return one entity by unique secondary key, or ``None``: ``store.get(Mineral, qid=...)``.
 
-        Reflects committed state. On a ``protected=True`` class a found-but-unreadable key is also
-        ``None`` (ADR-008 R12).
+        The lookup reflects committed state; the returned instance is the live one, buffered edits
+        included.
+        On a ``protected=True`` class a found-but-unreadable key is also ``None`` (ADR-008 R12).
         Raises ``QueryError`` for a non-Unique keyword, ``TypeError`` unless exactly one is given.
         """
         self._enter()

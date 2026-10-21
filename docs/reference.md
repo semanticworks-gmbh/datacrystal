@@ -1369,8 +1369,6 @@ df = pd.DataFrame(store.pluck(Mineral, "qid", "name", "crystal_system"),
 
 ## Behaviour notes
 
-Contract details that used to live in docstrings, by API.
-
 ### `Store.committing`
 
 The re-read lives inside the block, so a retry re-applies your intent to the winning value and is never last-writer-wins.
@@ -1390,11 +1388,23 @@ for txn in store.committing(retries=5):
 
 - `durability`: `"commit"` fsyncs every commit (power-loss durable), `"interval"` (default) group-commits at WAL checkpoints (a process crash loses nothing, an OS crash may lose the last commits and never corrupts), `"never"` is for benchmarks and scratch stores.
 - `debug=True` re-encodes the live CLEAN entities on every commit and raises `UntrackedMutationWarning` for any that changed without the dirty hook firing; it costs O(live entities) per commit and arms the eager dangling-ref check in its warn mode.
-- `strict_deletes=True` raises `DanglingRefError` at the commit that deletes an OID a surviving record still points at; `debug=True` alone warns (`DanglingDeleteWarning`). The flagged set is `incoming(dead)` after the commit's index folds. This is a dev-time bridge (ADR-003), not checked deletes.
+- `strict_deletes=True` raises `DanglingRefError` at the commit that deletes an OID a surviving record still points at; `debug=True` alone warns (`DanglingDeleteWarning`).
+  The flagged set is `incoming(dead)` after the commit's index folds.
+  This is a dev-time bridge (ADR-003), not checked deletes.
 - `lazy_timeout` (seconds) demotes loaded `Lazy` handles idle past the timeout; demotion runs on the owner only (sweeps piggyback on store calls, an owner-loop task under `aopen()`).
-- `cache_index` (default on, ADR-005) writes the built indexes to a sidecar on close and loads them at boot; a warm reopen skips the first-query rebuild (about 14x faster on a 6.2M store). The cache is never authoritative: a watermark mismatch or a stale, corrupt or newer sidecar silently rebuilds from the records.
-- `principal` is the config-trusted bootstrap identity, since someone must open the store that holds the `dc.Actor` registry. Omitted, the store acts as the anonymous principal (`uid=0`).
-- `NewerStoreError`: the on-disk format is newer than this build understands (invariant 9). `StoreLockedError`: for example a second `uvicorn` worker opening the same directory (invariant 10).
+- `cache_index` (default on, ADR-005) writes the built indexes to a sidecar on close and loads them at boot; a warm reopen skips the first-query rebuild (about 14x faster on a 6.2M store).
+  The cache is never authoritative: a watermark mismatch or a stale, corrupt or newer sidecar silently rebuilds from the records.
+- `principal` is the config-trusted bootstrap identity, since someone must open the store that holds the `dc.Actor` registry.
+  Omitted, the store acts as the anonymous principal (`uid=0`).
+- `NewerStoreError`: the on-disk format is newer than this build understands (invariant 9).
+  `StoreLockedError`: for example a second `uvicorn` worker opening the same directory (invariant 10).
+
+### `Store.commit` and `Store.delete` errors
+
+- `commit()` raises `OverflowError` for an integer field outside msgpack's signed or unsigned 64-bit range.
+- `commit()` raises `ValueError` when a `dc.BlobSource` declared a size its bytes do not total.
+- `commit()` raises `TypeError` when a `dc.Blob` field holds neither `bytes` nor a `dc.BlobSource`, or a field holds a value msgpack cannot encode.
+- `delete()` raises `DataCrystalError` for an instance of a different or closed store, and for the pinned root holder (assign `store.root` instead).
 
 ### `Store.acting_as` and `Store.principal`
 
@@ -1417,11 +1427,22 @@ On a `protected=True` class the natural-key lookup is unfenced by design (ADR-00
 ### Reading API: windows, order, streaming
 
 - `query(C)` hydrates every committed `C`, the same cost any non-indexed predicate pays, and is symmetric with `count()`, `pluck()` and `Snapshot.all()`.
-- `limit=` and `offset=` (#14) slice the candidate OIDs before hydration on a fully indexed query, so `query(C, limit=10)` loads 10 records; a residual predicate decodes to filter first and the window only trims the list. Order is ascending OID.
-- `order_by=(field, "asc"|"desc")` or a bare field (`EntityClass.f`, `dc.fields(C).f` or a name) sorts the whole match set before the window (#25): NULLs last, ties by ascending OID. An indexed field orders straight from the index (free for a `SortedIndex`, ADR-004); an un-indexed one decodes that field for every match.
+- `limit=` and `offset=` (#14) slice the candidate OIDs before hydration on a fully indexed query, so `query(C, limit=10)` loads 10 records; a residual predicate decodes to filter first and the window only trims the list.
+  Order is ascending OID.
+- `order_by=(field, "asc"|"desc")` or a bare field (`EntityClass.f`, `dc.fields(C).f` or a name) sorts the whole match set before the window (#25): NULLs last, ties by ascending OID.
+  An indexed field orders straight from the index (free for a `SortedIndex`, ADR-004); an un-indexed one decodes that field for every match.
 - On a `protected=True` class the candidates are intersected with the principal's readable OIDs before any window, order or hydration (ADR-008 R12), so a denied row never reaches the result.
-- `pluck(C, "name")` returns values and `pluck(cond, "a", "b")` tuples; references come back as `Ref` tokens for `get_many`. It windows like `query`, and the sort field need not be projected. `pluck(C, "_dc_owner")` stays legal because it reveals labels only of rows the caller can read.
-- `query_iter` yields the identical committed result set one chunk at a time with bounded memory, hydrating exactly as `query()` does, and reads committed state at iteration time. The owner guard is re-asserted on every pull, so a foreign thread or closed store stops the stream. The session principal is captured at call time, so a stream opened inside `acting_as(agent)` keeps `agent`'s view after the scope exits.
+- `pluck(C, "name")` returns values and `pluck(cond, "a", "b")` tuples; references come back as `Ref` tokens for `get_many`.
+  It windows like `query`, and the sort field need not be projected.
+  `pluck(C, "_dc_owner")` stays legal because it reveals labels only of rows the caller can read.
+- `query_iter` yields the identical committed result set one chunk at a time with bounded memory, hydrating exactly as `query()` does, and reads committed state at iteration time.
+  The owner guard is re-asserted on every pull, so a foreign thread or closed store stops the stream.
+  The session principal is captured at call time, so a stream opened inside `acting_as(agent)` keeps `agent`'s view after the scope exits.
+
+### `DeltaLog` configuration
+
+`flush_every` below 1 and a `max_segment_bytes` too small to hold one frame raise `DeltaLogConfigError`, as does a directory that is not a delta log or was written by a newer format.
+`flush_every=1` makes the log as durable as the store; `flush_every=N` fsyncs every N deltas, so a crash can lose up to N-1 of them from the log.
 
 ### Migrating records
 
@@ -1434,10 +1455,17 @@ Write-denial behaviour is in ADR-008 ("Read surfaces").
 ### Web reflection: `to_pydantic`
 
 `nested=N` opts in to bounded referent recursion; the default `0` turns every reference into its OID, which can never re-introduce N+1.
-With `nested=N` a reference whose referent is already resident (a live directly typed field, or a `Lazy` that `peek()` resolves) recurses into `to_pydantic(referent, nested=N-1)`; an unloaded `Lazy`, a snapshot `Ref` and any reference at depth 0 stay an OID. It never calls `.get()`, so it cannot force a load.
+With `nested=N` a reference whose referent is already resident (a live directly typed field, or a `Lazy` that `peek()` resolves) recurses into `to_pydantic(referent, nested=N-1)`; an unloaded `Lazy`, a snapshot `Ref` and any reference at depth 0 stay an OID.
+It never calls `.get()`, so it cannot force a load.
 A nested DTO sits in its `int`-typed reference slot through `model_construct`; the boundary annotation is frozen at `int` (#96).
 `face` selects the `entity_model` face (#98): `"plain"` (default), the input-shaped `"create"`, or the output-shaped `"public"`, which carries `oid` (`view.oid` for a snapshot view, the engine OID for a live entity) for `response_model=EntityPublic`.
-A `Redacted` source (ADR-008 W4-4) projects to `None`, never a DTO, because reading its fields raises `ReadDeniedError`; the check comes before the view branch since a `RedactedView` is also an `EntityView`. The return is annotated `BaseModel` because a twin only arrives from a deref surface, so callers that pass a deref result guard `isinstance(_, dc.Redacted)` first.
+A `Redacted` source (ADR-008 W4-4) projects to `None`, never a DTO, because reading its fields raises `ReadDeniedError`; the check comes before the view branch since a `RedactedView` is also an `EntityView`.
+The return is annotated `BaseModel` because a twin only arrives from a deref surface, so callers that pass a deref result guard `isinstance(_, dc.Redacted)` first.
+
+### Web reflection: `entity_model`
+
+Every face carries `ConfigDict(from_attributes=True)`, so `model_validate` reads fields by name off a live entity or a snapshot view.
+An `@entity(frozen=True)` class maps to `ConfigDict(frozen=True)`, so the DTO stays immutable too.
 
 ## See also
 

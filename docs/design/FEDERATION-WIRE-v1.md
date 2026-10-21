@@ -38,7 +38,7 @@ The watermark probe a follower polls to know whether to pull.
 
 | field | type | source |
 |---|---|---|
-| `tid` | int | `store.last_tid` (`_store.py:464`) — highest committed TID, 0 on an empty store |
+| `tid` | int | `store.last_tid` (`Store.last_tid`) — highest committed TID, 0 on an empty store |
 | `format` | str | exactly `"datacrystal-delta"` (`applier.py:38`) |
 | `version` | int | exactly `1` (`applier.py:39` CONTRACT_VERSION) |
 
@@ -67,7 +67,7 @@ a follower and the reference applier consume it with no new parser.
 ```
 
 Each delta map is exactly the dict `DeltaLog.replay(after_tid=after)` yields
-(`deltalog.py:296-312`), re-encoded with `encode_delta()` (`applier.py:61-63`).
+(`DeltaLog.replay`), re-encoded with `encode_delta()` (`applier.py:61-63`).
 The decoded map's top-level keys are the LOCKED set
 (`f`, `v`, `tid`, `ops`, `types`, `root` — `applier.py:41`,
 COMMIT-DELTA-v1.md:59-66); `ops` elements carry
@@ -79,14 +79,14 @@ COMMIT-DELTA-v1.md:76-82); `types` rows are `[cid, typename, [field, …]]`
 order (invariant 5). The follower applies them through the
 `ReferenceApplier`, which enforces §4: idempotent skip (`tid <= watermark`),
 atomic-with-watermark apply (`tid == watermark+1`), and **loud gap refusal**
-(`tid > watermark+1` raises `DeltaGapError`, `applier.py:108-112`). A
+(`tid > watermark+1` raises `DeltaGapError`, `ReferenceApplier.apply`). A
 follower whose `after` is behind the server's oldest retained segment gets a
 gap → it must re-bootstrap (replay-from-0). **Fail closed: a gap never
 guesses.**
 
 A from-zero bootstrap is `GET /v1/deltas?after=0` (the follower then folds the
 whole history; `replay(after_tid=0)` is faithful for a fresh-store log,
-`deltalog.py:296`).
+`DeltaLog.replay`).
 
 ---
 
@@ -138,7 +138,7 @@ NEW entities are minted an OID in P1 (`next_oid()`, `_ids.py:55`,
 
 | field | type | source |
 |---|---|---|
-| `applied_tid` | int | the new commit TID = `store.last_tid` after `commit()` (`_store.py:1046,464`); `null`/unchanged-tid only if the batch buffered nothing |
+| `applied_tid` | int | the new commit TID = `store.last_tid` after `commit()` (`Store.commit`, `Store.last_tid`); `null`/unchanged-tid only if the batch buffered nothing |
 | `keys` | object | `{natural_key_value: oid}` for every entry, read back from `ci.unique[key].get(value)` after P3 fold (`_store.py:1005`) — NEW entities report their freshly minted OID, existing keys the survivor's OID |
 
 ```json
@@ -229,9 +229,9 @@ These were the genuine choices; ratified with the defaults below so the contract
 - The OCC base token is hex(SHA-256(canonical msgpack record payload bytes)) — the same bytes that ride as op['payload']/op['prior']. It is captured at read, carried in /v1/submit, compared at submit by exact equality against the current persisted payload's hash. base==null means 'key must be absent'.
 - OCC enforcement is fail-closed and is the engine's existing prior!=current byte-equality check (applier.py:131-136), surfaced as HTTP 409 with zero ops applied. There is NO new persisted OCC field and NO read-path tid version.
 - All contribution fans into the single writer via store.submit on the owner thread (ADR-001); one /v1/submit batch = one store.commit() (all-or-nothing, invariant 4); a rejected commit leaves the TID sequence gapless (invariant 5).
-- /v1/submit response = {applied_tid, keys} where applied_tid = store.last_tid after commit (_store.py:464,1046) and keys = {natural_key_value: oid} read from the unique map ci.unique[key].get(value) after P3 fold (_store.py:1005,703-704). NEW OIDs are minted in P1 via next_oid() (_ids.py:55, _store.py:2056).
+- /v1/submit response = {applied_tid, keys} where applied_tid = store.last_tid after commit (Store.commit, Store.last_tid) and keys = {natural_key_value: oid} read from the unique map ci.unique[key].get(value) after P3 fold (_store.py:1005,703-704). NEW OIDs are minted in P1 via next_oid() (_ids.py:55, _store.py:2056).
 - /v1/head = {tid: store.last_tid, format: 'datacrystal-delta', version: 1}; a follower fails closed before pulling if version exceeds what it supports.
-- A delta gap on /v1/deltas (after behind the oldest retained segment) is refused loudly (DeltaGapError, applier.py:108-112) and forces a from-zero re-bootstrap (replay(after_tid=0), deltalog.py:296) — guessing is forbidden.
+- A delta gap on /v1/deltas (after behind the oldest retained segment) is refused loudly (DeltaGapError, ReferenceApplier.apply) and forces a from-zero re-bootstrap (replay(after_tid=0), DeltaLog.replay) — guessing is forbidden.
 
 ---
 

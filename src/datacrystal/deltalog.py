@@ -41,9 +41,11 @@ _VALID_OPS = ("upsert", "delete")
 
 
 class DeltaLogConfigError(DataCrystalError):
-    """The log directory is not a datacrystal delta log, or was written by a
-    newer log format than this build understands — refuse rather than
-    misread (the same format-honesty stance as ``NewerStoreError``).
+    """Refuse a delta log that cannot be opened or configured as asked.
+
+    The directory is not a datacrystal delta log, or a newer log format wrote it (refuse rather
+    than misread, as ``NewerStoreError`` does), or ``flush_every`` is below 1, or
+    ``max_segment_bytes`` is too small to hold one frame.
     """
 
 

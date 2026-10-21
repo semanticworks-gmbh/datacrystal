@@ -56,7 +56,7 @@ except ImportError as exc:  # pragma: no cover — core-only installs
 
 # Compute kernels are registered dynamically; pyarrow's bundled stubs do not
 # know them, so fetch by name (runtime-identical to pc.invert).
-_invert: Any = getattr(_pc, "invert")  # noqa: B009 - pyarrow.compute builds it at runtime, no static attribute
+_invert: Any = _pc.invert  # pyrefly: ignore[missing-attribute] - pyarrow.compute builds it at runtime
 
 # ``pyarrow.parquet`` ships no ``.pyi`` (only untyped ``.py``), so its public
 # functions arrive partially-unknown; fetch by name (like _invert above) and

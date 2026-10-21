@@ -353,8 +353,7 @@ def _permissions_view(self: Any) -> Permissions:
 
 
 def _permissions_assign(self: Any, value: Any) -> None:
-    """Set the four label columns from a :class:`Permissions`, the injected ``dc_permissions``
-    setter.
+    """Set the four label columns from a :class:`Permissions`, as the injected setter.
 
     ``child.dc_permissions = parent.dc_permissions`` copies all four columns verbatim, owner
     included, with groups in a fresh list.
@@ -635,9 +634,9 @@ def _contains_lazy(hint: Any) -> bool:
 
 
 def _check_r11_lazy_only(cls: type, field_name: str, hint: Any) -> None:
-    """Reject a direct reference to a protected class unless it sits inside ``Lazy[...]`` (ADR-008
-    R11).
+    """Reject a direct reference to a protected class outside ``Lazy[...]``.
 
+    ADR-008 R11.
     Legal forms are ``Lazy[X]``, ``Lazy[X] | None`` and ``list[Lazy[X]]``; this keeps ``Lazy.get()``
     the one read checkpoint.
     The walk mirrors :func:`_may_hold_entity` but stops at ``Lazy``.

@@ -106,30 +106,24 @@ def __dir__() -> list[str]:
     return sorted(__all__)
 
 
-__all__ = [  # noqa: RUF022 - grouped by source module, one comment per group
-    # _reflect
-    "FieldDescriptor",
-    "reflect",
-    # _pydantic (#96-#98)
-    "entity_model",
-    "from_pydantic",
-    "to_pydantic",
-    # _strawberry (#99-#101)
-    "StrawberryReflector",
-    "reflect_strawberry_type",
-    # _strawberry (#100): per-request DataLoader over a snapshot
+__all__ = [
     "LOADER_CONTEXT_KEY",
-    "SnapshotLoader",
-    "snapshot_context",
-    # _app (#92): FastAPI lifespan + per-request read/write/context deps
     "SNAPSHOT_CONTEXT_KEY",
+    "FieldDescriptor",
+    "SnapshotLoader",
+    "StrawberryReflector",
     "create_app",
+    "entity_model",
+    "federation_router",
+    "from_pydantic",
     "get_principal",
     "get_store",
     "graphql_context_getter",
     "read_snapshot",
+    "reflect",
+    "reflect_strawberry_type",
+    "snapshot_context",
     "store_lifespan",
     "submit_write",
-    # _federation (#149): coordinator replication read endpoints (item 21)
-    "federation_router",
+    "to_pydantic",
 ]
