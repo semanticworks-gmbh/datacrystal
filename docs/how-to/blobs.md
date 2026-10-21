@@ -43,13 +43,16 @@ with dc.Store.open("cabinet.store") as store:
 - On read the field is a `dc.BlobHandle`; `.size` and `.hash` come from the descriptor without a fetch, `.bytes()` fetches the whole value once and caches it.
 - `store.open_blob(entity, field)` returns an `io.BufferedReader` over a private read view, so you may keep reading it from another thread while the owner commits.
   Close it promptly, because it pins a read transaction; a snapshot has the twin `snapshot.open_blob(view, field)`.
+- A type checker sees `bytes` on the field, so assigning a `BlobSource` needs a line-level ignore; the other checker quirks are in [Typing](../reference.md#typing).
+- If the binary is a thing in its own right (dedup by hash, metadata, several owners), make it its own `@entity` with a `dc.Blob` field and an `Annotated[str, dc.Unique]` sha256, and reference it through `dc.Lazy`.
+  Core does no content-addressing, because that would force refcounting and garbage collection.
+
+## Writing a big blob without holding it whole in RAM
+
 - To write without holding the bytes in memory, assign a `dc.BlobSource(size, open_chunks)`.
   The size must be known up front, and `open_chunks` must return a fresh iterable on each call, because the engine reads it twice: once to hash and length-check before the commit takes its TID, once to fill the cell.
   A one-shot iterator or a wrong size fails loudly and changes nothing.
 - A single blob is capped at SQLite's cell limit of about 954 MiB and fails loudly beyond it; an unbounded stream needs a chunked layout, `[planned — #76]`.
-- A type checker sees `bytes` on the field, so assigning a `BlobSource` needs a line-level ignore; the other checker quirks are in [Typing](../reference.md#typing).
-- If the binary is a thing in its own right (dedup by hash, metadata, several owners), make it its own `@entity` with a `dc.Blob` field and an `Annotated[str, dc.Unique]` sha256, and reference it through `dc.Lazy`.
-  Core does no content-addressing, because that would force refcounting and garbage collection.
 
 Reference: [Storing binary blobs](../reference.md#storing-binary-blobs).
 Rationale: [ADR-007](../design/ADR-007-blob-fields.md).

@@ -44,9 +44,8 @@ Gates that switch on in a later wave say so by issue: ANN401, C901, PLR2004 in `
 ### teaching-docs
 - **Rule:** A docs page teaches one thing: it opens with one sentence on what the reader can do after it, then one runnable mineral-cabinet example, then only what the example cannot show; no filler or marketing words and no history, which goes to `CHANGELOG.md` or an ADR; one sentence per line. The README keeps a fixed shape — name and one sentence, status, quickstart in at most five commands, usage, extras, development gates, links — under 150 lines.
 - **Applies to:** `README.md`, `docs/tutorial.md`, `docs/how-to/`, `docs/explanation.md`, `docs/GUIDE.md`, `llms.txt`; `docs/reference.md` stays complete and dry (the drift guard) and only takes one sentence per line; `docs/design/` holds records and is out of scope.
-- **Enforced by:** ci — the fitness gates run the README quickstart twice and check internal doc links; review for the rest — the PR reviewer reads every changed page against the rule; #196 rewrites the pages and adds a one-sentence-per-line check on changed Markdown; cannot see: whether a page teaches.
-- **Source:** datacrystal's own (owner, 2026-10-20, #186), after tetrahedron decision 554 (project-readme) and its one-sentence-per-line convention.
-- **Exceptions:** every page as of 2026-10-20 (README 186 lines, hard-wrapped at 100), until #196.
+- **Enforced by:** ci — the fitness gates run the README quickstart twice and check internal doc links, and the `docs-wrap` job in `.github/workflows/ci.yml` runs `scripts/check_wrap.py --since` on the Markdown lines a PR adds; review for the rest — the PR reviewer reads every changed page against the rule and runs each Python example it adds; cannot see: whether a page teaches, whether an example still runs.
+- **Source:** datacrystal's own (owner decision 2026-10-20, #196), after tetrahedron decision 554 (project-readme) and its one-sentence-per-line convention.
 
 ### python-layout
 - **Rule:** The code lives in `src/datacrystal/`, the tests in `tests/`, helper scripts as self-contained PEP 723 scripts in `scripts/`; `examples/`, `benchmarks/` and `evals/` hold runnable demos, perf gates and proving grounds.

@@ -70,7 +70,7 @@ edge.close()
 - Both scripts define the same `@entity` classes and run as scripts, because a follower resolves only types that exist under the same module path.
 - The wire is three HTTP shapes under `/v1`: `GET /v1/head` (watermark probe), `GET /v1/deltas?after=<tid>` (the COMMIT-DELTA-v2 change-feed) and `POST /v1/submit` (contribute); the spec is [FEDERATION-WIRE-v1](../design/FEDERATION-WIRE-v1.md).
 - Run the coordinator with one worker.
-  The store is single-writer (the lease lock), and `POST /v1/submit` fans contributions onto the owner thread, so the store must be opened on the thread that runs the event loop; followers carry the read load ([deployment doctrine](web-deployment.md#the-deployment-doctrine--and-why-each-rule-holds)).
+  The store is single-writer (the lease lock), and `POST /v1/submit` fans contributions onto the owner thread, so the store must be opened on the thread that runs the event loop; followers carry the read load ([deployment](web-deployment.md)).
 - The router ships no auth and binds nothing, so an exposed bind is open and writable until you add one.
   Pass `dependencies=[Depends(check_key)]` to `federation_router(store, log, ...)` to guard every route, and put a reverse proxy in front for TLS, body-size and rate limits, because `/v1/submit` batches are unbounded and `GET /v1/deltas?after=0` materializes the whole retained history on the event loop.
 - `Store.follower(url, api_key=..., path=...)` replays the change-feed from TID 0 into a real local store, in memory by default and on disk with a `path`; `dc.open_follower(...)` is the function form.
