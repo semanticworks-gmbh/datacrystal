@@ -7,7 +7,7 @@ from typing import Annotated
 
 import datacrystal as dc
 
-TEAM = 5
+TEAM = 5  # a group is an integer id you name; datacrystal assigns none
 
 @dc.entity(protected=True)
 class Specimen:

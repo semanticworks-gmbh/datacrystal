@@ -639,6 +639,7 @@ store.attach(consumer)                          # 2. ride the stream from there
   Stamps are metadata, never data: derived state and replay digests are stamp-independent by construction.
   **The caveat that makes "pure audit" honest**: with no consumer attached, *nothing records the actor* — deltas are built only while watched and never retained, so where audit matters, attach a `DeltaLog` at store creation; `log.replay()` then answers "who changed what, when" from watermark 0.
 - A consumer that raises is **detached** with a `ConsumerDetachedWarning` — the commit stays durable, the store stays healthy, the sidecar rebuilds and re-attaches.
+  Under `-W error` the warning raises out of `commit()` after the commit is durable, and consumers later in the attach order miss that delta.
 - Writing a consumer?
   Implement the `dc.DeltaConsumer` protocol (a `watermark` property plus `apply(delta)`); `store.attach(consumer)` then rides it on the stream. `datacrystal.testing.check_delta_consumer(factory, content=...)` certifies an implementation against every contract obligation (idempotency, ordering, gap/version refusal, prior-based un-indexing); `datacrystal.testing.CountingConsumer` is the minimal reference implementation, `datacrystal/contract/applier.py` the normative one.
 

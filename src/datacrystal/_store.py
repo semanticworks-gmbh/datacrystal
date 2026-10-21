@@ -933,6 +933,8 @@ class Store:
             del self._pending_upserts[(ti.cls, field, value)]
         return None
 
+    # Commit: _p1_capture (validate, TID, flip state clean, build delta), _run_p2 (backend I/O,
+    # _p2_rollback on failure), _p3_finalize (indexes, fingerprints, last_tid), _deliver.
     def commit(self) -> int | None:
         """Atomically persist all buffered changes; return the new TID, or ``None`` if none.
 
@@ -959,8 +961,8 @@ class Store:
 
         A NEW entity carries ``base=None``, an edited one the SHA-256 of the payload it was read at
         (OCC). They go to ``_contribute_fn`` (``POST /v1/submit``); on success :meth:`sync` pulls
-        the delta back. A reject raises ``ConflictError`` or ``SchemaSkewError`` with the buffers
-        intact.
+        the delta back, but only when a sync function is set.
+        A reject raises ``ConflictError`` or ``SchemaSkewError`` with the buffers intact.
         See docs/design/COMMIT-DELTA-v2.md, section 8.
         """
         assert self._contribute_fn is not None

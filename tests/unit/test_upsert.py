@@ -9,12 +9,16 @@ O(changed), not O(rows)), and one batch may upsert the same key twice.
 from __future__ import annotations
 
 import warnings
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Annotated
 
 import pytest
 
 import datacrystal as dc
 from datacrystal._storage.memory import MemoryBackend
+from datacrystal._storage.sqlite import SqliteBackend
 from tests.conftest import Locality, Mineral
 from tests.unit.test_three_phase import _FailNTimes
 
@@ -603,3 +607,161 @@ def test_upsert_batch_commits_the_merged_name_after_a_p2_failure(
 
     assert names == ["rock crystal"]
     store.close()
+
+
+# -- a failed P2 on an upsert onto a committed record, on both backends ----------
+
+
+@dataclass
+class _FlakyCabinet:
+    """A store over a backend whose next commit can be armed to fail, plus a reopen."""
+
+    store: dc.Store
+    backend: _FailNTimes
+    reopen: Callable[[], dc.Store]
+
+
+@pytest.fixture(params=["memory", "sqlite"])
+def flaky_cabinet_with_quartz(
+    request: pytest.FixtureRequest, tmp_path: Path
+) -> Iterator[_FlakyCabinet]:
+    """Yield a cabinet with committed quartz "quartz" whose backend can fail the next commit."""
+    opened: list[dc.Store] = []
+    if request.param == "memory":
+        memory = MemoryBackend()
+        backend = _FailNTimes(memory, failures=0)
+
+        def reopen() -> dc.Store:
+            reopened = dc.Store._from_backend(memory)
+            opened.append(reopened)
+            return reopened
+    else:
+        directory = tmp_path / "cabinet"
+        directory.mkdir()
+        backend = _FailNTimes(SqliteBackend(directory / "data.sqlite"), failures=0)
+
+        def reopen() -> dc.Store:
+            reopened = dc.Store.open(directory)
+            opened.append(reopened)
+            return reopened
+
+    store = dc.Store._from_backend(backend)
+    store.store(Mineral(qid="Q43010", name="quartz"))
+    store.commit()
+    yield _FlakyCabinet(store, backend, reopen)
+    store.close()
+    for reopened in opened:
+        reopened.close()
+
+
+def test_retry_after_a_failed_commit_persists_the_upserted_name(
+    flaky_cabinet_with_quartz: _FlakyCabinet,
+) -> None:
+    """Given quartz committed, "rock crystal" upserted onto it and its commit failed in P2
+    When the store retries the commit, closes and reopens
+    Then the only name in the reopened store is "rock crystal"
+    """
+    cabinet = flaky_cabinet_with_quartz
+    cabinet.store.upsert(Mineral(qid="Q43010", name="rock crystal"))
+    cabinet.backend.failures = 1
+    with pytest.raises(OSError, match="injected"):
+        cabinet.store.commit()
+    cabinet.store.commit()
+    cabinet.store.close()
+
+    names = cabinet.reopen().pluck(Mineral, "name")
+
+    assert names == ["rock crystal"]
+
+
+def test_retry_after_a_failed_commit_still_hands_out_the_upserted_instance(
+    flaky_cabinet_with_quartz: _FlakyCabinet,
+) -> None:
+    """Given quartz committed, "rock crystal" upserted onto it and its commit failed in P2
+    When the store retries the commit
+    Then the store still hands out the instance the upsert returned (identity map, not disk)
+    """
+    cabinet = flaky_cabinet_with_quartz
+    survivor = cabinet.store.upsert(Mineral(qid="Q43010", name="rock crystal"))
+    cabinet.backend.failures = 1
+    with pytest.raises(OSError, match="injected"):
+        cabinet.store.commit()
+    cabinet.store.commit()
+
+    found = cabinet.store.get(Mineral, qid="Q43010")
+
+    assert found is survivor
+
+
+# -- an upsert after a commit that failed validation --------------------------------
+
+
+@pytest.fixture
+def quartz_with_rejected_duplicate(committed_quartz: Mineral, store: dc.Store) -> Mineral:
+    """Return the buffered duplicate whose commit raised UniqueViolationError on quartz's qid."""
+    duplicate = Mineral(qid="Q43010", name="duplicate")
+    store.store(duplicate)
+    with pytest.raises(dc.UniqueViolationError):
+        store.commit()
+    return duplicate
+
+
+@pytest.mark.usefixtures("quartz_with_rejected_duplicate")
+def test_upsert_after_a_rejected_commit_merges_into_the_committed_record(
+    store: dc.Store, committed_quartz: Mineral
+) -> None:
+    """Matching sees committed state, not the plain store() the rejected commit kept.
+
+    Given quartz committed and a plain-stored duplicate qid whose commit was rejected
+    When a same-qid Mineral named "rock crystal" is upserted
+    Then the committed quartz comes back
+    """
+    survivor = store.upsert(Mineral(qid="Q43010", name="rock crystal"))
+
+    assert survivor is committed_quartz
+
+
+@pytest.mark.usefixtures("quartz_with_rejected_duplicate")
+def test_upsert_after_a_rejected_commit_applies_the_new_name_to_the_committed_record(
+    store: dc.Store, committed_quartz: Mineral
+) -> None:
+    """Given quartz committed and a plain-stored duplicate qid whose commit was rejected
+    When a same-qid Mineral named "rock crystal" is upserted
+    Then the committed record is named "rock crystal"
+    """
+    survivor = store.upsert(Mineral(qid="Q43010", name="rock crystal"))
+
+    assert survivor.name == "rock crystal"
+
+
+@pytest.mark.usefixtures("quartz_with_rejected_duplicate")
+def test_commit_after_an_upsert_still_rejects_the_kept_duplicate(store: dc.Store) -> None:
+    """A rejected commit keeps its buffers, so the duplicate fails the next commit as well.
+
+    Given quartz committed and a plain-stored duplicate qid whose commit was rejected
+    When a same-qid Mineral is upserted and the store commits again
+    Then UniqueViolationError is raised
+    """
+    store.upsert(Mineral(qid="Q43010", name="rock crystal"))
+
+    with pytest.raises(dc.UniqueViolationError):
+        store.commit()
+
+
+@pytest.mark.usefixtures("quartz_with_rejected_duplicate")
+def test_commit_after_discarding_the_rejected_duplicate_persists_the_upsert(
+    store: dc.Store, store_factory: Callable[[], dc.Store]
+) -> None:
+    """Given quartz committed and a plain-stored duplicate qid whose commit was rejected
+    When the store discards, upserts "rock crystal" onto quartz, commits, closes and reopens
+    Then the only name in the reopened store is "rock crystal"
+    """
+    store.discard()
+    store.upsert(Mineral(qid="Q43010", name="rock crystal"))
+    store.commit()
+    store.close()
+
+    with store_factory() as reopened:
+        names = reopened.pluck(Mineral, "name")
+
+    assert names == ["rock crystal"]

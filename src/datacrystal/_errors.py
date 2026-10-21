@@ -219,6 +219,8 @@ class ConsumerDetachedWarning(UserWarning):
     The commit is durable and the store healthy; sidecars are rebuildable (invariant 11).
     Its watermark now lags, and ``attach()`` refuses it until it rebuilds, because deltas are not
     retained (COMMIT-DELTA-v1 section 5).
+    Under ``-W error`` it raises out of ``commit()`` after the commit is durable, and consumers
+    attached later miss that delta.
     """
 
 
