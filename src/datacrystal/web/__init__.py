@@ -9,7 +9,7 @@ Exports are append-only and grouped per submodule.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 # --- _pydantic: REST boundary (#96-#98) — needs only pydantic ------------------
 from datacrystal.web._pydantic import entity_model, from_pydantic, to_pydantic
@@ -86,7 +86,7 @@ _LAZY: dict[str, str] = {
 }
 
 
-def __getattr__(name: str) -> Any:
+def __getattr__(name: str) -> object:
     """Import the submodule owning a strawberry- or fastapi-backed name on first access (PEP 562).
 
     A follower install (no strawberry/fastapi) can therefore import this package.

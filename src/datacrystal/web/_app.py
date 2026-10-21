@@ -14,7 +14,7 @@ import threading
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import AbstractAsyncContextManager
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any, TypedDict, Unpack
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 
@@ -131,8 +131,20 @@ def _get_pool(request: Request) -> _SnapshotPool:
     return pool
 
 
+class StoreOpenOptions(TypedDict, total=False):
+    """The keyword options of :meth:`Store.open`, typed for the ``**open_kwargs`` passed on."""
+
+    durability: str
+    lock_ttl: float
+    debug: bool
+    strict_deletes: bool
+    lazy_timeout: float | None
+    cache_index: bool
+    principal: Principal | None
+
+
 def store_lifespan(
-    path: str | Path, **open_kwargs: Any
+    path: str | Path, **open_kwargs: Unpack[StoreOpenOptions]
 ) -> Callable[[FastAPI], AbstractAsyncContextManager[None]]:
     """Build a FastAPI ``lifespan`` that opens one store per worker process.
 
@@ -152,7 +164,7 @@ class _StoreLifespan:
 
     __slots__ = ("_app", "_open_kwargs", "_path", "store")
 
-    def __init__(self, app: FastAPI, path: Path, open_kwargs: dict[str, Any]) -> None:
+    def __init__(self, app: FastAPI, path: Path, open_kwargs: StoreOpenOptions) -> None:
         self._app = app
         self._path = path
         self._open_kwargs = open_kwargs
@@ -207,12 +219,12 @@ def get_principal() -> Principal | None:
 
 def read_snapshot(
     request: Request,
-    principal: Principal | None = Depends(get_principal),
+    principal: Annotated[Principal | None, Depends(get_principal)],
 ) -> Iterator[Snapshot]:
     """Yield the pooled snapshot for the current watermark, bound to the request principal.
 
-    Use it as ``snap: Snapshot = Depends(read_snapshot)``; it is readable from any thread or loop
-    (ADR-002).
+    Use it as ``snap: Annotated[Snapshot, Depends(read_snapshot)]``;
+    it is readable from any thread or loop (ADR-002).
     A generator dependency, so the pool refcount is released in teardown even if the handler raises.
     The principal rides on the shared core through ``Snapshot.for_principal`` in O(1) (ADR-008 R15);
     ``None`` reads as the anonymous base.
@@ -231,12 +243,12 @@ def read_snapshot(
 
 async def submit_write(
     request: Request,
-    principal: Principal | None = Depends(get_principal),
+    principal: Annotated[Principal | None, Depends(get_principal)],
 ) -> _OwnerWriter:
     """Return a callable that ships a mutation to the owner and resolves once it has committed.
 
-    Use it as ``write = Depends(submit_write)`` and ``await write(fn)`` with ``fn(store) ->
-    result``.
+    Use it as ``write: Annotated[_OwnerWriter, Depends(submit_write)]``.
+    Then ``await write(fn)`` with ``fn(store) -> result``.
     The closure runs on the owner thread via ``store.submit()`` (ADR-001), so the route never
     mutates directly.
     It must return plain data: a live entity in the result raises ``EntityEscapeError``.
@@ -253,14 +265,14 @@ class _OwnerWriter:
         self._store = store
         self._principal = principal
 
-    async def __call__(self, fn: Callable[[Store], Any]) -> Any:
+    async def __call__[T](self, fn: Callable[[Store], T]) -> T:
         """Run ``fn(store)`` on the owner thread as the request principal and await the commit."""
         store = self._store
         # acting_as must wrap inside the closure: the store resets the acting stack around
         # every submitted closure (W1). None is an explicit anonymous scope.
         principal = self._principal if self._principal is not None else Principal(uid=0)
 
-        def run() -> Any:
+        def run() -> T:
             with store.acting_as(principal):
                 return fn(store)
 
@@ -281,7 +293,7 @@ SNAPSHOT_CONTEXT_KEY = "dc_snapshot"
 
 
 def graphql_context_getter(
-    snapshot: Snapshot = Depends(read_snapshot),
+    snapshot: Annotated[Snapshot, Depends(read_snapshot)],
 ) -> Mapping[str, Any]:
     """Build a per-request GraphQL ``context`` of ``{snapshot, loader}`` (#92/#100).
 
@@ -299,7 +311,7 @@ def create_app(
     path: str | Path,
     *,
     routers: list[Any] | None = None,
-    **open_kwargs: Any,
+    **open_kwargs: Unpack[StoreOpenOptions],
 ) -> FastAPI:
     """Build a FastAPI app with the store lifespan wired and each of ``routers`` included (#92).
 

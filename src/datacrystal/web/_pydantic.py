@@ -11,7 +11,8 @@ See ``docs/design/SPIKE-pydantic-interop.md`` and ``docs/reference.md``.
 from __future__ import annotations
 
 import types
-from typing import Annotated, Any, Literal, Union, cast, get_args, get_origin
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Annotated, Any, Literal, Union, cast, get_args, get_origin
 
 import pydantic
 from pydantic import ConfigDict, Field, create_model
@@ -23,6 +24,9 @@ from datacrystal._records import BlobToken, RefToken
 from datacrystal._redacted import Redacted
 from datacrystal._snapshot import EntityView, Ref
 from datacrystal.web._reflect import FieldDescriptor, list_ref_target, reflect
+
+if TYPE_CHECKING:
+    from datacrystal._store import Store
 
 __all__ = ["entity_model", "from_pydantic", "to_pydantic"]
 
@@ -74,7 +78,7 @@ def entity_model(cls: type, *, face: Face = "plain") -> type[pydantic.BaseModel]
 
 
 def to_pydantic(
-    source: Any, *, nested: int = 0, face: Face = "plain"
+    source: object, *, nested: int = 0, face: Face = "plain"
 ) -> pydantic.BaseModel:
     """Project a live entity or ``EntityView`` into a detached :func:`entity_model` DTO (#97, #98).
 
@@ -106,7 +110,7 @@ def to_pydantic(
             "store.snapshot() view"
         )
     model = entity_model(cls, face=face)
-    data = {name: _dto_value(value, nested) for name, value in values.items()}
+    data: dict[str, Any] = {name: _dto_value(value, nested) for name, value in values.items()}
     if face == "public":
         if oid is None:
             raise ValueError(
@@ -120,7 +124,9 @@ def to_pydantic(
     return model.model_validate(data)
 
 
-def from_pydantic(model_instance: pydantic.BaseModel, cls: type, *, store: Any = None) -> Any:
+def from_pydantic(
+    model_instance: pydantic.BaseModel, cls: type, *, store: Store | None = None
+) -> Any:  # noqa: ANN401 - a public return typed per cls would break every caller's checking
     """Rebuild a live ``@entity`` of ``cls`` from a boundary DTO via its public constructor (#98).
 
     The result is a fresh ``STATE_NEW`` instance; the engine slots are never written, and a
@@ -190,38 +196,22 @@ def _type_info_for_view(view: EntityView) -> type:
     return ti.cls
 
 
-def _dto_value(value: Any, nested: int) -> Any:
+def _dto_value(value: object, nested: int) -> object:
     """Project one field value to its detached DTO form (#97), like the engine's read transforms.
 
     References become OIDs, containers plain ``list`` / ``dict``; ``nested`` is as in
     :func:`to_pydantic`.
     No branch forces a load.
     """
-    if isinstance(value, Ref):
-        return value.oid
-    if isinstance(value, RefToken):  # raw decoded token (defensive; views freeze)
+    if isinstance(value, (Ref, RefToken)):  # RefToken: raw decoded token (defensive; views freeze)
         return value.oid
     if isinstance(value, (BlobToken, BlobHandle)):
         # Project the blob OID, never .bytes(), which would force a load (ADR-007 §3).
         return value.blob_oid
     if is_entity(value):
-        oid = oid_of(value)
-        if oid is None:
-            raise ValueError(
-                "cannot project an entity that was never stored — it has no OID "
-                "(store and commit it first)"
-            )
-        if nested > 0:
-            return to_pydantic(value, nested=nested - 1)
-        return oid
+        return _entity_dto_value(value, nested)
     if isinstance(value, Lazy):
-        handle = cast("Lazy[Any]", value)
-        target = handle.peek()  # mirror swizzle()/_view_value(): a loaded handle
-        if target is not None:  # is best — recurse only into what is resident
-            return _dto_value(target, nested)
-        if handle.oid is None:
-            raise ValueError("cannot project an unloaded Lazy without an OID")
-        return handle.oid
+        return _lazy_dto_value(cast("Lazy[Any]", value), nested)
     if isinstance(value, (list, tuple)):
         # A live PersistentList is a list, a view's container a tuple.
         return [_dto_value(item, nested) for item in cast("list[Any]", value)]
@@ -231,12 +221,35 @@ def _dto_value(value: Any, nested: int) -> Any:
     return value  # scalars, None, datetime/date/time pass native
 
 
+def _entity_dto_value(entity: object, nested: int) -> object:
+    """Project a stored entity to its OID, or to a nested DTO while ``nested`` allows."""
+    oid = oid_of(entity)
+    if oid is None:
+        raise ValueError(
+            "cannot project an entity that was never stored — it has no OID "
+            "(store and commit it first)"
+        )
+    if nested > 0:
+        return to_pydantic(entity, nested=nested - 1)
+    return oid
+
+
+def _lazy_dto_value(handle: Lazy[Any], nested: int) -> object:
+    """Project a loaded handle through its target, an unloaded one to its OID."""
+    target = handle.peek()  # mirror swizzle()/_view_value(): a loaded handle
+    if target is not None:  # is best — recurse only into what is resident
+        return _dto_value(target, nested)
+    if handle.oid is None:
+        raise ValueError("cannot project an unloaded Lazy without an OID")
+    return handle.oid
+
+
 def _has_nested_dto(data: dict[str, Any]) -> bool:
     """Report whether any projected value carries a nested DTO, which needs ``model_construct``."""
     return any(_contains_model(v) for v in data.values())
 
 
-def _contains_model(value: Any) -> bool:
+def _contains_model(value: object) -> bool:
     """Report whether ``value`` is or recursively contains a Pydantic model."""
     if isinstance(value, pydantic.BaseModel):
         return True
@@ -247,7 +260,7 @@ def _contains_model(value: Any) -> bool:
     return False
 
 
-def _guard_owner(entity: Any) -> None:
+def _guard_owner(entity: object) -> None:
     """Raise ``WrongThreadError`` if a foreign thread projects a live entity (ADR-001).
 
     A never-stored entity, or one whose store was collected, has no owner, so the guard does
@@ -262,7 +275,7 @@ def _guard_owner(entity: Any) -> None:
         store._guard()  # raises WrongThreadError off the owner thread (ADR-001)
 
 
-def _boundary_annotation(d: FieldDescriptor) -> Any:
+def _boundary_annotation(d: FieldDescriptor) -> object:
     """Return the Pydantic annotation a reflected field carries across the request edge.
 
     A reference becomes ``int`` (its OID), a list edge ``list[int]`` (#103), each ``| None`` if
@@ -278,7 +291,7 @@ def _boundary_annotation(d: FieldDescriptor) -> Any:
     return core
 
 
-def _field_info(default_factory: Any, d: FieldDescriptor) -> FieldInfo:
+def _field_info(default_factory: Callable[[], Any] | None, d: FieldDescriptor) -> FieldInfo:
     """Build the Pydantic ``FieldInfo`` (default and marker metadata) for a field.
 
     The engine stores every default as a zero-arg factory (``TypeInfo.defaults``), so it is called
@@ -304,7 +317,7 @@ def _marker_extra(d: FieldDescriptor) -> dict[str, Any]:
     return extra
 
 
-def _strip_optional(hint: Any) -> tuple[Any, bool]:
+def _strip_optional(hint: object) -> tuple[object, bool]:
     """Split ``X | None`` into ``(X, True)``; a non-optional hint → ``(hint, False)``."""
     if get_origin(hint) in (Union, types.UnionType):
         args = [a for a in get_args(hint) if a is not type(None)]
@@ -314,12 +327,12 @@ def _strip_optional(hint: Any) -> tuple[Any, bool]:
     return hint, False
 
 
-def _is_optional(hint: Any) -> bool:
+def _is_optional(hint: object) -> bool:
     """Report whether ``hint`` is ``X | None``."""
     return _strip_optional(hint)[1]
 
 
-def _contains_entity(hint: Any) -> bool:
+def _contains_entity(hint: object) -> bool:
     """Report whether the marker-stripped core is, or optionally wraps, an ``@entity``.
 
     A directly-typed ``@entity`` field is a reference too, so it crosses as an OID like a ``Lazy``.
