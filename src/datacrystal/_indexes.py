@@ -820,7 +820,11 @@ def readable_bitmap(p: Principal, ci: ClassIndexes) -> BitMap64 | None:
 
 
 _ORDERING_OPS = (">=", ">", "<=", "<")
-_STRING_MATCH_OPS = ("contains", "startswith")
+_STRING_MATCHERS: dict[str, Callable[[str, str], bool]] = {
+    "contains": lambda needle, key: needle in key,
+    "startswith": lambda needle, key: key.startswith(needle),
+}
+_STRING_MATCH_OPS = tuple(_STRING_MATCHERS)
 
 _Planned = tuple[BitMap64 | None, Condition | None]
 
@@ -829,7 +833,7 @@ def _matches_string_key(op: str, needle: str, key: object) -> bool:
     """Report whether an index key is a string that contains / starts with ``needle``."""
     if not isinstance(key, str):
         return False
-    return needle in key if op == "contains" else key.startswith(needle)
+    return _STRING_MATCHERS[op](needle, key)
 
 
 def _plan_list_field(cond: Pred, ci: ClassIndexes) -> _Planned:
