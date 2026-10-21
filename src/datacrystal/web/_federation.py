@@ -1,26 +1,10 @@
 """``datacrystal[web]`` federation surface — the coordinator's federation endpoints.
 
-:func:`federation_router` mounts the LOCKED
-[FEDERATION-WIRE-v1](../../../docs/design/FEDERATION-WIRE-v1.md) contract
-(ROADMAP item 21, epic #146): ``GET /v1/head`` (the watermark probe a follower
-polls), ``GET /v1/deltas?after=<tid>`` (COMMIT-DELTA-v2 frames — byte-for-byte
-the length-prefixed frame the :class:`~datacrystal.deltalog.DeltaLog` already
-writes, re-encoded from :meth:`~datacrystal.deltalog.DeltaLog.replay`), and
-``POST /v1/submit`` (contribute: a follower's writes fanned into the single writer
-via ``store.submit``, ADR-001). ``/v1/submit`` is **fail-closed** (FEDERATION-WIRE-v1
-§5): a malformed envelope → 422, a cid-lineage skew → 409 (``SchemaSkewError``), and
-an OCC ``base`` mismatch → 409 (``ConflictError``); a batch is all-or-nothing (a
-rejected op discards the whole batch's buffered writes).
+:func:`federation_router` mounts the LOCKED ``docs/design/FEDERATION-WIRE-v1.md`` contract
+(ROADMAP item 21, epic #146): ``GET /v1/head``, ``GET /v1/deltas`` and ``POST /v1/submit``.
+You bring your own authn/z via ``dependencies``, applied to every route.
+The coordinator trusts an authenticated client: the follower-side ref guards are conveniences.
 
-You bring your own authn/z: pass FastAPI ``dependencies=[Depends(...)]`` and they
-apply to every federation route — nothing here is exempt from your auth (the same
-seam as the rest of the extra). The coordinator trusts an authenticated client: the
-follower-side ref guards (new→new, container refs, blob) are client conveniences,
-not coordinator-enforced — gate write access with your auth, and run behind a
-reverse proxy (body/rate limits) as the deployment doctrine prescribes.
-
-``fastapi`` is imported only inside this submodule, so a bare ``import
-datacrystal`` never pulls it (the dep-isolation fitness gate).
 """
 
 from __future__ import annotations
@@ -73,29 +57,17 @@ def federation_router(
 ) -> APIRouter:
     """Build the federation router (``/v1/head`` + ``/v1/deltas`` + ``/v1/submit``).
 
-    Args:
-        store: the coordinator's store (the single writer); its
-            :attr:`~datacrystal.Store.last_tid` feeds ``/v1/head``.
-        deltalog: the :class:`~datacrystal.deltalog.DeltaLog` attached to
-            ``store`` — :meth:`~datacrystal.deltalog.DeltaLog.replay` feeds
-            ``/v1/deltas``. (The store exposes no delta-log accessor, so it is
-            passed explicitly; attach it with ``store.attach(deltalog)`` first.)
-        dependencies: FastAPI ``Depends(...)`` applied to every route — you bring
-            authn/z.
-
-    Returns:
-        An :class:`fastapi.APIRouter` (prefix ``/v1``) to mount with
-        ``app.include_router(...)``.
+    ``store.last_tid`` feeds ``/v1/head``; ``deltalog`` (attached to ``store``, passed explicitly
+    because the store exposes no accessor) feeds ``/v1/deltas``.
+    ``dependencies`` apply to every route.
+    Returns an :class:`fastapi.APIRouter` with prefix ``/v1``.
     """
     router = APIRouter(prefix="/v1", dependencies=list(dependencies or []))
 
     async def head() -> dict[str, Any]:
-        """The watermark probe: ``{tid, format, version}`` (liveness + lag).
+        """Return the watermark probe ``{tid, format, version}``.
 
-        ``async def`` on purpose: it runs on the event-loop thread = the store's
-        owner thread (ADR-001), so reading the watermark is serialized with the
-        inline ``/v1/submit`` commit rather than racing it from a threadpool
-        worker (#149 peer-review fix — see :func:`deltas`).
+        ``async def`` so it runs on the owner thread, like :func:`deltas`.
         """
         return {
             "tid": store.last_tid,
@@ -104,27 +76,10 @@ def federation_router(
         }
 
     async def deltas(after: int = Query(0, ge=0)) -> Response:
-        """COMMIT-DELTA-v2 frames with ``tid > after``, in strict TID order.
+        """Return the COMMIT-DELTA-v2 frames with ``tid > after`` in strict TID order.
 
-        The body is zero or more ``[>Q length][encode_delta(delta)]`` frames —
-        the exact bytes a follower applies through the reference applier. ``after``
-        defaults to 0 (a from-genesis bootstrap).
-
-        ``async def`` is load-bearing: a *sync* handler would run in Starlette's
-        threadpool, OFF the owner thread, where :meth:`DeltaLog.replay` would
-        iterate the lock-free segment/buffer state while a concurrent
-        ``/v1/submit`` commit mutates it on the owner thread — silently yielding a
-        short or repeated frame stream (a wire gap the LOCKED contract forbids).
-        Running on the loop thread (= owner thread) serializes ``replay`` with the
-        inline commit; ``replay``'s body never awaits, so the loop cannot
-        interleave a commit into it (#149 peer-review fix; ADR-001 / DeltaLog
-        owner-confinement).
-
-        v0 cost note: because it runs on the loop thread, a large ``replay``
-        (notably a from-genesis ``after=0`` bootstrap) blocks the event loop for
-        its duration — the deliberate v0 trade for a race-free wire. Bootstrap is
-        one-time per follower and the retained history is bounded by the operator's
-        DeltaLog retention; chunked/streamed replay is a demand-driven follow-on.
+        Each frame is ``[>Q length][encode_delta(delta)]``; ``after=0`` is a from-genesis bootstrap.
+        ``async def`` is load-bearing: see ``docs/design/FEDERATION-WIRE-v1.md`` (Threading).
         """
         chunks: list[bytes] = []
         for delta in deltalog.replay(after_tid=after):
@@ -135,25 +90,15 @@ def federation_router(
         )
 
     async def submit(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
-        """Fan a contribution into the single writer (FEDERATION-WIRE-v1 Shape 3).
+        """Fan a contribution into the single writer and return ``{applied_tid, keys}``.
 
-        Body is ``{idem?, ops: [{type, key, fields, base?}]}``. Each op rebuilds a
-        live ``@entity`` from its create-face ``fields`` and is ``upsert``-ed by
-        its natural ``key``; the whole batch is one ``store.submit`` closure → one
-        ``commit`` (all-or-nothing). Returns ``{applied_tid, keys}`` mapping each
-        natural-key value to its OID (newly minted or the merged survivor's).
-
-        Fail-closed guards (FEDERATION-WIRE-v1 §5): a malformed envelope → 422; a
-        field the coordinator's class lacks → 409 (cid-lineage, #154); a key field
-        that is not ``dc.Unique`` → 422; an OCC ``base`` that no longer matches the
-        current payload → 409 (#155, ``ConflictError``). Idempotency rides the
-        natural-key upsert (a retry re-merges to the same OID — no server ledger).
+        One batch is one ``store.submit`` closure and one all-or-nothing ``commit``.
+        The fail-closed status codes (422 malformed, 409 skew or OCC mismatch) are in
+        FEDERATION-WIRE-v1 §5 and the "Conflict envelope" decision.
+        A retry re-merges through the natural-key upsert, so there is no server ledger.
         """
-        # The write fans onto the store's owner thread (below). That only runs
-        # inline — never hangs — when the owner IS this event-loop thread, the
-        # documented deployment (open the store on the serving thread, ADR-001).
-        # A misdeployment would otherwise queue the fan-in with no pump and await
-        # forever; fail loud instead of a silent hang (#155 peer-review fix).
+        # The fan-in runs inline only when the store's owner is this event-loop thread;
+        # otherwise it would queue with no pump and hang (#155), so fail loud.
         if threading.get_ident() != store._owner:
             raise HTTPException(
                 500,
@@ -173,10 +118,8 @@ def federation_router(
             ):
                 raise HTTPException(422, detail="each op needs 'type', 'key', 'fields'")
             op = cast("dict[str, Any]", raw_op)
-            # Shape-check the envelope BEFORE any semantic read: a non-str
-            # type/key or a non-dict fields is a malformed envelope → 422, not a
-            # 409 (e.g. set("astring") would mis-fire the schema-skew guard,
-            # #154/#155 peer-review fix). FEDERATION-WIRE-v1 types fields as object.
+            # Shape-check before any semantic read: set("astring") would mis-fire the
+            # schema-skew guard (#154/#155), so a malformed envelope is a 422, not a 409.
             op_type, op_key, op_fields = op["type"], op["key"], op["fields"]
             if not (
                 isinstance(op_type, str)
@@ -191,13 +134,9 @@ def federation_router(
             if info is None:
                 raise HTTPException(422, detail=f"unknown type {op_type!r}")
             if info.protected:
-                # ADR-008 R16 interim: contributions run anonymous, and the
-                # anonymous principal can neither create protected records
-                # (R6) nor clear any floor — so the coordinator refuses
-                # protected-class batches pre-flight, fail closed, before
-                # the owner thread is touched (all-or-nothing is trivial:
-                # nothing was buffered). Per-follower principals are the
-                # deferred follow-up that lifts this.
+                # ADR-008 R16 interim: anonymous can neither create protected records nor
+                # clear a floor, so refuse pre-flight, before anything is buffered.
+                # Per-follower principals lift this.
                 raise HTTPException(403, detail={
                     "error": "write-denied", "type": op_type,
                     "message": f"{op_type} is protected=True — federation "
@@ -230,20 +169,10 @@ def federation_router(
             prepared.append((info, op_key, op.get("base"), dto))
 
         def fan_in() -> dict[str, Any]:
-            # All-or-nothing (FEDERATION-WIRE-v1 §3): a batch interleaves the OCC
-            # check and upsert per op, so a rejected later op (OCC, schema-skew,
-            # dangling ref) would otherwise leave the EARLIER ops' upserts buffered
-            # — and the next /v1/submit's commit() would flush them, making a
-            # 409-rejected contribution silently durable + replicated. discard()
-            # (owner thread, here) clears the buffer so a failed batch leaves the
-            # store exactly as it was. The happy path commits and never discards.
-            #
-            # Identity honesty (epic #168 W1, review finding): a contribution is
-            # a THIRD PARTY's write — stamping it with the coordinator operator's
-            # ambient principal would put remote work under the operator's name
-            # in the permanent audit log. Until per-follower principals land
-            # (Permissions phase 3), every contribution stamps anonymous
-            # (actor=0): "identity not known", never "the operator did this".
+            # All-or-nothing: discard() on failure, or a rejected op's earlier upserts stay
+            # buffered and the next /v1/submit commit() would make them durable.
+            # Identity honesty (epic #168 W1): a third party's write is stamped anonymous
+            # (actor=0), never with the operator's ambient principal.
             with store.acting_as(_ANONYMOUS):
                 try:
                     survivors: dict[Any, Any] = {}
@@ -277,9 +206,7 @@ def federation_router(
         try:
             return await asyncio.wrap_future(store.submit(fan_in))
         except ConflictError as exc:
-            # The LOCKED conflict envelope: {error, key, expected_base,
-            # actual_base} so a client can re-read and retry (#155 peer-review fix
-            # — the fields were previously flattened into a message and lost).
+            # The LOCKED conflict envelope, so a client can re-read and retry.
             raise HTTPException(
                 409,
                 detail={
