@@ -1,21 +1,10 @@
 """COMMIT-DELTA-v2 reference applier.
 
-This file is **normative**: where the prose spec
-(docs/design/COMMIT-DELTA-v2.md) and this implementation disagree, this
-implementation and the byte-pinned replay vectors win.
-
-v2 (epic #168 W1): every delta carries the required audit stamps ``actor``
-(committing principal's uid, 0 = anonymous) and ``at`` (int ns, injectable
-clock). Under the no-compat ruling (ADR-008 batch 1) a v2 consumer accepts
-**exactly** ``v == 2`` — newer AND older versions are refused loudly
-(§4.5); pre-v2 streams are recreated, never migrated. ``state_digest()``
-deliberately excludes the stamps, so replayed *state* stays byte-stable
-across clock and identity differences.
-
-Engine-free by design — it imports msgspec, stdlib, and (when available)
-the datacrystal error taxonomy. Copy this single file into any consumer
-project and it runs; outside the package the taxonomy import degrades to
-plain ``Exception`` bases.
+Normative: where docs/design/COMMIT-DELTA-v2.md and this file disagree, this file and the
+byte-pinned replay vectors win.
+A consumer accepts exactly ``v == 2`` and refuses older and newer versions (spec §4.5, ADR-008).
+Engine-free: a consumer can copy this single file; without datacrystal the error bases degrade to
+``Exception``.
 """
 
 from __future__ import annotations
@@ -94,6 +83,7 @@ class ReferenceApplier:
     """
 
     def __init__(self) -> None:
+        """Start from an empty state at watermark 0."""
         self.objects: dict[int, bytes] = {}
         self.types: dict[int, tuple[str, tuple[str, ...]]] = {}
         self.root_oid: int | None = None

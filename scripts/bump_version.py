@@ -1,22 +1,10 @@
-"""Bump the project version in EVERY file that carries it (issue #176).
+"""Bump the project version in every file that carries it (issue #176).
 
-pyproject.toml is the single source of truth; everything else is a mirror
-this script rewrites in lockstep:
-
-* ``src/datacrystal/__init__.py`` — ``__version__`` (drift bit us at v0.1.0)
-* ``README.md`` — the version badge, every ``@vX.Y.Z`` git-pin install
-  command, and the ``Status: **X.Y.Z**`` line incl. its ``v0.2–X.Y`` range
-  (drifted to 0.7.0 after the v0.8.0 release — the incident behind #176)
-* ``CLAUDE.md`` — the bare version number in the header prose (the
-  per-version summary prose stays human-written)
-
-``release.yml`` calls this as its bump step; the fitness gate
-``tests/fitness/test_version_sync.py`` asserts the mirrors agree on every
-CI run, so drift fails loudly no matter how it happened.
+pyproject.toml is the single source of truth; the other ``MIRROR_FILES`` are rewritten in lockstep.
+``release.yml`` calls this; ``tests/fitness/test_version_sync.py`` fails when a mirror drifts.
 
 Usage: ``python scripts/bump_version.py {patch|minor|major} [--root DIR]``.
-Prints ``old -> new`` and, when ``$GITHUB_OUTPUT`` is set, appends
-``version=<new>`` for the workflow.
+Prints ``old -> new`` and, when ``$GITHUB_OUTPUT`` is set, appends ``version=<new>``.
 """
 
 from __future__ import annotations
@@ -38,7 +26,7 @@ MIRROR_FILES = (
 
 
 def read_version(root: Path) -> str:
-    """The authoritative version: pyproject.toml's ``version = "X.Y.Z"``."""
+    """Return the authoritative version: pyproject.toml's ``version = "X.Y.Z"``."""
     text = (root / "pyproject.toml").read_text()
     m = re.search(r'^version = "([^"]+)"', text, re.MULTILINE)
     if not m:

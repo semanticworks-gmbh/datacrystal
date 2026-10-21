@@ -1,58 +1,10 @@
-"""``datacrystal[arrow]`` — persistent parquet mirrors of the object graph
-(ROADMAP item 7, resequenced into late v0.x 2026-06-12).
+"""``datacrystal[arrow]``: persistent parquet mirrors of the object graph (ROADMAP item 7).
 
-The watermark pipeline's *second* real consumer, and the measured answer to
-projection/range analytics over millions of records (the MaStR feedback's
-63-second one-column read): every committed entity of a mirrored type
-becomes a row in a per-type Arrow table, kept current from COMMIT-DELTA-v2
-deltas and persisted as parquet — DuckDB/polars/pandas read
-``mirror.table(Specimen)`` zero-copy, and the data directory itself is a
-parquet datalake after ``compact()`` (ROADMAP item 16's positioning).
-
-Storage model (an intentionally tiny LSM):
-
-* Each flush appends one **segment** parquet file per touched type, holding
-  at most one row per OID (latest wins) plus tombstone rows for deletes.
-* ``manifest.json`` is the atomic commit point (temp file + ``os.replace``):
-  it names the watermark, the type lineage, and exactly which segments are
-  live. A crash mid-flush leaves orphan segments that the next open sweeps;
-  the durable watermark never lies (COMMIT-DELTA-v1 §4.3).
-* Reads **fold** segments newest-first per OID and drop tombstones;
-  ``compact()`` (also automatic past ``max_segments``) collapses a type to
-  one fold-free segment.
-
-Schema model: column types are inferred from the *values* (payloads are
-schema-order field lists; the type rows carry names only) and promoted
-through a total lattice — ``null`` < everything, ``bool`` < ``int`` <
-``float``, lists unify element-wise, and any genuinely mixed shape falls
-back to **msgpack-encoded binary** (decode via :func:`decode_fallback`), so
-additive schema evolution (invariant 8: a changed field shape gets a new
-cid) can never wedge the mirror. Entity references become int64 OID columns
-(field metadata ``datacrystal.tag = "ref"``); missing fields of older
-lineage shapes are filled from the live class's defaults exactly like
-snapshot materialization — so incremental mirroring ≡ bootstrap-from-
-snapshot (fitness #13) — or null when no class is registered.
-
-Protected data on disk (ADR-008 R13 honesty obligation): mirroring a
-``protected=True`` class writes BOTH its ordinary columns and its four
-``_dc_*`` label columns to the parquet segments in **plaintext** — a mirror
-of protected data is protected data (the same obligation the FTS sidecar
-carries, ADR-008 R13). The per-record read fence lives in the engine /
-snapshot tier, NOT here: once a row lands in a segment, anyone who can read
-the parquet directory reads it unfenced. So the full mirror is built as the
-AUDITED ROOT — :meth:`ArrowMirror.bootstrap` requires a **root-bound**
-snapshot for a protected (or persisted ``_dc_*`` label-bearing) type; a
-non-root snapshot's ``_stream`` fails closed (ADR-008 W4-5), exactly as
-``migrate()`` rewrites the whole extent under a privileged principal. Protect
-the mirror directory with filesystem permissions befitting its most-sensitive
-mirrored class, and treat ``compact()``ed parquet as sensitive as the store.
-
-Owner confinement: ``apply()`` runs on the store's owner thread (that is
-where deltas are delivered); call ``table()`` there too and hand the
-returned (immutable) ``pyarrow.Table`` to any thread or engine you like.
-Like the store file, a mirror directory has ONE owner process: opening it
-twice concurrently is unsupported (the open-time orphan sweep would treat
-the other instance's fresh segments as crash debris).
+A COMMIT-DELTA-v2 consumer keeping one Arrow table per mirrored type, persisted as parquet segments
+under an atomic ``manifest.json``; ``compact()`` leaves a plain parquet datalake.
+A mirror of a protected class is plaintext on disk (ADR-008 R13), and a mirror directory has one
+owner process and one owner thread for ``apply()`` and ``table()``.
+Storage model and schema lattice: docs/how-to/analytics.md.
 """
 
 from __future__ import annotations
@@ -200,9 +152,7 @@ def _decimal_parts(tag: str) -> tuple[int, int]:
 
 
 def _unify_decimal_tags(a: str, b: str) -> str:
-    """The narrowest decimal wide enough for both: the larger integer part plus
-    the larger scale, or the fallback when that exceeds 38 digits.
-    """
+    """Return the narrowest decimal tag covering both, or "fallback" past 38 digits."""
     (pa_, sa), (pb, sb) = _decimal_parts(a), _decimal_parts(b)
     scale = max(sa, sb)
     precision = max(pa_ - sa, pb - sb) + scale
@@ -271,7 +221,7 @@ def _storable(value: Any, tag: str) -> Any:
 
 
 def _semantic(value: Any, tag: str) -> Any:
-    """The inverse of :func:`_storable`: arrow-read value → decoded value."""
+    """Return the decoded value for an arrow-read ``value``; the inverse of :func:`_storable`."""
     if value is None:
         return None
     if tag == "ref":
@@ -366,40 +316,11 @@ class _TableState:
 class ArrowMirror:
     """A COMMIT-DELTA-v2 consumer mirroring committed entities to parquet.
 
-    Fresh store::
-
-        mirror = ArrowMirror("cabinet.mirror")
-        store.attach(mirror)
-        ... store.commit() ...
-        table = mirror.table(Specimen)        # pyarrow.Table, zero-copy ready
-        duckdb.from_arrow(table)              # or polars.from_arrow(table)
-
-    Lived-in store (deltas are not retained — spec §5)::
-
-        with store.snapshot() as snap:
-            mirror = ArrowMirror.bootstrap("cabinet.mirror", snap)
-        store.attach(mirror)
-
-    ``only`` restricts mirroring to some entity classes (or typename
-    strings); default mirrors every type in the stream. ``flush_every``
-    batches N applied deltas per parquet flush — the durable watermark then
-    trails the live one by up to N-1 commits, and a crash inside that
-    window costs a rebuild (the engine refuses behind-the-watermark
-    re-attach; bootstrap again). The default of 1 keeps the mirror exactly
-    as durable as the store. All settings are persisted; reopening with
-    different ones raises :class:`MirrorConfigError`.
-
-    ``rows_flushed`` is a public diagnostic counter: rows written by the
-    most recent flush — pin your own O(delta) gates on it (fitness #9
-    shape), exactly like this package's tests do.
-
-    ``OID_COLUMN`` is the name of the int64 primary-key column every table
-    carries — the join key for the "filter in datacrystal, aggregate in
-    DuckDB" recipe (GUIDE, Arrow mirrors): a bitmap ``store.snapshot()``
-    query yields ``EntityView``/``Ref`` ``.oid`` values that select rows of
-    this column. It is a public constant so the handoff never hard-codes the
-    internal string. ``parquet_dir()`` names the on-disk segment directory
-    for a type (DuckDB ``read_parquet`` over ``compact()``ed mirrors).
+    On a fresh store attach it directly; on a lived-in store use :meth:`bootstrap` (spec §5).
+    ``only`` restricts the mirrored types; ``flush_every`` batches N deltas per flush (1 = as
+    durable as the store); reopening with other settings raises :class:`MirrorConfigError`.
+    ``rows_flushed`` counts the last flush's rows, for O(delta) gates (fitness #9).
+    ``OID_COLUMN`` is the int64 key to join a datacrystal query with DuckDB.
     """
 
     #: Name of the int64 primary-key column in every ``table()`` / parquet
@@ -410,6 +331,10 @@ class ArrowMirror:
                  only: Iterable[type | str] | None = None,
                  flush_every: int = 1, max_segments: int = 16,
                  _wipe: bool = False) -> None:
+        """Open or create the mirror directory at ``path``.
+
+        Raises MirrorConfigError for ``flush_every`` below 1 or ``max_segments`` below 2.
+        """
         if flush_every < 1:
             raise MirrorConfigError("flush_every must be >= 1")
         if max_segments < 2:
@@ -449,6 +374,11 @@ class ArrowMirror:
         return self._watermark
 
     def apply(self, delta: dict[str, Any]) -> bool:
+        """Mirror one delta; return False on an idempotent skip (§4.2), True when it advanced.
+
+        Raises DeltaFormatError for a foreign marker or a non-current version, DeltaGapError on a
+        TID gap.
+        """
         if delta.get("f") != FORMAT_MARKER:
             raise DeltaFormatError(f"not a datacrystal delta: f={delta.get('f')!r}")
         version = delta.get("v")
@@ -517,37 +447,12 @@ class ArrowMirror:
                   only: Iterable[type | str] | None = None,
                   flush_every: int = 1, max_segments: int = 16,
                   batch: int = 50_000) -> ArrowMirror:
-        """(Re)build the mirror from one ``store.snapshot()`` — the recipe
-        for attaching to a store with history, and the rebuild path after a
-        staleness refusal. Any existing directory at ``path`` is replaced.
+        """Build the mirror from one ``store.snapshot()``, replacing any directory at ``path``.
 
-        Streams the extent in ``batch``-sized chunks (#16): peak resident rows
-        is O(batch), not O(extent), so a store **larger than RAM** can be
-        mirrored — lower ``batch`` to trade throughput for a smaller footprint.
-        ``batch`` is independent of ``flush_every`` (which configures the
-        mirror's post-bootstrap *delta* batching, and defaults to 1 — chunking
-        the bootstrap by it would write one segment per row). Crash-safe — the
-        watermark is stamped only by the FINAL flush, so a crash mid-bootstrap
-        leaves the manifest watermark at 0 (≠ ``snapshot.tid``) and reopen
-        forces a clean re-bootstrap rather than trusting a partial extent.
-        Compaction is suppressed during the stream (≤1 per type, no O(M²)
-        thrash).
-
-        Mirroring a ``protected=True`` (or persisted ``_dc_*`` label-bearing)
-        type requires a **root-bound** ``snapshot`` — build it with
-        ``store.snapshot(principal=dc.root_principal(uid))`` (the audited
-        break-glass, R9). The mirror is a full plaintext copy of the extent
-        including the protected columns (see the module docstring's honesty
-        obligation), so it is built under the store root exactly as
-        ``migrate()`` rewrites the whole extent under a privileged principal.
-        A non-root snapshot fails closed here (nothing is wiped or written);
-        its ``_stream`` would refuse mid-scan anyway (ADR-008 W4-5). This is an
-        enforced guard, never a silent privilege elevation — the caller must
-        consciously choose root to mint a plaintext mirror of protected data.
-
-        Raises:
-            ReadDeniedError: the snapshot is not root-bound yet ``snapshot``
-                would mirror a protected / ``_dc_*`` label-bearing type (W4-5).
+        The extent streams in ``batch``-sized chunks (#16): a store larger than RAM can be mirrored.
+        The final flush alone stamps the watermark, so a crash mid-bootstrap forces a re-bootstrap.
+        A protected type needs a root-bound snapshot (``dc.root_principal``, ADR-008 R9), as the
+        mirror is plaintext; otherwise ReadDeniedError.
         """
         if batch < 1:
             raise MirrorConfigError("batch must be >= 1")
@@ -576,20 +481,10 @@ class ArrowMirror:
     def _require_root_for_protected(
         snapshot: Any, only: Iterable[type | str] | None
     ) -> None:
-        """Fail closed BEFORE anything is wiped or written if this bootstrap
-        would mirror a protected (or persisted ``_dc_*`` label-bearing) type
-        but the ``snapshot`` is not root-bound.
+        """Fail closed before anything is wiped if a protected type would be mirrored without root.
 
-        The parquet mirror is a full plaintext copy of the extent — protected
-        columns included (module-docstring honesty obligation) — so it must be
-        minted as the audited store root (``dc.root_principal``), exactly as
-        ``migrate()`` rewrites the whole extent under a privileged principal.
-        A non-root ``snapshot._stream`` would refuse mid-scan anyway (ADR-008
-        W4-5); raising up front means a mistaken non-root call never destroys
-        an existing good mirror (``_wipe``) and never leaves a half-written
-        one. This is enforcement, NOT elevation: bootstrap never re-derives a
-        root handle for the caller — choosing root is the caller's conscious,
-        audited act.
+        Raising up front keeps a mistaken non-root call from destroying a good mirror (``_wipe``) or
+        leaving a half-written one. This is enforcement, never elevation: the caller chooses root.
         """
         principal = getattr(snapshot, "principal", None)
         if principal is not None and is_root(principal):
@@ -621,10 +516,11 @@ class ArrowMirror:
         return tuple(sorted(set(self._tables) | set(self._pending)))
 
     def table(self, cls_or_typename: type | str) -> pa.Table:
-        """The current mirror of one type as an immutable ``pyarrow.Table``:
-        one row per live entity (``__oid__`` int64 first, then the fields,
-        sorted by name), at this mirror's ``watermark`` — unflushed rows
-        included. Hand the table to DuckDB/polars/pandas zero-copy.
+        """Return the current mirror of one type as an immutable ``pyarrow.Table``.
+
+        One row per live entity (``__oid__`` first, then the fields by name) at this mirror's
+        watermark,
+        unflushed rows included; DuckDB, polars and pandas read it zero-copy.
         """
         typename = (
             cls_or_typename if isinstance(cls_or_typename, str)
@@ -665,18 +561,10 @@ class ArrowMirror:
             path.unlink(missing_ok=True)
 
     def parquet_dir(self, cls_or_typename: type | str) -> Path:
-        """The on-disk directory holding one type's parquet segment(s) — the
-        path to feed DuckDB's ``read_parquet('.../*.parquet')`` so the engine
-        scans the columnar files directly, off the owner thread and without
-        going through :meth:`table` in RAM.
+        """Return the directory holding one type's parquet segments, for DuckDB ``read_parquet``.
 
-        After :meth:`compact` this directory is exactly one fold-free parquet
-        file (current state only) — the parquet-datalake story. Without a
-        compaction it may hold several LSM segments that still need newest-
-        wins folding per ``OID_COLUMN`` and tombstone filtering, so a raw
-        multi-segment read can show superseded/deleted rows; ``compact()``
-        first (or read :meth:`table`) when you need the exact live set. The
-        directory exists once the type has been flushed at least once.
+        After :meth:`compact` it holds exactly one fold-free file; before, several LSM segments that
+        need newest-wins folding and tombstone filtering. It exists once the type has been flushed.
         """
         typename = (
             cls_or_typename if isinstance(cls_or_typename, str)
@@ -716,15 +604,19 @@ class ArrowMirror:
         self._applies_since_flush = 0
 
     def close(self) -> None:
+        """Flush the pending rows."""
         self.flush()
 
     def __enter__(self) -> Self:
+        """Return the mirror itself."""
         return self
 
     def __exit__(self, *exc: object) -> None:
+        """Close the mirror."""
         self.close()
 
     def __repr__(self) -> str:
+        """Return the watermark and the mirrored types."""
         return (
             f"<datacrystal.arrow.ArrowMirror watermark={self._watermark} "
             f"types={list(self.typenames)}>"

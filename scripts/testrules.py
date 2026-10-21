@@ -7,21 +7,9 @@
 
 Usage: uv run scripts/testrules.py [<test_*.py>...]
 With no path it checks every test_*.py under tests/; exit 1 on any finding.
-
 Copied from tetrahedron tools/testrules, 2026-10-20 (#186); owned here from now on.
-
-Every module:
-- a test (module-level or in a class): a name of three or more words, a Given / When / Then
-  docstring, no argument that is a fixture with a scope other than function
-- in a test body: if / for / while / try, a lambda, a comprehension outside an assert
-- anywhere in the module: sleep(), an assert outside a test, a parametrize row that is not
-  plain values
-
-A module under tests/spec/ also:
-- a docstring with a title, one purpose sentence `In order to <value>, <who> <does what>.`,
-  at most 5 bullets
-- at most 7 classes, each marked rule("AC-n") and documented with one sentence
-- xfail only with strict=True and a `#N` reason
+The rules are standards readable-tests and spec-by-example; the self-tests in test_testrules.py list
+each one.
 """
 
 from __future__ import annotations
@@ -73,12 +61,12 @@ def is_spec_module(path: Path) -> bool:
 
 
 def call_name(node: ast.AST) -> str:
-    """The unparsed callee of a call node, or an empty string for any other node."""
+    """Return the unparsed callee of a call node, or an empty string for any other node."""
     return ast.unparse(node.func) if isinstance(node, ast.Call) else ""
 
 
 def row_values(parametrize: ast.Call) -> list[ast.expr]:
-    """The cells of every row in a parametrize call — inside pytest.param(...) or a bare tuple."""
+    """Return the cells of every parametrize row, inside pytest.param(...) or a bare tuple."""
     cells: list[ast.expr] = []
     for row in getattr(parametrize.args[1], "elts", []):
         if isinstance(row, ast.Call):
@@ -95,7 +83,7 @@ def non_function_scope(fixture: ast.Call) -> bool:
 
 
 def scoped_fixture_names(tree: ast.Module) -> set[str]:
-    """The names of the fixtures in the module whose scope is not function."""
+    """Return the names of the fixtures in the module whose scope is not function."""
     return {
         node.name
         for node in ast.walk(tree)
@@ -105,7 +93,7 @@ def scoped_fixture_names(tree: ast.Module) -> set[str]:
 
 
 def conftest_scoped_fixtures(path: Path) -> set[str]:
-    """The names of the wider-scoped fixtures in the neighbouring conftest.py."""
+    """Return the names of the wider-scoped fixtures in the neighbouring conftest.py."""
     names: set[str] = set()
     for folder in path.resolve().parents:
         if (folder / "conftest.py").is_file():
@@ -116,7 +104,7 @@ def conftest_scoped_fixtures(path: Path) -> set[str]:
 
 
 def module_findings(tree: ast.Module) -> list[Finding]:
-    """The findings in test bodies and module-wide: control flow, sleep, helper asserts, rows."""
+    """Return the findings in test bodies and module-wide (control flow, sleep, asserts, rows)."""
     found = []
     for test in tests_of(tree):
         inside_assert = {id(inner) for node in ast.walk(test) if isinstance(node, ast.Assert) for inner in ast.walk(node)}
@@ -157,7 +145,7 @@ def test_findings(test: ast.FunctionDef | ast.AsyncFunctionDef, scoped_fixtures:
 
 
 def xfail_findings(tree: ast.Module) -> list[Finding]:
-    """The findings for an xfail that is not strict or names no issue."""
+    """Return the findings for an xfail that is not strict or names no issue."""
     found = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Call) and call_name(node).endswith("mark.xfail"):
@@ -177,7 +165,7 @@ def xfail_findings(tree: ast.Module) -> list[Finding]:
 
 
 def spec_findings(tree: ast.Module) -> list[Finding]:
-    """The findings that apply to a module under tests/spec/."""
+    """Return the findings that apply to a module under tests/spec/."""
     found = []
     head = ast.get_docstring(tree) or ""
     if not PURPOSE_LINE.search(head):

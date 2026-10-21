@@ -1,13 +1,9 @@
 """In-memory storage fake: protocol-faithful, durable for the process.
 
-Exists so the engine test suite runs parametrized over (sqlite, memory) —
-the fake keeps data across Store close/reopen as long as the same backend
-instance is reused, which is exactly what reopen-semantics tests need
-without touching disk.
-
-Thread safety mirrors the sqlite backend's serialized connection: commit P2
-calls ``apply()`` from the store's IO worker thread while the owner thread
-may keep reading (ADR-001), so the fake serializes its calls with a lock.
+The engine test suite runs parametrized over (sqlite, memory).
+Data survives Store close/reopen as long as the same backend instance is reused.
+Calls are serialized with a lock: commit P2 applies from the IO worker thread while the owner thread
+reads (ADR-001).
 """
 
 from __future__ import annotations
@@ -126,12 +122,9 @@ class MemoryBackend:
 
     def apply(self, batch: CommitBatch) -> None:
         with self._lock:
-            # Materialize streamed blobs FIRST — consuming a source is the only
-            # step that can fail (it may raise, or lie about its size), so do it
-            # before mutating any state. The list comprehension completes wholly
-            # or raises wholly, giving the same all-or-nothing atomicity the
-            # sqlite backend gets from BEGIN IMMEDIATE/ROLLBACK (the SIGKILL/fail
-            # tests demand both backends behave identically).
+            # Materialize streamed blobs first: consuming a source is the only step that can fail
+            # (it may raise or lie about its size), so it precedes any state change and gives the
+            # all-or-nothing atomicity sqlite gets from BEGIN IMMEDIATE/ROLLBACK.
             streamed: list[StoredBlob] = []
             for sb in batch.blob_streams:  # no blobopen → materialize the chunks
                 data = b"".join(sb.open_chunks())
