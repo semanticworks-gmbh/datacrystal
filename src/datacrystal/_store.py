@@ -558,7 +558,7 @@ class Store:
         ``durability`` is the fsync triad: ``"commit"``, ``"interval"`` (default), ``"never"``.
         ``debug`` fingerprints live entities per commit; ``strict_deletes`` is the ADR-003 check.
         ``cache_index`` writes the index sidecar (ADR-005); ``lazy_timeout`` demotes idle handles.
-        ``principal`` is the ambient identity (default ``uid=0``); see reference.md, "Behaviour notes".
+        ``principal`` is the ambient identity (default ``uid=0``); reference.md, "Behaviour notes".
         """
         import sqlite3
 
