@@ -21,6 +21,7 @@ from typing import Annotated
 import pytest
 
 import datacrystal as dc
+from datacrystal._snapshot import Snapshot
 from datacrystal.contract.applier import DeltaFormatError, DeltaGapError, ReferenceApplier
 from datacrystal.deltalog import DeltaLog, DeltaLogConfigError
 from datacrystal.testing import check_delta_consumer
@@ -96,6 +97,21 @@ def open_log(tmp_path: Path) -> Iterator[OpenLog]:
 
     yield open_
     for log in opened:
+        log.close()
+
+
+@pytest.fixture
+def bootstrap_log(tmp_path: Path) -> Iterator[Callable[[str, Snapshot], DeltaLog]]:
+    """Return a factory bootstrapping a DeltaLog under tmp_path from a snapshot; close all after."""
+    bootstrapped: list[DeltaLog] = []
+
+    def bootstrap(name: str, snapshot: Snapshot) -> DeltaLog:
+        log = DeltaLog.bootstrap(tmp_path / name, snapshot)
+        bootstrapped.append(log)
+        return log
+
+    yield bootstrap
+    for log in bootstrapped:
         log.close()
 
 
@@ -535,7 +551,7 @@ def test_reopened_rolled_log_replays_in_tid_order(
 
 
 def test_bootstrap_pins_the_log_to_the_join_point(
-    store_with_logless_tid_1: dc.Store, tmp_path: Path
+    store_with_logless_tid_1: dc.Store, bootstrap_log: Callable[[str, Snapshot], DeltaLog]
 ) -> None:
     """Given a store that committed tid 1 before any log existed
     When a log is bootstrapped from a snapshot
@@ -545,16 +561,15 @@ def test_bootstrap_pins_the_log_to_the_join_point(
     """
     with store_with_logless_tid_1.snapshot() as snap:
         expected_types = set(snap.types)
-        log = DeltaLog.bootstrap(tmp_path / "joined.deltalog", snap)
+        log = bootstrap_log("joined.deltalog", snap)
 
     assert log.genesis_tid == 1
     assert log.watermark == 1
     assert set(log.genesis_types) == expected_types
-    log.close()
 
 
 def test_bootstrapped_log_records_only_post_join_history(
-    store_with_logless_tid_1: dc.Store, tmp_path: Path
+    store_with_logless_tid_1: dc.Store, bootstrap_log: Callable[[str, Snapshot], DeltaLog]
 ) -> None:
     """Given a log bootstrapped at tid 1 and attached
     When a second drawer is committed
@@ -562,14 +577,13 @@ def test_bootstrapped_log_records_only_post_join_history(
     """
     store = store_with_logless_tid_1
     with store.snapshot() as snap:
-        log = DeltaLog.bootstrap(tmp_path / "joined.deltalog", snap)
+        log = bootstrap_log("joined.deltalog", snap)
     store.attach(log)
     store.root = [*store.root, Cabinet(qid="C2", name="after logging")]
 
     store.commit()
 
     assert tids_of(list(log.replay())) == [2]
-    log.close()
 
 
 # -- crash-debris reconciliation (the open-time invariant) ------------------------

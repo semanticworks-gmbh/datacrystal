@@ -127,7 +127,9 @@ def test_bypass_write_on_a_hydrated_entity_is_detected() -> None:
 def test_tracked_changes_and_rereads_raise_no_warning() -> None:
     """Given a committed mineral changed through the hook and a tracked container
     When the debug store commits with UntrackedMutationWarning turned into an error
+    And commits a second time with nothing pending
     Then no warning is raised
+    And the second commit finds nothing to commit, the dirty entity's fingerprint having refreshed
     """
     with dc.Store._from_backend(MemoryBackend(), debug=True) as store:
         quartz = Mineral(qid="Q1", name="quartz", tags=["smoky", "rutile"])
@@ -139,8 +141,10 @@ def test_tracked_changes_and_rereads_raise_no_warning() -> None:
         with warnings.catch_warnings():
             warnings.simplefilter("error", dc.UntrackedMutationWarning)
             tid = store.commit()
+            second_tid = store.commit()
 
         assert tid is not None
+        assert second_tid is None
 
 
 def test_commit_with_nothing_pending_raises_no_warning() -> None:

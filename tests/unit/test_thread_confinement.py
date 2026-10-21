@@ -30,7 +30,7 @@ def test_foreign_thread_store_access_raises_wrong_thread(
     """
     read_root = foreign_thread.submit(getattr, store, "root")
     with pytest.raises(dc.WrongThreadError, match="snapshot"):
-        read_root.result()
+        read_root.result(timeout=10)
 
 
 def test_foreign_thread_query_raises_wrong_thread(
@@ -44,7 +44,7 @@ def test_foreign_thread_query_raises_wrong_thread(
     store.commit()
     query = foreign_thread.submit(store.query, Mineral)
     with pytest.raises(dc.WrongThreadError):
-        query.result()
+        query.result(timeout=10)
 
 
 def test_foreign_thread_write_raises_before_mutating(
@@ -60,7 +60,7 @@ def test_foreign_thread_write_raises_before_mutating(
     store.commit()
     rename = foreign_thread.submit(setattr, quartz, "name", "changed")
     with pytest.raises(dc.WrongThreadError):
-        rename.result()
+        rename.result(timeout=10)
     assert quartz.name == "quartz"
 
 

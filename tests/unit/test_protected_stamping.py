@@ -2,8 +2,7 @@
 and the upsert label shield (ADR-008, epic #168).
 
 The retrofit tests fabricate same-typename classes to simulate "the class
-turned protected between runs" (the schema-evolution house pattern); the
-per-file pyright relaxations exist only for that.
+turned protected between runs" (the schema-evolution house pattern).
 """
 
 from __future__ import annotations
@@ -114,7 +113,7 @@ def _commit_drawer_holding_three_gems(store: dc.Store) -> None:
         store.commit()
 
 
-def _commit_labeled_drawer_then_anonymous_smuggle(store: dc.Store) -> int | None:
+def _commit_shelf_then_anonymous_smuggle(store: dc.Store) -> int | None:
     """Commit an empty shelf as ANNA, then buffer a new protected gem on it anonymously."""
     with store.acting_as(ANNA):
         shelf = PlainShelf(label="s1")
@@ -226,9 +225,9 @@ class TestAnonymousRefusal:
     def test_p1_discovery_refuses_an_anonymous_commit(self, store: dc.Store) -> None:
         """Given a committed shelf with a new protected gem buffered on it anonymously
         When the anonymous session commits
-        Then the commit raises WriteDeniedError naming anonymous, before any TID is taken
+        Then the commit raises WriteDeniedError naming anonymous
         """
-        _commit_labeled_drawer_then_anonymous_smuggle(store)
+        _commit_shelf_then_anonymous_smuggle(store)
         with pytest.raises(WriteDeniedError, match="anonymous"):
             store.commit()
 
@@ -237,7 +236,7 @@ class TestAnonymousRefusal:
         When Anna retries the commit
         Then the smuggled gem is stamped with Anna as owner
         """
-        _commit_labeled_drawer_then_anonymous_smuggle(store)
+        _commit_shelf_then_anonymous_smuggle(store)
         with pytest.raises(WriteDeniedError):
             store.commit()
         with store.acting_as(ANNA):
@@ -250,7 +249,7 @@ class TestAnonymousRefusal:
         When Anna retries the commit
         Then the TID is the one right after the last commit (invariant 5)
         """
-        tid_before = _commit_labeled_drawer_then_anonymous_smuggle(store)
+        tid_before = _commit_shelf_then_anonymous_smuggle(store)
         with pytest.raises(WriteDeniedError):
             store.commit()
         with store.acting_as(ANNA):
@@ -534,6 +533,8 @@ class TestUpsertShield:
         with store.acting_as(ANNA):
             gem = Gem(name="tourmaline")
             store.store(gem)
+            gem._dc_groups.append(ORG)  # pyrefly: ignore[missing-attribute]
+            gem._dc_write_floor = dc.CURATOR  # pyrefly: ignore[missing-attribute]
             store.commit()
             survivor = store.upsert(Gem(name="tourmaline"))
         assert survivor._dc_owner == 2
@@ -548,6 +549,7 @@ class TestUpsertShield:
         with store.acting_as(ANNA):
             gem = Gem(name="tourmaline")
             store.store(gem)
+            gem._dc_groups.append(ORG)  # pyrefly: ignore[missing-attribute]
             gem._dc_write_floor = dc.CURATOR  # pyrefly: ignore[missing-attribute]
             store.commit()
             survivor = store.upsert(Gem(name="tourmaline"))
@@ -562,6 +564,7 @@ class TestUpsertShield:
             gem = Gem(name="tourmaline")
             store.store(gem)
             gem._dc_groups.append(ORG)  # pyrefly: ignore[missing-attribute]
+            gem._dc_write_floor = dc.CURATOR  # pyrefly: ignore[missing-attribute]
             store.commit()
             survivor = store.upsert(Gem(name="tourmaline"))
         assert list(survivor._dc_groups) == [ORG]

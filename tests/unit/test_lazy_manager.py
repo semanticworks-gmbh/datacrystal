@@ -147,6 +147,23 @@ def test_access_refreshes_the_idle_clock(
     assert loaded_handle.loaded
 
 
+def test_owner_calls_right_after_a_sweep_do_not_sweep_again(
+    lazy_store: dc.Store, clock: _Clock, loaded_handle: dc.Lazy[Locality]
+) -> None:
+    """Given a handle demoted by a sweep at t=11
+    When an owner API call follows at t=12, inside the sweep interval
+    Then the manager still counts one demotion
+    """
+    clock.now = 11.0
+    lazy_store.get(Mineral, qid="Q1")
+    clock.now = 12.0
+
+    lazy_store.get(Mineral, qid="Q1")
+
+    assert lazy_store._lazyman is not None
+    assert lazy_store._lazyman.demoted_total == 1
+
+
 def test_user_made_lazy_of_never_demotes(clock: _Clock) -> None:
     """Lazy.of(entity) without an OID cannot reload itself, so the manager leaves it alone.
 

@@ -53,6 +53,11 @@ from tests.conftest import Locality, Mineral
 _MINERAL = f"{Mineral.__module__}:{Mineral.__qualname__}"
 
 
+def _apply_all(consumer: CountingConsumer, deltas: list[dict]) -> None:
+    for delta in deltas:
+        consumer.apply(delta)
+
+
 def _free_port() -> int:
     """Bind ``:0`` to claim a free TCP port, then release it for uvicorn."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -745,7 +750,7 @@ def test_served_feed_replays_cleanly_through_a_conforming_consumer(
     served = list(log.replay(after_tid=0))
     consumer = CountingConsumer()
 
-    list(map(consumer.apply, served))
+    _apply_all(consumer, served)
 
     assert consumer.watermark == 1
     assert consumer.content().get(_MINERAL, 0) >= 2

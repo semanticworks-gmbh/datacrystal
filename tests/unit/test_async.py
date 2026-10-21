@@ -94,8 +94,9 @@ async def _open_async_store(backend: _GatedApply | MemoryBackend) -> dc.AsyncSto
     return dc.AsyncStore(dc.Store._from_backend(backend))
 
 
-async def _loop_is_free() -> str:
-    return "alive"
+async def _commit_is_pending_after_a_loop_turn(commit_task: asyncio.Task[int | None]) -> bool:
+    finished, _ = await asyncio.wait([commit_task], timeout=0)
+    return not finished
 
 
 async def _result_of(future: Future[int]) -> int:
@@ -147,9 +148,13 @@ def parked_commit(runner: asyncio.Runner) -> Iterator[_ParkedCommit]:
     astore.store(quartz)
     backend.release.clear()
     commit_task = runner.get_loop().create_task(astore.commit())
-    runner.run(asyncio.to_thread(backend.entered.wait, 10))
+    entered = runner.run(asyncio.to_thread(backend.entered.wait, 10))
+    if not entered:
+        raise TimeoutError("the commit's P2 never entered the backend")
     yield _ParkedCommit(astore, backend, quartz, commit_task)
     backend.release.set()
+    runner.run(asyncio.wait_for(commit_task, 10))
+    astore.close()
 
 
 @pytest.fixture
@@ -210,11 +215,11 @@ def test_loop_stays_free_while_p2_is_parked(
 ) -> None:
     """Given a commit whose P2 is parked in the executor
     When the owner loop runs a task
-    Then the task completes with "alive"
+    Then the task completes while the commit is still pending
     """
-    beat = runner.run(_loop_is_free())
+    pending = runner.run(_commit_is_pending_after_a_loop_turn(parked_commit.commit_task))
 
-    assert beat == "alive"
+    assert pending is True
 
 
 def test_async_commit_completes_once_p2_is_released(

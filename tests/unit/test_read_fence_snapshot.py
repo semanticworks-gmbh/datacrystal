@@ -143,6 +143,23 @@ def test_outsider_sibling_queries_no_dossier(store: dc.Store) -> None:
     assert found == []
 
 
+def test_a_second_query_on_the_same_outsider_snapshot_still_sees_no_dossier(
+    store: dc.Store,
+) -> None:
+    """Given a team-shared dossier and an owner-only dossier
+    And an outsider's snapshot that already counted the dossiers
+    When the same snapshot queries dossiers
+    Then it sees none, the cached readable set still fencing
+    """
+    _seed_shared(store)
+    with store.snapshot(principal=OUTSIDER) as outsider_snap:
+        outsider_snap.count(Dossier)
+
+        found = outsider_snap.query(Dossier)
+
+    assert found == []
+
+
 def test_snapshot_binds_the_acting_principal_by_default(store: dc.Store) -> None:
     """Given a store acted on as the member
     When a snapshot is taken without naming a principal

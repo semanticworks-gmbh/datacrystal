@@ -494,8 +494,8 @@ def test_frozen_protected_event_refuses_a_field_assignment(
     _commit_sealed_event(store_factory)
     with store_factory() as reopened, reopened.acting_as(CURATOR_ANNA):
         back = reopened.query(SealedEvent)[0]
-    with pytest.raises(FrozenEntityError):
-        back.note = "edited"
+        with pytest.raises(FrozenEntityError):
+            back.note = "edited"
 
 
 def test_frozen_protected_event_refuses_an_append_to_its_tags(
@@ -508,8 +508,8 @@ def test_frozen_protected_event_refuses_an_append_to_its_tags(
     _commit_sealed_event(store_factory)
     with store_factory() as reopened, reopened.acting_as(CURATOR_ANNA):
         back = reopened.query(SealedEvent)[0]
-    with pytest.raises(FrozenEntityError):
-        back.tags.append("x")
+        with pytest.raises(FrozenEntityError):
+            back.tags.append("x")
 
 
 def test_frozen_protected_event_refuses_an_append_to_its_groups(
@@ -522,5 +522,5 @@ def test_frozen_protected_event_refuses_an_append_to_its_groups(
     _commit_sealed_event(store_factory)
     with store_factory() as reopened, reopened.acting_as(CURATOR_ANNA):
         back = reopened.query(SealedEvent)[0]
-    with pytest.raises(FrozenEntityError):
-        back._dc_groups.append(3)
+        with pytest.raises(FrozenEntityError):
+            back._dc_groups.append(3)

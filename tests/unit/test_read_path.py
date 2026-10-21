@@ -122,6 +122,18 @@ def test_count_of_a_residual_condition_hydrates_nothing(cabinet: dc.Store) -> No
     assert _live_entities(cabinet) == live_before
 
 
+def test_count_of_a_conjunction_hydrates_nothing(cabinet: dc.Store) -> None:
+    """Given a cabinet and the number of live entities beforehand
+    When crystal_system == "trigonal" and mohs >= 7.0 is counted
+    Then no entity was constructed
+    """
+    live_before = _live_entities(cabinet)
+
+    cabinet.count((M.crystal_system == "trigonal") & (M.mohs >= 7.0))
+
+    assert _live_entities(cabinet) == live_before
+
+
 def test_count_ignores_a_buffered_insert(cabinet: dc.Store) -> None:
     """Given a cabinet with a pending, uncommitted mineral
     When Mineral is counted

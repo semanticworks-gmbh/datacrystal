@@ -39,6 +39,7 @@ from tests.property._labeled_corpus import (
     ANONYMOUS,
     OUTSIDE_ROOT,
     ROOT,
+    Corpus,
     Labels,
     committed_labels_by_oid,
     labeled_corpus,
@@ -157,6 +158,77 @@ def test_the_owner_sees_their_row_in_the_readable_bitmap(row: dict[str, Any]) ->
 
         readable = set(corpus.index.extent) if bitmap is None else set(bitmap)
         assert only_oid in readable
+
+
+# --- the bitmap compiler over a fixed corpus (deterministic examples) ----------------
+
+MIXED_ROWS = [
+    {"owner": 2, "groups": [], "read_floor": dc.VIEWER},
+    {"owner": 3, "groups": [7], "read_floor": dc.VIEWER},
+    {"owner": 3, "groups": [8], "read_floor": dc.VIEWER},
+]
+
+
+@pytest.fixture
+def mixed_corpus() -> Iterator[Corpus]:
+    """Yield a corpus of rows A (owned by 2), B (owner 3, group 7) and C (owner 3, group 8)."""
+    with labeled_corpus(0, MIXED_ROWS) as corpus:
+        yield corpus
+
+
+def test_an_owner_with_a_membership_grant_reads_the_owned_and_the_granted_rows(
+    mixed_corpus: Corpus,
+) -> None:
+    """Given rows A (owner 2), B (group 7) and C (group 8)
+    When readable_bitmap compiles uid 2 holding a viewer membership of group 7
+    Then they read A and B and not C
+    """
+    row_a, row_b, _row_c = sorted(mixed_corpus.oracle)
+    owner_with_grant = dc.Principal(uid=2, memberships={7: dc.VIEWER})
+
+    bitmap = readable_bitmap(owner_with_grant, mixed_corpus.index)
+
+    assert bitmap is not None
+    assert set(bitmap) == {row_a, row_b}
+
+
+def test_compiling_a_grant_does_not_widen_the_owner_postings(mixed_corpus: Corpus) -> None:
+    """Given uid 2 holding a viewer membership of group 7 was compiled once
+    When readable_bitmap compiles uid 2 again, now without memberships
+    Then uid 2 reads only row A, the row it owns
+    """
+    row_a, _row_b, _row_c = sorted(mixed_corpus.oracle)
+    readable_bitmap(dc.Principal(uid=2, memberships={7: dc.VIEWER}), mixed_corpus.index)
+
+    bitmap = readable_bitmap(dc.Principal(uid=2, memberships={}), mixed_corpus.index)
+
+    assert bitmap is not None
+    assert set(bitmap) == {row_a}
+
+
+def test_an_owner_without_memberships_reads_only_the_rows_they_own(mixed_corpus: Corpus) -> None:
+    """Given rows A (owner 2), B (owner 3, group 7) and C (owner 3, group 8)
+    When readable_bitmap compiles uid 3 without memberships
+    Then uid 3 reads B and C
+    And uid 3 does not read A
+    """
+    row_a, row_b, row_c = sorted(mixed_corpus.oracle)
+
+    bitmap = readable_bitmap(dc.Principal(uid=3, memberships={}), mixed_corpus.index)
+
+    assert bitmap is not None
+    assert set(bitmap) == {row_b, row_c}
+    assert row_a not in set(bitmap)
+
+
+def test_a_root_outside_every_group_reads_every_row_as_no_filter(mixed_corpus: Corpus) -> None:
+    """Given rows A, B and C
+    When readable_bitmap compiles a root principal outside every group
+    Then it answers None, meaning no filter
+    """
+    bitmap = readable_bitmap(OUTSIDE_ROOT, mixed_corpus.index)
+
+    assert bitmap is None
 
 
 # --- the two committed-label sources (D1/D4) ------------------------------------

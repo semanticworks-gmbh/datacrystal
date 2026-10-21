@@ -17,7 +17,7 @@ of the level count, an N+1 regression slipped the loader and this fails the PR
 that introduced it.
 
 It reuses the KICKOFF counting-storage harness pattern from
-:mod:`tests.fitness.test_scale_shape` (``CountingBackend.load_calls``), counting
+:mod:`tests.fitness.test_scale_shape` (``ReadViewCountingBackend.load_calls``), counting
 at the storage seam the snapshot actually reads through
 (:meth:`~datacrystal._snapshot.Snapshot.get_many` →
 ``_load_missing`` → ``read_view.load_many``) — so the count is the true number
@@ -88,7 +88,7 @@ class _CountingReadView:
     are deliberately not counted (the documented one-time cost), like the live-store wrapper.
     """
 
-    def __init__(self, inner: StorageReadView, counter: CountingBackend) -> None:
+    def __init__(self, inner: StorageReadView, counter: ReadViewCountingBackend) -> None:
         self._inner = inner
         self._counter = counter
 
@@ -114,7 +114,7 @@ class _CountingReadView:
         self._inner.close()
 
 
-class CountingBackend:
+class ReadViewCountingBackend:
     """Count the batch reads on a backend's read views.
 
     The KICKOFF 'counting storage wrapper' pattern (``test_scale_shape.py``), pointed at the
@@ -219,7 +219,7 @@ def _nested_selection(depth: int) -> str:
 class Tree:
     """A snapshot over a counting backend and the level-0 nodes a query starts from."""
 
-    backend: CountingBackend
+    backend: ReadViewCountingBackend
     snapshot: Snapshot
     roots: Sequence[object]
 
@@ -234,7 +234,7 @@ def open_chain_tree() -> Iterator[Callable[[int, int], Tree]]:
     with ExitStack() as cleanup:
 
         def open_tree(depth: int, fanout: int) -> Tree:
-            backend = CountingBackend(MemoryBackend())
+            backend = ReadViewCountingBackend(MemoryBackend())
             store = dc.Store._from_backend(backend)
             cleanup.callback(store.close)
             heads = _build_chain_tree(store, depth=depth, fanout=fanout)
@@ -284,10 +284,11 @@ def test_nested_graphql_batches_stay_below_the_followed_edges(
     tree = open_chain_tree(4, 6)
     schema = _schema_exposing_list(StrawberryReflector().reflect(Mineral), tree.roots)
 
-    asyncio.run(
+    result = asyncio.run(
         schema.execute(_nested_selection(4), context_value=snapshot_context(tree.snapshot))
     )
 
+    assert result.errors is None, result.errors
     assert tree.backend.load_calls < 24
 
 
@@ -301,10 +302,11 @@ def test_nested_graphql_serves_every_followed_edge_from_the_batches(
     tree = open_chain_tree(4, 6)
     schema = _schema_exposing_list(StrawberryReflector().reflect(Mineral), tree.roots)
 
-    asyncio.run(
+    result = asyncio.run(
         schema.execute(_nested_selection(4), context_value=snapshot_context(tree.snapshot))
     )
 
+    assert result.errors is None, result.errors
     assert tree.backend.records_loaded == 24
 
 
@@ -382,7 +384,7 @@ def alteration_tree() -> Iterator[Tree]:
 
     The tree has 3 + 9 + 27 = 39 followed edges across 3 levels.
     """
-    backend = CountingBackend(MemoryBackend())
+    backend = ReadViewCountingBackend(MemoryBackend())
     store = dc.Store._from_backend(backend)
     root_oid = _build_alteration_tree(store, depth=3, fanout=3)
     with store.snapshot() as snapshot:

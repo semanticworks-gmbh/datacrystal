@@ -301,6 +301,36 @@ def test_dict_update_marks_the_owner_dirty(counted_store: dc.Store) -> None:
     assert tid is not None
 
 
+def test_dict_update_stores_positional_and_keyword_pairs(counted_store: dc.Store) -> None:
+    """Given a committed root {"n": 1}
+    When it is updated with {"a": 1} and k=3
+    Then the root holds n, a and k with their values
+    """
+    counted_store.root.update({"a": 1}, k=3)
+
+    assert dict(counted_store.root) == {"n": 1, "a": 1, "k": 3}
+
+
+def test_list_insert_puts_the_item_at_the_index(tagged_store: dc.Store) -> None:
+    """Given a committed mineral tagged ["c", "a", "b"]
+    When "x" is inserted at index 1
+    Then the tags read ["c", "x", "a", "b"]
+    """
+    tagged_store.root.tags.insert(1, "x")
+
+    assert list(tagged_store.root.tags) == ["c", "x", "a", "b"]
+
+
+def test_list_insert_of_a_container_wraps_it_for_the_owner(tagged_store: dc.Store) -> None:
+    """Given a committed mineral tagged ["c", "a", "b"]
+    When a plain list is inserted at index 0
+    Then the inserted item is a PersistentList holding its values
+    """
+    tagged_store.root.tags.insert(0, ["n"])
+
+    assert isinstance(tagged_store.root.tags[0], dc.PersistentList)
+
+
 def test_dict_setdefault_of_a_new_key_marks_the_owner_dirty(counted_store: dc.Store) -> None:
     """Given a committed root {"n": 1}
     When setdefault adds "fresh" and the store commits

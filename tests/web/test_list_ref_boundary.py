@@ -110,6 +110,9 @@ def _oids_of(entities: list[Mineral]) -> list[int]:
 def _live_minerals(store: dc.Store, count: int) -> list[Mineral]:
     """Read ``count`` committed minerals back from the store by qid."""
     found = [store.get(Mineral, qid=f"Q{i}") for i in range(count)]
+    missing = [i for i, mineral in enumerate(found) if mineral is None]
+    if missing:
+        raise LookupError(f"minerals Q{missing} were never committed")
     return [mineral for mineral in found if mineral is not None]
 
 

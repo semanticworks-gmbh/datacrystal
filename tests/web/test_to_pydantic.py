@@ -405,7 +405,7 @@ def test_foreign_thread_raises_before_read(stock: tuple[Mineral, Locality]) -> N
     )
 
     worker.start()
-    worker.join()
+    worker.join(timeout=10)
 
     assert captured == [dc.WrongThreadError]
 
@@ -424,7 +424,7 @@ def test_view_is_thread_safe(store: dc.Store, stock: tuple[Mineral, Locality]) -
             target=_dump_view_in_thread, args=(out, snap.get(_oid(mineral)))
         )
         worker.start()
-        worker.join()
+        worker.join(timeout=10)
 
     assert [dump["qid"] for dump in out] == ["Q-QTZ"]
 

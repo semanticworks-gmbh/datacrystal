@@ -218,6 +218,23 @@ def test_idle_blob_is_demoted_at_the_next_boundary_sweep(spy_cabinet: _SpyCabine
     spy_cabinet.store.close()
 
 
+def test_reading_a_cached_blob_refreshes_its_idle_clock(spy_cabinet: _SpyCabinet) -> None:
+    """Given a handle fetched at t=0 and read again at t=8 with a 10 s lazy timeout
+    When the clock reads 16 s and the store's root is touched
+    Then the handle is still loaded, idle only 8 s
+    """
+    handle = _handle(spy_cabinet.store.root[0].image)
+    handle.bytes()
+    spy_cabinet.clock.now = 8.0
+    handle.bytes()
+    spy_cabinet.clock.now = 16.0
+
+    _ = spy_cabinet.store.root
+
+    assert handle.loaded
+    spy_cabinet.store.close()
+
+
 def test_demoted_blob_reloads_transparently(spy_cabinet: _SpyCabinet) -> None:
     """Given a handle that was fetched, then demoted after 11 s idle
     When its bytes are read again
@@ -902,7 +919,7 @@ def test_upsert_with_an_identical_blob_does_not_restore_it(store_factory: StoreF
     first = store.get(Scan, qid="S1")
     assert first is not None
     oid1 = _handle(first.image).blob_oid
-    del first  # let the live entity go, so the next get rehydrates from the store
+    del first  # a live entity keeps raw bytes after a changed-blob upsert; the next get rehydrates a BlobHandle
     store.upsert(Scan(qid="S1", label="v2", image=IMG))
     store.commit()
 
@@ -945,7 +962,7 @@ def test_upsert_with_a_changed_blob_mints_a_fresh_blob_oid(store_factory: StoreF
     first = store.get(Scan, qid="S1")
     assert first is not None
     oid1 = _handle(first.image).blob_oid
-    del first  # let the live entity go, so the next get rehydrates from the store
+    del first  # a live entity keeps raw bytes after a changed-blob upsert; the next get rehydrates a BlobHandle
     store.upsert(Scan(qid="S1", label="v1", image=IMG + b"!"))
     store.commit()
 

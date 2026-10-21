@@ -551,6 +551,22 @@ def test_ordered_values_are_sorted_with_no_denied_row_in_the_ordering(
     assert values == sorted(values)
 
 
+@pytest.mark.parametrize("principal_name", PRINCIPAL_NAMES)
+@pytest.mark.parametrize("order_field", ["category", "note"])
+def test_query_rows_come_back_sorted_with_no_denied_row_in_the_ordering(
+    seeded: dc.Store, order_field: str, principal_name: str
+) -> None:
+    """Given the ten-row corpus
+    When a principal queries the specimens ordered by a field
+    Then that field's values come back sorted, denied rows never sneaking into the ordering
+    """
+    with seeded.acting_as(PRINCIPALS[principal_name]):
+        found = seeded.query(Specimen, order_by=order_field)
+    assert [getattr(row, order_field) for row in found] == sorted(
+        getattr(row, order_field) for row in found
+    )
+
+
 # --- paging determinism: filtered set is exactly partitioned -----------------
 # OWNER reads 7 of 10 rows (S0 S1 S2 S3 S4 S6 S7): three limit=3 pages of 3, 3 and 1.
 

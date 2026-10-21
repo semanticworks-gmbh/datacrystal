@@ -72,6 +72,11 @@ def walk_calls(store: dc.Store, monkeypatch: pytest.MonkeyPatch) -> dict[str, in
     return calls
 
 
+def _store_all(store: dc.Store, entities: list[Specimen]) -> None:
+    for entity in entities:
+        store.store(entity)
+
+
 def _flat_specimens(count: int) -> list[Specimen]:
     return [
         Specimen(
@@ -116,7 +121,7 @@ def test_flat_type_walks_no_fields(store: dc.Store, walk_calls: dict[str, int]) 
     When the store commits
     Then no field was walked, neither on store() nor on commit
     """
-    list(map(store.store, _flat_specimens(25)))
+    _store_all(store, _flat_specimens(25))
 
     store.commit()
 

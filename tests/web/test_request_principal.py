@@ -227,7 +227,7 @@ def test_interleaved_requests_and_foreign_thread_keep_their_own_identity(
     first = _send(app, "POST", "/minerals", params={"qid": "Q-a"})
     foreign = threading.Thread(target=_commit_from_a_foreign_thread, args=(operator_store,))
     foreign.start()
-    foreign.join()
+    foreign.join(timeout=10)
     second = _send(app, "POST", "/minerals", params={"qid": "Q-b"})
 
     assert first.status_code == 200

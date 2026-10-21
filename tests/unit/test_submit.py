@@ -64,7 +64,7 @@ def _plain_fields(store: dc.Store) -> dict[str, str]:
 
 
 def _ship(foreign_thread: ThreadPoolExecutor, store: dc.Store, fn: Callable[[], object]) -> Future:
-    return foreign_thread.submit(store.submit, fn).result()
+    return foreign_thread.submit(store.submit, fn).result(timeout=10)
 
 
 def test_foreign_submission_stays_queued_until_the_owner_calls_in(
@@ -89,7 +89,7 @@ def test_foreign_submission_runs_on_owner_piggyback(
     future = _ship(foreign_thread, store, partial(store.store, Mineral(qid="Q1", name="quartz")))
     store.commit()
     assert future.done()
-    assert isinstance(future.result(), int)
+    assert isinstance(future.result(timeout=10), int)
 
 
 def test_piggybacked_submission_is_committed_with_the_owner(
@@ -135,7 +135,7 @@ def test_run_pending_runs_submissions_in_fifo_order(
     third = _ship(foreign_thread, store, partial(_record, seen, 2))
     store.run_pending()
     assert seen == [0, 1, 2]
-    assert [first.result(), second.result(), third.result()] == [0, 1, 2]
+    assert [first.result(timeout=10), second.result(timeout=10), third.result(timeout=10)] == [0, 1, 2]
 
 
 def test_second_run_pending_finds_nothing(
@@ -253,7 +253,7 @@ def test_direct_foreign_access_still_raises_wrong_thread(
     """
     trespass = foreign_thread.submit(store.commit)
     with pytest.raises(dc.WrongThreadError, match="submit"):
-        trespass.result()
+        trespass.result(timeout=10)
 
 
 def test_close_fails_pending_submissions(

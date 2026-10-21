@@ -11,12 +11,25 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from pathlib import Path
+from typing import Annotated
 
 import pytest
 
 import datacrystal as dc
 import datacrystal._indexes as _idx
 from tests.conftest import Locality, Mineral
+
+
+@dc.entity
+class Tag:
+    """A museum tag holding a direct (non-Lazy) reference to a mineral."""
+
+    text: Annotated[str, dc.Unique]
+    mineral: Mineral | None = None
+
+
+def _texts(tags: list[Tag]) -> list[str]:
+    return sorted(t.text for t in tags)
 
 
 def _names(nodes: list[Mineral]) -> list[str]:
@@ -180,3 +193,29 @@ def test_reverse_cache_survives_a_second_warm_reopen(tmp_path: Path) -> None:
 
     assert names == ["a", "b"]
     second.close()
+
+
+def test_incremental_fold_follows_a_direct_entity_ref_added_after_cache_load(
+    tmp_path: Path,
+) -> None:
+    """Given a cached reverse index with tag t1 pointing straight at mineral azurite
+    When the store is reopened, the index is loaded, and tag t2 pointing at azurite is committed
+    Then the backlinks of azurite are t1 and t2
+    """
+    seed = dc.Store.open(tmp_path / "graph", cache_index=True)
+    azurite = Mineral(qid="Q1", name="azurite")
+    seed.store(Tag(text="t1", mineral=azurite))
+    seed.commit()
+    seed.incoming(azurite)
+    seed.close()
+    s = dc.Store.open(tmp_path / "graph", cache_index=True)
+    reopened_azurite = s.get(Mineral, qid="Q1")
+    assert reopened_azurite is not None
+    s.incoming(reopened_azurite)
+    s.store(Tag(text="t2", mineral=reopened_azurite))
+    s.commit()
+
+    texts = _texts(s.incoming(reopened_azurite))
+
+    assert texts == ["t1", "t2"]
+    s.close()

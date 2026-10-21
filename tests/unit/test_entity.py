@@ -244,6 +244,96 @@ def test_fulltext_rejects_an_empty_language() -> None:
         dc.FullText(language="")
 
 
+def test_lazy_refs_are_found_inside_unions_and_lists_but_not_in_plain_fields() -> None:
+    """Given an entity with Lazy, Lazy | None, list[Lazy] and plain str, dict and int | None fields
+    When its field specs are read
+    Then the three Lazy-bearing fields hold lazy refs
+    And the plain ones do not
+    """
+
+    @dc.entity
+    class LazyShelf:
+        direct: dc.Lazy[Mineral]
+        optional: dc.Lazy[Mineral] | None
+        listed: list[dc.Lazy[Mineral]]
+        plain: str
+        mapping: dict[str, int]
+        maybe_int: int | None
+
+    specs = _specs_by_name(LazyShelf)
+
+    assert specs["direct"].lazy_refs is True
+    assert specs["optional"].lazy_refs is True
+    assert specs["listed"].lazy_refs is True
+    assert specs["plain"].lazy_refs is False
+    assert specs["mapping"].lazy_refs is False
+    assert specs["maybe_int"].lazy_refs is False
+
+
+def test_entity_refs_are_found_in_entity_unions_and_not_in_scalar_fields() -> None:
+    """Given an entity with Mineral, Mineral | None, Any, str and int | None fields
+    When its field specs are read
+    Then the first three may hold an entity ref
+    And str and int | None may not
+    """
+
+    @dc.entity
+    class RefShelf:
+        direct: Mineral
+        optional: Mineral | None
+        anything: Any
+        label: str
+        count: int | None
+
+    specs = _specs_by_name(RefShelf)
+
+    assert specs["direct"].entity_ref is True
+    assert specs["optional"].entity_ref is True
+    assert specs["anything"].entity_ref is True
+    assert specs["label"].entity_ref is False
+    assert specs["count"].entity_ref is False
+
+
+def test_a_type_with_an_entity_ref_field_reports_entity_refs() -> None:
+    """Given an entity with a Mineral | None field and a str field
+    When the type info is asked for entity refs
+    Then it says True
+    """
+
+    @dc.entity
+    class RefHolder:
+        label: str
+        mineral: Mineral | None = None
+
+    has_refs = type_info(RefHolder).has_entity_refs
+
+    assert has_refs is True
+
+
+def test_fulltext_markers_carry_flag_and_language_into_the_spec() -> None:
+    """Given an entity with a FullText(language="de"), a bare FullText and an unmarked field
+    When its field specs are read
+    Then the marked fields are fulltext
+    And only the first has the language "de"
+    And the unmarked field is not fulltext and has no language
+    """
+
+    @dc.entity
+    class NoteShelf:
+        plain: str
+        german: Annotated[str, dc.FullText(language="de")]
+        bare: Annotated[str, dc.FullText]
+
+    specs = _specs_by_name(NoteShelf)
+
+    assert specs["german"].fulltext is True
+    assert specs["german"].fulltext_language == "de"
+    assert specs["bare"].fulltext is True
+    assert specs["bare"].fulltext_language is None
+    assert specs["plain"].fulltext is False
+    assert specs["plain"].fulltext_language is None
+
+
 def test_index_on_a_bare_list_is_rejected_at_decoration() -> None:
     """#19: the "must be scalar" error fires at decoration, not lazily at first commit().
 

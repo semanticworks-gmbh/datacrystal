@@ -327,3 +327,20 @@ def test_unarmed_store_leaves_reverse_index_unbuilt(dev_store_factory: StoreOpen
 
     assert store._index.reverse_built is False
     store.close()
+
+
+def test_store_opened_with_default_flags_leaves_reverse_index_unbuilt(tmp_path: Path) -> None:
+    """Given azurite pointing at Tsumeb Mine, committed, in a store opened without any dev flag
+    When Tsumeb Mine is deleted and the store commits
+    Then the reverse index is still unbuilt, so debug defaults to off
+    """
+    store = dc.Store.open(tmp_path / "default-store")
+    tsumeb = _tsumeb()
+    store.store(_azurite_at(tsumeb))
+    store.commit()
+    store.delete(tsumeb)
+
+    store.commit()
+
+    assert store._index.reverse_built is False
+    store.close()

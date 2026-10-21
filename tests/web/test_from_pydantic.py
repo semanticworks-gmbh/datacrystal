@@ -282,7 +282,7 @@ def test_store_resolution_is_owner_confined(
     worker = threading.Thread(target=_record_error_type, args=(captured, resolve))
 
     worker.start()
-    worker.join()
+    worker.join(timeout=10)
 
     assert captured == [dc.WrongThreadError]
 

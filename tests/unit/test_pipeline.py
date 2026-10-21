@@ -457,8 +457,9 @@ def test_commit_stays_durable_when_a_consumer_explodes(
     """Given an exploding and a healthy consumer attached
     When the store commits a one-mineral root
     Then the commit returns TID 1
+    And the healthy consumer already received delta 1 in that commit
     """
-    store, _, _ = store_with_exploding_and_surviving
+    store, _, surviving = store_with_exploding_and_surviving
     store.root = [Mineral(qid="Q1", name="quartz")]
 
     with warnings.catch_warnings():
@@ -466,6 +467,7 @@ def test_commit_stays_durable_when_a_consumer_explodes(
         tid = store.commit()
 
     assert tid == 1
+    assert surviving.watermark == 1
     store.close()
 
 

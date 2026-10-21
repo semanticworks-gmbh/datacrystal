@@ -656,6 +656,7 @@ def test_phrase_highlight_leaves_a_non_adjacent_blue_unmarked(
         "NOT kristalle",
         "(((",
         '""',
+        "AND OR NOT",
     ],
 )
 def test_fts5_operators_in_a_query_are_inert_text(

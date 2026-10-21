@@ -16,7 +16,7 @@ from typing import Annotated
 import pytest
 
 import datacrystal as dc
-from datacrystal._entity import type_info
+from datacrystal._entity import FieldSpec, type_info
 
 
 @dc.entity
@@ -45,6 +45,10 @@ def _spec_flags() -> dict[str, tuple[bool, bool]]:
     return {s.name: (s.multivalued, s.indexed) for s in type_info(Specimen).specs}
 
 
+def _spec_named(entity: type, name: str) -> FieldSpec:
+    return {s.name: s for s in type_info(entity).specs}[name]
+
+
 @pytest.fixture
 def drawer(store: dc.Store) -> dc.Store:
     """Return a store with specimens S1..S4 committed."""
@@ -70,13 +74,19 @@ def test_a_list_index_field_is_marked_multivalued_and_indexed() -> None:
 
 
 def test_an_optional_list_field_is_marked_multivalued() -> None:
-    """Given the Specimen entity with an indexed optional list field aliases
+    """Given an entity decorated with an indexed list[str] | None field aliases
     When its field specs are read
-    Then aliases is multivalued
+    Then aliases is multivalued and indexed
     """
-    flags = _spec_flags()
 
-    assert flags["aliases"][0] is True
+    @dc.entity
+    class Labelled:
+        aliases: Annotated[list[str] | None, dc.Index] = None
+
+    spec = _spec_named(Labelled, "aliases")
+
+    assert spec.multivalued is True
+    assert spec.indexed is True
 
 
 def test_a_scalar_field_is_not_marked_multivalued() -> None:

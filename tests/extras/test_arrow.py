@@ -95,16 +95,17 @@ class MirrorShop:
         self,
         name: str | None = None,
         only: Iterable[type | str] | None = None,
-        flush_every: int = 1,
+        flush_every: int | None = None,
         max_segments: int = 16,
     ) -> ArrowMirror:
-        """Open a mirror directory by name, or a fresh one."""
-        mirror = ArrowMirror(
-            self.directory / (name or f"mirror-{next(_ids)}"),
-            only=only,
-            flush_every=flush_every,
-            max_segments=max_segments,
-        )
+        """Open a mirror by name, or a fresh one; flush_every None leaves the library default."""
+        directory = self.directory / (name or f"mirror-{next(_ids)}")
+        if flush_every is None:
+            mirror = ArrowMirror(directory, only=only, max_segments=max_segments)
+        else:
+            mirror = ArrowMirror(
+                directory, only=only, flush_every=flush_every, max_segments=max_segments
+            )
         self.opened.append(mirror)
         return mirror
 

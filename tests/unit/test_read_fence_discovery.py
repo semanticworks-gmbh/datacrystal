@@ -237,6 +237,7 @@ class TestGetManyKeyFormAlignment:
         _commit_shared_and_owner_only(store, "A", "B")
         with store.acting_as(MEMBER):
             got = store.get_many(Specimen, label=["A", "B", "nope"])
+        assert got[0] is not None
         assert got[0].label == "A"
 
     def test_get_many_leaves_a_denied_slot_none(self, store: dc.Store) -> None:
