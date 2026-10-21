@@ -1,134 +1,85 @@
-# How-to: vector and hybrid search (bring your own embeddings)
+# How-to: search by vector and fuse it with full-text ranking
 
-Goal: semantic / RAG retrieval over your live objects — store the embeddings you compute, rank by
-exact cosine similarity, and (optionally) fuse that ranking with `datacrystal[fts]` BM25 for hybrid
-search. The differentiator is that the text index, the vectors, and the structured fields are the
-**same store**: one `snapshot()`, one query, no separate vector database to keep in sync.
+After this page you can store embeddings you computed, rank them by exact cosine similarity under a structured prefilter, and fuse that ranking with BM25.
 
-datacrystal never owns the embedding **model**. `sentence-transformers` (and its ~5 GB of
-torch) lives in *your* application, not the library's dependency tree — the core stays
-`{msgspec, pyroaring}`. You pass vectors in; datacrystal stores them and ranks them.
+datacrystal never owns the embedding model; you compute vectors in your application and datacrystal stores and ranks them.
+This example uses 3-dimensional toy vectors; replace `embed` with a call to your model, for example `sentence-transformers` (a dependency of your application, not of datacrystal).
 
 ```python
-pip install sentence-transformers      # YOUR dependency, not datacrystal's
-```
-
-## Store the vector as bytes
-
-A 768-dim `float32` embedding (the size `BAAI/bge-base-en-v1.5` produces) is 3072 bytes — store it
-as a plain inline `bytes` field. You own the dtype and shape; datacrystal stores opaque bytes.
-
-```python
-import numpy as np
+import math
+import struct
 from typing import Annotated
-import datacrystal as dc
-from sentence_transformers import SentenceTransformer
 
-model = SentenceTransformer("BAAI/bge-base-en-v1.5")     # 768-dim, ~3 KB per vector
+import datacrystal as dc
+from datacrystal.fts import FullTextIndex
+
+DIMENSIONS = 3
+
+def pack(vector: list[float]) -> bytes:
+    norm = math.sqrt(sum(x * x for x in vector))
+    return struct.pack(f"{DIMENSIONS}f", *(x / norm for x in vector))
+
+def unpack(blob: bytes) -> tuple[float, ...]:
+    return struct.unpack(f"{DIMENSIONS}f", blob)
 
 @dc.entity
 class Mineral:
     qid: Annotated[str, dc.Unique]
     name: str
-    crystal_system: Annotated[str, dc.Index]             # a structured field to prefilter on
-    notes: str | None = None
-    embedding: bytes | None = None                       # 3072 bytes, stored inline
+    crystal_system: Annotated[str, dc.Index]
+    notes: Annotated[str | None, dc.FullText(language="en")] = None
+    embedding: bytes | None = None
 
-def embed(text: str) -> bytes:
-    v = model.encode(text, normalize_embeddings=True)    # unit-norm ⇒ cosine == dot product
-    return v.astype(np.float32).tobytes()
+store = dc.Store.open("cabinet.store")
+index = FullTextIndex("cabinet.fts")
+store.attach(index)
+if store.root is None:
+    store.root = {"seeded": True}
+    for qid, name, system, notes, vector in [
+        ("Q193563", "azurite", "monoclinic", "deep blue copper carbonate", [0.9, 0.1, 0.2]),
+        ("Q190063", "malachite", "monoclinic", "bright green copper carbonate", [0.8, 0.3, 0.1]),
+        ("Q43010", "quartz", "trigonal", "clear silicon dioxide", [0.1, 0.9, 0.3]),
+    ]:
+        store.store(Mineral(qid=qid, name=name, crystal_system=system, notes=notes, embedding=pack(vector)))
+    store.commit()
 
-for m in store.query(Mineral):                           # backfill; or set it on first write
-    if m.notes:
-        m.embedding = embed(m.notes)
-store.commit()
-```
-
-- **Inline `bytes` is the right default at this size.** It is a native msgpack scalar — no
-  indirection. Reach for `Annotated[bytes, dc.Blob]` only once the vector would bloat *scans* of the
-  owning type (a ColBERT per-token matrix at tens of KB on a frequently-scanned type), where the
-  out-of-line, descriptor-only scan-skip pays off — see [Storing binary
-  blobs](../reference.md#storing-binary-blobs). Avoid `list[float]`: it is the largest on disk and
-  decodes element by element.
-- datacrystal stores no dtype/shape metadata — you carry it. Keep the dimension fixed per field (768
-  here) so `np.frombuffer(...).reshape(n, 768)` is unambiguous on read.
-
-## Search: bitmap prefilter, then exact rerank
-
-Narrow to a candidate set with a normal bitmap query, then compute cosine top-k over just those
-rows. This is the same **candidate-set → Python residual** shape the [reading
-API](../reference.md#reading-api) already runs — the planner does the indexed prefilter; the vector
-math is the residual. Reading happens over a pinned [`snapshot()`](../reference.md#snapshots), so it
-is exact and callable from any thread.
-
-```python
-def knn(store, query_text, k=10, *, where=None):
-    q = model.encode(query_text, normalize_embeddings=True).astype(np.float32)
-    with store.snapshot() as snap:                       # frozen view; close promptly
+def nearest(query: list[float], k: int, where=None) -> list[int]:
+    query_vector = unpack(pack(query))
+    with store.snapshot() as snap:
         views = snap.query(where) if where is not None else snap.all(Mineral)
-        rows = [v for v in views if v.embedding is not None]
-        if not rows:
-            return []
-        mat = np.frombuffer(b"".join(v.embedding for v in rows),
-                            dtype=np.float32).reshape(len(rows), 768)
-        scores = mat @ q                                 # one matmul; unit-norm ⇒ cosine
-        top = np.argsort(-scores)[:k]
-        return [(rows[i].oid, float(scores[i])) for i in top]
+        scored = [(sum(a * b for a, b in zip(query_vector, unpack(view.embedding))), view.oid)
+                  for view in views if view.embedding is not None]
+    return [oid for _, oid in sorted(scored, reverse=True)[:k]]
 
-S = dc.fields(Mineral)
-hits = knn(store, "deep-blue copper carbonate", k=5,
-           where=(S.crystal_system == "monoclinic"))     # roaring prefilter → exact rerank
-results = store.get_many([oid for oid, _ in hits])        # one storage round-trip
-```
-
-The tighter the structured prefilter, the smaller the matmul — the metadata filter does the heavy
-lifting and the vector scan only reranks what survives it.
-
-## Hybrid: fuse BM25 and dense with RRF
-
-You already have lexical search via [`datacrystal[fts]`](search.md). Reciprocal Rank Fusion (the
-standard pattern) combines two ranked lists on **rank, not score** — so the BM25-vs-cosine scale
-mismatch never arises, with no normalization. `k=60` is the community default.
-
-```python
-def rrf(*ranked_oid_lists, k=60):
-    score = {}
+def rrf(*ranked_oid_lists: list[int], k: int = 60) -> list[int]:
+    score: dict[int, float] = {}
     for ranked in ranked_oid_lists:
         for rank, oid in enumerate(ranked):
             score[oid] = score.get(oid, 0.0) + 1.0 / (k + rank + 1)
-    return sorted(score, key=score.get, reverse=True)
+    return sorted(score, key=score.__getitem__, reverse=True)
 
-dense   = [oid for oid, _ in knn(store, q, k=50)]                 # vector rank list
-lexical = [h.oid for h in idx.search(q, cls=Mineral, limit=50)]   # BM25 via datacrystal[fts]
-fused   = store.get_many(rrf(dense, lexical)[:10])                # one ranking over one store
+F = dc.fields(Mineral)
+dense = nearest([0.85, 0.2, 0.15], k=3, where=F.crystal_system == "monoclinic")
+lexical = [hit.oid for hit in index.search("copper carbonate", cls=Mineral, limit=3)]
+fused = store.get_many(rrf(dense, lexical)[:2])
+print([m.name for m in store.get_many(dense)], [m.name for m in fused])
+store.close()
 ```
 
-`idx` is the `FullTextIndex` from the [full-text how-to](search.md). A small
-`fuse_rrf(*ranked_lists, k=60)` library helper is `[planned — theme:search]`; until it lands, the
-function above is the whole thing.
+- Store the vector as an inline `bytes` field: you own the dtype and shape, and datacrystal stores opaque bytes.
+  Keep the dimension fixed per field so a reader can reshape the bytes without metadata.
+  A 768-dimension `float32` vector is 3072 bytes, which is the right size for inline storage.
+- Use `Annotated[bytes, dc.Blob]` only when the vector would bloat scans of the owning type, for example a per-token matrix of tens of KB ([blobs](blobs.md)).
+  Avoid `list[float]`, which is the largest on disk and decodes element by element.
+- The structured prefilter runs through the bitmap planner first, so the vector scan only ranks the survivors; this is the candidate-set then residual shape of the [Reading API](../reference.md#reading-api).
+  With unit-norm vectors cosine equals the dot product, and with `numpy` the rerank over a prefiltered set is one matrix multiplication.
+- Read through a [`snapshot()`](../reference.md#snapshots) so the ranking is exact and callable from any thread.
+- Reciprocal Rank Fusion combines the two lists on rank rather than score, so BM25 and cosine need no normalization; `k=60` is the community default.
+  A library helper `fuse_rrf` is `[planned — theme:search]`, and `rrf` above is the whole of it until then.
+- Exact brute force is the baseline of comparable embedded tools (LanceDB, sqlite-vec, `llm`) and holds up to about 100K vectors or 100 ms per query; a tight prefilter reaches much larger corpora.
+- Beyond that there are two paths, and neither is in core.
+  An in-process approximate index, the `datacrystal[vector]` extra (a usearch sidecar with a `dc.Vector` marker, GitHub #22), is `[planned — item 11]`.
+  The analytics tier mirrors entities to parquet with [`datacrystal[arrow]`](analytics.md) and searches there with DuckDB's VSS extension, because the core planner never grows a cost model ([why](../explanation.md#query-semantics-the-planner-the-residual-and-the-candidate-set)).
+- Late interaction (ColBERT) stores a matrix of per-token vectors as `Annotated[bytes, dc.Blob]` and computes MaxSim in Python; treat it as a separate, advanced path.
 
-## Honest scope: when brute force is enough, and when it isn't
-
-Exact brute-force top-k is the shipped baseline in comparable embedded tools (LanceDB, sqlite-vec,
-Simon Willison's `llm`), and the industry-consensus crossover is around **~100K vectors / ~100ms**
-per query — comfortably inside datacrystal's embedded, single-writer sweet spot. With a structured
-prefilter narrowing the candidate set first, you reach much larger corpora before the matmul is the
-bottleneck.
-
-Beyond that ceiling there are two on-creed paths, neither baked into core:
-
-- **Approximate (ANN) at scale, in-process:** the `datacrystal[vector]` extra — a usearch sidecar
-  consumer with a `dc.Vector` field marker, one index file per field — is `[planned — item 11]`
-  (GitHub #22), demand-gated. When it lands it targets single-vector ANN; it rides the same
-  commit-delta pipeline as `[fts]`/`[arrow]`.
-- **Analytics-tier ANN:** mirror entities to parquet with [`datacrystal[arrow]`](analytics.md) and
-  search there — DuckDB's VSS/HNSW extension owns the cost-based, billion-scale tier (the
-  "[DuckDB owns clever](../explanation.md#query-semantics-the-planner-the-residual-and-the-candidate-set)"
-  doctrine). The core query
-  planner stays rule-based and never grows a vector cost model.
-
-Late-interaction (ColBERT, e.g. `lightonai/GTE-ModernColBERT-v1` via pylate) is a heavier shape: a
-variable-length matrix of per-token 128-dim vectors per document, scored with MaxSim rather than a
-single dot product. Store the matrix as `Annotated[bytes, dc.Blob]` and compute MaxSim in Python —
-but treat it as an advanced, separate path, not the first thing to reach for. Like the store, a
-snapshot is read from the thread that opened it.
+Related: [full-text search](search.md).
