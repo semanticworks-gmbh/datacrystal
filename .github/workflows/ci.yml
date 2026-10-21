@@ -63,6 +63,25 @@ jobs:
           print(f"wheel OK: {wheel}")
           EOF
 
+  docs-wrap:
+    # Standard teaching-docs: one sentence per line, on the Markdown lines the PR adds (no-op on push to main).
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: check_wrap self-tests
+        run: uv run scripts/test_check_wrap.py
+
+      - name: One sentence per line
+        run: uv run scripts/check_wrap.py --since "origin/${{ github.base_ref }}"
+
   test-rules:
     # Standard readable-tests: testrules on every test module the PR changes (no-op on push to main).
     if: github.event_name == 'pull_request'
