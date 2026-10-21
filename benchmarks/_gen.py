@@ -208,7 +208,7 @@ class _SpecimenLayer:
     def __init__(
         self,
         rng: random.Random,
-        specimen_cls: type[Specimen] | type[CuratedSpecimen],
+        specimen_cls: type[Specimen | CuratedSpecimen],
         pick_mineral: Callable[[], Mineral],
     ) -> None:
         self.rng = rng

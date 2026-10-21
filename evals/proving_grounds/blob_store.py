@@ -73,7 +73,8 @@ def sha256_of_file(path: Path, chunk: int = 1 << 20) -> tuple[str, int]:
     return h.hexdigest(), size
 
 
-def main() -> None:
+def select_files() -> tuple[list[Path], str, Path]:
+    """Return the corpus files plus the glob and root they came from, per the BLOB_* env knobs."""
     blob_dir = os.environ.get("BLOB_DIR")
     if not blob_dir:
         sys.exit(
@@ -83,21 +84,21 @@ def main() -> None:
     root = Path(blob_dir)
     glob = os.environ.get("BLOB_GLOB", "**/*.pdf")
     cap = int(os.environ.get("BLOB_MAX", "0"))
-    chunk = int(os.environ.get("BLOB_CHUNK", str(1 << 20)))
 
     files = sorted(p for p in root.glob(glob) if p.is_file())
     if cap:
         files = files[:cap]
     if not files:
         sys.exit(f"no files matched {glob!r} under {root}")
+    return files, glob, root
 
-    shutil.rmtree(STORE, ignore_errors=True)
-    print(f"datacrystal proving ground: blob store  ({sys.platform})")
-    print(f"corpus: {len(files):,} files matching {glob!r} under {root}\n")
 
-    # Pre-hash on disk (the correctness oracle + dedup keys). Done here so the
-    # ingest timing measures datacrystal, not the SHA of the source files.
-    truth: dict[str, tuple[str, int]] = {}   # path -> (sha256, size)
+def hash_corpus(files: list[Path]) -> tuple[dict[str, tuple[str, int]], int, tuple[Path, int]]:
+    """Pre-hash on disk: the correctness oracle plus dedup keys.
+
+    Returns ``(path -> (sha256, size), total bytes, (largest file, its size))``.
+    """
+    truth: dict[str, tuple[str, int]] = {}
     total_bytes = 0
     largest: tuple[Path, int] = (files[0], 0)
     for p in files:
@@ -106,16 +107,13 @@ def main() -> None:
         total_bytes += size
         if size > largest[1]:
             largest = (p, size)
-    print(f"corpus bytes:          {total_bytes / 1e6:>9.1f} MB   "
-          f"(largest single file {largest[1] / 1e6:.1f} MB)\n")
+    return truth, total_bytes, largest
 
-    # --- INGEST (streamed write — bytes never whole in RAM) -------------------
-    # tracemalloc isolates the Python working set from the ~35 MB interpreter
-    # baseline (and the sqlite C-side page cache), so the heap peak below is what
-    # STREAMING actually allocates — ~one BLOB_CHUNK, independent of file size.
-    t0 = time.perf_counter()
-    tracemalloc.start()
-    store = dc.Store.open(STORE)
+
+def ingest_documents(
+    store: dc.Store, files: list[Path], truth: dict[str, tuple[str, int]], chunk: int
+) -> int:
+    """Stream each distinct file into ``store`` as a Document, one commit each; return the count."""
     seen: set[str] = set()
     n_docs = 0
     for p in files:
@@ -130,6 +128,53 @@ def main() -> None:
         ))
         store.commit()           # one doc per commit: heap bounded by ONE streamed fill
         n_docs += 1
+    return n_docs
+
+
+def sum_metadata(s: dc.Store) -> tuple[int, int]:
+    """Scan path+size of every Document, touching no blob bytes; return (count, bytes summed)."""
+    scanned = 0
+    total_meta = 0
+    for _path, size in s.pluck(Document, "path", "size"):   # metadata only
+        scanned += 1
+        total_meta += size
+    return scanned, total_meta
+
+
+def count_mismatches(s: dc.Store) -> tuple[int, int]:
+    """Re-hash every stored blob against its sha256 key; return (checked, mismatched)."""
+    checked = 0
+    bad = 0
+    for _path, sha in s.pluck(Document, "path", "sha256"):
+        doc = s.get(Document, sha256=sha)
+        assert doc is not None
+        if doc.content.hash.hex() != sha or hashlib.sha256(doc.content.bytes()).hexdigest() != sha:
+            bad += 1
+        checked += 1
+    return checked, bad
+
+
+def main() -> None:
+    files, glob, root = select_files()
+    chunk = int(os.environ.get("BLOB_CHUNK", str(1 << 20)))
+
+    shutil.rmtree(STORE, ignore_errors=True)
+    print(f"datacrystal proving ground: blob store  ({sys.platform})")
+    print(f"corpus: {len(files):,} files matching {glob!r} under {root}\n")
+
+    # Done here so the ingest timing measures datacrystal, not the SHA of the source files.
+    truth, total_bytes, largest = hash_corpus(files)
+    print(f"corpus bytes:          {total_bytes / 1e6:>9.1f} MB   "
+          f"(largest single file {largest[1] / 1e6:.1f} MB)\n")
+
+    # --- INGEST (streamed write — bytes never whole in RAM) -------------------
+    # tracemalloc isolates the Python working set from the ~35 MB interpreter
+    # baseline (and the sqlite C-side page cache), so the heap peak below is what
+    # STREAMING actually allocates — ~one BLOB_CHUNK, independent of file size.
+    t0 = time.perf_counter()
+    tracemalloc.start()
+    store = dc.Store.open(STORE)
+    n_docs = ingest_documents(store, files, truth, chunk)
     _, peak_ingest = tracemalloc.get_traced_memory()
     tracemalloc.stop()
     t_ingest = time.perf_counter() - t0
@@ -158,11 +203,7 @@ def main() -> None:
 
     tracemalloc.start()
     t0 = time.perf_counter()
-    scanned = 0
-    total_meta = 0
-    for _path, size in s.pluck(Document, "path", "size"):   # metadata only
-        scanned += 1
-        total_meta += size
+    scanned, total_meta = sum_metadata(s)
     t_scan = time.perf_counter() - t0
     _, peak_scan = tracemalloc.get_traced_memory()
     tracemalloc.stop()
@@ -197,14 +238,7 @@ def main() -> None:
 
     # --- CORRECTNESS ORACLE ---------------------------------------------------
     t0 = time.perf_counter()
-    checked = 0
-    bad = 0
-    for _path, sha in s.pluck(Document, "path", "sha256"):
-        doc = s.get(Document, sha256=sha)
-        assert doc is not None
-        if doc.content.hash.hex() != sha or hashlib.sha256(doc.content.bytes()).hexdigest() != sha:
-            bad += 1
-        checked += 1
+    checked, bad = count_mismatches(s)
     t_verify = time.perf_counter() - t0
     s.close()
     print(f"\ncorrectness:           {checked:>9,} docs re-hashed   {t_verify:6.2f}s   "

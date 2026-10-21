@@ -141,11 +141,8 @@ def walk_closure(start: PackageVersion) -> tuple[int, int]:
     return maxd, len(seen)
 
 
-def main() -> None:
-    shutil.rmtree(STORE, ignore_errors=True)
-    print(f"datacrystal proving ground: deps.dev dependency graph  ({sys.platform})\n")
-
-    # --- FETCH + PARSE (cached) -----------------------------------------------
+def load_graph() -> tuple[dict[Key, PackageVersion], set[tuple[Key, Key]]]:
+    """Fetch (cached) and parse the seed graphs into deduplicated nodes and edges."""
     t0 = time.perf_counter()
     nodes: dict[Key, PackageVersion] = {}
     edges: set[tuple[Key, Key]] = set()
@@ -166,8 +163,11 @@ def main() -> None:
     t_fetch = time.perf_counter() - t0
     print(f"fetched {len(SEEDS)} resolved graphs (cached): "
           f"{len(nodes):>6,} distinct package-versions, {len(edges):,} edges  {t_fetch:6.2f}s")
+    return nodes, edges
 
-    # --- INGEST ---------------------------------------------------------------
+
+def ingest(nodes: dict[Key, PackageVersion], edges: set[tuple[Key, Key]]) -> None:
+    """Store every node with its lazy adjacency, then close the store."""
     t0 = time.perf_counter()
     store = dc.Store.open(STORE)
     for fk, tk in edges:
@@ -182,18 +182,24 @@ def main() -> None:
           f"{t_ingest:6.2f}s  ({len(nodes) / t_ingest:,.0f} nodes/s)")
     print(f"  on disk:             {on_disk:>6.2f} MB   peak RSS {peak_rss_mb():.0f} MB")
     store.close()
-    del nodes
-    gc.collect()
 
-    # --- REOPEN (cold) --------------------------------------------------------
+
+def reopen_cold() -> tuple[dc.Store, int]:
+    """Reopen the store cold and return it with the node count."""
     t0 = time.perf_counter()
     s = dc.Store.open(STORE)
     n = s.count(PackageVersion)
     t_open = time.perf_counter() - t0
     print(f"\nreopened cold:         {n:>6,} nodes           {t_open:6.2f}s "
           "(open + index build)")
+    return s, n
 
-    # --- THE CYCLE PROOF (the deps.dev-specific result, #29) ------------------
+
+def prove_cycle(s: dc.Store) -> dict[int, list[int]]:
+    """Find a real cycle after reopen and follow it around to the same live instance.
+
+    Returns the adjacency (oid -> dependency oids) the later sections reuse.
+    """
     adj: dict[int, list[int]] = {}
     for pv in s.query(PackageVersion):
         oid = oid_of(pv)
@@ -211,8 +217,11 @@ def main() -> None:
         cur = next(d.get() for d in cur.dependencies if d.oid == nxt_oid)
     assert cur is cyc[0], "one-instance-per-OID must hold THROUGH a cycle"
     print("  followed the cycle back to the SAME live instance ✓ (identity through a cycle)")
+    return adj
 
-    # --- LAZY CLOSURE WALK (#29 iterative + #30 lazy, on a cyclic graph) -------
+
+def prove_lazy_walk(s: dc.Store, n: int) -> None:
+    """Walk the lazy closure of a cyclic graph without a RecursionError."""
     gc.collect()
     gulp = s.get(PackageVersion, coordinate="NPM/gulp/4.0.2")
     assert gulp is not None
@@ -225,10 +234,12 @@ def main() -> None:
     print(f"  live entities now:   {len(s._registry):>6,}  "  # pyright: ignore[reportPrivateUsage]
           f"(of {n:,} — lazy adjacency kept the rest off the RAM budget)")
 
-    # --- incoming() = DEPENDENTS, proven == full scan (#20) -------------------
+
+def prove_incoming(s: dc.Store, adj: dict[int, list[int]]) -> None:
+    """Show ``incoming()`` equals a full edge scan and that a second backlink reuses its index."""
     in_degree: dict[int, int] = {}
     t0 = time.perf_counter()
-    for oid, deps in adj.items():
+    for deps in adj.values():
         for d in deps:
             in_degree[d] = in_degree.get(d, 0) + 1
     t_scan = time.perf_counter() - t0
@@ -249,7 +260,9 @@ def main() -> None:
           "— matches the full scan exactly ✓")
     print(f"  a SECOND backlink reuses the built index in {t_reuse:.2f} ms (no re-scan)")
 
-    # --- HYDRATE vs DECODE ----------------------------------------------------
+
+def compare_hydrate_and_decode(s: dc.Store) -> None:
+    """Time a decode-level pluck against a hydrated query and check one instance per OID."""
     gc.collect()
     t0 = time.perf_counter()
     names_decode = s.pluck(PackageVersion, "name")
@@ -267,6 +280,20 @@ def main() -> None:
     assert a is via_query, "identity broken: one OID must be one live instance"
     print("\ncorrectness: one instance per OID across paths ✓ · "
           "cyclic graph reopened + traversed without RecursionError ✓")
+
+
+def main() -> None:
+    shutil.rmtree(STORE, ignore_errors=True)
+    print(f"datacrystal proving ground: deps.dev dependency graph  ({sys.platform})\n")
+    nodes, edges = load_graph()
+    ingest(nodes, edges)
+    del nodes
+    gc.collect()
+    s, n = reopen_cold()
+    adj = prove_cycle(s)
+    prove_lazy_walk(s, n)
+    prove_incoming(s, adj)
+    compare_hydrate_and_decode(s)
     s.close()
 
 

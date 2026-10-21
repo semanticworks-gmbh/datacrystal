@@ -21,6 +21,9 @@ from typing import Annotated
 
 import datacrystal as dc
 
+HEAVY_SPECIMEN_G = 30.0
+HARD_MOHS = 6.0
+
 # --- the model --------------------------------------------------------------
 
 
@@ -119,11 +122,11 @@ def main() -> None:
         # Bitmap query (single-class by design; KICKOFF §5). dc.fields() is
         # the type-checker-clean route; `Specimen.quality == ...` also works.
         S, M = dc.fields(Specimen), dc.fields(Mineral)
-        hits = store.query((S.quality == "fine") & (S.mass_g >= 30.0))
-        print(f"fine specimens >= 30 g: {len(hits)}")
+        hits = store.query((S.quality == "fine") & (S.mass_g >= HEAVY_SPECIMEN_G))
+        print(f"fine specimens >= {HEAVY_SPECIMEN_G:g} g: {len(hits)}")
 
         # Condition AST over the mineral facets
-        hard_cubic = store.query((M.crystal_system == "cubic") & (M.mohs >= 6.0))
+        hard_cubic = store.query((M.crystal_system == "cubic") & (M.mohs >= HARD_MOHS))
         print("hard cubic minerals:", sorted(m.name for m in hard_cubic))
 
         # Unique secondary key + lazy traversal
