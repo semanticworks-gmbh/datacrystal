@@ -17,14 +17,17 @@ extend-select = [
     "ANN001", "ANN002", "ANN003", "ANN201", "ANN202", "ANN204", "ANN205", "ANN206",
     "D", "D401", "ANN", # the target set; the ignores below hold the paths that are not at 0 yet
     "PT", "FBT001", # readable-tests, tests only (ignored elsewhere below)
+    "T20", # structured-logging: no print() outside CLI output
 ]
 # extend-select adds to ruff's own default set (E4, E7, E9, F and the 0.17 additions), which is on and at 0.
-# Not selected yet: D102, D105, D107, D403, D415, D401 (docstring form) and T20 (print in src/): #191;
+# Not selected yet: D102, D105, D107, D403, D415, D401 (docstring form): #191;
 # C901, PLR2004, ANN401 in src/: #192.
 # D205 stays off as in tetrahedron (the summary may run into the first paragraph).
 extend-ignore = ["D205"]
 
 [lint.per-file-ignores]
+# print() is CLI output in scripts, examples and the on-demand proving grounds and benchmarks.
+"{scripts/**,examples/**,evals/**,benchmarks/**}" = ["T20"]
 # Ruff cannot select a rule for some files only, so the test rules are ignored everywhere else.
 "!{tests/**,scripts/test_*.py,benchmarks/test_*.py,**/conftest.py}" = ["PT", "FBT001"]
 # Not library code: on-demand proving grounds and runnable examples.

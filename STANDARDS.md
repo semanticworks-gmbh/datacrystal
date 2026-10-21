@@ -34,7 +34,6 @@ Gates that switch on in a later wave say so by issue: D401, docstring form and l
 - **Applies to:** `src/`; a script for its diagnostics, not its output.
 - **Enforced by:** review — the PR reviewer checks new log calls, warnings and `print()` calls, until #191 selects ruff `T20` for `src/`; cannot see: user data inside a field. Nothing in `src/` logs today; #195 adds the first events.
 - **Source:** tetrahedron decision 553, copied 2026-10-20 (#186), in library form: core dependencies stay `{msgspec, pyroaring}` (invariant 2), so no structlog; an app on structlog renders the `extra` fields through its stdlib bridge (`ProcessorFormatter` with `ExtraAdder`).
-- **Exceptions:** the contract vector generator `src/datacrystal/contract/vectors/_generate.py` prints, until #191 moves it to `scripts/`.
 
 ### english-only
 - **Rule:** Code, comments, docstrings and technical documentation are written in English; a term from another language is translated or, where no English term is established, kept.

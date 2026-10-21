@@ -3,8 +3,7 @@
 KICKOFF M2 names an "engine-free contract/ reference applier": a consumer
 must be able to take the applier into any project with msgspec and nothing
 else. Like the pickle-free gate, this is an AST walk — mechanical, not
-aspirational. The vectors generator is held to the same standard so the
-contract can never quietly start depending on what it specifies.
+aspirational.
 """
 
 from __future__ import annotations

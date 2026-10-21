@@ -1,6 +1,6 @@
 """Author the COMMIT-DELTA-v2 replay vectors.
 
-Run once per contract version (`uv run python src/datacrystal/contract/vectors/_generate.py`)
+Run once per contract version (`uv run scripts/generate_vectors.py`)
 and commit the outputs. The vectors are BYTE-PINNED: regenerating them is a
 contract-version bump with a new spec, never a quiet refresh (spec §6). The
 v2 regeneration (epic #168 W1) replaced the retired v1 set wholesale under
@@ -24,11 +24,12 @@ import msgspec
 
 from datacrystal.contract.applier import ReferenceApplier, encode_delta
 
-HERE = Path(__file__).parent
+HERE = Path(__file__).resolve().parent.parent / "src" / "datacrystal" / "contract" / "vectors"
 _enc = msgspec.msgpack.Encoder()
 
 
 def ref(oid: int) -> msgspec.msgpack.Ext:
+    """An entity reference: ext type 1 carrying the 8-byte OID."""
     return msgspec.msgpack.Ext(1, struct.pack(">q", oid))
 
 
@@ -129,6 +130,7 @@ DELTAS = [
 
 
 def main() -> None:
+    """Write the vector files and ``expected.json`` next to the contract package."""
     applier = ReferenceApplier()
     digests: dict[str, str] = {}
     for name, delta in DELTAS:
