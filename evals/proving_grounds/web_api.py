@@ -62,8 +62,9 @@ import sys
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import field
+from http import HTTPStatus
 from pathlib import Path
-from typing import Annotated, Any, Self
+from typing import Annotated, Any, BinaryIO, Self
 
 import datacrystal as dc
 
@@ -88,6 +89,7 @@ from datacrystal._storage.memory import MemoryBackend
 from datacrystal._storage.protocol import (
     BootInfo,
     CommitBatch,
+    StorageReadView,
     StoredBlob,
     StoredRecord,
 )
@@ -131,7 +133,7 @@ class _CountingReadView:
     issues. Index builds go through ``scan_type`` and are deliberately NOT counted
     (the documented one-time cost), exactly like the fitness-gate wrapper."""
 
-    def __init__(self, inner: Any, counter: CountingBackend) -> None:
+    def __init__(self, inner: StorageReadView, counter: CountingBackend) -> None:
         self._inner = inner
         self._counter = counter
 
@@ -152,7 +154,7 @@ class _CountingReadView:
 
     def open_blob_stream(
         self, oid: int, on_close: Callable[[], None] | None = None
-    ) -> Any:
+    ) -> BinaryIO:
         return self._inner.open_blob_stream(oid, on_close)
 
     def close(self) -> None:
@@ -227,11 +229,13 @@ class _PydanticConstructionCounter:
         self._orig_init = pydantic.BaseModel.__init__
         self._orig_validate = pydantic.BaseModel.model_validate.__func__  # the classmethod
 
-        def counting_init(model_self: Any, /, **data: Any) -> None:
+        def counting_init(model_self: pydantic.BaseModel, /, **data: object) -> None:
             counter.count += 1
             counter._orig_init(model_self, **data)
 
-        def counting_validate(cls: Any, *args: Any, **kwargs: Any) -> Any:
+        def counting_validate(
+            cls: type[pydantic.BaseModel], *args: object, **kwargs: object
+        ) -> pydantic.BaseModel:
             counter.count += 1
             return counter._orig_validate(cls, *args, **kwargs)
 
@@ -386,6 +390,20 @@ def percentiles(samples_ms: list[float]) -> tuple[float, float, float]:
 # --- OBO parsing (mirrors proving ground #1) ----------------------------------
 
 
+def apply_term_line(term: dict[str, Any], line: str) -> None:
+    """Record one ``key: value`` line of a ``[Term]`` stanza on its dict."""
+    if line.startswith("id: "):
+        term["id"] = line[4:].strip()
+    elif line.startswith("name: "):
+        term["name"] = line[6:].strip()
+    elif line.startswith("namespace: "):
+        term["namespace"] = line[11:].strip()
+    elif line.startswith("is_a: "):
+        term["is_a"].append(line[6:].split("!", maxsplit=1)[0].strip())
+    elif line == "is_obsolete: true":
+        term["obsolete"] = True
+
+
 def parse_obo(path: Path) -> dict[str, dict[str, Any]]:
     out: dict[str, dict[str, Any]] = {}
     cur: dict[str, Any] | None = None
@@ -404,16 +422,7 @@ def parse_obo(path: Path) -> dict[str, dict[str, Any]]:
                 finalize(cur)
                 cur = None
             elif cur is not None and line:
-                if line.startswith("id: "):
-                    cur["id"] = line[4:].strip()
-                elif line.startswith("name: "):
-                    cur["name"] = line[6:].strip()
-                elif line.startswith("namespace: "):
-                    cur["namespace"] = line[11:].strip()
-                elif line.startswith("is_a: "):
-                    cur["is_a"].append(line[6:].split("!")[0].strip())
-                elif line == "is_obsolete: true":
-                    cur["obsolete"] = True
+                apply_term_line(cur, line)
         finalize(cur)
     return out
 
@@ -496,14 +505,14 @@ def run_rest(client: TestClient, namespace: str | None, n: int) -> None:
         params["namespace"] = namespace
     # one warm-up (build the index, JIT the route) outside the measured window
     warm = client.get("/terms", params=params)
-    assert warm.status_code == 200
+    assert warm.status_code == HTTPStatus.OK
     rows = len(warm.json())
     samples: list[float] = []
     for _ in range(n):
         t0 = time.perf_counter()
         resp = client.get("/terms", params=params)
         samples.append((time.perf_counter() - t0) * 1000)
-        assert resp.status_code == 200
+        assert resp.status_code == HTTPStatus.OK
     p50, p99, tput = percentiles(samples)
     print(f"\nREST  GET /terms  (limit 50, {rows} rows, {n} calls):")
     print(f"  p50 {p50:7.2f} ms   p99 {p99:7.2f} ms   {tput:8.0f} req/s")
@@ -523,7 +532,7 @@ def run_graphql_nested(
         t0 = time.perf_counter()
         resp = client.post("/graphql", json={"query": query})
         samples.append((time.perf_counter() - t0) * 1000)
-        assert resp.status_code == 200
+        assert resp.status_code == HTTPStatus.OK
     p50, p99, tput = percentiles(samples)
     print(f"\nGraphQL  nested term→parents (depth {depth}, {n} calls):")
     print(f"  p50 {p50:7.2f} ms   p99 {p99:7.2f} ms   {tput:8.0f} req/s")
@@ -608,12 +617,12 @@ def assert_zero_pydantic_oracle(
     with _PydanticConstructionCounter() as counter:
         resp = client.post("/graphql", json={"query": gql_query})
         gql_pydantic = counter.count
-    assert resp.status_code == 200 and resp.json().get("errors") is None
+    assert resp.status_code == HTTPStatus.OK and resp.json().get("errors") is None
 
     with _PydanticConstructionCounter() as counter:
         rest = client.get("/terms", params={"limit": 50})
         rest_pydantic = counter.count
-    assert rest.status_code == 200
+    assert rest.status_code == HTTPStatus.OK
     rest_rows = len(rest.json())
 
     assert gql_pydantic == 0, (

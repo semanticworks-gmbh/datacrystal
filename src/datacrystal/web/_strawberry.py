@@ -10,7 +10,7 @@ Reference fields batch through a per-request :class:`SnapshotLoader` (#100, ``we
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any, cast
 
 from strawberry.annotation import StrawberryAnnotation
@@ -87,7 +87,7 @@ def snapshot_context(snapshot: Snapshot) -> dict[str, Any]:
     return {LOADER_CONTEXT_KEY: SnapshotLoader(snapshot)}
 
 
-def _make_relation_resolver(name: str, *, list_edge: bool) -> Any:
+def _make_relation_resolver(name: str, *, list_edge: bool) -> Callable[..., object]:
     """Build the async relation resolver for the reference field ``name`` (#100).
 
     The closure takes exactly ``(root, info)`` and has no return annotation: the field type is
@@ -97,7 +97,7 @@ def _make_relation_resolver(name: str, *, list_edge: bool) -> Any:
     """
     if list_edge:
 
-        async def resolve_list(root: Any, info: Info[Any, Any]) -> Any:
+        async def resolve_list(root: object, info: Info[Any, Any]) -> object:
             edges = getattr(root, name)
             if edges is None:
                 return []
@@ -114,7 +114,7 @@ def _make_relation_resolver(name: str, *, list_edge: bool) -> Any:
         resolve_list.__qualname__ = f"_make_relation_resolver.resolve_{name}"
         return resolve_list
 
-    async def resolve(root: Any, info: Info[Any, Any]) -> Any:
+    async def resolve(root: object, info: Info[Any, Any]) -> object:
         ref = getattr(root, name)
         if ref is None:
             return None
@@ -279,7 +279,7 @@ def reflect_strawberry_type(cls: type) -> type:
     return StrawberryReflector().reflect(cls)
 
 
-def _plain_field(name: str, core_type: Any) -> StrawberryField:
+def _plain_field(name: str, core_type: object) -> StrawberryField:
     """Build a resolver-less Strawberry field of ``core_type`` named ``name``.
 
     Strawberry's default resolver does ``getattr`` on the parent, a frozen ``EntityView`` here.

@@ -19,9 +19,12 @@ from collections.abc import Callable, Generator, Iterable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from contextvars import ContextVar
+from functools import partial
 from pathlib import Path
 from types import TracebackType
-from typing import Any, BinaryIO, Self, cast
+from typing import TYPE_CHECKING, Any, BinaryIO, NoReturn, Self, cast
+
+from pyroaring import BitMap64
 
 from datacrystal._actors import Actor, Principal
 from datacrystal._conditions import (
@@ -77,6 +80,7 @@ from datacrystal._errors import (
 from datacrystal._ids import FORMAT_VERSION, OID_BASE, TID_BASE, IdAllocator
 from datacrystal._index_cache import IndexCache
 from datacrystal._indexes import (
+    ClassIndexes,
     IndexManager,
     QueryPlan,
     explain_plan,
@@ -90,6 +94,7 @@ from datacrystal._permissions import (
     PERM_FIELDS,
     PERM_LEGACY_FILLS,
     VIEWER,
+    LabelColumns,
     authority_towards,
     can_read_row,
     is_root,
@@ -123,9 +128,25 @@ from datacrystal._storage.protocol import (
 )
 from datacrystal.contract.applier import DeltaGapError
 
+if TYPE_CHECKING:
+    from datacrystal._follower import HttpClient
+    from datacrystal._storage.lock import LeaseLock  # imported lazily at runtime (see Store.open)
+
 # Exact-type membership for the hydration fast path (decode produces exact
 # builtin types, never subclasses — subclass-shaped values still take _resolve).
 _SCALAR_TYPES = frozenset((str, int, float, bool, bytes))
+
+# Values that reference nothing, so a graph walk or a ref harvest skips them.
+_LEAF_TYPES = (str, float, int, bytes)
+
+# ``sqlite3.threadsafety`` of a fully serialized build, the level off-thread P2 needs.
+_SQLITE_SERIALIZED = 3
+
+# The four ``_dc_`` columns of a protected record: (owner, groups, read floor, write floor).
+type _Labels = tuple[int, list[int], int, int]
+
+type _IndexEntries = list[tuple[int, TypeInfo, dict[str, Any]]]
+type _RefEntries = list[tuple[int, set[int]]]  # (referrer oid, {target oids}) — #20
 
 # Sentinel for Store._perm_positions: "not computed yet" (None already means
 # a pre-protection lineage cid — the R7 legacy fill, ADR-008).
@@ -146,6 +167,24 @@ class _Root:
     value: Any = None
 
 
+class _EncodedBatch:
+    """What P1's encode step collects: record payloads, new type rows and out-of-line blobs."""
+
+    __slots__ = ("blob_data", "blob_swaps", "new_types", "records", "stream_data")
+
+    def __init__(self) -> None:
+        self.new_types: list[tuple[int, str, list[str]]] = []
+        self.records: list[tuple[int, int, bytes]] = []  # (oid, cid, payload)
+        # Out-of-line blob values (ADR-007 / #82): (oid, size, hash, data); the record keeps a
+        # BLOB_EXT descriptor.
+        self.blob_data: list[tuple[int, int, bytes, bytes]] = []
+        # Streamed blobs (ADR-007 §4): (oid, size, hash, open_chunks) — the bytes are NOT
+        # resident; they fill a zeroblob cell in P2.
+        self.stream_data: list[tuple[int, int, bytes, Callable[[], Iterable[bytes]]]] = []
+        # (obj, field, blob_oid, size, hash) — applied in P3 after durability.
+        self.blob_swaps: list[tuple[Any, str, int, int, bytes]] = []
+
+
 class _Capture:
     """Everything P1 hands to P2/P3 — and enough to compensate a failed P2."""
 
@@ -161,8 +200,8 @@ class _Capture:
     )
 
     def __init__(self, tid: int, batch: CommitBatch,
-                 index_entries: list[tuple[int, TypeInfo, dict[str, Any]]],
-                 ref_entries: list[tuple[int, set[int]]],
+                 index_entries: _IndexEntries,
+                 ref_entries: _RefEntries,
                  flipped: list[tuple[int, Any, int]],
                  delta: dict[str, Any] | None,
                  deletes: list[tuple[int, TypeInfo, Any | None]],
@@ -224,7 +263,7 @@ class _CommitAttempt:
 class Store:
     """An open datacrystal store. Create via :meth:`Store.open`."""
 
-    def __init__(self, backend: StorageBackend, lock: Any | None, *,
+    def __init__(self, backend: StorageBackend, lock: LeaseLock | None, *,
                  p2_inline: bool = False, debug: bool = False,
                  strict_deletes: bool = False,
                  lazy_timeout: float | None = None,
@@ -243,7 +282,7 @@ class Store:
         # so only explicit verb changes on top are ceiling-checked. Keyed by oid: set in
         # _stamp_perm_labels, read by _check_write_gate, cleared with the buffer (kept across a
         # denied commit so a fixed-up retry still has it).
-        self._birth_labels: dict[int, tuple[int, list[int], int, int]] = {}
+        self._birth_labels: dict[int, _Labels] = {}
         # delete() buffer (ADR-003): oid → (TypeInfo, live instance or None).
         # The strong reference keeps the doomed instance alive until P3 so a
         # pre-commit read cannot rehydrate a mutable CLEAN twin beside it.
@@ -292,7 +331,7 @@ class Store:
         # no user references would be collected and silently rehydrated,
         # losing identity and any in-place mutations. Lazy[T] is the explicit
         # cut point where pinning (and memory) stops.
-        self._root_holder: Any = None
+        self._root_holder: _Root | None = None
         # Session identity (epic #168 W1): the ambient principal commits are stamped with
         # (COMMIT-DELTA-v2). It is config-trusted: the store that holds the Actor registry cannot
         # resolve its own opener. A ContextVar, not a plain stack, so an acting_as scope is
@@ -507,7 +546,7 @@ class Store:
                 if stack and stack[-1] is principal:
                     self._acting.set(stack[:-1])
 
-    def _resolve_registry_actor(self, uid: int) -> Any:
+    def _resolve_registry_actor(self, uid: int) -> Actor:
         """Resolve ``uid`` through the committed Actor registry, enforcing the sponsor gates.
 
         A non-human must name a sponsor that resolves to a committed human actor. Reads via
@@ -573,7 +612,7 @@ class Store:
             backend = SqliteBackend(directory / "data.sqlite", durability=durability)
             # Off-thread P2 shares the connection with owner-thread reads;
             # that requires a serialized sqlite3 build (CPython's default).
-            return cls(backend, lock, p2_inline=sqlite3.threadsafety < 3,
+            return cls(backend, lock, p2_inline=sqlite3.threadsafety < _SQLITE_SERIALIZED,
                        debug=debug, strict_deletes=strict_deletes,
                        lazy_timeout=lazy_timeout,
                        cache_dir=directory if cache_index else None,
@@ -589,7 +628,7 @@ class Store:
         *,
         api_key: str | None = None,
         path: str | Path | None = None,
-        client: Any | None = None,
+        client: HttpClient | None = None,
     ) -> Store:
         """Open a read replica synced from a coordinator's federation endpoint.
 
@@ -653,13 +692,13 @@ class Store:
     # -- public surface ------------------------------------------------------
 
     @property
-    def root(self) -> Any:
+    def root(self) -> Any:  # noqa: ANN401 - the root is whatever value the caller persisted
         self._enter()
         if self._root_oid is None:
             return None
         if self._root_holder is None:
             try:
-                self._root_holder = self._load_oid(self._root_oid)
+                self._root_holder = self._load_root_holder(self._root_oid)
             except DanglingRefError as exc:
                 raise DanglingRefError(
                     f"{exc} — the root graph references a deleted entity "
@@ -669,7 +708,7 @@ class Store:
         return self._root_holder.value
 
     @root.setter
-    def root(self, value: Any) -> None:
+    def root(self, value: object) -> None:
         """Capture the assigned root at once: containers are tracked, new entities registered.
 
         Lists and dicts read from ``store.root`` are persistent containers, so in-place mutation
@@ -685,7 +724,7 @@ class Store:
             holder = self._root_holder
             if holder is None:
                 try:
-                    holder = self._load_oid(self._root_oid)
+                    holder = self._load_root_holder(self._root_oid)
                 except DanglingRefError:
                     # The old root graph references a deleted entity (ADR-003
                     # unchecked deletes). Recovery path: replace the holder
@@ -704,20 +743,17 @@ class Store:
         """The current commit watermark (0 before the first commit)."""
         return self._last_tid
 
-    def store(self, obj: Any) -> int:
+    def store(self, obj: object) -> int:
         """Register ``obj`` and new entities reachable from it for the next commit; return its OID.
 
         Raises ``NotAnEntityError`` for a non-entity and ``DeletedEntityError`` for a deleted one
         (OIDs are never reused).
         """
         self._enter()
-        if not is_entity(obj):
-            raise NotAnEntityError(
-                f"{type(obj).__name__} is not an @entity class instance"
-            )
+        _require_entity(obj)
         return self._register_graph(obj)
 
-    def mark_dirty(self, obj: Any) -> None:
+    def mark_dirty(self, obj: object) -> None:
         """Buffer an entity for the next commit explicitly, the rarely needed escape hatch.
 
         Attribute writes and in-place container mutation are tracked automatically.
@@ -725,15 +761,8 @@ class Store:
         ``dc.Redacted`` twin (ADR-008 R14).
         """
         self._enter()
-        if not is_entity(obj):
-            raise NotAnEntityError(
-                f"{type(obj).__name__} is not an @entity class instance"
-            )
-        if isinstance(obj, Redacted):
-            raise ReadDeniedError(
-                f"this {type(obj).__name__} is a redacted twin — never "
-                "committable (ADR-008 R14)"
-            )
+        _require_entity(obj)
+        _forbid_redacted(obj)
         if state_of(obj) == STATE_DELETED:
             raise DeletedEntityError(
                 f"this {type(obj).__name__} was deleted via store.delete(); "
@@ -746,7 +775,7 @@ class Store:
             set_state(obj, STATE_DIRTY)
             self._dirty[oid] = obj
 
-    def delete(self, obj_or_cls: Any, /, **unique_key: Any) -> bool:
+    def delete(self, obj_or_cls: object, /, **unique_key: object) -> bool:
         """Delete an entity's record at the next ``commit()`` (ADR-003).
 
         Call it by instance, ``store.delete(m)``, or by key, ``store.delete(Mineral, qid="Q1")``.
@@ -757,38 +786,34 @@ class Store:
         """
         self._enter()
         if isinstance(obj_or_cls, type):
-            ti = type_info(obj_or_cls)  # loud for non-entity classes
-            if len(unique_key) != 1:
-                raise TypeError(
-                    "delete(EntityClass, ...) takes exactly one unique-field "
-                    "keyword argument"
-                )
-            (field, value), = unique_key.items()
-            spec = ti.spec(field)
-            if spec is None or not spec.unique:
-                raise QueryErrorFor(obj_or_cls, field)
-            if self._cid_by_typename.get(ti.typename) is None:
-                return False
-            ci = self._index.ensure(ti)
-            oid = ci.unique[field].get(value)
-            if oid is None or oid in self._deleted:
-                return False
-            return self._delete_oid(self._registry.get(oid), oid, ti)
+            return self._delete_by_key(obj_or_cls, unique_key)
         if unique_key:
             raise TypeError(
                 "delete(entity) takes no keyword arguments — use "
                 "delete(EntityClass, field=value) for key-based deletion"
             )
-        obj = obj_or_cls
-        if not is_entity(obj):
-            raise NotAnEntityError(
-                f"{type(obj).__name__} is not an @entity class instance"
+        return self._delete_instance(obj_or_cls)
+
+    def _delete_by_key(self, cls: type, unique_key: dict[str, object]) -> bool:
+        ti = type_info(cls)  # loud for non-entity classes
+        if len(unique_key) != 1:
+            raise TypeError(
+                "delete(EntityClass, ...) takes exactly one unique-field "
+                "keyword argument"
             )
-        if isinstance(obj, Redacted):
-            raise ReadDeniedError(
-                f"this {type(obj).__name__} is a redacted twin — never "
-                "committable (ADR-008 R14)"
-            )
+        (field, value), = unique_key.items()
+        _require_unique(cls, ti, field)
+        if self._cid_by_typename.get(ti.typename) is None:
+            return False
+        ci = self._index.ensure(ti)
+        oid = ci.unique[field].get(value)
+        if oid is None or oid in self._deleted:
+            return False
+        return self._delete_oid(self._registry.get(oid), oid, ti)
+
+    def _delete_instance(self, obj: object) -> bool:
+        _require_entity(obj)
+        _forbid_redacted(obj)
         oid = oid_of(obj)
         if oid is None:
             return False  # never registered with a store — nothing to delete
@@ -802,7 +827,7 @@ class Store:
             )
         return self._delete_oid(obj, oid, type_info(obj))
 
-    def _delete_oid(self, obj: Any | None, oid: int, ti: TypeInfo) -> bool:
+    def _delete_oid(self, obj: object | None, oid: int, ti: TypeInfo) -> bool:
         if oid == self._root_oid:
             raise DataCrystalError(
                 "the root holder cannot be deleted — assign store.root instead"
@@ -820,7 +845,7 @@ class Store:
         self._deleted[oid] = (ti, obj)
         return True
 
-    def upsert(self, obj: Any, /, key: str | None = None) -> Any:
+    def upsert(self, obj: object, /, key: str | None = None) -> Any:  # noqa: ANN401 - the survivor is an instance of the caller's own class
         """Insert ``obj``, or merge it into the entity that already owns its natural key.
 
         ``key`` names a ``dc.Unique`` field, optional when the class has exactly one. The live
@@ -830,29 +855,10 @@ class Store:
         Raises ``TypeError``, ``QueryError``, ``UniqueViolationError``.
         """
         self._enter()
-        if not is_entity(obj):
-            raise NotAnEntityError(
-                f"{type(obj).__name__} is not an @entity class instance"
-            )
-        if isinstance(obj, Redacted):
-            raise ReadDeniedError(
-                f"this {type(obj).__name__} is a redacted twin — never "
-                "committable (ADR-008 R14)"
-            )
+        _require_entity(obj)
+        _forbid_redacted(obj)
         ti = type_info(obj)
-        unique_fields = [s.name for s in ti.specs if s.unique]
-        if key is None:
-            if len(unique_fields) != 1:
-                raise TypeError(
-                    f"{type(obj).__name__} has {len(unique_fields)} Unique "
-                    "fields — pass key=<field name> to choose the natural key"
-                    if unique_fields else
-                    f"{type(obj).__name__} has no Unique field — upsert needs "
-                    "a natural key (mark one field Annotated[..., dc.Unique])"
-                )
-            key = unique_fields[0]
-        elif key not in unique_fields:
-            raise QueryErrorFor(cast("type[object]", type(obj)), key)
+        key = _natural_key_field(obj, ti, key)
         value = getattr(obj, key)
         if value is None:
             raise QueryError(
@@ -873,18 +879,10 @@ class Store:
                 "with the store — upsert fresh (untracked) instances or the "
                 "canonical instance"
             )
-        # data_field_names: the _dc_ label columns are NEVER merged (W2-3,
-        # ADR-008) — a fresh probe instance carries R6 birth defaults, and
-        # copying them would reset the survivor's curated labels (and
-        # /v1/submit rides upsert). IS field_names for unprotected classes.
-        for name in ti.data_field_names:
-            new = getattr(obj, name)
-            cur = getattr(existing, name)
-            if not _equivalent(cur, new):
-                setattr(existing, name, new)  # the one-shot hook buffers it
+        _merge_data_fields(existing, obj, ti)
         return existing
 
-    def _payload_digest(self, ti: TypeInfo, field: str, value: Any) -> str | None:
+    def _payload_digest(self, ti: TypeInfo, field: str, value: object) -> str | None:
         """Return the persisted payload's hex SHA-256 for unique ``field == value``, else ``None``.
 
         The OCC base token of ``/v1/submit`` (#155, FEDERATION-WIRE-v1). It hashes the persisted
@@ -901,7 +899,7 @@ class Store:
         rec = self._backend.load_many([oid]).get(oid)
         return hashlib.sha256(rec.payload).hexdigest() if rec is not None else None
 
-    def _find_by_key(self, ti: TypeInfo, field: str, value: Any) -> Any | None:
+    def _find_by_key(self, ti: TypeInfo, field: str, value: object) -> object | None:
         """Find the entity an upsert merges into: the committed unique map, then earlier upserts.
 
         A key freed by a buffered delete is reusable (ADR-003). The lookup self-heals against
@@ -998,11 +996,7 @@ class Store:
         lands in the *next* commit; a failed P2 compensates via
         :meth:`_p2_rollback`.
         """
-        if self._lock is not None and self._lock.lost:
-            raise LeaseLostError(
-                "this process lost the single-writer lease (paused too long?); "
-                "another process may own the store now — refusing to write"
-            )
+        self._assert_lease_held()
         if self._debug:
             self._sweep_untracked()  # before discovery: rescued entities get walked too
         self._discover_new_graphs()
@@ -1018,7 +1012,47 @@ class Store:
             return None
         # Validate before allocating the TID: a rejected commit must leave
         # the TID sequence gapless (replay determinism).
-        index_entries: list[tuple[int, TypeInfo, dict[str, Any]]] = []
+        index_entries, ref_entries, gate_records = self._validate_before_tid(pending, deletes)
+        encoded = self._encode_pending(pending)
+        priors, delete_ops = self._read_delta_priors(pending, deletes, gate_records)
+        tid = self._alloc.next_tid()
+        records = [
+            StoredRecord(oid=oid, cid=cid, tid=tid, payload=payload)
+            for oid, cid, payload in encoded.records
+        ]
+        batch = self._build_batch(tid, records, encoded, deletes)
+        delta = (
+            build_delta(tid, records, encoded.new_types, self._root_oid, priors, delete_ops,
+                        actor=self.principal.uid, at=self._clock())
+            if self._consumers
+            else None
+        )
+        flipped = self._flip_captured(pending)
+        self._new.clear()
+        self._dirty.clear()
+        self._deleted.clear()
+        self._birth_labels.clear()  # baselines consumed; a retry re-stamps
+        return _Capture(tid, batch, index_entries, ref_entries, flipped, delta,
+                        deletes, encoded.blob_swaps)
+
+    def _assert_lease_held(self) -> None:
+        if self._lock is not None and self._lock.lost:
+            raise LeaseLostError(
+                "this process lost the single-writer lease (paused too long?); "
+                "another process may own the store now — refusing to write"
+            )
+
+    def _validate_before_tid(
+        self,
+        pending: dict[int, Any],
+        deletes: list[tuple[int, TypeInfo, Any | None]],
+    ) -> tuple[_IndexEntries, _RefEntries, dict[int, StoredRecord]]:
+        """Run every P1 check that must reject before the TID exists; return what P2 and P3 reuse.
+
+        Unique, sorted-temporal, dangling-delete and write-gate failures all raise here, so a
+        rejected commit keeps the TID sequence gapless (invariant 5).
+        """
+        index_entries: _IndexEntries = []
         prot_pending: list[tuple[int, Any, TypeInfo]] = []
         for oid, obj in pending.items():
             ti = type_info(obj)
@@ -1032,11 +1066,12 @@ class Store:
         prot_deletes = [(oid, ti) for oid, ti, _ in deletes if ti.protected]
         # #110: the eager dangling-ref check (debug/strict_deletes) needs the reverse index built,
         # so force it before the ref-harvest gate; unarmed, the gate below stays lazy (spec §5).
-        if (self._debug or self._strict_deletes) and deletes:
+        dangling_check_armed = (self._debug or self._strict_deletes) and bool(deletes)
+        if dangling_check_armed:
             self._index.ensure_reverse()
         # #20: harvest outgoing refs for the reverse index — only when it is
         # already built (spec §5: an unwatched store pays nothing for it).
-        ref_entries: list[tuple[int, set[int]]] = (
+        ref_entries: _RefEntries = (
             [(oid, self._harvest_live_refs(obj)) for oid, obj in pending.items()]
             if self._index.reverse_built else []
         )
@@ -1044,7 +1079,7 @@ class Store:
         # BEFORE the TID is allocated (a strict raise must leave the sequence
         # gapless, invariant 5; validation precedes allocation, same as encoding
         # and unique checks above).
-        if (self._debug or self._strict_deletes) and deletes:
+        if dangling_check_armed:
             self._check_dangling_deletes(deletes, ref_entries)
         self._index.check_unique(index_entries, deleted=set(self._deleted))
         # #106 / ADR-004 §4: reject a SortedIndex datetime field mixing naive +
@@ -1060,120 +1095,111 @@ class Store:
             self._check_write_gate(prot_pending, prot_deletes)
             if prot_pending or prot_deletes else {}
         )
-        new_types: list[tuple[int, str, list[str]]] = []
-        encoded: list[tuple[int, int, bytes]] = []
-        # Out-of-line blob values this commit writes (ADR-007 / #82): each non-None dc.Blob field's
-        # bytes go to the blobs table and the record keeps a BLOB_EXT descriptor. The sink runs
-        # during encoding, before the TID exists, so it records (oid, size, hash, data) now and the
-        # StoredBlobs are stamped with this commit's tid later.
-        blob_data: list[tuple[int, int, bytes, bytes]] = []
-        # Streamed blobs (ADR-007 §4): (oid, size, hash, open_chunks) — the bytes
-        # are NOT resident; they fill a zeroblob cell in P2.
-        stream_data: list[tuple[int, int, bytes, Callable[[], Iterable[bytes]]]] = []
-        # (obj, field, blob_oid, size, hash) — applied in P3 after durability.
-        blob_swaps: list[tuple[Any, str, int, int, bytes]] = []
+        return index_entries, ref_entries, gate_records
 
-        def blob_sink(value: Any) -> tuple[int, int, bytes]:
-            blob_oid = self._alloc.next_oid()
-            if isinstance(value, BlobSource):
-                # Pre-TID pass 1: hash + length-check WITHOUT holding the bytes
-                # whole. A size mismatch raises here, before the TID is taken →
-                # the sequence stays gapless (invariant 5). P2 reads the source
-                # AGAIN to fill the cell (hence BlobSource must be re-readable).
-                hasher = hashlib.sha256()
-                total = 0
-                for chunk in value.open_chunks():
-                    hasher.update(chunk)
-                    total += len(chunk)
-                if total != value.size:
-                    raise ValueError(
-                        f"a dc.BlobSource declared size {value.size} but its "
-                        f"bytes total {total} — fix the size or the source"
-                    )
-                digest = hasher.digest()
-                stream_data.append((blob_oid, value.size, digest, value.open_chunks))
-                return blob_oid, value.size, digest
-            if isinstance(value, (bytes, bytearray)):
-                data = bytes(value)
-                digest = hashlib.sha256(data).digest()
-                blob_data.append((blob_oid, len(data), digest, data))
-                return blob_oid, len(data), digest
-            raise TypeError(
-                f"a dc.Blob field accepts bytes or a dc.BlobSource, not "
-                f"{type(value).__name__}"
-            )
+    def _encode_pending(self, pending: dict[int, Any]) -> _EncodedBatch:
+        """Encode every buffered entity to its record payload, collecting types and blobs.
 
+        Encoding can reject values (e.g. ints beyond msgpack's 64-bit range), so it runs BEFORE
+        the TID allocation: a rejected commit consumes no TID and the buffers stay intact for a
+        fixed-up retry (gapless sequence, invariant 5).
+        """
+        out = _EncodedBatch()
+        blob_sink = partial(self._sink_blob, out=out)
         for oid, obj in pending.items():
             ti = type_info(obj)
-            cid = self._cid_for(ti, new_types)
+            cid = self._cid_for(ti, out.new_types)
             values = [getattr(obj, name) for name in ti.field_names]
             blob_positions = self._blob_positions(ti)
-            # Encoding can reject values (e.g. ints beyond msgpack's 64-bit
-            # range) — it must run BEFORE the TID allocation so a rejected
-            # commit consumes no TID and the buffers stay intact for a
-            # fixed-up retry (gapless sequence, invariant 5).
             payload = encode_payload(
                 values, self._oid_for_encode,
                 blob_positions=blob_positions,
                 blob_sink=blob_sink if blob_positions else None,
             )
-            encoded.append((oid, cid, payload))
-            # Record streamed-source fields for the P3 swap, reading each field's
-            # blob descriptor straight from the just-encoded payload — so two
-            # fields sharing ONE BlobSource each pick up their OWN blob OID
-            # (id(value) keying would alias both to the last-allocated one).
-            streamed_positions = [
-                i for i in blob_positions if isinstance(values[i], BlobSource)
-            ]
-            if streamed_positions:
-                decoded = decode_payload(payload)
-                for i in streamed_positions:
-                    tok = cast("BlobToken", decoded[i])  # the field's BLOB_EXT descriptor
-                    blob_swaps.append(
-                        (obj, ti.field_names[i], tok.blob_oid, tok.size, tok.hash)
-                    )
-        # Prior payloads for the delta stream (COMMIT-DELTA-v1 §3): the last durable payload of
-        # every persisted record, read O(delta) and only while consumers watch, before the TID
-        # allocation (a failed read consumes no TID). Deletes always have a persisted record, and
-        # their tombstones carry it as prior (spec §3.1).
+            out.records.append((oid, cid, payload))
+            _note_streamed_swaps(obj, ti, values, blob_positions, payload, out.blob_swaps)
+        return out
+
+    def _sink_blob(self, value: object, *, out: _EncodedBatch) -> tuple[int, int, bytes]:
+        """Allocate a blob OID for a ``dc.Blob`` field value and queue its bytes (ADR-007 / #82).
+
+        The sink runs during encoding, before the TID exists, so it records ``(oid, size, hash,
+        data)`` now and the StoredBlobs are stamped with this commit's tid later.
+        """
+        blob_oid = self._alloc.next_oid()
+        if isinstance(value, BlobSource):
+            # Pre-TID pass 1: hash + length-check WITHOUT holding the bytes
+            # whole. A size mismatch raises here, before the TID is taken →
+            # the sequence stays gapless (invariant 5). P2 reads the source
+            # AGAIN to fill the cell (hence BlobSource must be re-readable).
+            digest = _hash_blob_source(value)
+            out.stream_data.append((blob_oid, value.size, digest, value.open_chunks))
+            return blob_oid, value.size, digest
+        if isinstance(value, (bytes, bytearray)):
+            data = bytes(value)
+            digest = hashlib.sha256(data).digest()
+            out.blob_data.append((blob_oid, len(data), digest, data))
+            return blob_oid, len(data), digest
+        raise TypeError(
+            f"a dc.Blob field accepts bytes or a dc.BlobSource, not "
+            f"{type(value).__name__}"
+        )
+
+    def _read_delta_priors(
+        self,
+        pending: dict[int, Any],
+        deletes: list[tuple[int, TypeInfo, Any | None]],
+        gate_records: dict[int, StoredRecord],
+    ) -> tuple[dict[int, bytes], list[tuple[int, int, bytes]]]:
+        """Read the last durable payload of every persisted record for the delta stream.
+
+        COMMIT-DELTA-v1 §3: O(delta) and only while consumers watch, before the TID allocation (a
+        failed read consumes no TID). Deletes always have a persisted record, and their tombstones
+        carry it as prior (spec §3.1).
+        """
         priors: dict[int, bytes] = {}
         delete_ops: list[tuple[int, int, bytes]] = []
-        if self._consumers:
-            persisted_oids = [oid for oid in pending if oid not in self._new]
-            want = persisted_oids + [oid for oid, _, _ in deletes]
-            # Merge with the write gate's loads: a protected prior is read
-            # exactly once even when consumers watch. The `if self._consumers:`
-            # guard itself stays — spec §5, an unwatched store pays nothing
-            # for DELTA priors (the gate pays only for protected records).
-            missing = [oid for oid in want if oid not in gate_records]
-            prior_records = dict(gate_records)
-            if missing:
-                prior_records.update(self._backend.load_many(missing))
-            for oid in persisted_oids:
-                rec = prior_records.get(oid)
-                if rec is None:
-                    raise DataCrystalError(
-                        f"internal error: dirty entity oid {oid} has no "
-                        "persisted record to take a prior payload from"
-                    )
-                priors[oid] = rec.payload
-            for oid, _, _ in deletes:
-                rec = prior_records.get(oid)
-                if rec is None:
-                    raise DataCrystalError(
-                        f"internal error: deleted entity oid {oid} has no "
-                        "persisted record to take a tombstone prior from"
-                    )
-                delete_ops.append((oid, rec.cid, rec.payload))
-        tid = self._alloc.next_tid()
-        records = [
-            StoredRecord(oid=oid, cid=cid, tid=tid, payload=payload)
-            for oid, cid, payload in encoded
-        ]
-        batch = CommitBatch(
+        if not self._consumers:
+            return priors, delete_ops
+        persisted_oids = [oid for oid in pending if oid not in self._new]
+        want = persisted_oids + [oid for oid, _, _ in deletes]
+        # Merge with the write gate's loads: a protected prior is read
+        # exactly once even when consumers watch. The `if self._consumers:`
+        # guard itself stays — spec §5, an unwatched store pays nothing
+        # for DELTA priors (the gate pays only for protected records).
+        missing = [oid for oid in want if oid not in gate_records]
+        prior_records = dict(gate_records)
+        if missing:
+            prior_records.update(self._backend.load_many(missing))
+        for oid in persisted_oids:
+            rec = prior_records.get(oid)
+            if rec is None:
+                raise DataCrystalError(
+                    f"internal error: dirty entity oid {oid} has no "
+                    "persisted record to take a prior payload from"
+                )
+            priors[oid] = rec.payload
+        for oid, _, _ in deletes:
+            rec = prior_records.get(oid)
+            if rec is None:
+                raise DataCrystalError(
+                    f"internal error: deleted entity oid {oid} has no "
+                    "persisted record to take a tombstone prior from"
+                )
+            delete_ops.append((oid, rec.cid, rec.payload))
+        return priors, delete_ops
+
+    def _build_batch(
+        self,
+        tid: int,
+        records: list[StoredRecord],
+        encoded: _EncodedBatch,
+        deletes: list[tuple[int, TypeInfo, Any | None]],
+    ) -> CommitBatch:
+        return CommitBatch(
             tid=tid,
             records=records,
-            new_types=new_types,
+            new_types=encoded.new_types,
             meta={
                 "next_oid": str(self._alloc.oid_watermark),
                 "next_cid": str(self._alloc.cid_watermark),
@@ -1187,41 +1213,27 @@ class Store:
             deletes=[oid for oid, _, _ in deletes],
             blobs=[
                 StoredBlob(oid=boid, tid=tid, size=size, hash=h, data=data)
-                for boid, size, h, data in blob_data
+                for boid, size, h, data in encoded.blob_data
             ],
             blob_streams=[
                 StreamedBlob(oid=boid, tid=tid, size=size, hash=h, open_chunks=oc)
-                for boid, size, h, oc in stream_data
+                for boid, size, h, oc in encoded.stream_data
             ],
         )
-        delta = (
-            build_delta(tid, records, new_types, self._root_oid, priors, delete_ops,
-                        actor=self.principal.uid, at=self._clock())
-            if self._consumers
-            else None
-        )
+
+    def _flip_captured(self, pending: dict[int, Any]) -> list[tuple[int, Any, int]]:
+        """Flip the captured set to CLEAN and register it; return each prior state."""
         flipped: list[tuple[int, Any, int]] = []
         for oid, obj in pending.items():
             ti = type_info(obj)
             if ti.frozen:
-                # Frozen __init__ bypasses the tracked __setattr__, so its
-                # containers are still plain — bind them now so post-commit
-                # in-place mutation raises instead of silently doing nothing.
-                for name in ti.field_names:
-                    value = getattr(obj, name)
-                    if isinstance(value, (list, dict, tuple)):
-                        set_field(obj, name, wrap_value(value, obj))
+                _bind_frozen_containers(obj, ti)
             flipped.append((oid, obj, state_of(obj)))
             set_state(obj, STATE_CLEAN)
             self._registry.add(oid, obj)
-        self._new.clear()
-        self._dirty.clear()
-        self._deleted.clear()
-        self._birth_labels.clear()  # baselines consumed; a retry re-stamps
-        return _Capture(tid, batch, index_entries, ref_entries, flipped, delta,
-                        deletes, blob_swaps)
+        return flipped
 
-    def _prior_labels(self, rec: StoredRecord) -> tuple[int, list[int], int, int]:
+    def _prior_labels(self, rec: StoredRecord) -> _Labels:
         """Return the four ``_dc_`` label values of a prior payload, decoded without entities.
 
         A cid whose shape lacks the columns predates protection and gets the shared R7 legacy fill,
@@ -1280,93 +1292,43 @@ class Store:
         persisted_oids = [oid for oid, _, _ in prot_pending if oid not in self._new]
         persisted_oids += [oid for oid, _ in prot_deletes]
         records = self._backend.load_many(persisted_oids) if persisted_oids else {}
-        labels: dict[int, tuple[int, list[int], int, int]] = {}
-        for oid, rec in records.items():
-            labels[oid] = self._prior_labels(rec)
-
-        def deny(msg: str) -> None:
-            raise WriteDeniedError(f"{msg} — as principal uid={p.uid}; the buffer "
-                                   "is intact: discard() or fix and re-commit "
-                                   "(ADR-008)")
-
+        labels = {oid: self._prior_labels(rec) for oid, rec in records.items()}
         for oid, obj, ti in prot_pending:
             prior = labels.get(oid)
             if prior is None:
-                # NEW record: no floor to clear. The anonymous case is normally refused at the
-                # stamp site (W2-2); this closes the remaining paths. The baseline is the
-                # birth/inherited labels, not empty: inheritance is library policy, so the
-                # principal answers only for what it staged on top.
-                if p.uid == 0:
-                    deny(f"cannot create a protected {ti.cls.__name__} as the "
-                         "anonymous principal (a record nobody owns must not "
-                         "exist, R6/R7a)")
-                base = self._birth_labels.get(oid, (obj._dc_owner, [], VIEWER, VIEWER))
-                if obj._dc_owner != base[0]:
-                    # F2 (ADR-008 R6): the birth owner is the acting uid stamped in
-                    # _stamp_perm_labels. Setting `_dc_owner` between store() and commit() would
-                    # forge it, planting a record in a victim's owner-only space or an owner=0
-                    # orphan; this pins ownership at birth like the persisted branch does.
-                    deny(f"cannot stamp {ti.cls.__name__} oid={oid} with owner "
-                         f"{obj._dc_owner}: a new record's owner is the acting "
-                         f"principal ({base[0]}), never assigned by hand (R6)")
+                base = self._gate_new_record(p, oid, obj, ti)
             else:
-                held = authority_towards(p, prior[0], prior[1])
-                if held < prior[3]:
-                    deny(f"write to {ti.cls.__name__} oid={oid} denied: the "
-                         f"record's write floor is {prior[3]} and your "
-                         f"authority towards it is {held} (the floor binds "
-                         "everyone, including the owner — the curation "
-                         "guarantee)")
-                if obj._dc_owner != prior[0]:
-                    # Ownership is immutable after birth: only root (R9, short-circuited above) may
-                    # reassign it. Otherwise any writer clearing the write floor could stage itself
-                    # as owner, gaining a permanent owner-read bypass and minting its personal-best
-                    # level into the R8 ceiling, which reads the STAGED owner (ADR-008 R8,
-                    # amendment 2026-07-15).
-                    deny(f"cannot change owner of {ti.cls.__name__} oid={oid} "
-                         f"from {prior[0]} to {obj._dc_owner}: ownership is "
-                         "immutable after birth — only root may reassign it (R9)")
-                base = prior
-            staged_groups = list(obj._dc_groups)
-            ceiling = authority_towards(p, obj._dc_owner, staged_groups)
-            base_groups: set[int] = set(base[1])
-            for g in set(staged_groups) - base_groups:
-                if level(p, g) == NO_STANDING:
-                    deny(f"cannot share {ti.cls.__name__} oid={oid} into group "
-                         f"{g}: you hold no standing there (R8 — cross-group "
-                         "handoff goes through someone who holds both groups)")
-            for label_name, staged, was in (
-                ("read", obj._dc_read_floor, base[2]),
-                ("write", obj._dc_write_floor, base[3]),
-            ):
-                if staged != was and staged > ceiling:
-                    deny(f"cannot set {ti.cls.__name__} oid={oid} {label_name} "
-                         f"floor to {staged}: your own authority towards the "
-                         f"record is {ceiling} (R8 ceiling — a label write is "
-                         "a write, bounded by what you hold)")
+                base = _gate_persisted_record(p, oid, obj, ti, prior)
+            _gate_label_changes(p, oid, obj, ti, base)
             if ti.cls is Actor:
-                # F1 (ADR-008 R8): an Actor's `memberships` is authority, since acting_as(uid)
-                # turns a stored level into a live Principal; without this a writer could mint
-                # Actor(memberships={WORLD: EXECUTIVE}) and act as root. So every CHANGED
-                # membership must be at most the level the committer holds in that group (root
-                # returned above). Lowering or removing never blocks.
                 prior_m = (self._prior_actor_memberships(records[oid])
                            if prior is not None else {})
-                for g, lvl in obj.memberships.items():
-                    if lvl != prior_m.get(g) and lvl > level(p, g):
-                        deny(f"cannot grant Actor uid={obj.uid} level {lvl} in "
-                             f"group {g}: your own level there is {level(p, g)} "
-                             "— an Actor's memberships are authority, capped by "
-                             "what you hold (R8 ceiling on authority-bearing "
-                             "grants; only root may mint root)")
+                _gate_actor_memberships(p, obj, prior_m)
         for oid, ti in prot_deletes:
-            owner, groups, _read, write_floor = labels[oid]
-            held = authority_towards(p, owner, groups)
-            if held < write_floor:
-                deny(f"delete of {ti.cls.__name__} oid={oid} denied: its write "
-                     f"floor is {write_floor} and your authority towards it "
-                     f"is {held} (a delete is a write)")
+            _gate_delete(p, oid, ti, labels[oid])
         return records
+
+    def _gate_new_record(self, p: Principal, oid: int, obj: LabelColumns, ti: TypeInfo) -> _Labels:
+        """Gate a NEW protected record and return its baseline: the birth/inherited labels.
+
+        There is no floor to clear. The anonymous case is normally refused at the stamp site
+        (W2-2); this closes the remaining paths. The baseline is not empty: inheritance is library
+        policy, so the principal answers only for what it staged on top.
+        """
+        if p.uid == 0:
+            _deny_write(p, f"cannot create a protected {ti.cls.__name__} as the "
+                           "anonymous principal (a record nobody owns must not "
+                           "exist, R6/R7a)")
+        base = self._birth_labels.get(oid, (obj._dc_owner, [], VIEWER, VIEWER))
+        if obj._dc_owner != base[0]:
+            # F2 (ADR-008 R6): the birth owner is the acting uid stamped in
+            # _stamp_perm_labels. Setting `_dc_owner` between store() and commit() would
+            # forge it, planting a record in a victim's owner-only space or an owner=0
+            # orphan; this pins ownership at birth like the persisted branch does.
+            _deny_write(p, f"cannot stamp {ti.cls.__name__} oid={oid} with owner "
+                           f"{obj._dc_owner}: a new record's owner is the acting "
+                           f"principal ({base[0]}), never assigned by hand (R6)")
+        return base
 
     def _run_p2(self, batch: CommitBatch) -> None:
         """P2: backend I/O on bytes only, off the owner thread."""
@@ -1721,7 +1683,7 @@ class Store:
         core = _SnapshotCore(self._backend.read_view())
         return Snapshot(core, bound)
 
-    def open_blob(self, entity: Any, field: str) -> BinaryIO:
+    def open_blob(self, entity: object, field: str) -> BinaryIO:
         """Open a committed ``dc.Blob`` field as a binary stream (ADR-007 §3).
 
         Return an ``io.BufferedReader`` whose range reads pull only the spanned bytes. The stream
@@ -1763,7 +1725,7 @@ class Store:
             f"{type(value).__name__!r}"
         )
 
-    def get(self, cls: type, **unique_key: Any) -> Any | None:
+    def get(self, cls: type, **unique_key: object) -> Any | None:  # noqa: ANN401 - an instance of whichever class the caller names
         """Return one entity by unique secondary key, or ``None``: ``store.get(Mineral, qid=...)``.
 
         The lookup reflects committed state; the returned instance is the live one, buffered edits
@@ -1776,9 +1738,7 @@ class Store:
             raise TypeError("get() takes exactly one unique-field keyword argument")
         ti = type_info(cls)
         (field, value), = unique_key.items()
-        spec = ti.spec(field)
-        if spec is None or not spec.unique:
-            raise QueryErrorFor(cls, field)
+        _require_unique(cls, ti, field)
         if self._cid_by_typename.get(ti.typename) is None:
             return None
         ci = self._index.ensure(ti)
@@ -1793,7 +1753,8 @@ class Store:
                     return None  # found-but-denied ≡ absent (ADR-008 R12)
         return self._load_oid(oid)
 
-    def get_many(self, refs: Iterable[Any] | type, /, **unique_key: Any) -> list[Any]:
+    def get_many(self, refs: Iterable[Any] | type, /,
+                 **unique_key: Iterable[object]) -> list[Any]:
         """Hydrate many entities in one storage round-trip (SDA delta 5).
 
         Shapes: ``get_many(mixed)`` (OIDs, ``Lazy``, ``Ref``, entities) and ``get_many(Mineral,
@@ -1811,52 +1772,34 @@ class Store:
                 )
             return self._get_many_by_key(refs, unique_key)
         items: list[Any] = list(refs)  # a class without kwargs falls through
-        wanted: list[int] = []
-        for item in items:
-            if isinstance(item, Lazy):
-                lazy = cast("Lazy[Any]", item)
-                oid = lazy.oid
-                if not lazy.loaded and oid is not None:
-                    wanted.append(oid)
-            elif isinstance(item, int):
-                wanted.append(item)
-            elif isinstance(item, Ref):
-                wanted.append(item.oid)
-            elif not is_entity(item):
-                raise NotAnEntityError(
-                    f"get_many() accepts OIDs, Lazy refs, snapshot Refs and "
-                    f"entities, got {type(item).__name__}"
-                )
+        wanted = _wanted_oids(items)
         missing = [oid for oid in wanted if self._registry.get(oid) is None]
         cache = self._backend.load_many(missing) if missing else {}
-        out: list[Any] = []
-        for item in items:
-            if isinstance(item, Lazy):
-                lazy = cast("Lazy[Any]", item)
-                oid = lazy.oid
-                if lazy.loaded or oid is None:
-                    out.append(lazy.get())
-                else:
-                    out.append(self._load_oid_deref(oid, cache))
-            elif isinstance(item, int):
-                out.append(self._load_oid_deref(item, cache))
-            elif isinstance(item, Ref):
-                out.append(self._load_oid_deref(item.oid, cache))
-            else:
-                out.append(item)
-        return out
+        return [self._deref_item(item, cache) for item in items]
 
-    def _get_many_by_key(self, cls: type, unique_key: dict[str, Any]) -> list[Any]:
+    def _deref_item(self, item: object, cache: dict[int, StoredRecord]) -> object:
+        """Resolve one ``get_many`` item at the R14 checkpoint; an entity passes through."""
+        if isinstance(item, Lazy):
+            lazy = cast("Lazy[Any]", item)
+            oid = lazy.oid
+            if lazy.loaded or oid is None:
+                return lazy.get()
+            return self._load_oid_deref(oid, cache)
+        if isinstance(item, int):
+            return self._load_oid_deref(item, cache)
+        if isinstance(item, Ref):
+            return self._load_oid_deref(item.oid, cache)
+        return item
+
+    def _get_many_by_key(self, cls: type, unique_key: dict[str, Iterable[object]]) -> list[Any]:
         if len(unique_key) != 1:
             raise TypeError(
                 "get_many() takes exactly one unique-field keyword argument"
             )
         ti = type_info(cls)
-        (field, values), = unique_key.items()
-        spec = ti.spec(field)
-        if spec is None or not spec.unique:
-            raise QueryErrorFor(cls, field)
-        values = list(values)
+        (field, key_values), = unique_key.items()
+        _require_unique(cls, ti, field)
+        values = list(key_values)
         if self._cid_by_typename.get(ti.typename) is None:
             return [None] * len(values)  # silent like get(): the miss idiom
         ci = self._index.ensure(ti)
@@ -1901,7 +1844,7 @@ class Store:
         cache = self._backend.load_many(missing) if missing else {}
         return [self._load_oid(o, cache) for o in oids]
 
-    def _get_by_key_unchecked(self, cls: type, field: str, value: Any) -> Any | None:
+    def _get_by_key_unchecked[T](self, cls: type[T], field: str, value: object) -> T | None:
         """Return ``get()`` minus the read fence (ADR-008 W3-3), the identity-bootstrap seam.
 
         Used by :meth:`_resolve_registry_actor`: ``Actor`` is protected, so a fenced lookup would
@@ -1912,10 +1855,11 @@ class Store:
         if self._cid_by_typename.get(ti.typename) is None:
             return None
         oid = self._index.ensure(ti).unique[field].get(value)
-        return None if oid is None else self._load_oid(oid)
+        # the unique map of cls's type names an instance of it
+        return None if oid is None else cast("T", self._load_oid(oid))
 
     def query(self, target: type | Condition, *, limit: int | None = None,
-              offset: int = 0, order_by: Any = None) -> list[Any]:
+              offset: int = 0, order_by: object = None) -> list[Any]:
         """Return the hydrated committed entities matching ``target``, a Condition or entity class.
 
         ``query(Mineral)`` spells the full extent; :meth:`explain` shows the plan.
@@ -1932,15 +1876,7 @@ class Store:
             self._warn_unseen(ti)
             return []
         ci = self._index.ensure(ti)
-        if cond is None:
-            bitmap, residual = None, None
-        else:
-            bitmap, residual = plan(cond, ci)
-        candidate = bitmap if bitmap is not None else ci.extent
-        if ti.protected:
-            rb = readable_bitmap(self.principal, ci)
-            if rb is not None:
-                candidate = candidate & rb  # a NEW bitmap — never mutate ci.extent
+        candidate, residual = self._candidates(ti, ci, cond, self.principal)
         if order_by is not None:
             field, descending = parse_order_by(order_by, ti)
             if residual is None:
@@ -1958,7 +1894,21 @@ class Store:
         objs = [o for o in self._get_many_unchecked(oids) if residual.evaluate(o)]
         return apply_window(objs, limit, offset)
 
-    def _ordered_window(self, ti: TypeInfo, ci: Any, matched: Any, field: str,
+    def _candidates(self, ti: TypeInfo, ci: ClassIndexes, cond: Condition | None,
+                    principal: Principal) -> tuple[BitMap64, Condition | None]:
+        """Return the bitmap of candidate OIDs for ``cond`` and the residual left to evaluate."""
+        if cond is None:
+            bitmap, residual = None, None
+        else:
+            bitmap, residual = plan(cond, ci)
+        candidate = bitmap if bitmap is not None else ci.extent
+        if ti.protected:
+            rb = readable_bitmap(principal, ci)
+            if rb is not None:
+                candidate = candidate & rb  # a NEW bitmap — never mutate ci.extent
+        return candidate, residual
+
+    def _ordered_window(self, ti: TypeInfo, ci: ClassIndexes, matched: BitMap64, field: str,
                         descending: bool, limit: int | None, offset: int) -> list[int]:
         """Return the ``(offset, limit)`` window of ``matched`` in order_by order (#25/#66).
 
@@ -1972,7 +1922,7 @@ class Store:
         ordered = order_by_values(matched, values.__getitem__, descending)
         return apply_window(ordered, limit, offset)
 
-    def incoming(self, entity: Any) -> list[Any]:
+    def incoming(self, entity: object) -> list[Any]:
         """Return every committed entity that references ``entity``, for backlinks (ROADMAP 8).
 
         Answered from a rebuildable reverse index (invariant 11), built on first call. A deleted
@@ -1995,33 +1945,45 @@ class Store:
         p = self.principal
         if is_root(p):
             return self._get_many_unchecked(oids)
+        survivors, to_load = self._readable_registered(oids, p)
+        cache = self._backend.load_many(to_load) if to_load else {}
+        survivors += self._readable_unregistered(to_load, cache, p)
+        survivors.sort()  # deterministic ascending-OID order
+        return [self._load_oid(o, cache) for o in survivors]
+
+    def _readable_registered(self, oids: list[int], p: Principal) -> tuple[list[int], list[int]]:
+        """Split referrer OIDs into the readable ones already live and those still to load."""
         survivors: list[int] = []
         to_load: list[int] = []
         for oid in oids:
             obj = self._registry.get(oid)
-            if obj is not None:
-                ti_r = type_info(obj)
-                if not ti_r.protected:
-                    survivors.append(oid)
-                    continue
-                labels = self._index.ensure(ti_r).committed_labels(oid)
-                if labels is not None and can_read_row(p, *labels):
-                    survivors.append(oid)
+            if obj is None:
+                to_load.append(oid)
                 continue
-            to_load.append(oid)
-        cache = self._backend.load_many(to_load) if to_load else {}
+            ti = type_info(obj)
+            if not ti.protected:
+                survivors.append(oid)
+                continue
+            labels = self._index.ensure(ti).committed_labels(oid)
+            if labels is not None and can_read_row(p, *labels):
+                survivors.append(oid)
+        return survivors, to_load
+
+    def _readable_unregistered(self, to_load: list[int], cache: dict[int, StoredRecord],
+                               p: Principal) -> list[int]:
+        """Return the loaded referrers the principal may read, judged on their committed labels."""
+        survivors: list[int] = []
         for oid in to_load:
             rec = cache.get(oid)
             if rec is None:
                 continue  # racing delete fold — the posting outlived the record (ADR-003)
-            ti_r = self._ti_for_cid(rec.cid)
-            if ti_r.protected:
+            ti = self._ti_for_cid(rec.cid)
+            if ti.protected:
                 owner, groups, read_floor, _write_floor = self._prior_labels(rec)
                 if not can_read_row(p, owner, groups, read_floor):
                     continue
             survivors.append(oid)
-        survivors.sort()  # deterministic ascending-OID order
-        return [self._load_oid(o, cache) for o in survivors]
+        return survivors
 
     def verify(self) -> list[tuple[str, int]]:
         """Return the ``(typename, oid)`` pairs that do not decode to their live class (#26 (c)).
@@ -2147,7 +2109,7 @@ class Store:
 
     def pluck(self, target: type | Condition, *fields: str,
               limit: int | None = None, offset: int = 0,
-              order_by: Any = None) -> list[Any]:
+              order_by: object = None) -> list[Any]:
         """Project fields without constructing entities, the decode-level column read (ROADMAP 4).
 
         ``pluck(Mineral, "name")`` returns values, ``pluck(cond, "a", "b")`` tuples; refs are
@@ -2161,34 +2123,14 @@ class Store:
             raise TypeError("pluck() takes at least one field name")
         cls, cond = query_target(target, "pluck")
         ti = type_info(cls)
-        known = set(ti.field_names)
-        for name in fields:
-            if name not in known:
-                raise QueryError(
-                    f"{cls.__name__}.{name} is not a persisted field "
-                    f"(fields: {', '.join(ti.field_names)})"
-                )
+        _require_persisted_fields(cls, ti, fields)
         if self._cid_by_typename.get(ti.typename) is None:
             self._warn_unseen(ti)
             return []
         ci = self._index.ensure(ti)
-        if cond is not None:
-            bitmap, residual = plan(cond, ci)
-        else:
-            bitmap, residual = None, None
-        candidate = bitmap if bitmap is not None else ci.extent
-        if ti.protected:
-            rb = readable_bitmap(self.principal, ci)
-            if rb is not None:
-                candidate = candidate & rb  # a NEW bitmap — never mutate ci.extent
+        candidate, residual = self._candidates(ti, ci, cond, self.principal)
         raw_cond = _raw_condition(residual) if residual is not None else None
-        single = fields[0] if len(fields) == 1 else None
-
-        def project(row: dict[str, Any]) -> Any:
-            if single is not None:
-                return _publish(row[single])
-            return tuple(_publish(row[name]) for name in fields)
-
+        project = _projector(fields)
         if order_by is not None:
             ofield, descending = parse_order_by(order_by, ti)
             if residual is None and ofield in ci.eq:
@@ -2199,23 +2141,24 @@ class Store:
                 return [project(row) for _oid, row in self._iter_raw(ti, oids)]
             # honest O(matches): decode every candidate, filter, order by the
             # sort field's decoded value, then window + project.
-            rows = [
-                (oid, row) for oid, row in self._iter_raw(ti, list(candidate))
-                if raw_cond is None or raw_cond.evaluate(_RawView(row))
-            ]
-            rows = _order_rows(rows, ofield, descending)
+            rows = _order_rows(
+                list(self._matching_rows(ti, list(candidate), raw_cond)), ofield, descending
+            )
             return [project(row) for _oid, row in apply_window(rows, limit, offset)]
 
         windowed_early = residual is None
         # #51: no residual → take the window lazily (O(offset+limit)); a residual
         # must decode every candidate before the window can be applied.
         oids = window_iter(candidate, limit, offset) if windowed_early else list(candidate)
-        out: list[Any] = []
-        for _oid, row in self._iter_raw(ti, oids):
-            if raw_cond is not None and not raw_cond.evaluate(_RawView(row)):
-                continue
-            out.append(project(row))
+        out = [project(row) for _oid, row in self._matching_rows(ti, oids, raw_cond)]
         return out if windowed_early else apply_window(out, limit, offset)
+
+    def _matching_rows(self, ti: TypeInfo, oids: list[int],
+                       raw_cond: Condition | None) -> Iterator[tuple[int, dict[str, Any]]]:
+        """Yield the decoded rows of ``oids`` that satisfy the raw residual, if there is one."""
+        for oid, row in self._iter_raw(ti, oids):
+            if raw_cond is None or raw_cond.evaluate(_RawView(row)):
+                yield oid, row
 
     def query_iter(self, target: type | Condition) -> Iterator[Any]:
         """Iterate the committed result set of :meth:`query` chunk by chunk, in bounded memory.
@@ -2237,15 +2180,7 @@ class Store:
             self._warn_unseen(ti)
             return
         ci = self._index.ensure(ti)
-        if cond is None:
-            bitmap, residual = None, None
-        else:
-            bitmap, residual = plan(cond, ci)
-        candidate = bitmap if bitmap is not None else ci.extent
-        if ti.protected:
-            rb = readable_bitmap(principal, ci)
-            if rb is not None:
-                candidate = candidate & rb  # a NEW bitmap — never mutate ci.extent
+        candidate, residual = self._candidates(ti, ci, cond, principal)
         oids = list(candidate)
         for start in range(0, len(oids), _RAW_CHUNK):
             self._guard()  # ADR-001: re-assert before hydrating each new chunk
@@ -2319,7 +2254,7 @@ class Store:
         if self._lazyman is not None:
             self._lazyman.maybe_sweep()
 
-    def _on_first_write(self, obj: Any) -> None:
+    def _on_first_write(self, obj: object) -> None:
         """First write to a CLEAN entity (called by the one-shot hook,
         BEFORE the mutation lands).
         """
@@ -2332,7 +2267,7 @@ class Store:
         assert oid is not None  # CLEAN implies stamped
         self._dirty[oid] = obj
 
-    def _register_graph(self, obj: Any, walked: set[int] | None = None) -> int:
+    def _register_graph(self, obj: object, walked: set[int] | None = None) -> int:
         if walked is None:
             walked = set()
         # Queue entries carry the ENQUEUING protected container (or None):
@@ -2343,40 +2278,11 @@ class Store:
         queue: deque[tuple[Any, Any]] = deque([(obj, None)])
         while queue:
             current, container = queue.popleft()
-            if isinstance(current, Redacted):
-                # ADR-008 R14: a twin has no engine state slot (state_of() would raise
-                # AttributeError), so catch it before that call, whether it is the top-level
-                # argument (store(), root setter, upsert) or was smuggled into another entity's
-                # field and enqueued by _walk_value.
-                raise ReadDeniedError(
-                    f"this {type(current).__name__} is a redacted twin — "
-                    "never committable (ADR-008 R14)"
-                )
-            if state_of(current) == STATE_DELETED:
-                raise DeletedEntityError(
-                    f"this {type(current).__name__} was deleted via "
-                    "store.delete() and cannot be stored again — create a "
-                    "new entity instead (OIDs are never reused)"
-                )
+            _require_storable(current)
             oid = oid_of(current)
             fresh = oid is None
             if oid is None:
-                ti = type_info(current)
-                if ti.protected and self.principal.uid == 0:
-                    # R6 (derived): a record nobody owns must not be creatable
-                    # — refused BEFORE the entity is stamped or buffered, so a
-                    # doomed record never enters the buffer (commit-retry could
-                    # not re-stamp it; only discard() could). P1-discovered
-                    # children hit this pre-TID too (invariant 5).
-                    raise WriteDeniedError(
-                        f"cannot create a protected {type(current).__name__} as "
-                        "the anonymous principal (uid 0) — a record nobody owns "
-                        "must not exist (ADR-008 R6/R7a); open the store with "
-                        "principal=... or wrap the write in store.acting_as(...)"
-                    )
-                oid = self._alloc.next_oid()
-                stamp(current, oid, self, state_of(current))
-                self._new[oid] = current
+                oid = self._adopt_unregistered(current)
             if oid in walked:
                 continue
             walked.add(oid)
@@ -2384,24 +2290,48 @@ class Store:
                 ti = type_info(current)
                 if fresh and ti.protected:
                     self._stamp_perm_labels(current, container)
-                # Flat-entity fast-path (#52): a type none of whose fields can
-                # hold an entity ref (a SOR row of scalars/strings, FKs kept as
-                # plain str) has nothing to discover — skip the per-field walk
-                # entirely. has_entity_refs mirrors _walk_value's leaf set, so a
-                # ref-bearing field is never wrongly skipped.
-                if ti.has_entity_refs:
-                    child_container = current if ti.protected else None
-                    for spec in ti.specs:
-                        # eager_position drives the R11 runtime check: a field
-                        # whose refs do NOT decode as Lazy handles would
-                        # eager-materialize a protected child (ADR-008 R11 leak
-                        # backstop — see _walk_value).
-                        self._walk_value(getattr(current, spec.name), queue,
-                                         child_container,
-                                         eager_position=not spec.lazy_refs)
-        return oid_of(obj)  # pyrefly: ignore[bad-return]  # the walk above stamped obj, so it has an oid
+                self._queue_field_entities(current, ti, queue)
+        return oid_of(obj)  # pyrefly: ignore[bad-return] - the walk above stamped obj, so it has an oid
 
-    def _stamp_perm_labels(self, obj: Any, container: Any) -> None:
+    def _adopt_unregistered(self, entity: object) -> int:
+        """Give a never-stored entity its OID, stamp it and buffer it as NEW; return the OID."""
+        if type_info(entity).protected and self.principal.uid == 0:
+            # R6 (derived): a record nobody owns must not be creatable
+            # — refused BEFORE the entity is stamped or buffered, so a
+            # doomed record never enters the buffer (commit-retry could
+            # not re-stamp it; only discard() could). P1-discovered
+            # children hit this pre-TID too (invariant 5).
+            raise WriteDeniedError(
+                f"cannot create a protected {type(entity).__name__} as "
+                "the anonymous principal (uid 0) — a record nobody owns "
+                "must not exist (ADR-008 R6/R7a); open the store with "
+                "principal=... or wrap the write in store.acting_as(...)"
+            )
+        oid = self._alloc.next_oid()
+        stamp(entity, oid, self, state_of(entity))
+        self._new[oid] = entity
+        return oid
+
+    def _queue_field_entities(self, entity: object, ti: TypeInfo,
+                              queue: deque[tuple[Any, Any]]) -> None:
+        """Queue the entities the fields of ``entity`` reach, with ``entity`` as their container."""
+        # Flat-entity fast-path (#52): a type none of whose fields can
+        # hold an entity ref (a SOR row of scalars/strings, FKs kept as
+        # plain str) has nothing to discover — skip the per-field walk
+        # entirely. has_entity_refs mirrors _walk_value's leaf set, so a
+        # ref-bearing field is never wrongly skipped.
+        if ti.has_entity_refs:
+            child_container = entity if ti.protected else None
+            for spec in ti.specs:
+                # eager_position drives the R11 runtime check: a field
+                # whose refs do NOT decode as Lazy handles would
+                # eager-materialize a protected child (ADR-008 R11 leak
+                # backstop — see _walk_value).
+                self._walk_value(getattr(entity, spec.name), queue,
+                                 child_container,
+                                 eager_position=not spec.lazy_refs)
+
+    def _stamp_perm_labels(self, obj: LabelColumns, container: LabelColumns | None) -> None:
         """Stamp birth labels on a fresh protected record, once, from :meth:`_register_graph`.
 
         ``_dc_owner`` is the acting principal's uid, never inherited (R6 provenance). Groups and
@@ -2439,30 +2369,12 @@ class Store:
         for obj in [*self._new.values(), *self._dirty.values()]:
             self._register_graph(obj, walked)
 
-    def _walk_value(self, value: Any, queue: deque[tuple[Any, Any]],
-                    container: Any = None, *, eager_position: bool = False) -> None:
-        if value is None or isinstance(value, (str, float, int, bytes)):
+    def _walk_value(self, value: object, queue: deque[tuple[Any, Any]],
+                    container: object | None = None, *, eager_position: bool = False) -> None:
+        if value is None or isinstance(value, _LEAF_TYPES):
             return  # overwhelmingly the common case: scalars reference nothing
         if is_entity(value):
-            if (eager_position and type_info(value).protected
-                    and not isinstance(value, Redacted)):
-                # R11 runtime complement (ADR-008): _entity._check_r11_lazy_only cannot see
-                # Any-typed fields, bare containers or store.root, so this closes it at the write
-                # boundary. It keys on the field position's decode mode, not a Lazy wrapper:
-                # `swizzle` collapses `Lazy.of(x)` to a bare RefToken in a non-`Lazy[...]` field,
-                # which re-decodes eagerly. Only `spec.lazy_refs` is exempt.
-                raise TypeError(
-                    f"{type(value).__name__} is protected — protected classes "
-                    "are Lazy-referable only (ADR-008 R11). The FIELD must be "
-                    "typed dc.Lazy[...] (e.g. `dc.Lazy["
-                    f"{type(value).__name__}]`): an Any/untyped field, a bare "
-                    "container, or store.root cannot hold a protected reference, "
-                    "because it persists and re-decodes as an eager edge even "
-                    "when the value is wrapped in dc.Lazy.of(...)"
-                )
-            oid = oid_of(value)
-            if oid is None or oid in self._new or oid in self._dirty:
-                queue.append((value, container))
+            self._queue_entity(value, queue, container, eager_position=eager_position)
         elif isinstance(value, Lazy):
             target = cast("Lazy[Any]", value)._peek_unchecked()
             if target is not None:
@@ -2481,7 +2393,30 @@ class Store:
                 self._walk_value(item, queue, container,
                                  eager_position=eager_position)
 
-    def _harvest_live_refs(self, obj: Any) -> set[int]:
+    def _queue_entity(self, entity: object, queue: deque[tuple[Any, Any]],
+                      container: object | None, *, eager_position: bool) -> None:
+        """Queue a not-yet-walked entity, refusing a protected one in an eager field (R11)."""
+        if (eager_position and type_info(entity).protected
+                and not isinstance(entity, Redacted)):
+            # R11 runtime complement (ADR-008): _entity._check_r11_lazy_only cannot see
+            # Any-typed fields, bare containers or store.root, so this closes it at the write
+            # boundary. It keys on the field position's decode mode, not a Lazy wrapper:
+            # `swizzle` collapses `Lazy.of(x)` to a bare RefToken in a non-`Lazy[...]` field,
+            # which re-decodes eagerly. Only `spec.lazy_refs` is exempt.
+            raise TypeError(
+                f"{type(entity).__name__} is protected — protected classes "
+                "are Lazy-referable only (ADR-008 R11). The FIELD must be "
+                "typed dc.Lazy[...] (e.g. `dc.Lazy["
+                f"{type(entity).__name__}]`): an Any/untyped field, a bare "
+                "container, or store.root cannot hold a protected reference, "
+                "because it persists and re-decodes as an eager edge even "
+                "when the value is wrapped in dc.Lazy.of(...)"
+            )
+        oid = oid_of(entity)
+        if oid is None or oid in self._new or oid in self._dirty:
+            queue.append((entity, container))
+
+    def _harvest_live_refs(self, obj: object) -> set[int]:
         """Return the OIDs ``obj`` references: entity and Lazy refs in fields and containers (#20).
 
         The live-object twin of ``_indexes.harvest_ref_oids``. A ref and a ``Lazy`` to the same
@@ -2491,7 +2426,7 @@ class Store:
         stack: list[Any] = [getattr(obj, n) for n in type_info(obj).field_names]
         while stack:
             v = stack.pop()
-            if v is None or isinstance(v, (str, float, int, bytes)):
+            if v is None or isinstance(v, _LEAF_TYPES):
                 continue
             if is_entity(v):
                 vid = oid_of(v)
@@ -2514,7 +2449,7 @@ class Store:
                 stack.extend(cast("dict[Any, object]", v).values())
         return out
 
-    def _oid_for_encode(self, obj: Any) -> int:
+    def _oid_for_encode(self, obj: object) -> int:
         oid = oid_of(obj)
         if oid is None:
             raise DataCrystalError(
@@ -2532,7 +2467,7 @@ class Store:
             i for i, spec in enumerate(ti.specs) if spec.blob
         )
 
-    def _fingerprint_payload(self, obj: Any, ti: TypeInfo) -> bytes:
+    def _fingerprint_payload(self, obj: object, ti: TypeInfo) -> bytes:
         """Re-encode an entity to a stable payload for the debug fingerprint, without blob I/O.
 
         A hydrated ``dc.Blob`` holds a ``BlobHandle`` whose descriptor is already stable. ``oid``
@@ -2717,15 +2652,20 @@ class Store:
                     by_name = dict(zip(persisted, values))
                 spec.glue(by_name)
 
-    def _load_oid(self, oid: int, cache: dict[int, StoredRecord] | None = None) -> Any:
+    def _load_oid(self, oid: int, cache: dict[int, StoredRecord] | None = None) -> object:
         self._guard()
         obj = self._registry.get(oid)
         if obj is not None:
             return obj
         return self._materialize_graph(oid, cache)
 
-    def _load_oid_deref(self, oid: int,
-                        cache: dict[int, StoredRecord] | None = None) -> Any:
+    def _load_root_holder(self, oid: int) -> _Root:
+        # cast: the store's root OID always names the _Root record it created
+        return cast("_Root", self._load_oid(oid))
+
+    def _load_oid_deref(
+        self, oid: int, cache: dict[int, StoredRecord] | None = None
+    ) -> Any:  # noqa: ANN401 - an instance or twin whose fields Lazy and the tests read
         """Load ``oid`` at the R14 deref checkpoint (ADR-008 W3-4): instance, twin or dangling.
 
         It judges committed labels only (W3 D1): judging a staged ``share()`` would let a principal
@@ -2737,20 +2677,9 @@ class Store:
         self._guard()
         obj = self._registry.get(oid)
         if obj is not None:
-            ti = type_info(obj)
-            if not ti.protected:
-                return obj
-            p = self.principal
-            if is_root(p):
-                return obj
-            labels = self._index.ensure(ti).committed_labels(oid)
-            if labels is not None:
-                if can_read_row(p, *labels):
-                    return obj
-                return make_twin(ti, oid)
-            # labels is None: an inconsistency for a registered CLEAN/DIRTY
-            # oid — should not happen. Fall through to the record path below
-            # and let ITS check decide: fail closed, never open.
+            checked = self._check_registered(obj, oid)
+            if checked is not None:
+                return checked
         rec = cache.get(oid) if cache else None
         if rec is None:
             rec = self._backend.load_many([oid]).get(oid)
@@ -2760,16 +2689,43 @@ class Store:
                 "(v0.x deletes are unchecked, ADR-003) or never committed; "
                 "the reference you followed is stale"
             )
-        ti = self._ti_for_cid(rec.cid)
-        if ti.protected:
-            p = self.principal
-            if not is_root(p):
-                owner, groups, read_floor, _write_floor = self._prior_labels(rec)
-                if not can_read_row(p, owner, groups, read_floor):
-                    return make_twin(ti, oid)  # nothing hydrated, registry untouched
+        twin = self._twin_if_unreadable(rec, oid)
+        if twin is not None:
+            return twin
         return self._materialize_graph(oid, cache if cache is not None else {oid: rec})
 
-    def _deref_cached_protected(self, obj: Any, oid: int) -> Any:
+    def _check_registered(self, obj: object, oid: int) -> object | None:
+        """Judge a registry hit at the checkpoint: the instance, a twin, or ``None`` to re-check."""
+        ti = type_info(obj)
+        if not ti.protected:
+            return obj
+        p = self.principal
+        if is_root(p):
+            return obj
+        labels = self._index.ensure(ti).committed_labels(oid)
+        if labels is None:
+            # An inconsistency for a registered CLEAN/DIRTY oid — should not
+            # happen. The caller falls through to the record path and lets ITS
+            # check decide: fail closed, never open.
+            return None
+        if can_read_row(p, *labels):
+            return obj
+        return make_twin(ti, oid)
+
+    def _twin_if_unreadable(self, rec: StoredRecord, oid: int) -> object | None:
+        """Return a twin when the principal may not read the protected record, else ``None``."""
+        ti = self._ti_for_cid(rec.cid)
+        if not ti.protected:
+            return None
+        p = self.principal
+        if is_root(p):
+            return None
+        owner, groups, read_floor, _write_floor = self._prior_labels(rec)
+        if can_read_row(p, owner, groups, read_floor):
+            return None
+        return make_twin(ti, oid)  # nothing hydrated, registry untouched
+
+    def _deref_cached_protected(self, obj: object, oid: int) -> object:
         """Resolve a cached protected target of a ``Lazy.of`` handle to the instance or a twin.
 
         This is the cross-principal fence for a handle shared through the live registry. A
@@ -2779,14 +2735,16 @@ class Store:
         """
         if oid in self._new:
             p = self.principal
+            # the caller (Lazy.get) checked type_info(obj).protected, so the label columns exist
+            labelled = cast("LabelColumns", obj)
             if is_root(p) or can_read_row(
-                    p, obj._dc_owner, list(obj._dc_groups), obj._dc_read_floor):
+                    p, labelled._dc_owner, list(labelled._dc_groups), labelled._dc_read_floor):
                 return obj
             return make_twin(type_info(obj), oid)
         return self._load_oid_deref(oid)
 
     def _materialize_graph(self, root_oid: int,
-                           cache: dict[int, StoredRecord] | None) -> Any:
+                           cache: dict[int, StoredRecord] | None) -> object:
         """Materialize ``root_oid`` and its EAGER reference closure with an explicit work-queue.
 
         The read-path twin of :meth:`_register_graph`: load depth is bounded by the heap, not the C
@@ -2796,9 +2754,9 @@ class Store:
         See docs/design/DESIGN.md, "Read-path loading and identity".
         """
         registered: list[int] = []
-        fill_queue: deque[tuple[Any, StoredRecord]] = deque()
+        fill_queue: deque[tuple[object, StoredRecord]] = deque()
 
-        def link(child_oid: int, *, root: bool = False) -> Any:
+        def link(child_oid: int, *, root: bool = False) -> object:
             # Return the live object for child_oid, enqueuing its bare shell if new, unfilled.
             # Read-side backstop for ADR-008 R11: a non-root PROTECTED target is never
             # eager-materialized into a shared parent; it fails closed to an unloaded Lazy, so a
@@ -2821,7 +2779,7 @@ class Store:
             child_ti = self._ti_for_cid(rec.cid)
             if not root and child_ti.protected:
                 return Lazy._unloaded(child_oid, self)
-            shell = cast("Any", object.__new__(child_ti.cls))
+            shell = object.__new__(child_ti.cls)
             stamp(shell, child_oid, self, STATE_CLEAN)
             self._registry.add(child_oid, shell)  # before fill: breaks cycles
             registered.append(child_oid)
@@ -2840,8 +2798,8 @@ class Store:
             raise
         return root
 
-    def _fill_entity(self, obj: Any, rec: StoredRecord,
-                     link: Callable[[int], Any]) -> None:
+    def _fill_entity(self, obj: object, rec: StoredRecord,
+                     link: Callable[[int], object]) -> None:
         ti = self._ti_for_cid(rec.cid)
         plan = self._hydration_plan(rec.cid, ti)
         values = decode_payload(rec.payload)
@@ -2879,9 +2837,9 @@ class Store:
             except BaseException:  # noqa: BLE001 - a fingerprint that cannot be taken is simply not recorded
                 self._fingerprints.pop(rec.oid, None)
 
-    def _resolve(self, value: Any, lazy: bool, owner: Any,
-                 link: Callable[[int], Any]) -> Any:
-        if value is None or isinstance(value, (str, float, int, bytes)):
+    def _resolve(self, value: object, lazy: bool, owner: object,
+                 link: Callable[[int], object]) -> object:
+        if value is None or isinstance(value, _LEAF_TYPES):
             return value  # scalar fast path: nothing to swizzle back
         if isinstance(value, BlobToken):
             # A dc.Blob field hydrates to a lazy BlobHandle, never raw bytes (ADR-007 §3):
@@ -2942,14 +2900,14 @@ class _RawView:
     def __init__(self, row: dict[str, Any]) -> None:
         self._row = row
 
-    def __getattr__(self, name: str) -> Any:
+    def __getattr__(self, name: str) -> object:
         try:
             return self._row[name]
         except KeyError:
             raise AttributeError(name) from None
 
 
-def _ref_target_oid(value: Any) -> int | None:
+def _ref_target_oid(value: object) -> int | None:
     """Return the OID an entity or Lazy handle points at, else None."""
     if is_entity(value):
         return oid_of(value)
@@ -2961,7 +2919,7 @@ def _ref_target_oid(value: Any) -> int | None:
     return None
 
 
-def _blob_hash(value: Any) -> bytes | None:
+def _blob_hash(value: object) -> bytes | None:
     """Return the sha256 of a blob-field value for upsert equivalence (ADR-007), or None.
 
     A hydrated ``BlobHandle`` carries it free; raw ``bytes``/``bytearray`` are hashed, since the
@@ -2975,7 +2933,7 @@ def _blob_hash(value: Any) -> bytes | None:
     return None
 
 
-def _equivalent(cur: Any, new: Any) -> bool:
+def _equivalent(cur: object, new: object) -> bool:
     """Would persisting ``new`` over ``cur`` write the same bytes? Decides
     whether upsert() skips a field. Conservative: references match by
     target OID (a Lazy handle and a direct reference encode identically);
@@ -3003,7 +2961,7 @@ def _equivalent(cur: Any, new: Any) -> bool:
     return False
 
 
-def _raw_value(value: Any) -> Any:
+def _raw_value(value: object) -> object:
     """Map entity/Lazy predicate values onto the decoded representation
     (RefTokens compare by OID), so residuals evaluate without hydration.
     """
@@ -3063,7 +3021,7 @@ def _raw_condition(cond: Condition) -> Condition:
     return cond
 
 
-def _publish(value: Any) -> Any:
+def _publish(value: object) -> object:
     """Turn a decoded payload value into pluck() output.
 
     Refs become public ``Ref`` tokens (``get_many()`` hydrates them), containers plain lists and
@@ -3082,7 +3040,7 @@ def _publish(value: Any) -> Any:
     return value
 
 
-def _find_escapee(value: Any) -> str | None:
+def _find_escapee(value: object) -> str | None:
     """Name the first live entity (or handle to one) inside a submit()
     result, or None if the value is plain data (ADR-001: EntityEscapeError).
     """
@@ -3102,6 +3060,246 @@ def _find_escapee(value: Any) -> str | None:
             if found is not None:
                 return found
     return None
+
+
+def _require_entity(obj: object) -> None:
+    if not is_entity(obj):
+        raise NotAnEntityError(
+            f"{type(obj).__name__} is not an @entity class instance"
+        )
+
+
+def _forbid_redacted(obj: object) -> None:
+    if isinstance(obj, Redacted):
+        raise ReadDeniedError(
+            f"this {type(obj).__name__} is a redacted twin — never "
+            "committable (ADR-008 R14)"
+        )
+
+
+def _require_storable(obj: object) -> None:
+    """Refuse a redacted twin or a deleted entity before it is registered."""
+    if isinstance(obj, Redacted):
+        # ADR-008 R14: a twin has no engine state slot (state_of() would raise
+        # AttributeError), so catch it before that call, whether it is the top-level
+        # argument (store(), root setter, upsert) or was smuggled into another entity's
+        # field and enqueued by _walk_value.
+        raise ReadDeniedError(
+            f"this {type(obj).__name__} is a redacted twin — "
+            "never committable (ADR-008 R14)"
+        )
+    if state_of(obj) == STATE_DELETED:
+        raise DeletedEntityError(
+            f"this {type(obj).__name__} was deleted via "
+            "store.delete() and cannot be stored again — create a "
+            "new entity instead (OIDs are never reused)"
+        )
+
+
+def _require_unique(cls: type, ti: TypeInfo, field: str) -> None:
+    spec = ti.spec(field)
+    if spec is None or not spec.unique:
+        raise QueryErrorFor(cls, field)
+
+
+def _require_persisted_fields(cls: type, ti: TypeInfo, fields: tuple[str, ...]) -> None:
+    known = set(ti.field_names)
+    for name in fields:
+        if name not in known:
+            raise QueryError(
+                f"{cls.__name__}.{name} is not a persisted field "
+                f"(fields: {', '.join(ti.field_names)})"
+            )
+
+
+def _projector(fields: tuple[str, ...]) -> Callable[[dict[str, Any]], object]:
+    """Build pluck's row-to-output function: a bare value for one field, else a tuple."""
+    if len(fields) == 1:
+        single = fields[0]
+        return lambda row: _publish(row[single])
+    return lambda row: tuple(_publish(row[name]) for name in fields)
+
+
+def _wanted_oids(items: list[Any]) -> list[int]:
+    """Return the OIDs ``get_many`` must load for ``items``, refusing a non-reference item."""
+    wanted: list[int] = []
+    for item in items:
+        if isinstance(item, Lazy):
+            lazy = cast("Lazy[Any]", item)
+            oid = lazy.oid
+            if not lazy.loaded and oid is not None:
+                wanted.append(oid)
+        elif isinstance(item, int):
+            wanted.append(item)
+        elif isinstance(item, Ref):
+            wanted.append(item.oid)
+        elif not is_entity(item):
+            raise NotAnEntityError(
+                f"get_many() accepts OIDs, Lazy refs, snapshot Refs and "
+                f"entities, got {type(item).__name__}"
+            )
+    return wanted
+
+
+def _natural_key_field(obj: object, ti: TypeInfo, key: str | None) -> str:
+    """Return the Unique field an upsert matches on: ``key``, or the class's only one."""
+    unique_fields = [s.name for s in ti.specs if s.unique]
+    if key is None:
+        if len(unique_fields) != 1:
+            raise TypeError(
+                f"{type(obj).__name__} has {len(unique_fields)} Unique "
+                "fields — pass key=<field name> to choose the natural key"
+                if unique_fields else
+                f"{type(obj).__name__} has no Unique field — upsert needs "
+                "a natural key (mark one field Annotated[..., dc.Unique])"
+            )
+        return unique_fields[0]
+    if key not in unique_fields:
+        raise QueryErrorFor(type(obj), key)
+    return key
+
+
+def _merge_data_fields(existing: object, incoming: object, ti: TypeInfo) -> None:
+    """Copy the changed data fields of ``incoming`` onto the surviving ``existing`` entity."""
+    # data_field_names: the _dc_ label columns are NEVER merged (W2-3,
+    # ADR-008) — a fresh probe instance carries R6 birth defaults, and
+    # copying them would reset the survivor's curated labels (and
+    # /v1/submit rides upsert). IS field_names for unprotected classes.
+    for name in ti.data_field_names:
+        new = getattr(incoming, name)
+        cur = getattr(existing, name)
+        if not _equivalent(cur, new):
+            setattr(existing, name, new)  # the one-shot hook buffers it
+
+
+def _hash_blob_source(source: BlobSource) -> bytes:
+    """Return the sha256 of a streamed blob source without holding its bytes whole."""
+    hasher = hashlib.sha256()
+    total = 0
+    for chunk in source.open_chunks():
+        hasher.update(chunk)
+        total += len(chunk)
+    if total != source.size:
+        raise ValueError(
+            f"a dc.BlobSource declared size {source.size} but its "
+            f"bytes total {total} — fix the size or the source"
+        )
+    return hasher.digest()
+
+
+def _note_streamed_swaps(
+    obj: object,
+    ti: TypeInfo,
+    values: list[Any],
+    blob_positions: frozenset[int],
+    payload: bytes,
+    blob_swaps: list[tuple[Any, str, int, int, bytes]],
+) -> None:
+    """Record the streamed-source fields of one encoded entity for the P3 swap.
+
+    Each field's blob descriptor is read straight from the just-encoded payload, so two fields
+    sharing ONE BlobSource each pick up their OWN blob OID (id(value) keying would alias both to
+    the last-allocated one).
+    """
+    streamed_positions = [
+        i for i in blob_positions if isinstance(values[i], BlobSource)
+    ]
+    if streamed_positions:
+        decoded = decode_payload(payload)
+        for i in streamed_positions:
+            tok = cast("BlobToken", decoded[i])  # the field's BLOB_EXT descriptor
+            blob_swaps.append(
+                (obj, ti.field_names[i], tok.blob_oid, tok.size, tok.hash)
+            )
+
+
+def _bind_frozen_containers(obj: object, ti: TypeInfo) -> None:
+    """Bind the containers of a frozen entity to it, so post-commit mutation raises.
+
+    A frozen ``__init__`` bypasses the tracked ``__setattr__``, so its containers are still plain
+    and an in-place change would silently do nothing.
+    """
+    for name in ti.field_names:
+        value = getattr(obj, name)
+        if isinstance(value, (list, dict, tuple)):
+            set_field(obj, name, wrap_value(value, obj))
+
+
+def _deny_write(p: Principal, message: str) -> NoReturn:
+    raise WriteDeniedError(f"{message} — as principal uid={p.uid}; the buffer "
+                           "is intact: discard() or fix and re-commit "
+                           "(ADR-008)")
+
+
+def _gate_persisted_record(p: Principal, oid: int, obj: LabelColumns, ti: TypeInfo,
+                           prior: _Labels) -> _Labels:
+    """Gate a write to a persisted protected record and return its prior labels as the baseline."""
+    held = authority_towards(p, prior[0], prior[1])
+    if held < prior[3]:
+        _deny_write(p, f"write to {ti.cls.__name__} oid={oid} denied: the "
+                       f"record's write floor is {prior[3]} and your "
+                       f"authority towards it is {held} (the floor binds "
+                       "everyone, including the owner — the curation "
+                       "guarantee)")
+    if obj._dc_owner != prior[0]:
+        # Ownership is immutable after birth: only root (R9, short-circuited by the caller) may
+        # reassign it. Otherwise any writer clearing the write floor could stage itself
+        # as owner, gaining a permanent owner-read bypass and minting its personal-best
+        # level into the R8 ceiling, which reads the STAGED owner (ADR-008 R8,
+        # amendment 2026-07-15).
+        _deny_write(p, f"cannot change owner of {ti.cls.__name__} oid={oid} "
+                       f"from {prior[0]} to {obj._dc_owner}: ownership is "
+                       "immutable after birth — only root may reassign it (R9)")
+    return prior
+
+
+def _gate_label_changes(p: Principal, oid: int, obj: LabelColumns, ti: TypeInfo,
+                        base: _Labels) -> None:
+    """Gate the staged groups and floors against the baseline and the principal's authority (R8)."""
+    staged_groups = list(obj._dc_groups)
+    ceiling = authority_towards(p, obj._dc_owner, staged_groups)
+    base_groups: set[int] = set(base[1])
+    for g in set(staged_groups) - base_groups:
+        if level(p, g) == NO_STANDING:
+            _deny_write(p, f"cannot share {ti.cls.__name__} oid={oid} into group "
+                           f"{g}: you hold no standing there (R8 — cross-group "
+                           "handoff goes through someone who holds both groups)")
+    for label_name, staged, was in (
+        ("read", obj._dc_read_floor, base[2]),
+        ("write", obj._dc_write_floor, base[3]),
+    ):
+        if staged != was and staged > ceiling:
+            _deny_write(p, f"cannot set {ti.cls.__name__} oid={oid} {label_name} "
+                           f"floor to {staged}: your own authority towards the "
+                           f"record is {ceiling} (R8 ceiling — a label write is "
+                           "a write, bounded by what you hold)")
+
+
+def _gate_actor_memberships(p: Principal, actor: Actor, prior_m: dict[int, int]) -> None:
+    """Gate every CHANGED membership of a staged Actor against the level the committer holds.
+
+    F1 (ADR-008 R8): an Actor's `memberships` is authority, since acting_as(uid) turns a stored
+    level into a live Principal; without this a writer could mint
+    Actor(memberships={WORLD: EXECUTIVE}) and act as root. Root returned earlier; lowering or
+    removing never blocks.
+    """
+    for g, lvl in actor.memberships.items():
+        if lvl != prior_m.get(g) and lvl > level(p, g):
+            _deny_write(p, f"cannot grant Actor uid={actor.uid} level {lvl} in "
+                           f"group {g}: your own level there is {level(p, g)} "
+                           "— an Actor's memberships are authority, capped by "
+                           "what you hold (R8 ceiling on authority-bearing "
+                           "grants; only root may mint root)")
+
+
+def _gate_delete(p: Principal, oid: int, ti: TypeInfo, labels: _Labels) -> None:
+    """Gate a delete of a protected record: it is a write, so the write floor binds."""
+    owner, groups, _read, write_floor = labels
+    held = authority_towards(p, owner, groups)
+    if held < write_floor:
+        _deny_write(p, f"delete of {ti.cls.__name__} oid={oid} denied: its write "
+                       f"floor is {write_floor} and your authority towards it "
+                       f"is {held} (a delete is a write)")
 
 
 def QueryErrorFor(cls: type, field: str) -> Exception:

@@ -15,6 +15,7 @@ import types
 import weakref
 from collections.abc import Callable, Mapping
 from typing import (
+    TYPE_CHECKING,
     Annotated,
     Any,
     Union,
@@ -30,8 +31,11 @@ from datacrystal._conditions import FieldExpr
 from datacrystal._containers import wrap_value
 from datacrystal._errors import FrozenEntityError, NotAnEntityError
 from datacrystal._lazy import Lazy
-from datacrystal._permissions import PERM_FIELDS, VIEWER, Permissions
+from datacrystal._permissions import PERM_FIELDS, VIEWER, LabelColumns, Permissions
 from datacrystal._state import STATE_NEW, touch
+
+if TYPE_CHECKING:
+    from datacrystal._store import Store
 
 
 class _Marker:
@@ -270,7 +274,7 @@ class EntityMeta(type):
     slot-descriptor speed.
     """
 
-    def __getattribute__(cls, name: str) -> Any:
+    def __getattribute__(cls, name: str) -> Any:  # noqa: ANN401 - a FieldExpr or any class attribute
         try:
             fields = type.__getattribute__(cls, "__dc_fieldset__")
         except AttributeError:
@@ -280,15 +284,13 @@ class EntityMeta(type):
         return type.__getattribute__(cls, name)
 
 
-def _entity_new(cls: type[Any], *args: Any, **kwargs: Any) -> Any:
-    # cls: type[Any] (not bare `type`) makes object.__new__ return Any, so no
-    # per-instance cast() is needed on this hot (every-entity) path.
+def _entity_new(cls: type, *args: object, **kwargs: object) -> object:
     self = object.__new__(cls)
     object.__setattr__(self, "__dc_state__", STATE_NEW)
     return self
 
 
-def _tracked_setattr(self: Any, name: str, value: Any) -> None:
+def _tracked_setattr(self: object, name: str, value: object) -> None:
     # Checks the owner thread (raising BEFORE the mutation lands), flips the
     # state to DIRTY and buffers the entity for commit.
     touch(self)
@@ -297,7 +299,7 @@ def _tracked_setattr(self: Any, name: str, value: Any) -> None:
     object.__setattr__(self, name, value)
 
 
-def _frozen_setattr(self: Any, name: str, value: Any) -> None:
+def _frozen_setattr(self: object, name: str, value: object) -> None:
     raise FrozenEntityError(
         f"{type(self).__name__} is an @entity(frozen=True) append-only record; "
         "create a new record instead of mutating"
@@ -340,7 +342,7 @@ def _inject_perm_columns(cls: type, annotations: dict[str, Any]) -> None:
     cls._dc_write_floor = dataclasses.field(default=VIEWER, init=False)
 
 
-def _permissions_view(self: Any) -> Permissions:
+def _permissions_view(self: LabelColumns) -> Permissions:
     """Return the injected ``dc_permissions`` getter value: the four columns as one frozen
     :class:`Permissions`.
     """
@@ -352,7 +354,7 @@ def _permissions_view(self: Any) -> Permissions:
     )
 
 
-def _permissions_assign(self: Any, value: Any) -> None:
+def _permissions_assign(self: LabelColumns, value: object) -> None:
     """Set the four label columns from a :class:`Permissions`, as the injected setter.
 
     ``child.dc_permissions = parent.dc_permissions`` copies all four columns verbatim, owner
@@ -458,11 +460,11 @@ def _make_entity(cls: type, frozen: bool, protected: bool = False) -> type:
     return final
 
 
-def is_entity(obj: Any) -> bool:
+def is_entity(obj: object) -> bool:
     return isinstance(type(obj), EntityMeta)
 
 
-def type_info(cls_or_obj: Any) -> TypeInfo:
+def type_info(cls_or_obj: object) -> TypeInfo:
     cls = cls_or_obj if isinstance(cls_or_obj, type) else type(cls_or_obj)
     try:
         return type.__getattribute__(cls, "__dc_typeinfo__")
@@ -472,7 +474,7 @@ def type_info(cls_or_obj: Any) -> TypeInfo:
         ) from None
 
 
-def oid_of(obj: Any) -> int | None:
+def oid_of(obj: object) -> int | None:
     """Return the entity's OID, or ``None`` if it was never registered with a store."""
     try:
         return object.__getattribute__(obj, "__dc_oid__")
@@ -480,22 +482,22 @@ def oid_of(obj: Any) -> int | None:
         return None
 
 
-def state_of(obj: Any) -> int:
+def state_of(obj: object) -> int:
     return object.__getattribute__(obj, "__dc_state__")
 
 
-def stamp(obj: Any, oid: int, store: Any, state: int) -> None:
+def stamp(obj: object, oid: int, store: Store, state: int) -> None:
     """Bind an entity to a store: set oid, store weakref and lifecycle state."""
     object.__setattr__(obj, "__dc_oid__", oid)
     object.__setattr__(obj, "__dc_store__", weakref.ref(store))
     object.__setattr__(obj, "__dc_state__", state)
 
 
-def set_state(obj: Any, state: int) -> None:
+def set_state(obj: object, state: int) -> None:
     object.__setattr__(obj, "__dc_state__", state)
 
 
-def set_field(obj: Any, name: str, value: Any) -> None:
+def set_field(obj: object, name: str, value: object) -> None:
     """Set a field bypassing the dirty-tracking hook (hydration only)."""
     object.__setattr__(obj, name, value)
 
@@ -505,96 +507,137 @@ def set_field(obj: Any, name: str, value: Any) -> None:
 
 def _resolve_specs(cls: type, field_names: tuple[str, ...]) -> tuple[FieldSpec, ...]:
     hints = get_type_hints(cls, include_extras=True)
-    specs: list[FieldSpec] = []
-    for name in field_names:
-        hint = hints.get(name, Any)
-        markers: list[_Marker] = []
-        core = _strip_annotated(hint, markers)
-        _check_r11_lazy_only(cls, name, core)
-        indexed = any(m is Index for m in markers)
-        unique = any(m is Unique for m in markers)
-        srt = any(m is SortedIndex for m in markers)
-        is_blob = any(m is Blob for m in markers)
-        fulltext = next((m for m in markers if isinstance(m, _FullText)), None)
-        renamed = next((m for m in markers if isinstance(m, RenamedFrom)), None)
-        glued = next((m for m in markers if isinstance(m, Glue)), None)
-        lazy_refs = _contains_lazy(core)
-        is_list = _is_list_of_scalar(core)
-        if is_blob:
-            # A blob is a raw-bytes leaf stored out-of-line (ADR-007): it must be
-            # `bytes` (or `bytes | None`), and cannot also be indexed/renamed/
-            # multivalued — a blob has no key to index, no column to rename, and
-            # the bytes never live in the record the index/rename paths read.
-            if not _is_bytes_or_optional(core):
-                raise TypeError(
-                    f"{cls.__name__}.{name}: a dc.Blob field must be bytes "
-                    f"(optionally | None) — out-of-line raw bytes have no other "
-                    f"shape (ADR-007), got {hint!r}"
-                )
-            if indexed or unique or srt:
-                raise TypeError(
-                    f"{cls.__name__}.{name}: a dc.Blob field cannot also be "
-                    "Index/Unique/SortedIndex — opaque out-of-line bytes are not "
-                    "indexable (ADR-007); index a separate hash/metadata field"
-                )
-            if fulltext is not None or renamed is not None or glued is not None:
-                raise TypeError(
-                    f"{cls.__name__}.{name}: a dc.Blob field cannot also be "
-                    "FullText/RenamedFrom/Glue — the bytes live out-of-line, not "
-                    "in the record those paths read (ADR-007)"
-                )
-        if (indexed or unique) and not (_is_indexable(core) or is_list):
-            raise TypeError(
-                f"{cls.__name__}.{name}: Index/Unique fields must be scalar "
-                f"(str, int, float, bool, datetime, date or Decimal, optionally | None) "
-                f"or a list of scalars, got {hint!r}"
-            )
-        if srt and not _is_indexable(core):
-            raise TypeError(
-                f"{cls.__name__}.{name}: SortedIndex fields must be a scalar "
-                f"(str, int, float, bool, datetime, date or Decimal, optionally | None) — "
-                f"a range index needs an orderable single value, got {hint!r}"
-            )
-        if unique and is_list:
-            raise TypeError(
-                f"{cls.__name__}.{name}: a Unique field cannot be a list "
-                f"(a multi-valued field has no single key), got {hint!r}"
-            )
-        if renamed is not None and (indexed or unique or srt):
-            raise TypeError(
-                f"{cls.__name__}.{name}: RenamedFrom on an indexed field is "
-                "not supported yet — v0.2 scopes renames to non-indexed fields "
-                "read through live hydration; rename an indexed field via a "
-                "migration instead"
-            )
-        if glued is not None and (indexed or unique or srt):
-            raise TypeError(
-                f"{cls.__name__}.{name}: Glue on an indexed field is not "
-                "supported yet — v0.2 scopes glue to non-indexed fields read "
-                "through live hydration / decode"
-            )
-        if glued is not None and renamed is not None:
-            raise TypeError(
-                f"{cls.__name__}.{name}: a field cannot declare both RenamedFrom "
-                "and Glue — RenamedFrom binds an old column by name, Glue computes "
-                "from the old record; pick one"
-            )
-        specs.append(FieldSpec(
-            name, lazy_refs, indexed, unique,
-            fulltext is not None,
-            fulltext.language if fulltext is not None else None,
-            multivalued=indexed and is_list,
-            renamed_from=renamed.old_name if renamed is not None else None,
-            glue=glued.fn if glued is not None else None,
-            sorted=srt,
-            blob=is_blob,
-            entity_ref=_may_hold_entity(core),
-            decimal=_is_decimal(core),
-        ))
-    return tuple(specs)
+    return tuple(_resolve_spec(cls, name, hints.get(name, Any)) for name in field_names)
 
 
-def _is_decimal(hint: Any) -> bool:
+@dataclasses.dataclass(frozen=True, slots=True)
+class _FieldMarkers:
+    """The markers found on one field's ``Annotated`` metadata."""
+
+    indexed: bool
+    unique: bool
+    sorted: bool
+    blob: bool
+    fulltext: _FullText | None
+    renamed: RenamedFrom | None
+    glued: Glue | None
+
+    @classmethod
+    def harvest(cls, markers: list[_Marker]) -> _FieldMarkers:
+        return cls(
+            indexed=any(m is Index for m in markers),
+            unique=any(m is Unique for m in markers),
+            sorted=any(m is SortedIndex for m in markers),
+            blob=any(m is Blob for m in markers),
+            fulltext=next((m for m in markers if isinstance(m, _FullText)), None),
+            renamed=next((m for m in markers if isinstance(m, RenamedFrom)), None),
+            glued=next((m for m in markers if isinstance(m, Glue)), None),
+        )
+
+    @property
+    def any_index(self) -> bool:
+        return self.indexed or self.unique or self.sorted
+
+
+def _resolve_spec(cls: type, name: str, hint: object) -> FieldSpec:
+    markers: list[_Marker] = []
+    core = _strip_annotated(hint, markers)
+    _check_r11_lazy_only(cls, name, core)
+    found = _FieldMarkers.harvest(markers)
+    is_list = _is_list_of_scalar(core)
+    if found.blob:
+        _check_blob_field(cls, name, hint, core, found)
+    _check_index_markers(cls, name, hint, core, found, is_list)
+    _check_rename_and_glue(cls, name, found)
+    return FieldSpec(
+        name, _contains_lazy(core), found.indexed, found.unique,
+        found.fulltext is not None,
+        found.fulltext.language if found.fulltext is not None else None,
+        multivalued=found.indexed and is_list,
+        renamed_from=found.renamed.old_name if found.renamed is not None else None,
+        glue=found.glued.fn if found.glued is not None else None,
+        sorted=found.sorted,
+        blob=found.blob,
+        entity_ref=_may_hold_entity(core),
+        decimal=_is_decimal(core),
+    )
+
+
+def _check_blob_field(
+    cls: type, name: str, hint: object, core: object, found: _FieldMarkers
+) -> None:
+    """Refuse a ``dc.Blob`` field that is not plain bytes or that carries another marker.
+
+    A blob is a raw-bytes leaf stored out-of-line (ADR-007): it has no key to index, no column to
+    rename and no value in the record the index and rename paths read.
+    """
+    if not _is_bytes_or_optional(core):
+        raise TypeError(
+            f"{cls.__name__}.{name}: a dc.Blob field must be bytes "
+            f"(optionally | None) — out-of-line raw bytes have no other "
+            f"shape (ADR-007), got {hint!r}"
+        )
+    if found.any_index:
+        raise TypeError(
+            f"{cls.__name__}.{name}: a dc.Blob field cannot also be "
+            "Index/Unique/SortedIndex — opaque out-of-line bytes are not "
+            "indexable (ADR-007); index a separate hash/metadata field"
+        )
+    if found.fulltext is not None or found.renamed is not None or found.glued is not None:
+        raise TypeError(
+            f"{cls.__name__}.{name}: a dc.Blob field cannot also be "
+            "FullText/RenamedFrom/Glue — the bytes live out-of-line, not "
+            "in the record those paths read (ADR-007)"
+        )
+
+
+def _check_index_markers(
+    cls: type, name: str, hint: object, core: object, found: _FieldMarkers, is_list: bool
+) -> None:
+    """Refuse an Index, Unique or SortedIndex marker on a type that cannot be its key."""
+    if (found.indexed or found.unique) and not (_is_indexable(core) or is_list):
+        raise TypeError(
+            f"{cls.__name__}.{name}: Index/Unique fields must be scalar "
+            f"(str, int, float, bool, datetime, date or Decimal, optionally | None) "
+            f"or a list of scalars, got {hint!r}"
+        )
+    if found.sorted and not _is_indexable(core):
+        raise TypeError(
+            f"{cls.__name__}.{name}: SortedIndex fields must be a scalar "
+            f"(str, int, float, bool, datetime, date or Decimal, optionally | None) — "
+            f"a range index needs an orderable single value, got {hint!r}"
+        )
+    if found.unique and is_list:
+        raise TypeError(
+            f"{cls.__name__}.{name}: a Unique field cannot be a list "
+            f"(a multi-valued field has no single key), got {hint!r}"
+        )
+
+
+def _check_rename_and_glue(cls: type, name: str, found: _FieldMarkers) -> None:
+    """Refuse RenamedFrom or Glue on an indexed field, and both on one field."""
+    if found.renamed is not None and found.any_index:
+        raise TypeError(
+            f"{cls.__name__}.{name}: RenamedFrom on an indexed field is "
+            "not supported yet — v0.2 scopes renames to non-indexed fields "
+            "read through live hydration; rename an indexed field via a "
+            "migration instead"
+        )
+    if found.glued is not None and found.any_index:
+        raise TypeError(
+            f"{cls.__name__}.{name}: Glue on an indexed field is not "
+            "supported yet — v0.2 scopes glue to non-indexed fields read "
+            "through live hydration / decode"
+        )
+    if found.glued is not None and found.renamed is not None:
+        raise TypeError(
+            f"{cls.__name__}.{name}: a field cannot declare both RenamedFrom "
+            "and Glue — RenamedFrom binds an old column by name, Glue computes "
+            "from the old record; pick one"
+        )
+
+
+def _is_decimal(hint: object) -> bool:
     """``Decimal`` or ``Decimal | None``."""
     if hint is _decimal.Decimal:
         return True
@@ -604,7 +647,7 @@ def _is_decimal(hint: Any) -> bool:
     return False
 
 
-def _is_bytes_or_optional(hint: Any) -> bool:
+def _is_bytes_or_optional(hint: object) -> bool:
     """``bytes`` or ``bytes | None`` — the only shape a ``dc.Blob`` field may
     take (ADR-007: out-of-line raw bytes have no other representation).
     """
@@ -616,7 +659,7 @@ def _is_bytes_or_optional(hint: Any) -> bool:
     return False
 
 
-def _strip_annotated(hint: Any, markers: list[_Marker]) -> Any:
+def _strip_annotated(hint: object, markers: list[_Marker]) -> object:
     while get_origin(hint) is Annotated:
         args = get_args(hint)
         markers.extend(a for a in args[1:] if isinstance(a, _Marker))
@@ -624,7 +667,7 @@ def _strip_annotated(hint: Any, markers: list[_Marker]) -> Any:
     return hint
 
 
-def _contains_lazy(hint: Any) -> bool:
+def _contains_lazy(hint: object) -> bool:
     origin = get_origin(hint)
     if origin is Lazy or hint is Lazy:
         return True
@@ -633,7 +676,7 @@ def _contains_lazy(hint: Any) -> bool:
     return any(_contains_lazy(a) for a in get_args(hint))
 
 
-def _check_r11_lazy_only(cls: type, field_name: str, hint: Any) -> None:
+def _check_r11_lazy_only(cls: type, field_name: str, hint: object) -> None:
     """Reject a direct reference to a protected class outside ``Lazy[...]``.
 
     ADR-008 R11.
@@ -668,11 +711,11 @@ def _check_r11_lazy_only(cls: type, field_name: str, hint: Any) -> None:
         )
 
 
-def _is_union(hint: Any) -> bool:
+def _is_union(hint: object) -> bool:
     return get_origin(hint) in (Union, types.UnionType)
 
 
-def _is_indexable(hint: Any) -> bool:
+def _is_indexable(hint: object) -> bool:
     """Return whether ``hint`` is a scalar (str/int/float/bool/datetime/date/Decimal) or optional
     scalar.
 
@@ -695,7 +738,7 @@ _REF_FREE_LEAVES = (str, int, float, bool, bytes, _dt.datetime, _dt.date, _dt.ti
                     _decimal.Decimal, type(None))
 
 
-def _may_hold_entity(hint: Any) -> bool:
+def _may_hold_entity(hint: object) -> bool:
     """Return True unless ``hint`` is provably ref-free (#52).
 
     Only used to skip work, so it must never return False for a type that could carry an entity ref.
@@ -715,7 +758,7 @@ def _may_hold_entity(hint: Any) -> bool:
     return True
 
 
-def _is_list_of_scalar(hint: Any) -> bool:
+def _is_list_of_scalar(hint: object) -> bool:
     """Return whether ``hint`` is ``list[scalar]`` or ``list[scalar] | None``, an inverted
     multi-valued index (#13).
     """

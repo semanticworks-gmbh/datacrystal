@@ -153,14 +153,21 @@ def walk_to_ultimate(entity: LegalEntity) -> tuple[int, int]:
     return depth, len(seen)
 
 
-def main() -> None:
-    if not RR.exists():
-        sys.exit(f"missing {RR} — download the GLEIF rr golden copy first "
-                 "(see module docstring)")
-    shutil.rmtree(STORE, ignore_errors=True)
-    print(f"datacrystal proving ground: GLEIF legal-entity ownership  ({sys.platform})\n")
+def enrich_from_level1(ent: dict[str, LegalEntity]) -> int:
+    """Copy legal name and jurisdiction from the Level-1 file, if present; return the count."""
+    enriched = 0
+    if LEI2.exists():
+        for lei, name, juris in stream_level1():
+            e = ent.get(lei)
+            if e is not None:
+                e.legal_name = name
+                e.jurisdiction = juris
+                enriched += 1
+    return enriched
 
-    # --- PARSE EDGES ----------------------------------------------------------
+
+def parse_edges() -> tuple[dict[str, str], dict[str, str], set[str]]:
+    """Parse the active RR edges into the direct and ultimate parent maps plus all LEIs."""
     t0 = time.perf_counter()
     direct: dict[str, str] = {}
     ultimate: dict[str, str] = {}
@@ -174,21 +181,16 @@ def main() -> None:
     print(f"parsed RR edges:       {n_edges:>9,} active edges     {t_parse:6.2f}s")
     print(f"  distinct entities:   {len(leis):>9,}  "
           f"({len(direct):,} direct, {len(ultimate):,} ultimate consolidations)")
+    return direct, ultimate, leis
 
-    deep_lei = deepest_chain(direct)
 
-    # --- INGEST ---------------------------------------------------------------
+def ingest(direct: dict[str, str], ultimate: dict[str, str], leis: set[str]) -> None:
+    """Store every entity with its lazy parents (and Level-1 enrichment), then close the store."""
+    n_edges = len(direct) + len(ultimate)
     t0 = time.perf_counter()
     store = dc.Store.open(STORE)
     ent = {lei: LegalEntity(lei=lei) for lei in leis}
-    enriched = 0
-    if LEI2.exists():
-        for lei, name, juris in stream_level1():
-            e = ent.get(lei)
-            if e is not None:
-                e.legal_name = name
-                e.jurisdiction = juris
-                enriched += 1
+    enriched = enrich_from_level1(ent)
     for child, parent in direct.items():
         ent[child].direct_parent = dc.Lazy.of(ent[parent])
     for child, parent in ultimate.items():
@@ -208,18 +210,21 @@ def main() -> None:
     print(f"  → first vision-scale absolute ingest number: "
           f"{len(ent) / t_ingest:,.0f} entities/s on a real {len(ent):,}-node graph")
     store.close()
-    del ent
-    gc.collect()
 
-    # --- REOPEN (cold) --------------------------------------------------------
+
+def reopen_cold() -> tuple[dc.Store, int]:
+    """Reopen the store cold and return it with the entity count."""
     t0 = time.perf_counter()
     s = dc.Store.open(STORE)
     n = s.count(LegalEntity)  # forces the one-time index build (a backend scan)
     t_open = time.perf_counter() - t0
     print(f"\nreopened cold:         {n:>9,} entities         {t_open:6.2f}s "
           "(open + index build)")
+    return s, n
 
-    # --- LAZY OWNERSHIP-CHAIN WALK (#29 + #30 on real data) -------------------
+
+def walk_ownership_chain(s: dc.Store, n: int, deep_lei: str) -> None:
+    """Walk the deepest ownership ladder lazily and report the live entity count."""
     gc.collect()
     deep = s.get(LegalEntity, lei=deep_lei)
     assert deep is not None
@@ -232,7 +237,9 @@ def main() -> None:
     print(f"  live entities now:   {len(s._registry):>9,}  "  # pyright: ignore[reportPrivateUsage]
           f"(of {n:,} — lazy parents kept the rest off the RAM budget)")
 
-    # --- THE HUB BACKLINK: incoming() on a real Zipf distribution (#20) -------
+
+def hub_backlink_by_scan(s: dc.Store) -> tuple[LegalEntity, set[int]]:
+    """Find the biggest consolidator by a full scan; return it and its distinct subsidiaries."""
     # Who consolidates the most subsidiaries? (a global bank / fund manager.)
     ref_counts: dict[int, int] = {}
     t0 = time.perf_counter()
@@ -259,8 +266,11 @@ def main() -> None:
           "→ exactly what #20 incoming() turns into an index lookup")
     del ref_counts
     gc.collect()
+    return hub, oracle
 
-    # --- SAME BACKLINK VIA THE REVERSE INDEX (#20 incoming()) -----------------
+
+def hub_backlink_by_index(s: dc.Store, hub: LegalEntity, oracle: set[int]) -> None:
+    """Answer the same backlink via ``incoming()`` and assert it matches the full scan."""
     t0 = time.perf_counter()
     subs = s.incoming(hub)  # first call builds the global reverse index (one scan)
     t_build = time.perf_counter() - t0
@@ -277,7 +287,9 @@ def main() -> None:
     print(f"  a SECOND, unrelated backlink reuses the built index in {t_reuse:.2f} ms "
           "(no re-scan)")
 
-    # --- HYDRATE vs DECODE ----------------------------------------------------
+
+def compare_hydrate_and_decode(s: dc.Store, deep_lei: str) -> None:
+    """Time a decode-level pluck against a hydrated query and check one instance per OID."""
     gc.collect()
     t0 = time.perf_counter()
     leis_decode = s.pluck(LegalEntity, "lei")  # decode-level, no entities
@@ -297,6 +309,24 @@ def main() -> None:
     assert a is via_query, "identity broken: one OID must be one live instance"
     print("\ncorrectness: one instance per OID across paths ✓ · "
           "ownership graph reopened + traversed without RecursionError ✓")
+
+
+def main() -> None:
+    if not RR.exists():
+        sys.exit(f"missing {RR} — download the GLEIF rr golden copy first "
+                 "(see module docstring)")
+    shutil.rmtree(STORE, ignore_errors=True)
+    print(f"datacrystal proving ground: GLEIF legal-entity ownership  ({sys.platform})\n")
+
+    direct, ultimate, leis = parse_edges()
+    deep_lei = deepest_chain(direct)
+    ingest(direct, ultimate, leis)
+    gc.collect()
+    s, n = reopen_cold()
+    walk_ownership_chain(s, n, deep_lei)
+    hub, oracle = hub_backlink_by_scan(s)
+    hub_backlink_by_index(s, hub, oracle)
+    compare_hydrate_and_decode(s, deep_lei)
     s.close()
 
 

@@ -1,5 +1,4 @@
-# Adopted from tetrahedron's ruff.toml (#186). A rule group is selected once it is at 0 on the paths
-# it covers; a group not yet clean is left out here, and the issue named beside it switches it on.
+# Adopted from tetrahedron's ruff.toml (#186). Every rule group below is at 0 on the paths it covers.
 # Run unpinned: `uvx ruff check .` (a new release's findings show at once).
 line-length = 100
 src = ["src", "tests"]
@@ -14,17 +13,18 @@ extend-select = [
     "D209", "D210", "D211", "D212", "D214", "D300", "D301", "D402", "D405", "D410", "D411",
     "D412", "D414", "D416", "D417", "D418", "D419",
     "W505", "PLR0916", # docstring and comment line length (max-doc-length below), too many boolean terms
-    # typed-python: ANN401 (Any) is left out until #192
-    "ANN001", "ANN002", "ANN003", "ANN201", "ANN202", "ANN204", "ANN205", "ANN206",
-    "D", "D401", "ANN", # the target set; the ignores below hold the paths that are not at 0 yet
+    "D", "D401", "ANN", # typed-python incl. ANN401 (Any); the ignores below hold the paths that are not at 0
+    "C901", "PLR2004", # self-documenting-code: complexity 10, a named constant for a magic value (tetrahedron's target set)
+    "BLE001", "TRY004", "UP007", # the rules a line-level `# noqa: <code> - <reason>` in src/ may waive (scripts/check_suppressions.py)
+    "B008", "PYI034", # fixed, never waived
+    "RUF100", # a noqa that suppresses nothing is dead
     "PT", "FBT001", # readable-tests, tests only (ignored elsewhere below)
     "T20", # structured-logging: no print() outside CLI output
 ]
 # extend-select keeps ruff's own default set on and names E4, E7, E9, F explicitly, so a narrower default cannot narrow the gate.
-# ANN is at 0 on every path except ANN401 (Any); T20 is at 0 outside the CLI paths ignored below.
+# T20 is at 0 outside the CLI paths ignored below.
 # The docstring form (D102, D105, D107, D401, D403, D415) gates in src/ and scripts/ since #191;
 # the five-body-line limit has no ruff rule and is checked in review.
-# Not selected: C901, PLR2004 and ANN401 in src/: #192.
 # D205 stays off as in tetrahedron (the summary may run into the first paragraph).
 extend-ignore = ["D205"]
 
@@ -40,12 +40,8 @@ extend-ignore = ["D205"]
 # Test modules (same ignores as semantic-studio): a fixture, helper or test double is named for what it does,
 # so a docstring would restate it (D103, D107); a Given / When / Then line ends without a period (D415, readable-tests).
 "{tests/**,scripts/test_*.py,benchmarks/test_*.py}" = ["D103", "D107", "D415"]
-# Outside the tests ANN401 (Any) is not at 0 yet: #192 switches it on.
-"{src/**,examples/**,scripts/**,evals/**,benchmarks/**}" = ["ANN401"]
-
-[lint.flake8-bugbear]
-# FastAPI dependency markers in a route signature are immutable by design.
-extend-immutable-calls = ["fastapi.Depends", "fastapi.Body"]
+# readable-tests wants the expected value as a literal in the assert (DAMP over DRY), as in tetrahedron's ruff.toml.
+"{tests/**,scripts/test_*.py,benchmarks/test_*.py,**/conftest.py}" = ["PLR2004"]
 
 [lint.pydocstyle]
 convention = "google"

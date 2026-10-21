@@ -16,7 +16,7 @@ import sys
 import zlib
 from collections.abc import Callable, Iterator
 from pathlib import Path
-from typing import Any, BinaryIO, cast
+from typing import TYPE_CHECKING, BinaryIO, cast
 
 from datacrystal._errors import (
     CorruptRecordError,
@@ -27,6 +27,9 @@ from datacrystal._errors import (
 from datacrystal._ids import FORMAT_VERSION
 from datacrystal._records import crc as _crc
 from datacrystal._storage.protocol import BootInfo, CommitBatch, StoredBlob, StoredRecord
+
+if TYPE_CHECKING:
+    from _typeshed import WriteableBuffer
 
 # The blobs table is a plain rowid table: blobopen needs the oid as a rowid alias (ADR-007 §2).
 # It has no cid column, a deliberate deviation from ADR-007's listed schema (a blob has no class).
@@ -143,15 +146,16 @@ class _SqliteBlobReader(io.RawIOBase):
     def seekable(self) -> bool:
         return True
 
-    def readinto(self, b: Any) -> int:  # buffer protocol
+    def readinto(self, b: WriteableBuffer) -> int:
         if self._overshoot:  # cursor parked past EOF → no bytes (file semantics)
             return 0
+        window = memoryview(b)
         try:
-            chunk = self._blob.read(len(b))
+            chunk = self._blob.read(len(window))
         except sqlite3.ProgrammingError as exc:
             raise _closed_underneath() from exc
         n = len(chunk)
-        b[:n] = chunk
+        window[:n] = chunk
         return n
 
     def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:

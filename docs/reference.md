@@ -93,8 +93,8 @@ replay-from-0 over
 sqlite-backed when `path=` is given. Each delta is validated through the reference applier (gaps
 refuse loudly, re-applies are idempotent) and persisted with the coordinator's own OIDs/TIDs, so the
 replica reproduces the coordinator's committed state exactly. `api_key` is sent as the `x-api-key`
-header; `client` injects an `httpx.Client`-compatible transport (advanced/testing). The HTTP
-transport ships in the **`datacrystal[follower]`** extra and is imported lazily, so a bare
+header; `client` injects an `httpx.Client`-compatible transport (advanced/testing), typed as the
+`dc.HttpClient` protocol. The HTTP transport ships in the **`datacrystal[follower]`** extra and is imported lazily, so a bare
 `import datacrystal` stays inside the `{msgspec, pyroaring}` budget.
 
 A follower stays current by calling **`store.sync()`** — a synchronous, owner-thread catch-up that
@@ -989,7 +989,8 @@ this is the API surface. The frameworks live only inside `datacrystal.web` — a
 
 ```python
 from datacrystal.web import (
-    create_app, store_lifespan, read_snapshot, submit_write, get_store, graphql_context_getter,
+    create_app, store_lifespan, StoreOpenOptions, read_snapshot, submit_write, get_store,
+    graphql_context_getter,
     entity_model, to_pydantic, from_pydantic,        # REST: @entity ↔ Pydantic DTO
     reflect_strawberry_type, StrawberryReflector,    # GraphQL: @entity → Strawberry type
     reflect, FieldDescriptor,                         # the shared reflection (both targets)
@@ -1002,7 +1003,8 @@ from datacrystal.web import (
 
 - **`create_app(path, **kwargs)`** — builds a FastAPI app that opens ONE store on startup and
   closes it on shutdown via the lifespan. **`store_lifespan`** is the underlying lifespan if you
-  build the app yourself.
+  build the app yourself. **`StoreOpenOptions`** is the `TypedDict` of the `Store.open` keywords
+  that `create_app` and `store_lifespan` pass on as `**kwargs`.
 - **`read_snapshot`** — a dependency yielding a per-request, per-watermark pooled `dc.Snapshot`
   (any thread), **bound to the request's principal** (`get_principal`, below); a read route reads
   `EntityView`s / DTOs off it, never live entities. REST and GraphQL reads both ride this snapshot

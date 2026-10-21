@@ -10,19 +10,18 @@ while an entity is alive, every path to it yields the *same* object.
 from __future__ import annotations
 
 import weakref
-from typing import Any
 
 
 class ObjectRegistry:
     __slots__ = ("_by_oid",)
 
     def __init__(self) -> None:
-        self._by_oid: weakref.WeakValueDictionary[int, Any] = weakref.WeakValueDictionary()
+        self._by_oid: weakref.WeakValueDictionary[int, object] = weakref.WeakValueDictionary()
 
-    def get(self, oid: int) -> Any | None:
+    def get(self, oid: int) -> object | None:
         return self._by_oid.get(oid)
 
-    def add(self, oid: int, obj: Any) -> None:
+    def add(self, oid: int, obj: object) -> None:
         self._by_oid[oid] = obj
 
     def discard(self, oid: int) -> None:
@@ -32,7 +31,7 @@ class ObjectRegistry:
         """
         self._by_oid.pop(oid, None)
 
-    def items(self) -> list[tuple[int, Any]]:
+    def items(self) -> list[tuple[int, object]]:
         """Snapshot of the live (oid, entity) pairs (debug sweep, tests)."""
         return list(self._by_oid.items())
 

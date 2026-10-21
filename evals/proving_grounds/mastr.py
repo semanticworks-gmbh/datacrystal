@@ -39,12 +39,15 @@ import shutil
 import sys
 import time
 import xml.etree.ElementTree as ET
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import field
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated
 
 import datacrystal as dc
+from datacrystal._entity import TypeInfo
+from datacrystal._indexes import ClassIndexes
+from datacrystal._storage.protocol import StoredRecord
 
 MASTR_DIR = Path(os.environ.get(
     "MASTR_DIR", str(Path.home() / "Downloads" / "Gesamtdatenexport_20260612_26")))
@@ -56,8 +59,14 @@ MAX = int(os.environ.get("MASTR_MAX", "0"))  # 0 = full corpus
 
 # Bundesland catalog codes used by EinheitSolar (1400–1416; a DIFFERENT enum than
 # the Marktakteure set). Just the few we print.
-BUNDESLAND = {1403: "Bayern", 1409: "Nordrhein-Westfalen", 1408: "Niedersachsen"}
-BETRIEB = {31: "In Planung", 35: "In Betrieb", 37: "Vorüb. stillgelegt", 38: "Endg. stillgelegt"}
+BAYERN = 1403
+NRW = 1409
+BUNDESLAND = {BAYERN: "Bayern", NRW: "Nordrhein-Westfalen", 1408: "Niedersachsen"}
+IN_BETRIEB = 35
+BETRIEB = {
+    31: "In Planung", IN_BETRIEB: "In Betrieb", 37: "Vorüb. stillgelegt", 38: "Endg. stillgelegt",
+}
+ONE_MEGAWATT_KW = 1000.0
 
 
 @dc.entity
@@ -213,11 +222,11 @@ def main() -> None:
 
     keys = s.pluck(SolarUnit, "mastr_nr")            # whole extent, decode-level
     _, t_get = timed(lambda: s.get(SolarUnit, mastr_nr=keys[0]))
-    bayern, t_c1 = timed(lambda: s.count(F.bundesland == 1403))
-    nrw, t_c2 = timed(lambda: s.count((F.bundesland == 1409) & (F.betriebsstatus == 35)))
-    names, t_pl = timed(lambda: s.pluck(F.bundesland == 1403, "name"))
-    _, t_hy = timed(lambda: s.query(F.bundesland == 1403, limit=100_000))
-    big, t_rg = timed(lambda: s.count(F.bruttoleistung >= 1000.0))     # SortedIndex range (#18)
+    bayern, t_c1 = timed(lambda: s.count(F.bundesland == BAYERN))
+    nrw, t_c2 = timed(lambda: s.count((F.bundesland == NRW) & (F.betriebsstatus == IN_BETRIEB)))
+    names, t_pl = timed(lambda: s.pluck(F.bundesland == BAYERN, "name"))
+    _, t_hy = timed(lambda: s.query(F.bundesland == BAYERN, limit=100_000))
+    big, t_rg = timed(lambda: s.count(F.bruttoleistung >= ONE_MEGAWATT_KW))     # SortedIndex range (#18)
     resid, t_res = timed(lambda: s.count(F.ort == "München"))           # non-indexed residual
 
     print(f"\nquery cost-ladder on {total:,} units  (indexed: mastr_nr·bundesland·"
@@ -258,9 +267,13 @@ def main() -> None:
     builds: list[int] = []
     real_build = _idx.build_class_indexes
 
-    def _counting_build(*a: Any, **k: Any) -> Any:
+    def _counting_build(
+        ti: TypeInfo,
+        lineage: list[tuple[int, list[str]]],
+        scan_type: Callable[[int], Iterable[StoredRecord]],
+    ) -> ClassIndexes:
         builds.append(1)
-        return real_build(*a, **k)
+        return real_build(ti, lineage, scan_type)
 
     _idx.build_class_indexes = _counting_build  # type: ignore[assignment]
     try:
