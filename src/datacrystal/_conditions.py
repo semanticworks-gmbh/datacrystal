@@ -1,29 +1,21 @@
 """The Condition AST (ROADMAP item 4).
 
-Class-level field access on an ``@entity`` class yields a :class:`FieldExpr`
-(via the entity metaclass — instance attribute access is untouched and pays
-zero overhead). Comparing a ``FieldExpr`` builds a :class:`Pred`; predicates
-compose with ``&``, ``|`` and ``~``::
+Class-level field access on an ``@entity`` class yields a :class:`FieldExpr`, comparing it
+builds a :class:`Pred`, and predicates compose with ``&``, ``|`` and ``~``::
 
     (Specimen.quality == "museum") & (Specimen.mass_g >= 100.0)
 
-Conditions are **single-class by design** — mixing fields of two entity
-classes raises :class:`QueryError` (cross-entity joins are v1, on Arrow
-mirrors). Evaluation is split by the store's planner: ``==`` / ``in_`` on
-indexed fields resolve to roaring bitmaps; ``contains()`` / ``startswith()``
-on indexed string fields iterate the index's *distinct keys* and OR the
-matching postings (KICKOFF M4 — O(distinct values), never entities);
-everything else runs as a residual Python predicate over the candidate set.
+Conditions are single-class by design; mixing two entity classes raises :class:`QueryError`.
+The planner resolves indexed predicates to bitmaps and runs the rest as a residual predicate.
 """
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from itertools import islice
-from typing import Any, Iterable, TypeVar, cast
+from typing import Any, cast
 
 from datacrystal._errors import QueryError
-
-_T = TypeVar("_T")
 
 
 class Condition:
@@ -31,25 +23,25 @@ class Condition:
 
     __slots__ = ()
 
-    def __and__(self, other: "Condition") -> "Condition":
+    def __and__(self, other: Condition) -> Condition:
         _require_condition(other)
         return And(_flatten(And, self) + _flatten(And, other))
 
-    def __or__(self, other: "Condition") -> "Condition":
+    def __or__(self, other: Condition) -> Condition:
         _require_condition(other)
         return Or(_flatten(Or, self) + _flatten(Or, other))
 
-    def __invert__(self) -> "Condition":
+    def __invert__(self) -> Condition:
         return Not(self)
 
     # Reflected operands catch the classic mistake
     # ``Cls.field == "x" & (other)``: `&` binds tighter than `==`, so Python
     # evaluates `"x" & condition` and lands here.
-    def __rand__(self, other: object) -> "Condition":
+    def __rand__(self, other: object) -> Condition:
         _require_condition(other)
         raise AssertionError("unreachable")
 
-    def __ror__(self, other: object) -> "Condition":
+    def __ror__(self, other: object) -> Condition:
         _require_condition(other)
         raise AssertionError("unreachable")
 
@@ -89,15 +81,15 @@ def _require_condition(other: object) -> None:
 
 def _flatten(kind: type, cond: Condition) -> tuple[Condition, ...]:
     if type(cond) is kind:
-        return cond.parts  # type: ignore[attr-defined]
+        return cond.parts
     return (cond,)
 
 
 def _refuse_float_against_decimal(cls: type, field: str, value: object) -> None:
-    """A ``float`` literal against a ``Decimal`` field is a TypeError (#184):
-    ``Decimal`` against ``float`` compares the float's binary expansion, so
-    ``== 0.1`` is False and a range edge lands on the wrong side; ``Decimal`` and
-    ``int`` literals are exact.
+    """Raise ``TypeError`` for a ``float`` literal against a ``Decimal`` field (#184).
+
+    ``Decimal`` against ``float`` compares the float's binary expansion, so ``== 0.1`` is False
+    and a range edge lands on the wrong side; ``Decimal`` and ``int`` literals are exact.
     """
     literals = cast("tuple[object, ...]", value) if isinstance(value, tuple) else (value,)
     if not any(isinstance(v, float) for v in literals):
@@ -232,7 +224,7 @@ def validate_window(limit: int | None, offset: int) -> None:
             raise ValueError(f"limit= must be >= 0, got {limit}")
 
 
-def apply_window(seq: list[_T], limit: int | None, offset: int) -> list[_T]:
+def apply_window[T](seq: list[T], limit: int | None, offset: int) -> list[T]:
     """Slice a result list to its ``(offset, limit)`` window. Result order is
     deterministic (ascending OID, preserved by ``get_many``), so a windowed read
     equals the unwindowed read sliced the same way (#14).
@@ -244,23 +236,21 @@ def apply_window(seq: list[_T], limit: int | None, offset: int) -> list[_T]:
     return seq
 
 
-def window_iter(candidate: Iterable[_T], limit: int | None, offset: int) -> list[_T]:
-    """The ``(offset, limit)`` window taken **lazily** from a sorted candidate
-    iterable (#51) — O(offset + limit), never materializing the whole candidate
-    set. Same result and order as ``apply_window(list(candidate), limit, offset)``
-    because the roaring candidate iterates in ascending OID; the win is that a
-    small ``limit`` over a huge extent stops after ``offset + limit`` instead of
-    listing every OID.
+def window_iter[T](candidate: Iterable[T], limit: int | None, offset: int) -> list[T]:
+    """Take the ``(offset, limit)`` window lazily from a sorted candidate iterable (#51).
+
+    Costs O(offset + limit) and equals ``apply_window(list(candidate), limit, offset)``, because
+    the roaring candidate iterates in ascending OID.
     """
     stop = None if limit is None else offset + limit
     return list(islice(candidate, offset, stop))
 
 
 def order_by_values(matched: Iterable[int], value_of: Any, descending: bool) -> list[int]:
-    """``matched`` OIDs (in ascending-OID order) sorted by ``value_of(oid)`` for
-    an order_by on a **non-indexed** field (#25): NULLs last, stable
-    ascending-OID tiebreak. ``matched`` MUST already be ascending-OID so the
-    stable sort preserves OID order within equal values (deterministic paging).
+    """Sort ``matched`` OIDs by ``value_of(oid)`` for an order_by on a non-indexed field (#25).
+
+    NULLs go last. ``matched`` MUST already be ascending-OID so the stable sort keeps OID order
+    within equal values (deterministic paging).
     """
     present: list[int] = []
     absent: list[int] = []
@@ -271,10 +261,10 @@ def order_by_values(matched: Iterable[int], value_of: Any, descending: bool) -> 
 
 
 def parse_order_by(order_by: Any, ti: Any) -> tuple[str, bool]:
-    """Resolve the frozen ``order_by`` contract (#25) to ``(field_name,
-    descending)``. Accepts ``(field, direction)`` or a bare ``field`` (ascending),
-    where ``field`` is a :class:`FieldExpr` (``EntityClass.f`` / ``dc.fields(C).f``)
-    or a field-name str and ``direction`` is ``'asc'``/``'desc'``.
+    """Resolve the frozen ``order_by`` contract (#25) to ``(field_name, descending)``.
+
+    Accept ``(field, direction)`` or a bare ``field`` (ascending); ``field`` is a
+    :class:`FieldExpr` or a name, and ``direction`` is ``'asc'`` or ``'desc'``.
     """
     field_ref: Any
     direction: Any
@@ -334,7 +324,7 @@ class FieldProxy:
     def __init__(self, cls: type) -> None:
         self._cls = cls
 
-    def __getattr__(self, name: str) -> "FieldExpr":
+    def __getattr__(self, name: str) -> FieldExpr:
         cls = self._cls
         fieldset = type.__getattribute__(cls, "__dc_fieldset__")
         if name not in fieldset:
@@ -346,7 +336,7 @@ class FieldProxy:
 
 
 def fields(entity_class: type) -> FieldProxy:
-    """A statically-typed handle for building query conditions.
+    """Return a statically-typed handle for building query conditions.
 
     ``Mineral.mohs >= 6.0`` works at runtime but type checkers infer the
     field's *value* type for class-level access and flag the comparison.
@@ -375,10 +365,10 @@ class FieldExpr:
         self.cls = cls
         self.name = name
 
-    def __eq__(self, value: Any) -> Pred:  # type: ignore[override]
+    def __eq__(self, value: object) -> Pred:  # pyrefly: ignore[bad-override]  # builds a predicate, not a bool
         return Pred(self.cls, self.name, "==", value)
 
-    def __ne__(self, value: Any) -> Pred:  # type: ignore[override]
+    def __ne__(self, value: object) -> Pred:  # pyrefly: ignore[bad-override]  # builds a predicate, not a bool
         return Pred(self.cls, self.name, "!=", value)
 
     def __lt__(self, value: Any) -> Pred:
@@ -410,7 +400,7 @@ class FieldExpr:
         _require_str(self.cls, self.name, "startswith", prefix)
         return Pred(self.cls, self.name, "startswith", prefix)
 
-    __hash__ = None  # type: ignore[assignment]
+    __hash__ = None
 
     def __repr__(self) -> str:
         return f"<field {self.cls.__name__}.{self.name}>"

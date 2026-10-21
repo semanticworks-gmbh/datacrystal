@@ -1,28 +1,9 @@
-"""datacrystal — your live objects, crystallized.
+"""Embed an object-graph database in Python: datacrystal crystallizes your live objects.
 
-An embedded object-graph database for Python, inspired by EclipseStore:
-typed Python objects **are** the database — pickle-free, crash-safe, with
-bitmap-indexed queries built in.
-
-Quickstart::
-
-    from typing import Annotated
-    import datacrystal as dc
-
-    @dc.entity
-    class Mineral:
-        qid: Annotated[str, dc.Unique]
-        name: str
-        crystal_system: Annotated[str | None, dc.Index] = None
-
-    store = dc.Store.open("cabinet.store")
-    if store.root is None:
-        store.root = [Mineral(qid="Q43010", name="quartz", crystal_system="trigonal")]
-    store.commit()
-    hits = store.query(Mineral.crystal_system == "trigonal")
-    store.close()
-
-Design docs: docs/design/ in the repository (DESIGN.md, ROADMAP.md, ADR-001).
+Inspired by EclipseStore.
+Typed Python objects are the database: pickle-free, crash-safe, with bitmap-indexed queries built
+in.
+Quickstart: README.md; design docs: docs/design/ (DESIGN.md, ROADMAP.md, ADR-001).
 """
 
 from typing import TYPE_CHECKING
@@ -34,17 +15,15 @@ from datacrystal._actors import (
     CURATOR,
     EXECUTIVE,
     NO_STANDING,
-    WORLD,
     STAFF,
     VIEWER,
+    WORLD,
     Actor,
     Principal,
     root_principal,
 )
 from datacrystal._conditions import fields
 from datacrystal._containers import PersistentDict, PersistentList
-from datacrystal._permissions import Permissions, protect, share, unshare
-from datacrystal._redacted import Redacted
 from datacrystal._entity import (
     Blob,
     FullText,
@@ -85,10 +64,12 @@ from datacrystal._errors import (
     WriteDeniedError,
     WrongThreadError,
 )
+from datacrystal._follower import open_follower
 from datacrystal._indexes import QueryPlan
 from datacrystal._lazy import BlobHandle, BlobSource, Lazy, blob_from_path
+from datacrystal._permissions import Permissions, protect, share, unshare
 from datacrystal._pipeline import DeltaConsumer
-from datacrystal._follower import open_follower
+from datacrystal._redacted import Redacted
 from datacrystal._snapshot import EntityView, Ref, Snapshot, SnapshotIndexes
 from datacrystal._store import Store
 
@@ -109,75 +90,75 @@ def __getattr__(name: str) -> object:  # PEP 562
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
-    "Store",
-    "AsyncStore",
-    "aopen",
-    "open_follower",
-    "entity",
-    "fields",
-    "Principal",
-    "root_principal",
-    "Actor",
-    "Permissions",
-    "share",
-    "unshare",
-    "protect",
-    "Redacted",
-    "WORLD",
-    "NO_STANDING",
-    "VIEWER",
+    "ADMIN",
     "AGENT",
     "AUTOMATION",
-    "STAFF",
     "CURATOR",
-    "ADMIN",
     "EXECUTIVE",
-    "Lazy",
-    "Index",
-    "Unique",
-    "FullText",
-    "RenamedFrom",
-    "Glue",
-    "SortedIndex",
+    "NO_STANDING",
+    "STAFF",
+    "VIEWER",
+    "WORLD",
+    "Actor",
+    "AsyncStore",
     "Blob",
     "BlobHandle",
     "BlobSource",
-    "blob_from_path",
-    "PersistentList",
-    "PersistentDict",
-    "Snapshot",
-    "SnapshotIndexes",
-    "EntityView",
-    "Ref",
-    "QueryPlan",
-    "DeltaConsumer",
+    "ConflictError",
     "ConsumerDetachedWarning",
+    "CorruptRecordError",
+    "DanglingDeleteWarning",
+    "DanglingRefError",
     "DataCrystalError",
-    "StoreClosedError",
-    "StoreLockedError",
-    "LeaseLostError",
-    "WrongThreadError",
+    "DeletedEntityError",
+    "DeltaConsumer",
     "EntityEscapeError",
+    "EntityView",
     "FrozenEntityError",
+    "FullText",
+    "Glue",
+    "Index",
+    "Lazy",
+    "LeaseLostError",
+    "MixedTemporalIndexError",
+    "NewerStoreError",
     "NotAnEntityError",
-    "UniqueViolationError",
+    "Permissions",
+    "PersistentDict",
+    "PersistentList",
+    "Principal",
+    "QueryError",
+    "QueryPlan",
+    "ReadDeniedError",
+    "Redacted",
+    "Ref",
+    "RenamedFrom",
     "SchemaMismatchError",
     "SchemaSkewError",
-    "ConflictError",
-    "UnknownActorError",
+    "Snapshot",
+    "SnapshotIndexes",
+    "SortedIndex",
     "SponsorRequiredError",
+    "Store",
+    "StoreClosedError",
+    "StoreLockedError",
     "UncommittedActorError",
-    "WriteDeniedError",
-    "ReadDeniedError",
+    "Unique",
+    "UniqueViolationError",
+    "UnknownActorError",
     "UnregisteredTypeError",
-    "NewerStoreError",
-    "CorruptRecordError",
-    "MixedTemporalIndexError",
-    "QueryError",
-    "DeletedEntityError",
-    "DanglingRefError",
-    "DanglingDeleteWarning",
     "UnseenTypeWarning",
     "UntrackedMutationWarning",
+    "WriteDeniedError",
+    "WrongThreadError",
     "__version__",
+    "aopen",
+    "blob_from_path",
+    "entity",
+    "fields",
+    "open_follower",
+    "protect",
+    "root_principal",
+    "share",
+    "unshare",
 ]

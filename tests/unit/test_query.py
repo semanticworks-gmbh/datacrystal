@@ -161,7 +161,7 @@ def test_none_is_an_indexable_value(cabinet: dc.Store) -> None:
     Then opal is returned
     """
     # pyrefly: ignore[bad-argument-type]
-    hits = cabinet.query(Mineral.crystal_system == None)  # noqa: E711
+    hits = cabinet.query(Mineral.crystal_system == None)  # noqa: E711 - the magic query path compares with ==
 
     assert _names(hits) == ["opal"]
 

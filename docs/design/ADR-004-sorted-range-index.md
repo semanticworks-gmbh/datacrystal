@@ -96,3 +96,8 @@ predicates from the index — a third deterministic planning rule, not an optimi
   substrate. This ADR does not require that; it makes it the natural next step.
 - Fitness: a range query's cost is f(hits + log n), not f(extent) — assertable as an operation-count
   gate (invariant 12) and provable on the MaStR proving ground (the 20 s scan → an index slice).
+
+## Amendment notes (added with #191)
+
+- `datetime` and `date` join the original str, int, float and bool key set (#106, which amends section 1; naive date and time were pre-authorized as range keys). Both are totally ordered and round-trip natively through the codec (aware datetimes as a UTC instant, naive ones as ISO text); the aware-versus-naive comparability fork is handled in the sorted run, not at the type gate.
+- `Decimal` joins them (#184): exact, totally ordered against `Decimal` and `int`, and round-tripped as its exact text by `DECIMAL_EXT_CODE`.

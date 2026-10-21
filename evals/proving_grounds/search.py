@@ -35,9 +35,10 @@ import resource
 import shutil
 import sys
 import time
+from collections.abc import Iterator
 from csv import reader as csv_reader
 from pathlib import Path
-from typing import Annotated, Iterator
+from typing import Annotated
 
 import datacrystal as dc
 from datacrystal._entity import oid_of

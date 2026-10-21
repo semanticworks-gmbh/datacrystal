@@ -1,27 +1,10 @@
 """The Store facade: open, root, store, commit, query, get, get_many.
 
-Concurrency contract (ADR-001, accepted): a store and its live graph are
-**owner-confined** — bound at ``open()`` to the opening thread. Foreign
-threads get ``WrongThreadError`` with the escape recipe in the message.
-
-The commit pipeline is the ratified three-phase machine (ADR-001 bound
-decision 2): P1 captures, encodes, FLIPS the captured set back to CLEAN and
-re-arms the hooks — all await-free on the owner, so a write racing P2
-re-dirties and lands in the next commit; P2 applies the batch (bytes only)
-on the store's single IO worker thread; P3 finalizes indexes and the
-watermark on the owner. A failed P2 compensates: captured entities return
-to their buffers (unless a racing write already re-buffered them) and the
-TID is reused — a rejected commit leaves the sequence gapless. The
-synchronous ``commit()`` blocks until P3; ``aopen()``'s commit awaits P2 so
-the event loop stays free.
-
-Write model (buffer-until-commit): ``store.store(obj)`` registers an object
-graph; mutating a CLEAN entity buffers it via the one-shot hook; in-place
-mutation of a list/dict field buffers its owner via the owner-bound
-persistent containers (``_containers.py``); nothing touches storage until
-``commit()``. The storer holds strong references to pending objects, so
-uncommitted work cannot be garbage-collected; the root holder is pinned so
-the root graph keeps stable identity.
+Owner-confined (ADR-001): foreign threads get ``WrongThreadError``. Commit is ADR-001's three-phase
+machine: P1 captures on the owner, P2 applies on the IO worker, P3 finalizes on the owner; a failed
+P2 reuses its TID, keeping the sequence gapless. Writes buffer until ``commit()``; the storer holds
+pending objects strongly and pins the root.
+Details: docs/design/ADR-001-concurrency-contract.md, "Implementation notes".
 """
 
 from __future__ import annotations
@@ -32,13 +15,15 @@ import threading
 import time
 import warnings
 from collections import deque
+from collections.abc import Callable, Generator, Iterable, Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from contextvars import ContextVar
-from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from types import TracebackType
-from typing import Any, BinaryIO, Callable, Generator, Iterable, Iterator, cast
+from typing import Any, BinaryIO, Self, cast
 
+from datacrystal._actors import Actor, Principal
 from datacrystal._conditions import (
     And,
     Condition,
@@ -52,7 +37,6 @@ from datacrystal._conditions import (
     validate_window,
     window_iter,
 )
-from datacrystal._actors import Actor, Principal
 from datacrystal._containers import PersistentDict, PersistentList, wrap_value
 from datacrystal._entity import (
     TYPES_BY_NAME,
@@ -66,7 +50,6 @@ from datacrystal._entity import (
     state_of,
     type_info,
 )
-from datacrystal._state import STATE_CLEAN, STATE_DELETED, STATE_DIRTY, STATE_NEW
 from datacrystal._errors import (
     ConflictError,
     ConsumerDetachedWarning,
@@ -91,18 +74,7 @@ from datacrystal._errors import (
     WriteDeniedError,
     WrongThreadError,
 )
-from datacrystal._ids import FORMAT_VERSION, IdAllocator, OID_BASE, TID_BASE
-from datacrystal._permissions import (
-    NO_STANDING,
-    PERM_FIELDS,
-    PERM_LEGACY_FILLS,
-    VIEWER,
-    authority_towards,
-    can_read_row,
-    is_root,
-    level,
-)
-from datacrystal._redacted import Redacted, make_twin
+from datacrystal._ids import FORMAT_VERSION, OID_BASE, TID_BASE, IdAllocator
 from datacrystal._index_cache import IndexCache
 from datacrystal._indexes import (
     IndexManager,
@@ -113,18 +85,35 @@ from datacrystal._indexes import (
     windowed_index_order,
 )
 from datacrystal._lazy import BlobHandle, BlobSource, Lazy, LazyReferenceManager
+from datacrystal._permissions import (
+    NO_STANDING,
+    PERM_FIELDS,
+    PERM_LEGACY_FILLS,
+    VIEWER,
+    authority_towards,
+    can_read_row,
+    is_root,
+    level,
+)
 from datacrystal._pipeline import DeltaConsumer, build_delta
 from datacrystal._records import (
     BlobToken,
     RefToken,
-    crc as _crc,
     decode_payload,
     encode_payload,
     fingerprint_payload,
 )
+from datacrystal._records import (
+    crc as _crc,
+)
+from datacrystal._redacted import Redacted, make_twin
 from datacrystal._registry import ObjectRegistry
-from datacrystal._snapshot import Ref, Snapshot
-from datacrystal._snapshot import _SnapshotCore  # pyright: ignore[reportPrivateUsage]  # the per-watermark core ctor
+from datacrystal._snapshot import (
+    Ref,
+    Snapshot,
+    _SnapshotCore,  # the per-watermark core ctor
+)
+from datacrystal._state import STATE_CLEAN, STATE_DELETED, STATE_DIRTY, STATE_NEW
 from datacrystal._storage.protocol import (
     CommitBatch,
     StorageBackend,
@@ -160,8 +149,16 @@ class _Root:
 class _Capture:
     """Everything P1 hands to P2/P3 — and enough to compensate a failed P2."""
 
-    __slots__ = ("tid", "batch", "index_entries", "ref_entries", "flipped",
-                 "delta", "deletes", "blob_swaps")
+    __slots__ = (
+        "batch",
+        "blob_swaps",
+        "deletes",
+        "delta",
+        "flipped",
+        "index_entries",
+        "ref_entries",
+        "tid",
+    )
 
     def __init__(self, tid: int, batch: CommitBatch,
                  index_entries: list[tuple[int, TypeInfo, dict[str, Any]]],
@@ -183,15 +180,11 @@ class _Capture:
 
 
 class _CommitAttempt:
-    """One iteration of a :meth:`Store.committing` loop — a context manager whose
-    block runs, then commits on a clean exit.
+    """One iteration of a :meth:`Store.committing` loop: run the block, commit on a clean exit.
 
-    On a follower a stale write raises :class:`ConflictError` from ``commit()``;
-    this discards the rejected buffer, pulls the coordinator's change (``sync``),
-    and signals the loop to re-run the block against fresh state. Any other exception
-    (a bug in the block, or a non-retryable reject like ``SchemaSkewError``)
-    propagates unchanged — only an OCC conflict is retried. On a single-node store
-    ``commit()`` never conflicts, so the first attempt always commits.
+    A ``ConflictError`` discards the buffer, ``sync()``s and signals a re-run against fresh state.
+    Any other exception propagates unchanged: only an OCC conflict is retried. On a single-node
+    store ``commit()`` never conflicts, so the first attempt commits.
     """
 
     __slots__ = ("_store", "committed", "conflict", "used")
@@ -202,7 +195,7 @@ class _CommitAttempt:
         self.conflict: ConflictError | None = None
         self.used = False
 
-    def __enter__(self) -> _CommitAttempt:
+    def __enter__(self) -> Self:
         self.used = True
         return self
 
@@ -245,13 +238,11 @@ class Store:
         self._registry = ObjectRegistry()
         self._new: dict[int, Any] = {}
         self._dirty: dict[int, Any] = {}
-        # Birth/inherited labels of fresh protected records (ADR-008 W2): the
-        # gate's baseline for a NEW record — inheritance and birth defaults are
-        # the LIBRARY's policy, never the principal's grant, so only explicit
-        # verb changes ON TOP of this are ceiling-checked. Keyed by oid,
-        # populated in _stamp_perm_labels, consumed by _check_write_gate,
-        # cleared when the buffer clears (survives a denied commit so a
-        # fixed-up retry still has it).
+        # Birth/inherited labels of fresh protected records (ADR-008 W2): the gate's baseline for a
+        # NEW record. Inheritance and birth defaults are library policy, not the principal's grant,
+        # so only explicit verb changes on top are ceiling-checked. Keyed by oid: set in
+        # _stamp_perm_labels, read by _check_write_gate, cleared with the buffer (kept across a
+        # denied commit so a fixed-up retry still has it).
         self._birth_labels: dict[int, tuple[int, list[int], int, int]] = {}
         # delete() buffer (ADR-003): oid → (TypeInfo, live instance or None).
         # The strong reference keeps the doomed instance alive until P3 so a
@@ -280,12 +271,10 @@ class Store:
         # work and one int per live entity for detection — development tool.
         self._debug = debug
         self._fingerprints: dict[int, int] = {}
-        # strict_deletes (#110, ADR-003 dev-time bridge): the eager dangling-ref
-        # check at commit. debug=True arms it as a WARN (DanglingDeleteWarning) so
-        # a bulk re-import is never bricked; strict_deletes=True promotes the same
-        # finding to a raised DanglingRefError — the stricter knob. Either arms the
-        # check; unarmed, the commit path is byte-for-byte unchanged (the reverse
-        # index stays unbuilt, spec §5: an unwatched store pays nothing).
+        # strict_deletes (#110, ADR-003): the eager dangling-ref check at commit. debug=True arms
+        # it as a warning (DanglingDeleteWarning), strict_deletes=True as a raised
+        # DanglingRefError. Unarmed, the commit path is unchanged and the reverse index stays
+        # unbuilt (spec §5).
         self._strict_deletes = strict_deletes
         # lazy_timeout=None means no demotion (the default): root pinning
         # plus explicit Lazy cut points already bound memory; the manager
@@ -304,16 +293,11 @@ class Store:
         # losing identity and any in-place mutations. Lazy[T] is the explicit
         # cut point where pinning (and memory) stops.
         self._root_holder: Any = None
-        # Session identity (epic #168 W1): the ambient principal this
-        # session's commits are stamped with (COMMIT-DELTA-v2). The opening
-        # identity is config-trusted — someone must open the store that holds
-        # the Actor registry, so bootstrap cannot resolve through it.
-        # acting_as() pushes scoped identities on top; uid 0 = anonymous.
-        # A ContextVar, not a plain stack: under aopen() an acting_as scope
-        # would otherwise leak across awaits into interleaved tasks on the
-        # same loop — contextvars make the scope task-confined by
-        # construction (each task sees its own stack), which is exactly the
-        # per-request identity the web tier composes on later (W2+).
+        # Session identity (epic #168 W1): the ambient principal commits are stamped with
+        # (COMMIT-DELTA-v2). It is config-trusted: the store that holds the Actor registry cannot
+        # resolve its own opener. A ContextVar, not a plain stack, so an acting_as scope is
+        # task-confined under aopen(). acting_as() pushes scoped identities on top; uid 0 is
+        # anonymous.
         self._principal = principal if principal is not None else Principal(uid=0)
         self._acting: ContextVar[tuple[Principal, ...]] = ContextVar(
             "datacrystal-acting", default=()
@@ -349,12 +333,10 @@ class Store:
     def _load_state(self, *, use_cache: bool) -> None:
         """(Re)derive all boot-time state from the backend, in one place.
 
-        Called at open (``use_cache=True``) and by a follower's :meth:`sync`
-        refresh (``use_cache=False``, #151) once new deltas have landed in the
-        backend: the allocator, watermark, root OID, type lineage, and a fresh
-        index manager are all re-read from ``backend.boot()``. A refresh rebuilds
-        the index from records (the watermark-stamped sidecar is only read at
-        open, never authoritative — invariant 11).
+        Called at open (``use_cache=True``) and by a follower's :meth:`sync` (``use_cache=False``,
+        #151). Allocator, watermark, root OID, type lineage and index manager are re-read from
+        ``backend.boot()``. A refresh rebuilds the index from records; the sidecar is only read at
+        open (invariant 11).
         """
         backend = self._backend
         boot = backend.boot()
@@ -423,24 +405,13 @@ class Store:
         self._load_state(use_cache=False)
 
     def sync(self) -> int:
-        """Pull and apply the coordinator's new deltas — follower catch-up (#151).
+        """Pull and apply the coordinator's new deltas and return the watermark (#151).
 
-        Synchronous, owner-thread, single-threaded (the v0 follower contract):
-        fetch the deltas after the local watermark, apply them, and refresh this
-        live store so the next read reflects them. Returns the (possibly
-        unchanged) watermark. Only a store opened with
-        :func:`~datacrystal.open_follower` can sync.
-
-        A live reference to a CLEAN entity read *before* a sync sees stale field
-        values afterwards — re-query for fresh reads (identity is by OID, so a
-        re-read returns the updated instance).
-
-        Raises:
-            WrongThreadError: called off the owner thread (ADR-001).
-            StoreClosedError: the store is closed.
-            DeltaGapError: a delta skipped past the watermark — resync from 0.
-            RuntimeError: this store is not a follower, or local writes are
-                buffered (commit or discard them before syncing).
+        Synchronous and owner-thread (the v0 follower contract); only an ``open_follower`` store
+        can sync. A live reference to a CLEAN entity read before a sync keeps stale values:
+        re-query.
+        Raises ``DeltaGapError`` (resync from 0), ``RuntimeError`` for a non-follower or buffered
+        writes. The OCC recovery loop: docs/design/COMMIT-DELTA-v2.md, section 8.
         """
         self._enter()
         if self._sync_fn is None:
@@ -454,74 +425,24 @@ class Store:
         return self._last_tid
 
     def discard(self) -> int:
-        """Drop all buffered (uncommitted) writes and re-read committed state.
+        """Drop all buffered writes and re-read committed state; return the committed watermark.
 
-        The rollback the :meth:`sync` error message names. A follower whose
-        ``commit()`` the coordinator rejected (``ConflictError``) still holds its
-        buffered edit, so ``sync()`` refuses; ``discard()`` clears the buffered
-        ``upsert``/``delete``/``store`` set and re-derives the live store from the
-        backend's committed records, so the next read reflects the durable state
-        and a following ``sync()`` can run. This is the OCC recovery loop:
-        ``discard()`` → ``sync()`` → re-read → re-apply → ``commit()`` (#153
-        peer-review fix). Works on **any** store, not only a follower — an
-        uncommitted local graph is dropped, the durable state reloaded.
-
-        A live reference read *before* the discard is detached from identity (a
-        fresh registry); re-read for the current values (identity is by OID).
-
-        Returns:
-            The current committed watermark (unchanged by a discard).
-
-        Raises:
-            WrongThreadError: called off the owner thread (ADR-001).
-            StoreClosedError: the store has already been closed.
+        The rollback that :meth:`sync` names: a rejected follower ``commit()`` leaves its buffer
+        held. OCC recovery loop: discard, sync, re-read, re-apply, commit (#153); works on any
+        store. A live reference read before the discard is detached: re-read for current values.
         """
         self._enter()
         self._refresh_from_backend()
         return self._last_tid
 
     def committing(self, *, retries: int = 3) -> Iterator[_CommitAttempt]:
-        """A retrying commit loop — the same code on a single-node store and a follower.
+        """Run a block in a commit loop that retries on conflict, the same code on any topology.
 
-        Drive it with ``for txn in store.committing(): with txn: ...``: the
-        ``with`` block reads and mutates, and is committed when it exits cleanly.
-        On a follower a stale write raises :class:`ConflictError`; instead of
-        surfacing it, this **re-runs your block** against fresh state (after a
-        ``discard`` + ``sync``), up to ``retries`` times, then re-raises if the
-        conflict persists. On a single-node store a commit can never conflict, so
-        the block runs exactly once — *identical code, behaviour follows the
-        topology* (the fractal contract).
-
-        This is the recommended way to write a read-modify-write: the re-read lives
-        **inside** the block, so a retry re-applies your *intent* to the winning
-        value (never last-writer-wins). Put the whole read-modify-write in the
-        block and do **not** call :meth:`commit` yourself — the ``with`` exit does.
-
-        Example::
-
-            for txn in store.committing(retries=5):
-                with txn:
-                    m = store.get(Mineral, qid="Q1")
-                    m.mohs = (m.mohs or 0) + 0.5   # re-read + re-applied each try
-
-        Args:
-            retries: how many times to re-run the block on a conflict before
-                giving up (``0`` = a single attempt that raises on conflict). The
-                first attempt is not a retry, so up to ``retries + 1`` runs total.
-
-        Yields:
-            A :class:`_CommitAttempt` to use as ``with txn:``; the loop ends as
-            soon as one attempt commits.
-
-        Raises:
-            WriteDeniedError: propagates UN-retried on the first attempt — a
-                permission denial is deterministic (ADR-008), not OCC: the
-                same principal re-denies forever; fix identity or labels, or
-                ``discard()``.
-            ConflictError: a follower's write still conflicts after ``retries``
-                recoveries (the entity keeps moving — surface it to the caller).
-            WrongThreadError: called off the owner thread (ADR-001).
-            StoreClosedError: the store has already been closed.
+        Use ``for txn in store.committing(): with txn: ...``; a clean exit commits. A follower's
+        stale write re-runs the block on fresh state (``discard``, ``sync``) up to ``retries``
+        times, then raises ``ConflictError``. Never call :meth:`commit` inside;
+        ``WriteDeniedError`` is not retried (ADR-008).
+        Details: docs/reference.md, "Behaviour notes".
         """
         self._enter()
         tries = 0
@@ -545,18 +466,12 @@ class Store:
 
     @property
     def principal(self) -> Principal:
-        """The principal currently in effect — the innermost :meth:`acting_as`
-        scope, or the ambient identity given at :meth:`open` (the anonymous
-        ``uid=0`` principal if none was given). Commits are stamped with this
-        principal's uid (COMMIT-DELTA-v2): the stamp is the **committing**
-        identity — writes buffered under A and committed under B stamp B.
+        """The principal in effect: the innermost :meth:`acting_as` scope, else the ambient one.
 
-        Under ``aopen()`` the scope is **task-confined** (contextvars): an
-        ``acting_as`` held across an ``await`` never leaks into interleaved
-        tasks on the same loop — each task acts as itself. Read from a
-        foreign thread this deliberately answers (it is plain frozen data,
-        no live-graph access) with THAT thread's view: no scopes can exist
-        there, so it reports the ambient identity.
+        Commits are stamped with the committing principal's uid (COMMIT-DELTA-v2), not the
+        buffering one. Under ``aopen()`` the scope is task-confined (contextvars). A foreign thread
+        has no scopes and reads the ambient identity.
+        Details: docs/reference.md, "Behaviour notes".
         """
         stack = self._acting.get()
         return stack[-1] if stack else self._principal
@@ -565,33 +480,11 @@ class Store:
     def acting_as(self, subject: int | Principal) -> Generator[Principal]:
         """Switch the session identity for a scope (epic #168 W1).
 
-        Given a :class:`~datacrystal.Principal`, it is used as-is — ephemeral
-        identities built from verified auth claims are fine; datacrystal is
-        never the identity provider ("authenticate outside, remember
-        inside"). Given an ``int`` uid, the shipped :class:`~datacrystal.Actor`
-        registry resolves it and the **sponsor gate** runs in core: a
-        non-human actor without a sponsor cannot act.
-
-        Scopes nest and the innermost wins; on exit the previous identity is
-        restored *in this task*. Under ``aopen()`` the scope is contextvar-
-        backed, so a task **spawned inside** the scope inherits the identity
-        and keeps it for its own lifetime even after this scope exits
-        (standard contextvar semantics) — spawn outside the scope, or open a
-        fresh ``acting_as`` inside the child task. ``commit()`` stamps
-        whatever principal is in effect when it runs (the committing
-        identity, not the buffering one). Registry resolution reads the
-        **committed** row only: an Actor with buffered edits refuses loudly.
-
-        Raises:
-            UnknownActorError: no ``dc.Actor`` row carries this uid.
-            UncommittedActorError: the resolved Actor row has buffered
-                (uncommitted) changes — commit the registry change first.
-            SponsorRequiredError: the resolved actor is non-human and its
-                sponsor gate fails — no sponsor named, or the sponsor does
-                not resolve to a registered human actor.
-            WrongThreadError: called from a thread other than the store's
-                owner (ADR-001).
-            StoreClosedError: the store has already been closed.
+        A :class:`~datacrystal.Principal` is used as-is; an ``int`` uid resolves through the
+        committed ``dc.Actor`` registry, where a non-human needs a sponsor. Scopes nest; under
+        ``aopen()`` a task spawned inside the scope inherits its identity.
+        Raises ``UnknownActorError``, ``UncommittedActorError``, ``SponsorRequiredError``.
+        Details: docs/reference.md, "Behaviour notes".
         """
         self._enter()
         if isinstance(subject, Principal):
@@ -615,17 +508,12 @@ class Store:
                     self._acting.set(stack[:-1])
 
     def _resolve_registry_actor(self, uid: int) -> Any:
-        """Resolve ``uid`` through the committed Actor registry, enforcing the
-        gates: the row exists, is committed (identity must be durable before
-        it acts), and — for a non-human — names a sponsor that resolves to a
-        registered committed HUMAN actor (the natural person who answers).
+        """Resolve ``uid`` through the committed Actor registry, enforcing the sponsor gates.
 
-        Reads via :meth:`_get_by_key_unchecked`, NOT :meth:`get` (ADR-008
-        W3-3, the identity-bootstrap bypass): ``Actor`` is protected, and a
-        W2-born row carries owner-only birth labels, so a fenced lookup
-        would raise ``UnknownActorError`` for any session that cannot yet
-        read its own registry row — including the anonymous session
-        resolving its very first ``acting_as(uid)``.
+        A non-human must name a sponsor that resolves to a committed human actor. Reads via
+        :meth:`_get_by_key_unchecked`, not :meth:`get` (ADR-008 W3-3): a fenced lookup would raise
+        ``UnknownActorError`` for a session that cannot yet read its own registry row.
+        See docs/design/ADR-008-permissions-contract.md, "R14 deref checkpoint".
         """
         actor = self._get_by_key_unchecked(Actor, "uid", uid)
         if actor is None:
@@ -663,75 +551,16 @@ class Store:
              lock_ttl: float = 10.0, debug: bool = False,
              strict_deletes: bool = False,
              lazy_timeout: float | None = None, cache_index: bool = True,
-             principal: Principal | None = None) -> "Store":
+             principal: Principal | None = None) -> Store:
         """Open (creating if needed) the store directory at ``path``.
 
-        The directory holds ``data.sqlite`` and the single-writer lease file
-        ``used.lock`` — a second concurrent opener fails with
-        ``StoreLockedError``.
-
-        ``durability`` is the fsync triad (KICKOFF M2): ``"commit"`` fsyncs
-        every commit (power-loss durable), ``"interval"`` (default) group-
-        commits at WAL checkpoints (process crash loses nothing; OS crash
-        may lose the last commits, never corrupts), ``"never"`` is for
-        benchmarks and scratch stores only.
-
-        ``debug=True`` arms the fingerprint safety net: every commit
-        re-encodes the live CLEAN entities and raises an
-        ``UntrackedMutationWarning`` for (and commits) any that changed
-        without the dirty-tracking hook firing. Development tool — it costs
-        O(live entities) per commit. It also arms the eager dangling-ref
-        check (see ``strict_deletes``) in its lenient WARN mode.
-
-        ``strict_deletes`` (#110, the ADR-003 dev-time bridge) arms an eager
-        dangling-reference check: at each ``commit()`` that deletes an OID a
-        *surviving* record still points at, datacrystal names the referrer(s)
-        immediately — turning a later mystery ``DanglingRefError`` (raised far
-        away, at the eventual dereference) into an at-the-delete diagnostic.
-        ``strict_deletes=True`` **raises** ``DanglingRefError`` at the offending
-        commit; ``debug=True`` alone runs the same check but only **warns**
-        (``DanglingDeleteWarning``) so a bulk re-import is never bricked. The
-        flagged set is exactly ``incoming(dead)`` after this commit's index
-        folds — prior-commit AND same-commit-new referrers, never co-deleted
-        ones. Unarmed (the default) the commit path is unchanged and pays
-        nothing. This is a dev-time *bridge*, NOT checked deletes — referential
-        integrity / cascades arrive with the v1 reverse-reference index.
-
-        ``lazy_timeout`` (seconds) enables the LazyReferenceManager: loaded
-        ``Lazy`` handles idle past the timeout demote back to unloaded,
-        releasing the subgraph behind the cut point. Demotion runs only on
-        the owner (sweeps piggyback on your store calls; under ``aopen()``
-        an owner-loop task sweeps). Timeout-only in v0.1.
-
-        ``cache_index`` (ADR-005, **on by default**) writes the built indexes to a
-        sidecar on close and loads them at boot instead of rebuilding from a scan —
-        a warm reopen skips the O(extent) first-query rebuild. With the
-        cardinality-matched representation (#12 Design A: a ``Unique`` field is a
-        flat key→oid map, not per-key bitmaps; ``_last_values`` is rebuilt lazily on
-        the first write), a read-only warm reopen is **~14x faster on a 6.2M store**
-        and the sidecar ~2.5x smaller. The cache is never authoritative — a
-        watermark/marker mismatch, or a stale/corrupt/newer sidecar, silently
-        rebuilds from the records (it can never return a wrong answer; SIGKILL-
-        tested). Pass ``cache_index=False`` to skip the sidecar (e.g. a scratch
-        store, or one you never reopen).
-
-        ``principal`` (epic #168 W1) is the **ambient session identity** —
-        the config-trusted bootstrap principal (someone must open the store
-        that holds the ``dc.Actor`` registry, so the opening identity cannot
-        resolve through it). Commits are stamped with the acting principal's
-        uid (COMMIT-DELTA-v2); ``acting_as()`` switches identity per scope.
-        Omitted, the store acts as the anonymous principal (``uid=0``) and
-        existing programs are unchanged — identity is opt-in.
-
-        Raises:
-            StoreLockedError: another process already holds the store's
-                single-writer lease (invariant 10) — e.g. a second
-                ``uvicorn`` worker opening the same directory.
-            NewerStoreError: the on-disk format is newer than this library
-                build understands; datacrystal refuses to open it rather
-                than misread it (invariant 9, format honesty).
+        The directory holds ``data.sqlite`` and the lease ``used.lock`` (``StoreLockedError``).
+        ``durability`` is the fsync triad: ``"commit"``, ``"interval"`` (default), ``"never"``.
+        ``debug`` fingerprints live entities per commit; ``strict_deletes`` is the ADR-003 check.
+        ``cache_index`` writes the index sidecar (ADR-005); ``lazy_timeout`` demotes idle handles.
+        ``principal`` is the ambient identity (default ``uid=0``); reference.md, "Behaviour notes".
         """
-        import sqlite3  # noqa: PLC0415 — stays lazy (dep-budget fitness #3)
+        import sqlite3
 
         from datacrystal._storage.lock import LeaseLock  # sqlite3/locking stay lazy
         from datacrystal._storage.sqlite import SqliteBackend
@@ -762,35 +591,12 @@ class Store:
         path: str | Path | None = None,
         client: Any | None = None,
     ) -> Store:
-        """Open a **read replica** synced from a coordinator's federation endpoint.
+        """Open a read replica synced from a coordinator's federation endpoint.
 
-        The follower constructor (ROADMAP item 21, FEDERATION-WIRE-v1) — the
-        sibling of :meth:`open`: ``Store.open(path)`` opens a local single writer,
-        ``Store.follower(url)`` opens a replica of a remote coordinator. It
-        bootstraps by replaying the coordinator's COMMIT-DELTA-v2 stream from TID 0
-        over ``GET /v1/deltas`` and returns a **real local** :class:`Store` you read
-        at full local speed; :meth:`sync` catches it up, and ``upsert`` + ``commit``
-        contributes back through the coordinator's single writer (use
-        :meth:`committing` for a read-modify-write — the same code as on a local
-        store). The top-level :func:`~datacrystal.open_follower` is the equivalent
-        function form.
-
-        Args:
-            url: the coordinator base URL (e.g. ``"https://coordinator"``).
-            api_key: sent as the ``x-api-key`` header (your auth seam; optional).
-            path: where the replica lives on disk (sqlite-backed); ``None``
-                (default) keeps it in memory.
-            client: an ``httpx.Client``-compatible transport (advanced/testing,
-                e.g. a ``fastapi.testclient.TestClient``); ``url``/``api_key`` are
-                then the client's responsibility.
-
-        Returns:
-            A :class:`Store` holding the coordinator's committed state at bootstrap.
-
-        Note:
-            The HTTP transport ships in the ``datacrystal[follower]`` extra and is
-            imported lazily, so a bare ``import datacrystal`` stays inside the
-            ``{msgspec, pyroaring}`` budget.
+        The sibling of :meth:`open` (FEDERATION-WIRE-v1): it replays COMMIT-DELTA-v2 from TID 0.
+        :meth:`sync` catches up and ``commit`` contributes back through the coordinator.
+        ``path=None`` keeps the replica in memory; ``client`` is a test transport. The HTTP
+        transport is the lazily imported ``datacrystal[follower]`` extra.
         """
         # lazy: open_follower lives in datacrystal._follower, which imports Store —
         # importing it at module load would be a cycle.
@@ -803,7 +609,7 @@ class Store:
                       strict_deletes: bool = False,
                       lazy_timeout: float | None = None,
                       lazy_clock: Callable[[], float] | None = None,
-                      principal: Principal | None = None) -> "Store":
+                      principal: Principal | None = None) -> Store:
         """Open over an explicit backend (tests; no lock file)."""
         return cls(backend, None, debug=debug, strict_deletes=strict_deletes,
                    lazy_timeout=lazy_timeout, lazy_clock=lazy_clock,
@@ -838,10 +644,10 @@ class Store:
         if self._lock is not None:
             self._lock.release()
 
-    def __enter__(self) -> "Store":
+    def __enter__(self) -> Self:
         return self
 
-    def __exit__(self, *exc: Any) -> None:
+    def __exit__(self, *exc: object) -> None:
         self.close()
 
     # -- public surface ------------------------------------------------------
@@ -864,18 +670,12 @@ class Store:
 
     @root.setter
     def root(self, value: Any) -> None:
-        """Assigning the root captures it immediately: lists/dicts come back
-        from ``store.root`` as tracked persistent containers (mutate them in
-        place — ``commit()`` sees it), and new entities in the value are
-        registered for the next commit.
+        """Capture the assigned root at once: containers are tracked, new entities registered.
 
-        Raises:
-            DeletedEntityError: the assigned value is (or contains) an entity
-                that was ``store.delete()``-d — it is detached; assign a fresh
-                instance instead.
-            WrongThreadError: called from a thread other than the one that
-                opened the store (owner confinement, ADR-001).
-            StoreClosedError: the store has already been closed.
+        Lists and dicts read from ``store.root`` are persistent containers, so in-place mutation
+        reaches ``commit()``.
+        Raises ``DeletedEntityError`` for a ``store.delete()``-d entity in the value: assign a
+        fresh instance.
         """
         self._enter()
         if self._root_oid is None:
@@ -905,17 +705,10 @@ class Store:
         return self._last_tid
 
     def store(self, obj: Any) -> int:
-        """Register ``obj`` (and every new entity reachable from it) for the
-        next commit; returns its OID.
+        """Register ``obj`` and new entities reachable from it for the next commit; return its OID.
 
-        Raises:
-            NotAnEntityError: ``obj`` is not an ``@entity`` class instance.
-            DeletedEntityError: ``obj`` (or a new entity reachable from it)
-                was deleted via ``store.delete()`` — OIDs are never reused,
-                so create a fresh entity instead.
-            WrongThreadError: called from a thread other than the store's
-                owner (ADR-001).
-            StoreClosedError: the store has already been closed.
+        Raises ``NotAnEntityError`` for a non-entity and ``DeletedEntityError`` for a deleted one
+        (OIDs are never reused).
         """
         self._enter()
         if not is_entity(obj):
@@ -925,19 +718,11 @@ class Store:
         return self._register_graph(obj)
 
     def mark_dirty(self, obj: Any) -> None:
-        """Explicitly buffer an entity for the next commit. Rarely needed —
-        attribute writes and in-place container mutation are tracked
-        automatically; this is the escape hatch for anything exotic.
+        """Buffer an entity for the next commit explicitly, the rarely needed escape hatch.
 
-        Raises:
-            NotAnEntityError: ``obj`` is not an ``@entity`` class instance.
-            ReadDeniedError: ``obj`` is a ``dc.Redacted`` twin — a denied
-                deref result is never committable (ADR-008 R14).
-            DeletedEntityError: ``obj`` was deleted via ``store.delete()``
-                (OIDs are never reused — create a new entity instead).
-            WrongThreadError: called from a thread other than the store's
-                owner (ADR-001).
-            StoreClosedError: the store has already been closed.
+        Attribute writes and in-place container mutation are tracked automatically.
+        Raises ``NotAnEntityError``, ``DeletedEntityError`` and ``ReadDeniedError`` for a
+        ``dc.Redacted`` twin (ADR-008 R14).
         """
         self._enter()
         if not is_entity(obj):
@@ -964,41 +749,11 @@ class Store:
     def delete(self, obj_or_cls: Any, /, **unique_key: Any) -> bool:
         """Delete an entity's record at the next ``commit()`` (ADR-003).
 
-        Two call shapes::
-
-            store.delete(mineral)                      # by live instance
-            store.delete(Mineral, qid="Q43010")        # by unique key, no hydration
-
-        Returns ``True`` if a deletion was buffered, ``False`` if there was
-        nothing to delete (unknown key, already deleted) — idempotent, never
-        raises for a miss. Deleting a NEW (never-committed) entity cancels
-        its pending insert. A buffered delete **wins** over any buffered
-        write to the same OID in the same commit.
-
-        Deletes are *unchecked* in v0.x: nothing stops you deleting an
-        entity other records still reference — following such a stale
-        reference raises :class:`~datacrystal._errors.DanglingRefError`.
-        Checked deletes (cascade/orphan validation) arrive with the v1
-        reverse-reference index. After the commit, a live instance you still
-        hold is a detached plain object: reads work, writes raise
-        :class:`~datacrystal._errors.DeletedEntityError`.
-
-        Raises:
-            NotAnEntityError: the positional argument is neither an
-                ``@entity`` instance nor an ``@entity`` class.
-            QueryError: the keyword field in the key-based shape is not a
-                ``dc.Unique`` field.
-            TypeError: the wrong call shape — the key-based form needs
-                exactly one unique-field keyword, the instance form takes
-                no keywords.
-            DataCrystalError: the given instance belongs to a different (or
-                closed) store, or it is the pinned root holder (assign
-                ``store.root`` instead of deleting it).
-            ReadDeniedError: the given instance is a ``dc.Redacted`` twin —
-                a denied deref result is never committable (ADR-008 R14).
-            WrongThreadError: called from a thread other than the store's
-                owner (ADR-001).
-            StoreClosedError: the store has already been closed.
+        Call it by instance, ``store.delete(m)``, or by key, ``store.delete(Mineral, qid="Q1")``.
+        Return ``True`` if a deletion was buffered, else ``False``; it wins over a buffered write.
+        Deletes are unchecked in v0.x: a stale reference raises ``DanglingRefError`` (ADR-003). A
+        held instance is detached after commit: reads work, writes raise ``DeletedEntityError``.
+        Raises ``NotAnEntityError``, ``QueryError`` (key not Unique), ``TypeError`` (call shape).
         """
         self._enter()
         if isinstance(obj_or_cls, type):
@@ -1066,56 +821,13 @@ class Store:
         return True
 
     def upsert(self, obj: Any, /, key: str | None = None) -> Any:
-        """Insert ``obj``, or merge it into the entity that already owns its
-        natural key — the KICKOFF M4 upsert-by-natural-key, ETL-loop shaped::
+        """Insert ``obj``, or merge it into the entity that already owns its natural key.
 
-            for row in feed:
-                store.upsert(Mineral(qid=row["qid"], name=row["name"]))
-            store.commit()
-
-        ``key`` names a ``dc.Unique`` field and may be omitted when the
-        class has exactly one. On a match the existing live instance is the
-        survivor (identity is never broken): every persisted field is
-        overwritten with ``obj``'s value, but only fields that actually
-        *changed* are written — re-importing an unchanged dataset buffers
-        nothing and the commit is O(changed), not O(rows). Returns the
-        canonical instance (the survivor, or ``obj`` itself when its key
-        was unseen).
-
-        Matching covers committed state plus entities buffered by earlier
-        ``upsert`` calls in the same batch (so one batch may see the same
-        key twice). Entities buffered via plain ``store()`` are not matched
-        — a duplicate there stays what it always was: a loud
-        ``UniqueViolationError`` from ``commit()``.
-
-        On a ``protected=True`` class the natural-key LOOKUP is read-
-        unfenced by design (ADR-008 W3-3): a filtered lookup would
-        duplicate-then-collide instead of merging. The RETURN, however, is
-        fenced (W4-6): a committed survivor the acting principal cannot
-        ``get()`` is denied with ``ReadDeniedError`` — upsert is a read-
-        modify-write, so it fails closed on an unreadable survivor rather
-        than handing it back (only its owner or root may upsert it). The
-        commit gate still fences the merge for a readable survivor (the
-        write floor applies as always); dedup is unaffected because the
-        lookup still finds the row.
-
-        Raises:
-            NotAnEntityError: ``obj`` is not an ``@entity`` class instance.
-            TypeError: ``key`` was omitted but the class has zero or several
-                ``dc.Unique`` fields (no single natural key to infer).
-            QueryError: ``key`` names a field that is not ``dc.Unique``, or
-                the natural-key value is ``None`` (None never matches).
-            UniqueViolationError: ``obj``'s key already belongs to another
-                entity and ``obj`` is itself registered with the store —
-                upsert a fresh (untracked) instance or the canonical one.
-            ReadDeniedError: ``obj`` is a ``dc.Redacted`` twin (a denied
-                deref result is never committable, ADR-008 R14), OR the
-                natural key already belongs to a committed record the acting
-                principal cannot read (upsert fails closed on an unreadable
-                survivor, W4-6).
-            WrongThreadError: called from a thread other than the store's
-                owner (ADR-001).
-            StoreClosedError: the store has already been closed.
+        ``key`` names a ``dc.Unique`` field, optional when the class has exactly one. The live
+        survivor is returned and only changed fields are written. Matching sees committed state and
+        earlier upserts of the batch, not plain ``store()``. An unreadable protected survivor
+        raises ``ReadDeniedError`` (ADR-008 W4-6).
+        Raises ``TypeError``, ``QueryError``, ``UniqueViolationError``.
         """
         self._enter()
         if not is_entity(obj):
@@ -1173,14 +885,12 @@ class Store:
         return existing
 
     def _payload_digest(self, ti: TypeInfo, field: str, value: Any) -> str | None:
-        """Hex SHA-256 of the CURRENT persisted payload for the entity whose
-        unique ``field == value``, or ``None`` if the key is absent.
+        """Return the persisted payload's hex SHA-256 for unique ``field == value``, else ``None``.
 
-        The OCC base token (#155, FEDERATION-WIRE-v1): ``/v1/submit`` compares a
-        follower's carried base against this. It reads the AUTHORITATIVE persisted
-        bytes (the backend record the follower itself hashed from the delta) — not
-        a re-encode of the live entity, whose lineage/defaults could diverge from
-        the stored bytes. Owner-thread (called inside the ``submit`` fan-in).
+        The OCC base token of ``/v1/submit`` (#155, FEDERATION-WIRE-v1). It hashes the persisted
+        bytes, not a re-encode of the live entity, whose lineage or defaults can diverge. Runs on
+        the owner thread inside the ``submit`` fan-in.
+        See docs/design/COMMIT-DELTA-v2.md, section 8.
         """
         if self._cid_by_typename.get(ti.typename) is None:
             return None
@@ -1192,23 +902,19 @@ class Store:
         return hashlib.sha256(rec.payload).hexdigest() if rec is not None else None
 
     def _find_by_key(self, ti: TypeInfo, field: str, value: Any) -> Any | None:
-        """The upsert lookup: committed unique map (a key freed by a
-        buffered delete is reusable, ADR-003), then earlier upserts of this
-        batch — self-healing against mid-batch key mutation or deletion.
+        """Find the entity an upsert merges into: the committed unique map, then earlier upserts.
+
+        A key freed by a buffered delete is reusable (ADR-003). The lookup self-heals against
+        mid-batch key mutation or deletion.
         """
         if self._cid_by_typename.get(ti.typename) is not None:
             ci = self._index.ensure(ti)
             oid = ci.unique[field].get(value)
             if oid is not None and oid not in self._deleted:
-                # The LOOKUP is read-unfenced BY DESIGN (ADR-008 W3-3): a
-                # filtered lookup would duplicate-then-collide
-                # (UniqueViolationError at commit). But the RETURN is fenced
-                # (W4-6, closing W3-3's accepted exposure): upsert is a
-                # read-modify-write, so a committed survivor the acting
-                # principal cannot READ is denied — never handed back — failing
-                # closed on absent labels too (a committed oid always has them).
-                # Dedup is unaffected: the lookup still found the row, and the
-                # write gate still fences the merge for a readable survivor.
+                # The LOOKUP is read-unfenced by design (ADR-008 W3-3): a filtered lookup would
+                # duplicate-then-collide. The RETURN is fenced (W4-6): a committed survivor the
+                # principal cannot READ is denied, failing closed on absent labels too. The write
+                # gate still fences the merge for a readable survivor.
                 if ti.protected and not is_root(self.principal):
                     labels = ci.committed_labels(oid)
                     if labels is None or not can_read_row(self.principal, *labels):
@@ -1230,43 +936,12 @@ class Store:
         return None
 
     def commit(self) -> int | None:
-        """Atomically persist all buffered changes; returns the new commit
-        TID, or ``None`` if there was nothing to commit.
+        """Atomically persist all buffered changes; return the new TID, or ``None`` if none.
 
-        All validation runs in P1 *before* the TID is allocated, so any of
-        these leaves the TID sequence gapless (invariant 5) and the buffered
-        changes intact for a fixed-up retry.
-
-        Raises:
-            LeaseLostError: this process lost the single-writer lease
-                (invariant 10) — another process may own the store now, so
-                the write is refused.
-            UniqueViolationError: a buffered change would create a duplicate
-                value in a ``dc.Unique`` field (against committed state or
-                another entity in the same commit).
-            MixedTemporalIndexError: a ``dc.SortedIndex`` ``datetime`` field
-                would mix timezone-naive and timezone-aware values, which are
-                not mutually orderable (ADR-004 §4).
-            DanglingRefError: only under ``strict_deletes=True`` — this commit
-                deletes a record another surviving record still points at
-                (the eager ADR-003 dangling-ref check).
-            WriteDeniedError: a buffered write to a protected record was
-                denied (ADR-008 R10): below the record's current write floor,
-                an R8 ceiling violation, or an anonymous protected create.
-                Like every P1 validation this fires before the TID — buffers
-                stay intact for ``discard()`` or a fixed-up retry (a denial
-                is deterministic: retrying under the same principal re-denies,
-                and ``committing()`` never auto-retries it).
-            OverflowError: an integer field value is outside msgpack's
-                signed/unsigned 64-bit range.
-            ValueError: a ``dc.BlobSource`` declared a size its bytes do not
-                total.
-            TypeError: a ``dc.Blob`` field holds neither ``bytes`` nor a
-                ``dc.BlobSource``, or a field holds a value msgpack cannot
-                encode (an unsupported type).
-            WrongThreadError: called from a thread other than the store's
-                owner (ADR-001).
-            StoreClosedError: the store has already been closed.
+        Validation runs in P1 before the TID, so a failure keeps the sequence gapless and the
+        buffers. A ``WriteDeniedError`` (ADR-008 R10) is deterministic: ``committing()`` never
+        retries it. Also raises ``LeaseLostError``, ``UniqueViolationError`` and
+        ``DanglingRefError`` (strict deletes).
         """
         self._enter()
         if self._contribute_fn is not None:  # a follower: fan in to the coordinator
@@ -1282,17 +957,13 @@ class Store:
         return self._p3_finalize(capture)
 
     def _contribute(self) -> int | None:
-        """A follower's ``commit()``: fan the buffered writes into the coordinator
-        (#153) instead of a local P1/P2/P3.
+        """Fan a follower's buffered writes into the coordinator instead of a local commit (#153).
 
-        Serializes the buffered NEW/DIRTY entities — a NEW one carries
-        ``base=None``; an edited existing one the SHA-256 of the payload it was
-        read at (OCC) — and hands them to the installed ``_contribute_fn`` (which
-        POSTs ``/v1/submit``). On success the local buffers clear and a
-        :meth:`sync` pulls the committed delta back (read-your-writes); identity
-        is by OID, so re-query for the coordinator-minted instance. A coordinator
-        reject raises ``ConflictError``/``SchemaSkewError`` with the buffers left
-        intact — re-read and retry.
+        A NEW entity carries ``base=None``, an edited one the SHA-256 of the payload it was read at
+        (OCC). They go to ``_contribute_fn`` (``POST /v1/submit``); on success :meth:`sync` pulls
+        the delta back. A reject raises ``ConflictError`` or ``SchemaSkewError`` with the buffers
+        intact.
+        See docs/design/COMMIT-DELTA-v2.md, section 8.
         """
         assert self._contribute_fn is not None
         if self._deleted:  # /v1/submit is upsert-only (FEDERATION-WIRE-v1 §3) —
@@ -1359,12 +1030,8 @@ class Store:
                     (oid, ti, {name: getattr(obj, name) for name in relevant})
                 )
         prot_deletes = [(oid, ti) for oid, ti, _ in deletes if ti.protected]
-        # #110: the eager dangling-ref check (debug/strict_deletes) needs the
-        # reverse index BUILT to enumerate surviving referrers of a deleted OID
-        # — force it before the ref-harvest gate so ref_entries is populated and
-        # the check sees both prior-commit and same-commit referrers. Unarmed,
-        # this is skipped and the gate below stays lazy (spec §5: an unwatched
-        # store pays nothing — the reverse index stays unbuilt).
+        # #110: the eager dangling-ref check (debug/strict_deletes) needs the reverse index built,
+        # so force it before the ref-harvest gate; unarmed, the gate below stays lazy (spec §5).
         if (self._debug or self._strict_deletes) and deletes:
             self._index.ensure_reverse()
         # #20: harvest outgoing refs for the reverse index — only when it is
@@ -1395,13 +1062,10 @@ class Store:
         )
         new_types: list[tuple[int, str, list[str]]] = []
         encoded: list[tuple[int, int, bytes]] = []
-        # Out-of-line blob values this commit writes (ADR-007 / #82). Each
-        # dc.Blob field with a non-None value is split out here: its bytes go to
-        # the blobs table, the record keeps only a tiny BLOB_EXT descriptor. The
-        # blob OID rides the existing partitioned OID space (invariant 6). The
-        # sink runs DURING encoding — before the TID is allocated — so it records
-        # (oid, size, hash, data) tuples now and the StoredBlobs are stamped with
-        # this commit's tid once it is known (a blob's descriptor carries no tid).
+        # Out-of-line blob values this commit writes (ADR-007 / #82): each non-None dc.Blob field's
+        # bytes go to the blobs table and the record keeps a BLOB_EXT descriptor. The sink runs
+        # during encoding, before the TID exists, so it records (oid, size, hash, data) now and the
+        # StoredBlobs are stamped with this commit's tid later.
         blob_data: list[tuple[int, int, bytes, bytes]] = []
         # Streamed blobs (ADR-007 §4): (oid, size, hash, open_chunks) — the bytes
         # are NOT resident; they fill a zeroblob cell in P2.
@@ -1468,14 +1132,10 @@ class Store:
                     blob_swaps.append(
                         (obj, ti.field_names[i], tok.blob_oid, tok.size, tok.hash)
                     )
-        # Prior payloads for the delta stream (COMMIT-DELTA-v1 §3): read
-        # back the last durable payload of every already-persisted record —
-        # O(delta) reads, only while consumers watch, and like encoding
-        # strictly before the TID allocation (a failed read rejects the
-        # commit without consuming a TID). Deletes always have a persisted
-        # record (NEW entities never enter the delete buffer), and their
-        # tombstones carry it as prior (spec §3.1, strictly verified by the
-        # reference applier).
+        # Prior payloads for the delta stream (COMMIT-DELTA-v1 §3): the last durable payload of
+        # every persisted record, read O(delta) and only while consumers watch, before the TID
+        # allocation (a failed read consumes no TID). Deletes always have a persisted record, and
+        # their tombstones carry it as prior (spec §3.1).
         priors: dict[int, bytes] = {}
         delete_ops: list[tuple[int, int, bytes]] = []
         if self._consumers:
@@ -1562,13 +1222,10 @@ class Store:
                         deletes, blob_swaps)
 
     def _prior_labels(self, rec: StoredRecord) -> tuple[int, list[int], int, int]:
-        """The four ``_dc_`` label values from a PRIOR persisted payload —
-        decode-level (constructs no entities, touches no registry; the
-        count()/pluck() doctrine). A cid whose persisted shape lacks the
-        columns predates protection → the R7 legacy fill, from the same
-        shared constant every decode site uses (never the R6 birth
-        defaults: that would read legacy write floors as VIEWER —
-        world-writable, R7 inverted). Positions cache per cid.
+        """Return the four ``_dc_`` label values of a prior payload, decoded without entities.
+
+        A cid whose shape lacks the columns predates protection and gets the shared R7 legacy fill,
+        never the R6 birth defaults (those read legacy write floors as VIEWER).
         """
         pos = self._perm_positions.get(rec.cid, _PERM_POS_UNSET)
         if pos is _PERM_POS_UNSET:
@@ -1590,11 +1247,11 @@ class Store:
         return (values[pos[0]], list(values[pos[1]]), values[pos[2]], values[pos[3]])
 
     def _prior_actor_memberships(self, rec: StoredRecord) -> dict[int, int]:
-        """The prior ``Actor.memberships`` map from a persisted payload —
-        decode-level (constructs no entity), for the F1 re-level ceiling so a
-        membership left UNCHANGED never needs re-clearing (ADR-008 R8). A cid
-        whose shape predates the field decodes as ``{}`` (every entry then
-        reads as newly granted, which only ever fails safe — stricter).
+        """Return the prior ``Actor.memberships`` map of a persisted payload, without entities.
+
+        Used by the F1 re-level ceiling, so an unchanged membership is never re-cleared (ADR-008
+        R8). A cid whose shape predates the field decodes as ``{}``: every entry reads as newly
+        granted, which fails safe.
         """
         persisted = self._persisted_fields.get(rec.cid, [])
         try:
@@ -1609,20 +1266,13 @@ class Store:
         prot_pending: list[tuple[int, Any, TypeInfo]],
         prot_deletes: list[tuple[int, TypeInfo]],
     ) -> dict[int, StoredRecord]:
-        """The ADR-008 write fence, in P1 strictly before the TID (R10):
-        every buffered protected write — content, label change, or delete —
-        must clear the record's CURRENT (persisted) write floor, and every
-        CHANGED floor must be ≤ the committing principal's own authority
-        (the R8 ceiling; unchanged floors never block a pure content edit,
-        which is also what keeps ``migrate()``'s verbatim re-stages legal).
-        The one bypass is root (R9) — decided from the principal alone, so
-        it short-circuits before any prior I/O; root commits still stamp.
+        """Enforce the ADR-008 write fence in P1, before the TID (R10); return the priors loaded.
 
-        Returns the prior records it loaded so the delta-priors block reads
-        each protected prior exactly once. Denial = ``WriteDeniedError``
-        with the buffers intact (``discard()`` or fix and retry — the
-        defined W2-6 state); ``committing()`` never retries it (denial is
-        deterministic, not OCC).
+        Every buffered protected write must clear the record's current write floor; every changed
+        floor must be at most the committer's authority (R8). Root bypasses (R9), decided from the
+        principal alone; root commits still stamp. Denial raises ``WriteDeniedError`` with the
+        buffers intact; ``committing()`` never retries it.
+        See docs/design/ADR-008-permissions-contract.md, "Birth labels and the write fence".
         """
         p = self.principal
         if is_root(p):
@@ -1642,27 +1292,20 @@ class Store:
         for oid, obj, ti in prot_pending:
             prior = labels.get(oid)
             if prior is None:
-                # NEW record: no floor to clear. The anonymous case is
-                # normally refused at the stamp site (W2-2); this closes the
-                # remaining paths (e.g. debug-mode rescue of an unstamped
-                # instance) identically. The gate baseline is the record's
-                # birth/inherited labels — NOT empty: inheritance is the
-                # library's policy (the container was already shared by
-                # someone with standing), so the acting principal is only
-                # answerable for what it staged ON TOP of it.
+                # NEW record: no floor to clear. The anonymous case is normally refused at the
+                # stamp site (W2-2); this closes the remaining paths. The baseline is the
+                # birth/inherited labels, not empty: inheritance is library policy, so the
+                # principal answers only for what it staged on top.
                 if p.uid == 0:
                     deny(f"cannot create a protected {ti.cls.__name__} as the "
                          "anonymous principal (a record nobody owns must not "
                          "exist, R6/R7a)")
                 base = self._birth_labels.get(oid, (obj._dc_owner, [], VIEWER, VIEWER))
                 if obj._dc_owner != base[0]:
-                    # F2 (ADR-008 R6, 2026-07-16): the birth owner is the acting
-                    # principal's uid, stamped in _stamp_perm_labels. Setting
-                    # `_dc_owner` between store() and commit() would forge it —
-                    # planting a record in a victim's owner-only space, or an
-                    # unreachable owner=0 orphan. The persisted branch already
-                    # pins ownership (R8 amendment); this pins it at birth too,
-                    # closing the create/persist asymmetry.
+                    # F2 (ADR-008 R6): the birth owner is the acting uid stamped in
+                    # _stamp_perm_labels. Setting `_dc_owner` between store() and commit() would
+                    # forge it, planting a record in a victim's owner-only space or an owner=0
+                    # orphan; this pins ownership at birth like the persisted branch does.
                     deny(f"cannot stamp {ti.cls.__name__} oid={oid} with owner "
                          f"{obj._dc_owner}: a new record's owner is the acting "
                          f"principal ({base[0]}), never assigned by hand (R6)")
@@ -1675,13 +1318,11 @@ class Store:
                          "everyone, including the owner — the curation "
                          "guarantee)")
                 if obj._dc_owner != prior[0]:
-                    # Ownership is immutable after birth: only root (R9, which
-                    # already short-circuited above) may reassign it. Without
-                    # this, any writer who clears the current write floor could
-                    # stage itself as owner and (a) gain a permanent owner-read
-                    # bypass and (b) mint its personal-best level into the R8
-                    # ceiling below (which reads the STAGED owner) — a chown is
-                    # not a mint for authority (ADR-008 R8, amendment 2026-07-15).
+                    # Ownership is immutable after birth: only root (R9, short-circuited above) may
+                    # reassign it. Otherwise any writer clearing the write floor could stage itself
+                    # as owner, gaining a permanent owner-read bypass and minting its personal-best
+                    # level into the R8 ceiling, which reads the STAGED owner (ADR-008 R8,
+                    # amendment 2026-07-15).
                     deny(f"cannot change owner of {ti.cls.__name__} oid={oid} "
                          f"from {prior[0]} to {obj._dc_owner}: ownership is "
                          "immutable after birth — only root may reassign it (R9)")
@@ -1704,17 +1345,11 @@ class Store:
                          f"record is {ceiling} (R8 ceiling — a label write is "
                          "a write, bounded by what you hold)")
             if ti.cls is Actor:
-                # F1 (ADR-008 R8, 2026-07-16): an Actor's `memberships` IS
-                # authority — acting_as(uid) turns a stored level into a live
-                # Principal. The generic new-record branch has no floor to
-                # clear, so without this a lowly writer could mint itself an
-                # Actor(memberships={WORLD: EXECUTIVE}) and acting_as() into
-                # root. The R8 ceiling extended to authority-bearing birth AND
-                # re-level: every CHANGED membership must be ≤ the level the
-                # committer holds in that group. Minting WORLD:EXECUTIVE thus
-                # needs the committer to already hold it — i.e. be root (which
-                # short-circuited at the top). Lowering/removing never blocks;
-                # a curator can still onboard a bot inside their own group.
+                # F1 (ADR-008 R8): an Actor's `memberships` is authority, since acting_as(uid)
+                # turns a stored level into a live Principal; without this a writer could mint
+                # Actor(memberships={WORLD: EXECUTIVE}) and act as root. So every CHANGED
+                # membership must be at most the level the committer holds in that group (root
+                # returned above). Lowering or removing never blocks.
                 prior_m = (self._prior_actor_memberships(records[oid])
                            if prior is not None else {})
                 for g, lvl in obj.memberships.items():
@@ -1741,11 +1376,12 @@ class Store:
             self._io_executor().submit(self._backend.apply, batch).result()
 
     def _p2_rollback(self, capture: _Capture) -> None:
-        """A failed P2 was never durable: re-buffer the captured set (unless
-        a racing write already re-buffered an entity) and reuse the TID —
-        the sequence stays gapless (invariant 5).
+        """Compensate a failed P2: re-buffer the captured set and reuse the TID (invariant 5).
+
+        A failed P2 was never durable. An entity that a racing write already re-buffered is left as
+        that write made it.
         """
-        self._alloc._next_tid = capture.tid  # pyright: ignore[reportPrivateUsage]  # gapless TID reuse, invariant 5
+        self._alloc._next_tid = capture.tid  # gapless TID reuse, invariant 5
         for oid, obj, prior in capture.flipped:
             if prior == STATE_NEW:
                 set_state(obj, STATE_NEW)
@@ -1781,16 +1417,13 @@ class Store:
         # plain bytes value is left as-is (it stays readable as itself).
         for obj, field, boid, size, digest in capture.blob_swaps:
             # engine-only BlobHandle constructor (users never call _bind)
-            handle = BlobHandle._bind(boid, size, digest, self)  # pyright: ignore[reportPrivateUsage]
+            handle = BlobHandle._bind(boid, size, digest, self)
             set_field(obj, field, handle)
         if self._debug:
-            # For a blob-bearing entity the stored payload carries the real
-            # blob OID, but the sweep recomputes a content-only (oid-0)
-            # descriptor — so fingerprint such entities through the same
-            # _fingerprint_payload epoch. (A streamed BlobSource was just swapped
-            # to a BlobHandle above; a whole-write bytes value is still resident
-            # bytes here — both descriptor-ize identically.) Non-blob records
-            # keep the cheap stored-crc.
+            # A blob-bearing entity's stored payload carries the real blob OID but the sweep
+            # recomputes a content-only (oid-0) descriptor, so fingerprint it through the same
+            # _fingerprint_payload epoch (a BlobSource was swapped to a BlobHandle above). Non-blob
+            # records keep the cheap stored-crc.
             flipped_by_oid = {oid: obj for oid, obj, _ in capture.flipped}
             for rec in capture.batch.records:
                 obj = flipped_by_oid.get(rec.oid)
@@ -1821,7 +1454,7 @@ class Store:
                         f"consumer applied tid {tid} but reports watermark "
                         f"{consumer.watermark} — it violates COMMIT-DELTA-v1 §4.3"
                     )
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - a raising consumer must never break a durable commit
                 self._consumers.remove(consumer)
                 warnings.warn(
                     ConsumerDetachedWarning(
@@ -1838,23 +1471,12 @@ class Store:
         deletes: list[tuple[int, TypeInfo, Any | None]],
         ref_entries: list[tuple[int, set[int]]],
     ) -> None:
-        """#110 (the ADR-003 dev-time bridge): name any *surviving* record still
-        pointing at an OID this commit deletes — turning a later spooky
-        ``DanglingRefError`` (raised far away at the eventual dereference, ADR-003
-        rule 8) into an at-the-delete diagnostic. ``strict_deletes=True`` raises;
-        ``debug=True`` alone warns. Runs in P1 *before* the TID allocation so a
-        raise leaves the sequence gapless (invariant 5).
+        """Name any surviving record that still points at an OID this commit deletes (#110).
 
-        The flagged set must equal ``incoming(dead)`` *after* this commit's P3
-        folds (``apply_reverse``/``remove_reverse`` at :meth:`_p3_finalize`), which
-        is the user-meaningful set. At P1 the reverse map (forced built by
-        ``ensure_reverse`` in :meth:`_p1_capture`) still reflects the *pre-commit*
-        watermark, so this reconstructs the post-fold referrers per deleted OID:
-        the pre-commit referrers, reconciled against THIS commit's harvested
-        outgoing refs (a NEW/DIRTY referrer that now points at the dead OID is
-        added; a DIRTY referrer that dropped the ref is removed), minus the
-        co-deleted set (a referrer also deleted here drops out — ADR-003: its
-        outgoing edges vanish). The seam is ``incoming(dead)`` (ADR-003, line 108).
+        ``strict_deletes=True`` raises, ``debug=True`` alone warns; it runs in P1 before the TID
+        (invariant 5). The flagged set equals ``incoming(dead)`` after this commit's P3 folds:
+        pre-commit referrers, reconciled with this commit's refs, minus co-deleted ones.
+        Reconstruction: docs/design/ADR-003-delete-semantics.md, "Dev-time bridge".
         """
         deleted_oids = {oid for oid, _, _ in deletes}
         rev = self._index.ensure_reverse()  # pre-commit map (forced built by P1)
@@ -1934,7 +1556,7 @@ class Store:
             try:
                 payload = self._fingerprint_payload(obj, ti)
                 changed = _crc(payload) != expected
-            except BaseException:
+            except BaseException:  # noqa: BLE001 - any failure to re-encode proves an untracked change
                 # It encoded fine when its fingerprint was taken, so the
                 # failure itself proves an untracked change (e.g. a brand-new
                 # entity attached via a bypass write). Rescue it: the commit
@@ -1961,19 +1583,12 @@ class Store:
         return self._io
 
     def submit(self, fn: Callable[[], Any]) -> Future[Any]:
-        """Run ``fn()`` on the owner thread; returns a Future for its result.
+        """Run ``fn()`` on the owner thread and return a Future for its result.
 
-        The sanctioned cross-thread write path (ADR-001): foreign threads
-        must not touch live entities, but they may ship a closure here. The
-        owner executes pending submissions whenever it next calls into the
-        store (piggyback), or explicitly via :meth:`run_pending`; under
-        ``aopen()`` the loop is woken instead. A result that would carry a
-        live entity (directly or inside a container) fails the Future with
-        ``EntityEscapeError`` — return plain data.
-
-        Raises:
-            StoreClosedError: the store has already been closed (so the
-                submission could never run).
+        The sanctioned cross-thread write path (ADR-001): the owner runs pending closures on its
+        next store call. A result carrying a live entity fails the Future with
+        ``EntityEscapeError``: return plain data.
+        Raises ``StoreClosedError`` if the store is closed.
         """
         if self._closed:
             raise StoreClosedError("this store has been closed")
@@ -2024,16 +1639,14 @@ class Store:
     def _execute_submission(self, fn: Callable[[], Any], future: Future[Any]) -> None:
         if not future.set_running_or_notify_cancel():
             return
-        # Identity isolation (epic #168 W1, review finding): the pump
-        # piggybacks on owner API calls, which may sit INSIDE an acting_as
-        # scope — a queued foreign-thread closure must never inherit that
-        # scoped identity (its commit would stamp another user's actor).
-        # Queued work always runs as the AMBIENT principal; a closure that
-        # should act as someone opens its own acting_as inside.
+        # Identity isolation (epic #168 W1): the pump piggybacks on owner calls that may sit inside
+        # an acting_as scope. A queued foreign-thread closure must not inherit it (its commit would
+        # stamp another user's actor): queued work runs as the AMBIENT principal, and a closure
+        # that should act as someone opens its own acting_as.
         token = self._acting.set(())
         try:
             result = fn()
-        except BaseException as exc:
+        except BaseException as exc:  # noqa: BLE001 - every error, even a BaseException, is handed to the waiting future
             future.set_exception(exc)
             return
         finally:
@@ -2049,25 +1662,13 @@ class Store:
         future.set_result(result)
 
     def attach(self, consumer: DeltaConsumer) -> None:
-        """Attach a COMMIT-DELTA-v2 consumer: from the next commit on it
-        receives every delta, in TID order, on the owner thread, strictly
-        after the commit is durable (ROADMAP item 3; spec §4 obligations).
+        """Attach a COMMIT-DELTA-v2 consumer that gets each later delta in TID order, once durable.
 
-        The consumer's watermark must equal ``store.last_tid``. Deltas are
-        not retained (spec §5), so a consumer that is *behind* cannot be
-        caught up — rebuild it from ``store.snapshot()`` (the snapshot's
-        ``tid`` and ``types`` are exactly the bootstrap it needs). A
-        consumer *ahead* of the store means the store was restored to an
-        older point — the sidecar is stale and must be rebuilt (fitness #13).
-
-        Raises:
-            DeltaGapError: the consumer's watermark is behind the store
-                (deltas are not retained — rebuild from ``store.snapshot()``)
-                or ahead of it (the sidecar is stale — rebuild it).
-            DataCrystalError: this consumer is already attached.
-            WrongThreadError: called from a thread other than the store's
-                owner (ADR-001).
-            StoreClosedError: the store has already been closed.
+        The consumer's watermark must equal ``store.last_tid``: deltas are not retained (spec §5),
+        so a consumer behind rebuilds from ``store.snapshot()``, and one ahead means a stale
+        sidecar (fitness #13).
+        Raises ``DeltaGapError`` for either mismatch and ``DataCrystalError`` if already attached.
+        See docs/design/COMMIT-DELTA-v2.md, section 8.
         """
         self._enter()
         watermark = consumer.watermark
@@ -2105,72 +1706,29 @@ class Store:
         raise DataCrystalError("this consumer is not attached")
 
     def snapshot(self, *, principal: Principal | None = None) -> Snapshot:
-        """A frozen, read-only view of the committed state at the current
-        durable commit watermark — **callable from any thread**, even while
-        the owner commits (ADR-001 rider 2; ADR-002 read views).
+        """Return a frozen read-only view of the committed state at the watermark, from any thread.
 
-        Bound to ONE acting principal (ADR-008 R15): ``principal=None`` captures
-        the acting principal in effect NOW (``self.principal`` — the innermost
-        ``acting_as`` scope, or the ambient identity); an explicit
-        :class:`~datacrystal.Principal` binds that identity instead (never
-        resolved via the Actor registry — Principal objects only). Discovery
-        surfaces filter to that principal's readable set; deref surfaces mask
-        denied protected rows as redacted twins. Derive a sibling handle for
-        another identity over the SAME shared state in O(1) with
-        :meth:`Snapshot.for_principal`.
-
-        Use it as a context manager and close it promptly: on the sqlite
-        backend an open snapshot pins a WAL read transaction. Views are
-        plain immutable data (:class:`EntityView`); references come back as
-        :class:`Ref` tokens for ``snapshot.get()`` — never live entities.
-
-        Raises:
-            StoreClosedError: the store has already been closed. (No owner
-                guard — a snapshot is callable from any thread.)
+        Safe during owner commits (ADR-002); close promptly, it pins a sqlite WAL read transaction.
+        Bound to one principal (ADR-008 R15): ``None`` takes the acting principal in effect now.
+        :meth:`Snapshot.for_principal` derives a sibling handle for another identity in O(1). Views
+        are immutable :class:`EntityView` data; references are :class:`Ref` tokens.
         """
         # Deliberately NOT _enter(): no owner guard, no piggyback work.
         # The read view isolates itself from the live engine entirely.
         if self._closed:
             raise StoreClosedError("this store has been closed")
         bound = principal if principal is not None else self.principal
-        core = _SnapshotCore(self._backend.read_view())  # pyright: ignore[reportPrivateUsage]
+        core = _SnapshotCore(self._backend.read_view())
         return Snapshot(core, bound)
 
     def open_blob(self, entity: Any, field: str) -> BinaryIO:
         """Open a committed ``dc.Blob`` field as a binary stream (ADR-007 §3).
 
-        Returns a file-like ``io.BufferedReader`` (``read(n)``/``seek``/``tell``,
-        a context manager) over the blob's raw bytes. A range read pulls only the
-        spanned bytes off disk, so peak RSS is bounded by the read buffer, never
-        the blob size — this is the way to read a big value (a PDF, a scan)
-        without materializing it whole, the streamed sibling of
-        :meth:`BlobHandle.bytes`.
-
-        The stream rides a private snapshot-isolated read view (ADR-002): once
-        opened it is safe to keep reading from **another thread** while the owner
-        commits, and an immutable blob row is never torn mid-read. Close it
-        promptly (it pins a WAL read transaction) — it is a context manager.
-
-        Resolving ``field`` reads the live ``entity``, so this call is
-        owner-confined; the returned stream is not. (For a fully off-owner read,
-        open from a :meth:`snapshot` view instead.) An unknown field raises
-        ``QueryError`` and a non-``dc.Blob`` field ``TypeError``; a ``None`` blob
-        raises ``ValueError``. An uncommitted raw-bytes value streams from an
-        in-memory ``BytesIO`` (nothing is saved by it yet); an uncommitted
-        ``dc.BlobSource`` raises ``ValueError`` — ``commit()`` it first, since its
-        bytes are not resident.
-
-        Raises:
-            NotAnEntityError: ``entity`` is not an ``@entity`` class instance.
-            QueryError: ``field`` is not a field of the entity.
-            TypeError: ``field`` is not a ``dc.Blob`` field (or holds an
-                unexpected blob value).
-            ValueError: the blob value is ``None``, or it holds an
-                uncommitted ``dc.BlobSource`` (whose bytes are not yet
-                resident — ``commit()`` first).
-            WrongThreadError: called from a thread other than the store's
-                owner (ADR-001); the returned stream itself is not confined.
-            StoreClosedError: the store has already been closed.
+        Return an ``io.BufferedReader`` whose range reads pull only the spanned bytes. The stream
+        rides a private snapshot view (ADR-002): readable from another thread; close it. The call
+        is owner-confined (it reads the live ``entity``); the stream is not.
+        Raises ``QueryError``, ``TypeError`` (not a Blob), ``ValueError`` (``None`` or uncommitted
+        ``BlobSource``).
         """
         self._enter()
         ti = type_info(entity)
@@ -2196,7 +1754,7 @@ class Store:
             # Uncommitted raw assignment: already whole in RAM, stream a copy.
             return io.BytesIO(bytes(value))
         if isinstance(value, BlobSource):
-            raise ValueError(
+            raise ValueError(  # noqa: TRY004 - ValueError is the documented contract
                 f"{ti.typename}.{field} holds an uncommitted dc.BlobSource — "
                 "commit() before opening a streamed-write blob for reading"
             )
@@ -2206,23 +1764,12 @@ class Store:
         )
 
     def get(self, cls: type, **unique_key: Any) -> Any | None:
-        """Look up one entity by a unique secondary key, e.g.
-        ``store.get(Mineral, qid="Q43010")``. Returns ``None`` if absent.
-        Reflects committed state.
+        """Return one entity by unique secondary key, or ``None``: ``store.get(Mineral, qid=...)``.
 
-        On a ``protected=True`` class, a key that exists but is unreadable
-        by the current principal (ADR-008) also returns ``None`` — found-
-        but-denied is indistinguishable from absent (R12: discovery never
-        leaks existence). Root sees everything.
-
-        Raises:
-            NotAnEntityError: ``cls`` is not an ``@entity`` class.
-            QueryError: the keyword field is not a ``dc.Unique`` field
-                (``get`` looks up unique secondary keys only).
-            TypeError: not exactly one unique-field keyword was given.
-            WrongThreadError: called from a thread other than the store's
-                owner (ADR-001).
-            StoreClosedError: the store has already been closed.
+        The lookup reflects committed state; the returned instance is the live one, buffered edits
+        included.
+        On a ``protected=True`` class a found-but-unreadable key is also ``None`` (ADR-008 R12).
+        Raises ``QueryError`` for a non-Unique keyword, ``TypeError`` unless exactly one is given.
         """
         self._enter()
         if len(unique_key) != 1:
@@ -2247,35 +1794,13 @@ class Store:
         return self._load_oid(oid)
 
     def get_many(self, refs: Iterable[Any] | type, /, **unique_key: Any) -> list[Any]:
-        """Batch-hydrate in one storage round-trip (SDA delta 5: N+1 is
-        never the user's problem). Two call shapes::
+        """Hydrate many entities in one storage round-trip (SDA delta 5).
 
-            store.get_many(mixed)                      # OIDs / Lazy / Ref / entities
-            store.get_many(Mineral, qid=["Q1", "Q2"])  # bulk unique-key lookup
-
-        The unique-key form returns a list aligned with the given values,
-        ``None`` where a key is absent — the bulk twin of :meth:`get`, for
-        ETL upserts that fetch thousands of natural keys at once. Like
-        :meth:`get`, a denied ``protected=True`` key is also a ``None``
-        slot (ADR-008 R12: found-but-denied ≡ absent).
-
-        The iterable (OID / ``Lazy`` / ``Ref`` / entity) form is a DEREF
-        surface, not a filter (ADR-008 R14): a denied-but-existing
-        ``protected=True`` OID/``Ref`` returns a :class:`~datacrystal.Redacted`
-        twin rather than ``None`` — you already hold that reference, so
-        this mirrors ``lazy_ref.get()``, never silently drops it.
-
-        Raises:
-            NotAnEntityError: an item in the iterable shape is not an OID,
-                ``Lazy``, ``Ref`` or entity; or, in the key shape, ``cls`` is
-                not an ``@entity`` class.
-            QueryError: the keyword field in the key shape is not a
-                ``dc.Unique`` field.
-            TypeError: the key shape was given a non-class first argument, or
-                not exactly one unique-field keyword.
-            WrongThreadError: called from a thread other than the store's
-                owner (ADR-001).
-            StoreClosedError: the store has already been closed.
+        Shapes: ``get_many(mixed)`` (OIDs, ``Lazy``, ``Ref``, entities) and ``get_many(Mineral,
+        qid=[...])``. The key form is aligned with the values, ``None`` where absent or denied
+        (R12). The iterable form is a DEREF surface (R14): a denied item returns a ``Redacted``
+        twin.
+        Raises ``NotAnEntityError``, ``QueryError``, ``TypeError`` for bad items or shapes.
         """
         self._enter()
         if unique_key:
@@ -2285,7 +1810,7 @@ class Store:
                     "class as its first argument"
                 )
             return self._get_many_by_key(refs, unique_key)
-        items: list[Any] = list(refs)  # type: ignore[arg-type]  # a class without kwargs falls through
+        items: list[Any] = list(refs)  # a class without kwargs falls through
         wanted: list[int] = []
         for item in items:
             if isinstance(item, Lazy):
@@ -2365,14 +1890,11 @@ class Store:
         ]
 
     def _get_many_unchecked(self, oids: Iterable[int]) -> list[Any]:
-        """Hydrate committed OIDs with NO read enforcement (ADR-008 W3-3).
+        """Hydrate committed OIDs with no read enforcement (ADR-008 W3-3), internal plumbing only.
 
-        Internal plumbing for callers that have already filtered the OID
-        set under the relevant principal (``query``/``query_iter``'s
-        post-intersect hydration, W3-2) or that are write plumbing that
-        must see every record regardless of who is acting (``migrate``).
-        Never exposed publicly — every public read surface goes through the
-        checked ``get``/``get_many``/deref path instead.
+        For callers that already filtered the OIDs under the relevant principal
+        (``query``/``query_iter``, W3-2) or that must see every record whoever acts (``migrate``).
+        Every public read goes through the checked ``get``/``get_many``/deref path instead.
         """
         oids = list(oids)
         missing = [o for o in oids if self._registry.get(o) is None]
@@ -2380,15 +1902,11 @@ class Store:
         return [self._load_oid(o, cache) for o in oids]
 
     def _get_by_key_unchecked(self, cls: type, field: str, value: Any) -> Any | None:
-        """``get()`` minus the read fence (ADR-008 W3-3) — the identity-
-        bootstrap seam.
+        """Return ``get()`` minus the read fence (ADR-008 W3-3), the identity-bootstrap seam.
 
-        Used by :meth:`_resolve_registry_actor`: ``Actor`` is protected and
-        a W2-born row carries owner-only birth labels, so a fenced lookup
-        would make ``acting_as(uid)`` raise ``UnknownActorError`` for any
-        session that cannot yet read its own registry row — including every
-        anonymous-to-login flow. Resolution is identity plumbing
-        ("authenticate outside, remember inside"), not disclosure.
+        Used by :meth:`_resolve_registry_actor`: ``Actor`` is protected, so a fenced lookup would
+        raise ``UnknownActorError`` for a session that cannot yet read its own registry row.
+        Resolution is identity plumbing ("authenticate outside, remember inside"), not disclosure.
         """
         ti = type_info(cls)
         if self._cid_by_typename.get(ti.typename) is None:
@@ -2398,46 +1916,13 @@ class Store:
 
     def query(self, target: type | Condition, *, limit: int | None = None,
               offset: int = 0, order_by: Any = None) -> list[Any]:
-        """Hydrated committed entities matching ``target`` — a Condition,
-        or an entity class for the **full extent**.
+        """Return the hydrated committed entities matching ``target``, a Condition or entity class.
 
-        ``query(Mineral)`` is the honest spelling of the expensive shape
-        (every committed Mineral is hydrated — the same cost any
-        non-indexed predicate already pays); symmetric with ``count()``/
-        ``pluck()``/``Snapshot.all()`` (decided 2026-06-12). The plan is
-        deterministic and inspectable: :meth:`explain`.
-
-        ``limit=``/``offset=`` window the result (#14). On a fully-indexed
-        (no-residual) query the slice is applied to the candidate OIDs
-        *before* hydration — ``query(C, limit=10)`` loads 10 records, not the
-        extent. A residual predicate must decode-to-filter first, so the
-        window there only trims the materialized list (it cannot prune the
-        scan). Result order is deterministic (ascending OID).
-
-        ``order_by=(field, 'asc'|'desc')`` (or a bare ``field`` for ascending,
-        where ``field`` is ``EntityClass.f`` / ``dc.fields(C).f`` / a name str)
-        sorts the **whole** match set before the window (#25): NULLs sort last,
-        ties break on ascending OID (deterministic paging). On an **indexed**
-        sort field the order comes straight from the index — a ``SortedIndex``
-        field (ADR-004) is effectively free; an un-indexed sort field must
-        decode that field for every match first (an honest O(matches) cost, the
-        same scan a non-indexed predicate pays).
-
-        On a ``protected=True`` class the candidate set is intersected with the
-        current principal's readable OIDs (ADR-008 R12/W3-2) *before* any
-        window/order/hydration — a denied row never reaches the result, never
-        pins a page, and never gets hydrated. Root sees the full match set.
-
-        Raises:
-            NotAnEntityError: ``target`` is an entity class that is not an
-                ``@entity`` class.
-            TypeError: ``target`` is neither an ``@entity`` class nor a
-                Condition, or ``limit``/``offset`` are not ints.
-            ValueError: ``limit`` or ``offset`` is negative.
-            QueryError: ``order_by`` names an invalid field or direction.
-            WrongThreadError: called from a thread other than the store's
-                owner (ADR-001).
-            StoreClosedError: the store has already been closed.
+        ``query(Mineral)`` spells the full extent; :meth:`explain` shows the plan.
+        ``limit``/``offset`` (#14) prune before hydration only on a fully-indexed query.
+        ``order_by=(field, 'asc'|'desc')`` sorts the whole match set before windowing (#25). On
+        ``protected=True`` candidates are intersected with the readable OIDs first (ADR-008 R12).
+        Raises ``QueryError``, ``TypeError`` and ``ValueError`` (negative window).
         """
         self._enter()
         validate_window(limit, offset)
@@ -2475,12 +1960,11 @@ class Store:
 
     def _ordered_window(self, ti: TypeInfo, ci: Any, matched: Any, field: str,
                         descending: bool, limit: int | None, offset: int) -> list[int]:
-        """The ``(offset, limit)`` window of ``matched`` in order_by order
-        (#25/#66). An **indexed** field windows straight from the index,
-        short-circuiting to O(offset+limit) when ``limit`` is set (#66); an
-        **un-indexed** field decodes that one field for every matched OID (the
-        honest O(matches) ceiling), then sorts (NULLs last, ascending-OID
-        tiebreak) and slices.
+        """Return the ``(offset, limit)`` window of ``matched`` in order_by order (#25/#66).
+
+        An indexed field windows straight from the index in O(offset+limit) when ``limit`` is set
+        (#66). An un-indexed field decodes that one field for every matched OID (the honest
+        O(matches) ceiling), then sorts (NULLs last, ascending-OID tiebreak) and slices.
         """
         if field in ci.eq:
             return windowed_index_order(ci, matched, field, descending, limit, offset)
@@ -2489,30 +1973,12 @@ class Store:
         return apply_window(ordered, limit, offset)
 
     def incoming(self, entity: Any) -> list[Any]:
-        """Every committed entity that **references** ``entity`` — backlinks for
-        impact analysis, orphan detection, digital-twin traversal (ROADMAP item
-        8). Answered from a rebuildable in-memory reverse-reference index (never
-        persisted, invariant 11): the first call scans the store once to build
-        it, then it is maintained incrementally at each commit.
+        """Return every committed entity that references ``entity``, for backlinks (ROADMAP 8).
 
-        Counts both eager and ``Lazy`` referrers, in scalar fields and inside
-        list/dict containers. Deletes fold incrementally (a deleted referrer
-        drops out; a deleted *target* keeps its postings, so ``incoming(dead)``
-        names the now-dangling referrers — ADR-003). The same backlinks at a
-        pinned watermark are :meth:`Snapshot.incoming`.
-
-        The reverse index is class-blind, so this is a DISCOVERY surface
-        (ADR-008 R12): a ``protected=True`` referrer the current principal
-        cannot read is silently absent from the result — backlinks never
-        leak existence — filtered at decode level, with zero extra backend
-        I/O beyond the hydration a readable referrer needed anyway. Root
-        sees every referrer.
-
-        Raises:
-            NotAnEntityError: ``entity`` is not an ``@entity`` class instance.
-            WrongThreadError: called from a thread other than the store's
-                owner (ADR-001).
-            StoreClosedError: the store has already been closed.
+        Answered from a rebuildable reverse index (invariant 11), built on first call. A deleted
+        target keeps its postings: ``incoming(dead)`` names dangling referrers (ADR-003). A
+        discovery surface (R12): an unreadable ``protected=True`` referrer is absent.
+        :meth:`Snapshot.incoming` gives the same at a pinned watermark.
         """
         self._enter()
         if not is_entity(entity):
@@ -2558,21 +2024,12 @@ class Store:
         return [self._load_oid(o, cache) for o in survivors]
 
     def verify(self) -> list[tuple[str, int]]:
-        """Decode every committed record against the current code, **without
-        mutating anything** — the read-only consistency check of #26 (c). Returns
-        the ``(typename, oid)`` pairs that do *not* decode to their live
-        ``@entity`` class's shape: a field removed-then-re-added with no default
-        or ``Glue``, a type the running code no longer defines, a payload whose
-        ``Glue`` function raises, or a corrupt record. An empty list means the
-        whole store reads cleanly under this code. ``verify()`` itself never
-        raises on a bad record — reporting it is the point — but the owner guard
-        still applies. Run it before :meth:`migrate`.
+        """Return the ``(typename, oid)`` pairs that do not decode to their live class (#26 (c)).
 
-        Raises:
-            WrongThreadError: called from a thread other than the store's
-                owner (ADR-001) — the only thing that stops ``verify()``;
-                a bad record is reported, never raised.
-            StoreClosedError: the store has already been closed.
+        A read-only check: it never raises on a bad record (the owner guard still applies). Bad
+        means a removed-then-re-added field without default or ``Glue``, an undefined type, a
+        raising ``Glue``, or a corrupt record. An empty list means the store reads cleanly; run it
+        before :meth:`migrate`.
         """
         self._enter()
         failures: list[tuple[str, int]] = []
@@ -2592,38 +2049,13 @@ class Store:
         return failures
 
     def migrate(self, *, batch: int = 10_000) -> int:
-        """Rewrite every record to the newest shape of its live ``@entity`` class
-        (#26 (c)) — the offline counterpart to read-time ``RenamedFrom``/``Glue``.
-        Each record persisted under an *older* lineage cid is hydrated (through
-        renames, glue and defaults) and re-committed under the current-shape cid,
-        so the migrated values become **real persisted columns** — a glued or
-        renamed field can then be indexed. Additive (a new lineage row, never a
-        blob mutation — invariant 8), owner-confined, lease-held, and crash-safe /
-        TID-gapless (it rides the normal commit machine, so a partial run just
-        resumes). **Idempotent**: a second run finds nothing stale and rewrites
-        nothing. Commits in ``batch``-sized chunks, so peak memory is bounded by
-        the batch, not the store. Returns the number of records rewritten; a type
-        with no live class here is left untouched (``verify()`` names it).
+        """Rewrite every record to the newest shape of its live class; return how many (#26 (c)).
 
-        Raises:
-            SchemaMismatchError: a record cannot be hydrated to its live
-                class's shape (a removed-then-re-added field with no default
-                or ``Glue``, or a damaged record) — run :meth:`verify` first
-                to surface these without mutating anything.
-            WriteDeniedError: a rewritten protected record's write floor is
-                not cleared by the migrating principal (ADR-008 — migrate
-                rides the normal commit machine, so the gate applies per
-                chunk; legacy records carry the R7 ``ADMIN`` floor, so run a
-                migration as a store-wide admin or root). A mid-run denial
-                leaves earlier chunks durable; after fixing the identity the
-                run resumes idempotently. :meth:`verify` is read-only and is
-                never gated.
-            LeaseLostError: this process lost the single-writer lease while
-                migrating (invariant 10); a partial run just resumes on the
-                next call (it is TID-gapless and idempotent).
-            WrongThreadError: called from a thread other than the store's
-                owner (ADR-001).
-            StoreClosedError: the store has already been closed.
+        The offline counterpart to read-time ``RenamedFrom``/``Glue``: stale records are
+        re-committed under the current cid, so migrated values become real, indexable columns. It
+        is additive, idempotent and crash-safe, committing in ``batch`` chunks. The write gate
+        applies per chunk: legacy records carry the R7 ``ADMIN`` floor (migrate as admin or root).
+        Raises ``SchemaMismatchError`` (run :meth:`verify` first) and ``WriteDeniedError``.
         """
         self._enter()
         migrated = 0
@@ -2656,33 +2088,12 @@ class Store:
         return migrated
 
     def explain(self, target: type | Condition) -> QueryPlan:
-        """The deterministic plan for ``target``: what answers from
-        bitmaps, what evaluates as a Python residual, and over how many
-        candidates — ``query()`` hydrates at most ``plan.candidates``
-        entities, ``count()``/``pluck()`` decode the same candidates
-        without constructing any.
+        """Return the deterministic plan for ``target``: bitmap parts and the Python residual.
 
-        Exactly two rules, never an optimizer (the analytics planner is
-        DuckDB over the ``[arrow]`` mirror): ``==``/``.in_()`` on
-        ``dc.Index``/``dc.Unique`` fields → bitmaps; everything else →
-        residual. Read-only; builds the class indexes on first use (the
-        same one-time O(extent) cost as a first query).
-
-        On a ``protected=True`` class the ``candidates``/``extent`` NUMBERS
-        are post-filtered to the current principal's readable subset
-        (ADR-008 R12: counts leak existence) — root sees the true numbers.
-        The plan itself is untouched: ``condition``/``residual``/``indexed``
-        and ``__str__`` report the query exactly as given, never a
-        "readable" rule (D8 — the planner stays rule-based, no cost model).
-
-        Raises:
-            NotAnEntityError: ``target`` is an entity class that is not an
-                ``@entity`` class.
-            TypeError: ``target`` is neither an ``@entity`` class nor a
-                Condition.
-            WrongThreadError: called from a thread other than the store's
-                owner (ADR-001).
-            StoreClosedError: the store has already been closed.
+        ``query()`` hydrates at most ``plan.candidates``; ``count()``/``pluck()`` decode them. Two
+        rules, no optimizer: ``==``/``.in_()`` on ``dc.Index``/``dc.Unique`` are bitmaps. The first
+        use builds the class indexes (a one-time O(extent) cost). On ``protected=True`` the counts
+        cover the readable subset only (R12).
         """
         self._enter()
         cls, cond = query_target(target, "explain")
@@ -2698,29 +2109,12 @@ class Store:
         return explain_plan(ti.typename, ci, cond, readable=readable)
 
     def count(self, target: type | Condition) -> int:
-        """How many committed entities match — without hydrating any.
+        """Count the committed entities matching ``target`` without hydrating any.
 
-        ``count(Mineral)`` is the class extent's cardinality; a fully
-        bitmap-answerable condition (``==``/``.in_()`` on indexed fields) is
-        bitmap cardinality — both O(1)-ish, zero record loads. A residual
-        predicate falls back to a decode-level scan of the candidates:
-        records are read and decoded but **no entity is constructed**.
-        Reads committed state (like :meth:`snapshot`, unlike :meth:`query`,
-        whose hydrated results show uncommitted in-memory changes).
-
-        On a ``protected=True`` class the count is over the current
-        principal's readable subset, not the raw extent/candidates (ADR-008
-        R12: counts leak existence, so they are post-filtered like every
-        other discovery surface). Root sees the true count.
-
-        Raises:
-            NotAnEntityError: ``target`` is an entity class that is not an
-                ``@entity`` class.
-            TypeError: ``target`` is neither an ``@entity`` class nor a
-                Condition.
-            WrongThreadError: called from a thread other than the store's
-                owner (ADR-001).
-            StoreClosedError: the store has already been closed.
+        ``count(Mineral)`` is the extent's cardinality, a bitmap-answerable condition is bitmap
+        cardinality, and a residual decodes candidates without building entities. Reads committed
+        state, unlike :meth:`query`. On ``protected=True`` it counts the principal's readable
+        subset (ADR-008 R12).
         """
         self._enter()
         cls, cond = query_target(target, "count")
@@ -2754,44 +2148,12 @@ class Store:
     def pluck(self, target: type | Condition, *fields: str,
               limit: int | None = None, offset: int = 0,
               order_by: Any = None) -> list[Any]:
-        """Project fields without constructing entities — the decode-level
-        column read (ROADMAP item 4; full columnar speed is the
-        ``datacrystal[arrow]`` mirror's job).
+        """Project fields without constructing entities, the decode-level column read (ROADMAP 4).
 
-        ``pluck(Mineral, "name")`` returns a list of values;
-        ``pluck(cond, "name", "mohs")`` a list of tuples. Entity references
-        come back as :class:`~datacrystal.Ref` tokens (feed them to
-        :meth:`get_many` to hydrate), containers as plain lists/dicts.
-        Reads committed state, like :meth:`count`.
-
-        ``limit=``/``offset=`` window the result (#14) with the same
-        stop-early semantics as :meth:`query`: a fully-indexed read decodes
-        only the windowed OIDs; a residual read decodes-to-filter, then
-        trims.
-
-        ``order_by=(field, 'asc'|'desc')`` sorts the whole match set before
-        the window, with the same contract as :meth:`query` (NULLs last,
-        ascending-OID tiebreak; an indexed sort field is ordered from the index,
-        an un-indexed one decodes that field for every match first). The sort
-        field need not be among the projected ``fields``.
-
-        On a ``protected=True`` class the candidates are intersected with the
-        current principal's readable OIDs before any decode (ADR-008 R12) —
-        including ``pluck(C, "_dc_owner")``, which stays legal: it reveals
-        labels only of rows the caller can already read. Root sees everything.
-
-        Raises:
-            NotAnEntityError: ``target`` is an entity class that is not an
-                ``@entity`` class.
-            QueryError: a projected field name is not a persisted field, or
-                ``order_by`` names an invalid field or direction.
-            TypeError: no field names were given, ``target`` is neither an
-                ``@entity`` class nor a Condition, or ``limit``/``offset``
-                are not ints.
-            ValueError: ``limit`` or ``offset`` is negative.
-            WrongThreadError: called from a thread other than the store's
-                owner (ADR-001).
-            StoreClosedError: the store has already been closed.
+        ``pluck(Mineral, "name")`` returns values, ``pluck(cond, "a", "b")`` tuples; refs are
+        ``Ref`` tokens. It reads committed state like :meth:`count`; windowing and ``order_by``
+        follow :meth:`query`. On ``protected=True`` only readable rows are decoded (ADR-008 R12).
+        Raises ``QueryError``, ``TypeError`` (no fields) and ``ValueError``.
         """
         self._enter()
         validate_window(limit, offset)
@@ -2856,41 +2218,12 @@ class Store:
         return out if windowed_early else apply_window(out, limit, offset)
 
     def query_iter(self, target: type | Condition) -> Iterator[Any]:
-        """The lazy sibling of :meth:`query` — **the same query, iterated**.
+        """Iterate the committed result set of :meth:`query` chunk by chunk, in bounded memory.
 
-        ``query`` materializes the matches as a list (and pages them with
-        ``limit=``/``offset=``); ``query_iter`` yields the *identical* committed
-        result set one chunk at a time, with **bounded memory**. The name is
-        deliberate: this is not a decoupled API with its own rules — it answers
-        the same condition with ``query()``'s hydration (live-instance field
-        reads), so any change to ``query``'s semantics is inherited here by
-        construction. Like ``count()``/``pluck()`` it reads committed state at
-        **iteration** time, not call time.
-
-        The ADR-001 owner guard is re-asserted on every pull, so a foreign
-        thread or a closed store stops the stream mid-flight
-        (``WrongThreadError`` / ``StoreClosedError``). The peak live set is
-        O(chunk), never O(extent) — walk millions of matches in bounded RAM.
-
-        On a ``protected=True`` class the candidate set is intersected with
-        the readable OIDs of the **session principal in effect at call
-        time** (ADR-008 W3-2) — the session principal is captured at call
-        time, so a stream opened inside ``acting_as(agent)`` keeps yielding
-        ``agent``'s view even after that ``acting_as`` scope has exited.
-
-        Additive surface: ``query()``'s signature and list return type stay
-        frozen.
-
-        Raises:
-            NotAnEntityError: ``target`` is an entity class that is not an
-                ``@entity`` class.
-            TypeError: ``target`` is neither an ``@entity`` class nor a
-                Condition.
-            WrongThreadError: called — or iterated — from a thread other than
-                the store's owner; the guard is re-asserted on every pull, so
-                this can stop the stream mid-flight (ADR-001).
-            StoreClosedError: the store is closed at the call, or closed
-                while the stream is being iterated.
+        It hydrates exactly like ``query()`` and reads committed state at iteration time. The peak
+        live set is O(chunk); the owner guard is re-asserted on every pull. On ``protected=True``
+        the principal in effect at call time is captured (ADR-008 W3-2), so a stream opened inside
+        ``acting_as(agent)`` keeps that view after the scope exits.
         """
         self._enter()
         cls, cond = query_target(target, "query_iter")
@@ -2916,12 +2249,10 @@ class Store:
         oids = list(candidate)
         for start in range(0, len(oids), _RAW_CHUNK):
             self._guard()  # ADR-001: re-assert before hydrating each new chunk
-            # _get_many_unchecked hydrates one chunk — candidates are already
-            # filtered above under the CAPTURED principal (ADR-008 W3-2); a
-            # checked get_many() would re-derive self.principal and could
-            # re-check under the WRONG (ambient) principal if acting_as() has
-            # since exited. Reassigning `chunk` each round lets the previous
-            # chunk's non-retained entities be collected (the O(chunk) bound).
+            # _get_many_unchecked hydrates one chunk: candidates were filtered above under the
+            # CAPTURED principal (ADR-008 W3-2), and a checked get_many() would re-check under the
+            # ambient one if acting_as() has exited. Reassigning `chunk` each round lets the
+            # previous chunk be collected (the O(chunk) bound).
             chunk = self._get_many_unchecked(oids[start:start + _RAW_CHUNK])
             if residual is not None:
                 chunk = [o for o in chunk if residual.evaluate(o)]
@@ -3013,12 +2344,10 @@ class Store:
         while queue:
             current, container = queue.popleft()
             if isinstance(current, Redacted):
-                # ADR-008 R14: a twin has no engine state slot (state_of()
-                # would raise AttributeError) — catch it here, before that
-                # call, whether it arrived as the top-level argument
-                # (store(), the root setter, upsert's fresh-insert path) or
-                # was smuggled into another entity's field and enqueued by
-                # _walk_value's Redacted exemption.
+                # ADR-008 R14: a twin has no engine state slot (state_of() would raise
+                # AttributeError), so catch it before that call, whether it is the top-level
+                # argument (store(), root setter, upsert) or was smuggled into another entity's
+                # field and enqueued by _walk_value.
                 raise ReadDeniedError(
                     f"this {type(current).__name__} is a redacted twin — "
                     "never committable (ADR-008 R14)"
@@ -3070,21 +2399,15 @@ class Store:
                         self._walk_value(getattr(current, spec.name), queue,
                                          child_container,
                                          eager_position=not spec.lazy_refs)
-        return oid_of(obj)  # type: ignore[return-value]
+        return oid_of(obj)  # pyrefly: ignore[bad-return]  # the walk above stamped obj, so it has an oid
 
     def _stamp_perm_labels(self, obj: Any, container: Any) -> None:
-        """Birth labels for a fresh protected record (ADR-008 R6, first
-        registration wins — this runs exactly once, from the ``fresh`` branch
-        of :meth:`_register_graph`).
+        """Stamp birth labels on a fresh protected record, once, from :meth:`_register_graph`.
 
-        ``_dc_owner`` = the acting principal's uid — NEVER inherited (R6
-        provenance; a legacy container would otherwise mint owner=0 children).
-        Groups + both floors copy from the enqueuing protected container when
-        there is one (write-time inheritance — labels are decided at write
-        time and stay stable, the concept's tranquility rule); a record with
-        no protected container keeps the inert R6 defaults. ``object.__setattr__``
-        is deliberate: frozen-safe (mirrors ``_fill_entity``), and the entity
-        is already buffered in ``self._new`` — no dirty-hook work needed.
+        ``_dc_owner`` is the acting principal's uid, never inherited (R6 provenance). Groups and
+        both floors copy from the enqueuing protected container, else the inert R6 defaults stay.
+        ``object.__setattr__`` is frozen-safe (mirrors ``_fill_entity``).
+        See docs/design/ADR-008-permissions-contract.md, "Birth labels and the write fence".
         """
         uid = self.principal.uid
         object.__setattr__(obj, "_dc_owner", uid)
@@ -3094,12 +2417,10 @@ class Store:
         if (container is not None
                 and not obj._dc_groups
                 and obj._dc_read_floor == obj._dc_write_floor == 0):  # VIEWER
-            # Inherit ONLY onto the untouched birth shape: NON-DEFAULT labels
-            # staged before store() (dc.share/protect) win over the
-            # container's — inheritance is a default, not an override. (A
-            # child left at the birth defaults is indistinguishable from
-            # untouched, so it inherits; relabel after store() to force
-            # owner-only inside a shared container — documented.)
+            # Inherit only onto the untouched birth shape: non-default labels staged before store()
+            # (dc.share/protect) win, as inheritance is a default. A child left at the birth
+            # defaults looks untouched; relabel after store() to force owner-only in a shared
+            # container.
             base_groups = list(container._dc_groups)
             base_read = container._dc_read_floor
             base_write = container._dc_write_floor
@@ -3125,24 +2446,11 @@ class Store:
         if is_entity(value):
             if (eager_position and type_info(value).protected
                     and not isinstance(value, Redacted)):
-                # R11 runtime complement (ADR-008, derived — dated 2026-07-15;
-                # corrected 2026-07-15 after the Fable read-fence review found a
-                # leak in the first cut): the decorator-time rule
-                # (_entity._check_r11_lazy_only) cannot see an Any-typed field, a
-                # bare/unparameterised container, or store.root — this closes the
-                # same rule at the write boundary the type system can't reach.
-                # The exemption keys on the FIELD POSITION'S decode mode, NOT on a
-                # runtime Lazy wrapper: `swizzle` collapses `Lazy.of(x)` to a bare
-                # `RefToken` for any non-`Lazy[...]`-typed field, so such a field
-                # RE-DECODES eagerly (`_contains_lazy(Any)`/`(list)` is False) and
-                # would eager-materialize the real protected child into a shared,
-                # registered parent for every principal — the deref checkpoint
-                # bypassed entirely. So a protected ref is a violation in any
-                # eager-decoding position, wrapper or not; only a genuinely lazy
-                # position (`spec.lazy_refs`, propagated below) is exempt. A
-                # Redacted twin is separately exempt (not an eager-ref violation)
-                # — enqueued as usual and caught by the more specific
-                # never-committable-twin check at the _register_graph loop top.
+                # R11 runtime complement (ADR-008): _entity._check_r11_lazy_only cannot see
+                # Any-typed fields, bare containers or store.root, so this closes it at the write
+                # boundary. It keys on the field position's decode mode, not a Lazy wrapper:
+                # `swizzle` collapses `Lazy.of(x)` to a bare RefToken in a non-`Lazy[...]` field,
+                # which re-decodes eagerly. Only `spec.lazy_refs` is exempt.
                 raise TypeError(
                     f"{type(value).__name__} is protected — protected classes "
                     "are Lazy-referable only (ADR-008 R11). The FIELD must be "
@@ -3156,7 +2464,7 @@ class Store:
             if oid is None or oid in self._new or oid in self._dirty:
                 queue.append((value, container))
         elif isinstance(value, Lazy):
-            target = cast("Lazy[Any]", value)._peek_unchecked()  # pyright: ignore[reportPrivateUsage]
+            target = cast("Lazy[Any]", value)._peek_unchecked()
             if target is not None:
                 # Propagate the field's decode mode, NOT an unconditional
                 # exemption: a Lazy wrapper in a lazy-typed field stays lazy
@@ -3174,10 +2482,10 @@ class Store:
                                  eager_position=eager_position)
 
     def _harvest_live_refs(self, obj: Any) -> set[int]:
-        """The OIDs ``obj`` references — direct entity refs and Lazy refs, in
-        scalar fields and inside list/dict containers (#20). The live-object
-        twin of ``_indexes.harvest_ref_oids``; both yield the same OIDs (a ref
-        and a ``Lazy`` to the same entity persist as the same OID).
+        """Return the OIDs ``obj`` references: entity and Lazy refs in fields and containers (#20).
+
+        The live-object twin of ``_indexes.harvest_ref_oids``. A ref and a ``Lazy`` to the same
+        entity persist as the same OID.
         """
         out: set[int] = set()
         stack: list[Any] = [getattr(obj, n) for n in type_info(obj).field_names]
@@ -3196,7 +2504,7 @@ class Store:
                 # _walk_value, which follows peek()).
                 vid = lz.oid
                 if vid is None:
-                    target = lz._peek_unchecked()  # pyright: ignore[reportPrivateUsage]
+                    target = lz._peek_unchecked()
                     vid = oid_of(target) if target is not None else None
                 if vid is not None:
                     out.add(vid)
@@ -3215,26 +2523,21 @@ class Store:
         return oid
 
     def _blob_positions(self, ti: TypeInfo) -> frozenset[int]:
-        """The indices (in ``ti.field_names`` order) of ``dc.Blob`` fields —
-        the spec-driven split signal ``encode_payload`` needs (ADR-007 §2: a
-        bytes value alone can't be told apart from an inline ``bytes`` scalar).
-        Cached on the TypeInfo's specs, so this is a cheap per-record lookup.
+        """Return the indices of the ``dc.Blob`` fields, in ``ti.field_names`` order.
+
+        ``encode_payload`` needs this spec-driven split signal: a bytes value alone cannot be told
+        from an inline ``bytes`` scalar (ADR-007 §2).
         """
         return frozenset(
             i for i, spec in enumerate(ti.specs) if spec.blob
         )
 
     def _fingerprint_payload(self, obj: Any, ti: TypeInfo) -> bytes:
-        """Re-encode an entity to a stable payload for the debug fingerprint
-        net, WITHOUT re-storing or fetching any blob (ADR-007). A hydrated
-        ``dc.Blob`` field holds a ``BlobHandle``, whose descriptor (size/hash) is
-        already stable; a live ``bytes`` value (an untracked raw assignment) is
-        descriptor-ized from its own bytes. The fingerprint only needs
-        determinism, not durability — no OID is minted, the blobs table is never
-        touched. ``oid`` is pinned to 0: a fingerprint is only ever compared to
-        another taken in the SAME representation epoch (re-stamped on every
-        hydrate/commit), so the real blob OID is irrelevant to mismatch
-        detection.
+        """Re-encode an entity to a stable payload for the debug fingerprint, without blob I/O.
+
+        A hydrated ``dc.Blob`` holds a ``BlobHandle`` whose descriptor is already stable. ``oid``
+        is pinned to 0: fingerprints are only compared within one representation epoch.
+        See docs/design/ADR-007-blob-fields.md, "Implementation notes".
         """
         values = [getattr(obj, name) for name in ti.field_names]
         positions = self._blob_positions(ti)
@@ -3250,25 +2553,21 @@ class Store:
             elif isinstance(v, bytes):
                 fp_values[i] = BlobToken(0, len(v), hashlib.sha256(v).digest())
             elif isinstance(v, BlobSource):
-                # Dead-defensive total-encode fallback: a fingerprint is only ever
-                # taken on a committed/hydrated holder (a BlobHandle) or a CLEAN
-                # sweep target — and assigning a BlobSource marks the holder DIRTY,
-                # which the sweep skips, while P3 swaps it to a BlobHandle before
-                # the post-commit fingerprint. So this branch is unreachable in
-                # practice; kept only so the encode never chokes on a stray source.
+                # Dead-defensive fallback: a fingerprint is only taken on a hydrated holder (a
+                # BlobHandle) or a CLEAN sweep target, and P3 swaps a BlobSource to a BlobHandle
+                # first. Unreachable in practice; kept so the encode never chokes on a stray
+                # source.
                 fp_values[i] = BlobToken(0, v.size, b"")
         return fingerprint_payload(fp_values, self._oid_for_encode)
 
     def _blob_read_gate(self, owner_oid: int) -> None:
-        """Enforce that the CURRENT principal may read the record that owns a
-        blob (ADR-008 W4-3) — a blob is readable only if its owning record is.
-        Called by :meth:`BlobHandle.bytes` and :meth:`open_blob` for a
-        PROTECTED owner (the caller guards on ``ti.protected``, so an
-        unprotected owner never reaches here — zero cost). Judges COMMITTED
-        labels, exactly like the deref checkpoint (D1); root passes.
+        """Enforce that the current principal may read the record that owns a blob (ADR-008 W4-3).
 
-        Raises:
-            ReadDeniedError: the owning record is unreadable by the principal.
+        Called by :meth:`BlobHandle.bytes` and :meth:`open_blob` only for a PROTECTED owner, so an
+        unprotected owner costs nothing. It judges committed labels like the deref checkpoint (D1);
+        root passes.
+        Raises ``ReadDeniedError`` when the owning record is unreadable.
+        See docs/design/ADR-008-permissions-contract.md, "R14 deref checkpoint".
         """
         p = self.principal
         if is_root(p):
@@ -3427,26 +2726,13 @@ class Store:
 
     def _load_oid_deref(self, oid: int,
                         cache: dict[int, StoredRecord] | None = None) -> Any:
-        """The R14 checkpoint for a DEREF surface (ADR-008 W3-4) — THREE
-        distinguishable outcomes: the real instance (readable), a
-        :class:`~datacrystal._redacted.Redacted` twin (exists, denied), or
-        ``DanglingRefError`` (no record at all). Judges COMMITTED labels
-        only (W3 D1): a staged ``share()``/``protect()`` is unvalidated
-        until the commit gate rules on it, so judging it here would let a
-        principal pre-grant itself visibility before the gate ever ran.
+        """Load ``oid`` at the R14 deref checkpoint (ADR-008 W3-4): instance, twin or dangling.
 
-        Unlike :meth:`_load_oid` (which stays principal-free by design —
-        R11 makes deref the ONE read checkpoint, so hydration and eager
-        graph materialization never need to know who is asking), this is
-        called only from deref surfaces: :meth:`~datacrystal._lazy.Lazy.get`
-        today; the ``get_many`` ref-form joins in W3-3.
-
-        A registry hit is checked too, not only the record path — an
-        earlier readable load must never leak the live instance to a later,
-        unreadable principal (the loaded-Lazy-cache landmine this story
-        closes in :meth:`~datacrystal._lazy.Lazy.get`). Either way the
-        registry and the live instance are untouched: a twin is built fresh
-        and never registered, so identity for the readable case is intact.
+        It judges committed labels only (W3 D1): judging a staged ``share()`` would let a principal
+        pre-grant itself. Unlike :meth:`_load_oid` (principal-free by design, R11) it serves deref
+        surfaces only. A registry hit is checked too, so no principal sees an instance another one
+        loaded.
+        See docs/design/ADR-008-permissions-contract.md, "R14 deref checkpoint".
         """
         self._guard()
         obj = self._registry.get(oid)
@@ -3484,19 +2770,12 @@ class Store:
         return self._materialize_graph(oid, cache if cache is not None else {oid: rec})
 
     def _deref_cached_protected(self, obj: Any, oid: int) -> Any:
-        """Resolve a CACHED protected target (held on a live ``Lazy.of`` handle)
-        to the real instance or a ``dc.Redacted`` twin under the CURRENT
-        principal (ADR-008 R14) — the cross-principal fence for a user handle
-        shared through the live registry.
+        """Resolve a cached protected target of a ``Lazy.of`` handle to the instance or a twin.
 
-        The pre-commit window is the wrinkle: a just-``store()``d target is
-        buffered (in ``self._new``) with an OID but no committed labels or
-        registry entry, so :meth:`_load_oid_deref` would raise
-        ``DanglingRefError`` on the creating principal's own in-flight object.
-        There we judge the target's LIVE birth labels instead — the labels it
-        will commit with (tranquility) — so the owner (and root) read their own
-        uncommitted work while an outsider in that window still gets a twin.
-        Once committed, the normal committed-label deref (D1) takes over.
+        This is the cross-principal fence for a handle shared through the live registry. A
+        just-``store()``d target has no committed labels, so :meth:`_load_oid_deref` would raise
+        ``DanglingRefError``; its live birth labels are judged instead (tranquility), so the owner
+        reads its uncommitted work and an outsider still gets a twin.
         """
         if oid in self._new:
             p = self.principal
@@ -3508,42 +2787,27 @@ class Store:
 
     def _materialize_graph(self, root_oid: int,
                            cache: dict[int, StoredRecord] | None) -> Any:
-        """Materialize ``root_oid`` and the transitive closure of its EAGER
-        references with an explicit work-queue — the read-path twin of the
-        iterative write path :meth:`_register_graph`, so load depth is bounded
-        by the heap, not the C stack (#29: a deep or cyclic eager graph that
-        committed fine must also reopen fine). ``Lazy`` refs are NOT followed
-        (they return handles — invariant 6's cut point is untouched).
+        """Materialize ``root_oid`` and its EAGER reference closure with an explicit work-queue.
 
-        Identity + cycles: each shell is registered BEFORE its fields are
-        filled, so a back-edge resolves to the in-progress shell instead of
-        recursing (the registry is the read path's ``walked`` set). Atomicity:
-        if any fill fails (a dangling eager ref, a schema mismatch), every shell
-        THIS call registered is discarded — a partial load never leaves a
-        half-built corpse behind the one-instance-per-OID contract.
+        The read-path twin of :meth:`_register_graph`: load depth is bounded by the heap, not the C
+        stack (#29); ``Lazy`` refs are not followed (invariant 6). Each shell is registered before
+        its fields are filled, so a back-edge finds the in-progress shell. If any fill fails, every
+        shell this call registered is discarded.
+        See docs/design/DESIGN.md, "Read-path loading and identity".
         """
         registered: list[int] = []
         fill_queue: deque[tuple[Any, StoredRecord]] = deque()
 
         def link(child_oid: int, *, root: bool = False) -> Any:
-            # The iterative replacement for the old recursive _load_oid follow:
-            # return the live object for child_oid, allocating + enqueuing its
-            # bare shell if new — WITHOUT filling it here.
-            #
-            # Read-side backstop for ADR-008 R11 (Fable review, 2026-07-15): a
-            # non-root PROTECTED target is NEVER eager-materialized into a
-            # shared, registered parent — that would hand the real instance to
-            # any principal, bypassing the deref checkpoint. It fails closed to
-            # an unloaded Lazy handle instead, so the field's future .get()
-            # routes through the checked deref (_load_oid_deref → real|twin per
-            # principal). The write path (_walk_value) already forbids CREATING
-            # such an edge; this closes the same hole for a record from any
-            # other source (federation, migration, a pre-R11 store). The root is
-            # exempt — _load_oid_deref already authorised it before calling here.
+            # Return the live object for child_oid, enqueuing its bare shell if new, unfilled.
+            # Read-side backstop for ADR-008 R11: a non-root PROTECTED target is never
+            # eager-materialized into a shared parent; it fails closed to an unloaded Lazy, so a
+            # later .get() takes the checked deref. _walk_value forbids creating such an edge; this
+            # covers other sources (federation, migration).
             existing = self._registry.get(child_oid)
             if existing is not None:
                 if not root and type_info(existing).protected:
-                    return Lazy._unloaded(child_oid, self)  # pyright: ignore[reportPrivateUsage]
+                    return Lazy._unloaded(child_oid, self)
                 return existing
             rec = cache.get(child_oid) if cache else None
             if rec is None:
@@ -3556,7 +2820,7 @@ class Store:
                 )
             child_ti = self._ti_for_cid(rec.cid)
             if not root and child_ti.protected:
-                return Lazy._unloaded(child_oid, self)  # pyright: ignore[reportPrivateUsage]
+                return Lazy._unloaded(child_oid, self)
             shell = cast("Any", object.__new__(child_ti.cls))
             stamp(shell, child_oid, self, STATE_CLEAN)
             self._registry.add(child_oid, shell)  # before fill: breaks cycles
@@ -3612,7 +2876,7 @@ class Store:
                 self._fingerprints[rec.oid] = _crc(
                     self._fingerprint_payload(obj, ti)
                 )
-            except BaseException:
+            except BaseException:  # noqa: BLE001 - a fingerprint that cannot be taken is simply not recorded
                 self._fingerprints.pop(rec.oid, None)
 
     def _resolve(self, value: Any, lazy: bool, owner: Any,
@@ -3620,34 +2884,30 @@ class Store:
         if value is None or isinstance(value, (str, float, int, bytes)):
             return value  # scalar fast path: nothing to swizzle back
         if isinstance(value, BlobToken):
-            # A dc.Blob field hydrates to a lazy BlobHandle, never raw bytes
-            # (ADR-007 §3): .size/.hash are free from the descriptor, .bytes()
-            # fetches on first touch and demotes like Lazy.
-            # ADR-008 W4-3: pass the owner OID only when the owner is protected,
-            # so .bytes() can re-gate the read under the current principal; an
-            # unprotected owner stays byte-identical (owner_oid=None → no gate).
+            # A dc.Blob field hydrates to a lazy BlobHandle, never raw bytes (ADR-007 §3):
+            # .size/.hash come free, .bytes() fetches on first touch. ADR-008 W4-3: pass the owner
+            # OID only for a protected owner so .bytes() can re-gate the read; an unprotected owner
+            # stays byte-identical.
             owner_oid = oid_of(owner) if type_info(owner).protected else None
-            return BlobHandle._bind(value.blob_oid, value.size, value.hash, self,  # pyright: ignore[reportPrivateUsage]
+            return BlobHandle._bind(value.blob_oid, value.size, value.hash, self,
                                     owner_oid=owner_oid)
         if isinstance(value, RefToken):
             if lazy:
                 existing = self._registry.get(value.oid)
-                # ADR-008 W3-4: a registry hit is only pre-loadable into the
-                # handle when its target is UNPROTECTED — a loaded handle
-                # embedded in a shared parent is a cross-principal cache
-                # (the same landmine Lazy.get() closes on the read side).
-                # A protected target always builds unloaded, so every future
-                # .get() re-derives through the checked deref.
+                # ADR-008 W3-4: a registry hit is pre-loaded into the handle only when its target
+                # is UNPROTECTED, as a loaded handle in a shared parent is a cross-principal cache
+                # (the landmine Lazy.get() closes). A protected target always builds unloaded, so
+                # every .get() re-derives through the checked deref.
                 if existing is not None and not type_info(existing).protected:
                     # engine-only Lazy constructors (users use Lazy.of)
-                    handle: Lazy[Any] = Lazy[Any]._loaded(  # pyright: ignore[reportPrivateUsage]
+                    handle: Lazy[Any] = Lazy[Any]._loaded(
                         existing, value.oid, self
                     )
                     if self._lazyman is not None:
                         self._lazyman.track(handle)
                     return handle
                 # engine-only Lazy constructors (users use Lazy.of)
-                unloaded: Lazy[Any] = Lazy._unloaded(value.oid, self)  # pyright: ignore[reportPrivateUsage]
+                unloaded: Lazy[Any] = Lazy._unloaded(value.oid, self)
                 return unloaded
             return link(value.oid)  # eager: hand off to the iterative driver (#29)
         if isinstance(value, list):
@@ -3690,25 +2950,23 @@ class _RawView:
 
 
 def _ref_target_oid(value: Any) -> int | None:
-    """The OID a reference-shaped value points at (entity or Lazy handle),
-    or None for plain values and not-yet-stored targets.
-    """
+    """Return the OID an entity or Lazy handle points at, else None."""
     if is_entity(value):
         return oid_of(value)
     if isinstance(value, Lazy):
         if value.oid is not None:
             return value.oid
-        target = cast("Lazy[Any]", value)._peek_unchecked()  # pyright: ignore[reportPrivateUsage]
+        target = cast("Lazy[Any]", value)._peek_unchecked()
         return oid_of(target) if target is not None else None
     return None
 
 
 def _blob_hash(value: Any) -> bytes | None:
-    """The sha256 of a blob-field value for upsert equivalence (ADR-007): a
-    hydrated ``BlobHandle`` carries it free; a raw ``bytes``/``bytearray`` value
-    is hashed (the write path accepts both, so equivalence must too — else an
-    identical ``bytearray`` upsert spuriously re-stores); anything else (e.g.
-    None, or a streamed ``BlobSource`` with no resident hash) is not a blob.
+    """Return the sha256 of a blob-field value for upsert equivalence (ADR-007), or None.
+
+    A hydrated ``BlobHandle`` carries it free; raw ``bytes``/``bytearray`` are hashed, since the
+    write path accepts both (else an identical ``bytearray`` upsert re-stores). Anything else
+    (None, a streamed ``BlobSource``) is not a blob.
     """
     if isinstance(value, BlobHandle):
         return value.hash
@@ -3727,13 +2985,10 @@ def _equivalent(cur: Any, new: Any) -> bool:
     """
     if cur is new:
         return True
-    # Blob fields compare by content hash (a hydrated BlobHandle carries the
-    # sha256; raw bytes are hashed): so an upsert that re-supplies the IDENTICAL
-    # blob is a no-op (no re-store, no new OID), and an unchanged blob behind a
-    # reopened entity is never rewritten (ADR-007). A blob-vs-None differs. A
-    # dc.BlobSource has no resident hash to compare cheaply (re-reading it would
-    # defeat streaming), so _blob_hash is None for it → an upsert that supplies a
-    # streamed source always re-writes (the safe, conservative choice).
+    # Blob fields compare by content hash (a BlobHandle carries the sha256, raw bytes are hashed),
+    # so an upsert re-supplying an identical blob is a no-op (ADR-007); a blob-vs-None differs. A
+    # dc.BlobSource has no resident hash (reading it would defeat streaming), so _blob_hash is None
+    # and an upsert with a streamed source always re-writes: the safe choice.
     if isinstance(cur, (BlobHandle, BlobSource)) or isinstance(new, (BlobHandle, BlobSource)):
         return _blob_hash(cur) == _blob_hash(new) and _blob_hash(cur) is not None
     cur_ref, new_ref = _ref_target_oid(cur), _ref_target_oid(new)
@@ -3760,7 +3015,7 @@ def _raw_value(value: Any) -> Any:
             )
         return RefToken(oid)
     if isinstance(value, Lazy):
-        target = cast("Lazy[Any]", value)._peek_unchecked()  # pyright: ignore[reportPrivateUsage]  # OID only, loaded handle knows best
+        target = cast("Lazy[Any]", value)._peek_unchecked()  # OID only, loaded handle knows best
         if target is not None:
             return _raw_value(target)
         if value.oid is None:
@@ -3782,9 +3037,10 @@ def _order_by_attr(objs: list[Any], field: str, descending: bool) -> list[Any]:
 
 def _order_rows(rows: list[tuple[int, dict[str, Any]]], field: str,
                 descending: bool) -> list[tuple[int, dict[str, Any]]]:
-    """Decoded ``(oid, row)`` pairs ordered by ``row[field]`` for the residual /
-    un-indexed pluck order_by path (#25): NULLs last, stable ascending-OID
-    tiebreak (``rows`` arrive ascending-OID from the candidate scan).
+    """Return decoded ``(oid, row)`` pairs ordered by ``row[field]`` for pluck order_by (#25).
+
+    NULLs last, stable ascending-OID tiebreak (``rows`` arrive ascending-OID from the candidate
+    scan).
     """
     present = [r for r in rows if r[1][field] is not None]
     absent = [r for r in rows if r[1][field] is None]
@@ -3808,13 +3064,11 @@ def _raw_condition(cond: Condition) -> Condition:
 
 
 def _publish(value: Any) -> Any:
-    """Decoded payload value → pluck() output: refs become public Ref
-    tokens (get_many() hydrates them), containers plain lists/dicts.
+    """Turn a decoded payload value into pluck() output.
 
-    A blob field plucks as its inert :class:`~datacrystal._records.BlobToken`
-    descriptor (``.blob_oid``/``.size``/``.hash``) — the bytes are NEVER read by
-    a decode-level scan (ADR-007): pluck/count/query around a blob-bearing type
-    touch only the 48-byte descriptor, not the blobs table.
+    Refs become public ``Ref`` tokens (``get_many()`` hydrates them), containers plain lists and
+    dicts. A blob field plucks as its inert ``BlobToken`` descriptor: a decode-level scan never
+    reads blob bytes (ADR-007).
     """
     if isinstance(value, BlobToken):
         return value
@@ -3835,7 +3089,7 @@ def _find_escapee(value: Any) -> str | None:
     if is_entity(value):
         return type(value).__name__
     if isinstance(value, Lazy):
-        target = cast("Lazy[Any]", value)._peek_unchecked()  # pyright: ignore[reportPrivateUsage]
+        target = cast("Lazy[Any]", value)._peek_unchecked()
         return f"Lazy[{type(target).__name__}]" if target is not None else "Lazy"
     if isinstance(value, (list, tuple, set, frozenset)):
         for item in cast("frozenset[object]", value):

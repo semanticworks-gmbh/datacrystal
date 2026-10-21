@@ -6,7 +6,6 @@ datacrystal[fts] is the only consumer; this covers exactly the surface
 so it types the strict-src gate without ever shipping in the wheel.
 """
 
-from __future__ import annotations
 
 class _Stemmer:
     def stemWord(self, word: str) -> str: ...

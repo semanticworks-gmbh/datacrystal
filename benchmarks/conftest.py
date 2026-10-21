@@ -17,7 +17,8 @@ import gc
 import os
 import time
 import warnings
-from typing import Any, Callable, Iterator
+from collections.abc import Callable, Iterator
+from typing import Any
 
 import pytest
 
@@ -54,8 +55,7 @@ def time_it(fn: Callable[[], Any], *, rounds: int = 5) -> float:
             t0 = time.perf_counter()
             fn()
             elapsed = time.perf_counter() - t0
-            if elapsed < best:
-                best = elapsed
+            best = min(best, elapsed)
     finally:
         if was_enabled:
             gc.enable()
@@ -85,7 +85,7 @@ def gate(name: str, value: float, threshold: float, *, unit: str = "×") -> None
 
 
 @pytest.fixture(scope="session")
-def big_store(tmp_path_factory) -> Iterator[dc.Store]:
+def big_store(tmp_path_factory: pytest.TempPathFactory) -> Iterator[dc.Store]:
     """The shared @{SPECIMENS} cabinet (sqlite, built once per session)."""
     path = tmp_path_factory.mktemp("bench") / "big.store"
     store = dc.Store.open(path)
@@ -96,7 +96,7 @@ def big_store(tmp_path_factory) -> Iterator[dc.Store]:
 
 
 @pytest.fixture(scope="session")
-def small_store(tmp_path_factory) -> Iterator[dc.Store]:
+def small_store(tmp_path_factory: pytest.TempPathFactory) -> Iterator[dc.Store]:
     """The same shape at a tenth the extent (scale-ratio gates)."""
     path = tmp_path_factory.mktemp("bench") / "small.store"
     store = dc.Store.open(path)

@@ -1,46 +1,10 @@
-"""``datacrystal[fts]`` — the SQLite FTS5 full-text sidecar (ROADMAP item 10).
+"""``datacrystal[fts]``: the SQLite FTS5 full-text sidecar (ROADMAP item 10).
 
-The first *real* commit-delta consumer (COMMIT-DELTA-v2): it rides the watermark pipeline
-exactly like the M3 contract spike (``tests/contract/fts_consumer.py``, its
-embryo) and delivers what the spike's honesty notes deferred — index-time
-Snowball stemming per ``dc.FullText(language=...)``, per-field exact and
-stemmed columns, BM25-ranked search (exact outranks stem-only), and
-fold+stem-consistent highlighting.
-
-Sidecar doctrine (COMMIT-DELTA-v1 §5, invariant 11): the index is derived
-data in its own SQLite file — rebuildable from ``store.snapshot()`` at any
-time, never inside the store's commit transaction, and applied O(delta):
-watermark, type lineage and document rows move in ONE sidecar transaction
-per delta, so a crash mid-apply rolls back whole and replay resumes from
-the persisted watermark.
-
-Design notes (decided 2026-06-12, with the extra's resequencing pre-tag):
-
-* **Three columns per prose field.** ``f_<field>`` holds the fold-normalized
-  exact tokens, ``s_<field>`` the fold-normalized Snowball stems — *both*
-  written and queried through the same Python normalization, so consistency
-  is by construction on both columns (an asymmetric raw/folded split is
-  exactly what breaks Cyrillic/Greek/kana recall). ``r_<field>`` keeps the
-  raw text UNINDEXED, purely as the snippet source. Queries match f_ and s_,
-  BM25 weights prefer exact (2.0 vs 1.0).
-* **Stem first, fold after.** Snowball stemmers need the diacritics the
-  fold removes (Russian ``й``/``ё`` steer suffix tables), so tokens are
-  stemmed in lowercase NFC form and the *stems* are folded — identically at
-  index and query time.
-* **Stemming is index-time, in Python.** sqlite3 cannot load custom FTS5
-  tokenizers; bare ``dc.FullText`` (no language) means fold-only exact
-  matching, exactly what the spike shipped.
-* **Documents are rows, rowid = OID.** OIDs are globally unique across
-  types (partitioned 64-bit space), so one table indexes every configured
-  type; ``typename`` is a filterable stored column.
-
-Honest limitations (documentation-honesty rule): unsegmented CJK text forms
-one token per run under unicode61 — ``水晶です`` is only findable as that
-whole run; proper CJK support needs a segmenting tokenizer [planned —
-demand-driven]. Abugida-script languages (Hindi, Nepali, Tamil) are refused
-loudly: both tokenizers split at vowel signs, which would feed the stemmers
-shredded consonants. Like the store itself, an index is owner-confined: use
-it from the thread that opened it (sqlite3 enforces this loudly).
+A COMMIT-DELTA-v2 consumer: derived data in its own SQLite file, rebuildable from a snapshot,
+applied O(delta) with watermark, type lineage and rows in one sidecar transaction per delta.
+Exact and stemmed columns per field, BM25 ranking (exact outranks stem-only), fold-consistent
+highlighting. Limits: unsegmented CJK is one token per run; abugida languages are refused.
+Column layout and the stem-then-fold order: docs/design/DESIGN.md, "Full-text sidecar".
 """
 
 from __future__ import annotations
@@ -49,10 +13,11 @@ import json
 import re
 import sqlite3
 import unicodedata
+from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Mapping
+from typing import TYPE_CHECKING, Any, Self
 
 from datacrystal._entity import TYPES_BY_NAME
 from datacrystal._errors import DataCrystalError, ReadDeniedError
@@ -77,7 +42,7 @@ except ImportError as exc:  # pragma: no cover — core-only installs
         "`pip install 'datacrystal[fts]'` (adds snowballstemmer)"
     ) from exc
 
-__all__ = ["FullTextIndex", "SearchHit", "FtsConfigError"]
+__all__ = ["FtsConfigError", "FullTextIndex", "SearchHit"]
 
 SIDECAR_FORMAT = "datacrystal-fts-sidecar"
 SIDECAR_VERSION = 1
@@ -112,13 +77,11 @@ class FtsConfigError(DataCrystalError):
 
 @dataclass(frozen=True, slots=True)
 class SearchHit:
-    """One ranked match: ``score`` is ``-bm25`` (higher = more relevant);
-    ``snippets`` maps field name → excerpt of the original text with the
-    matched surface forms marked ``[`` … ``]``. Highlighting runs the same
-    normalize-stem-fold transform that indexed the text, so a stemmed match
-    ("Kristall" finding "Kristalle") highlights correctly — which FTS5's
-    own ``snippet()`` cannot do over a stem column. Phrase needles only
-    mark adjacent runs.
+    """One ranked match: ``score`` is ``-bm25`` (higher is better).
+
+    ``snippets`` maps field name to an excerpt with the matched surface forms marked ``[`` ...
+    ``]``;
+    phrase needles mark only adjacent runs.
     """
 
     oid: int
@@ -146,19 +109,10 @@ def _tokens(text: str) -> list[str]:
 
 @lru_cache(maxsize=1 << 20)
 def _fold_token(token: str) -> str:
-    """NFKD-fold one token: strip diacritics, normalize compatibility forms
-    (``m²`` → ``m2``, ``ﬁ`` → ``fi``), lowercase — applied identically to
-    column content and query terms, so matching is fold-consistent by
-    construction.
+    """Return one token NFKD-folded: diacritics stripped, compatibility forms normalized, lowercase.
 
-    Memoized (#55): folding is a pure char-by-char NFKD pass and was the
-    index-build hot spot — at index scale the same surface forms and stems
-    recur en masse (a natural-language corpus folds the same ~tens-of-
-    thousands of distinct tokens 30×+ over), so a per-token cache collapses
-    millions of folds to the distinct vocabulary. The cache is keyed on the
-    exact input token, so it can NEVER change the output bytes — fold/stem
-    symmetry and BM25 relevance are untouched. Bounded so a giant vocabulary
-    cannot grow it without limit (it is an LRU, not a leak).
+    Applied identically to column content and query terms, so matching is fold-consistent.
+    The LRU cache (#55) is keyed on the exact token, so it can never change the output.
     """
     return "".join(
         ch for ch in unicodedata.normalize("NFKD", token)
@@ -210,34 +164,21 @@ _Needles = dict[str, list[list[str]]]
 class FullTextIndex:
     """A COMMIT-DELTA-v2 consumer indexing ``dc.FullText`` fields into FTS5.
 
-    Fresh store::
-
-        idx = FullTextIndex("cabinet.fts")     # config from @entity registry
-        store.attach(idx)
-        ... store.commit() ...
-        for hit in idx.search("Kristall"):     # stemming: finds "Kristalle"
-            print(hit.score, hit.snippet)
-
-    Lived-in store (deltas are not retained — spec §5)::
-
-        with store.snapshot() as snap:
-            idx = FullTextIndex.bootstrap("cabinet.fts", snap)
-        store.attach(idx)
-
-    ``fulltext`` overrides the registry-derived configuration with an
-    explicit ``{typename: {field: language-or-None}}`` map. The
-    configuration is persisted; reopening the same file with a different
-    one raises :class:`FtsConfigError` — a half-matching index is stale
-    derived data, rebuild it (invariant 11).
-
-    ``statements`` is a public diagnostic counter: SQL statements executed
-    by the most recent ``apply()`` — pin your own O(delta) gates on it,
-    exactly like this package's tests do (fitness #9 shape).
+    ``FullTextIndex(path)`` on a fresh store, then ``store.attach(idx)``; for a lived-in store use
+    :meth:`bootstrap` (spec §5). ``fulltext`` overrides the registry-derived ``{typename: {field:
+    language}}`` map; reopening with another map raises :class:`FtsConfigError` (invariant 11).
+    ``statements`` counts the SQL statements of the last ``apply()``, for O(delta) gates (fitness
+    #9).
     """
 
     def __init__(self, path: str | Path, *,
                  fulltext: Mapping[str, Mapping[str, str | None]] | None = None,
                  _wipe: bool = False) -> None:
+        """Open or create the sidecar at ``path``, refusing a configuration that contradicts it.
+
+        Raises FtsConfigError for nothing to index, a non-identifier field or an unsupported
+        language.
+        """
         config = fulltext if fulltext is not None else _registry_fulltext()
         self._fulltext: dict[str, dict[str, str | None]] = {
             typename: {field: _resolve_language(lang) for field, lang in fields.items()}
@@ -258,13 +199,9 @@ class FullTextIndex:
         self._fields: tuple[str, ...] = tuple(sorted({
             field for fields in self._fulltext.values() for field in fields
         }))
-        # The read-fence trigger set, computed ONCE (ADR-008 R13/W4-5): a
-        # configured typename whose live @entity class is protected — OR whose
-        # live class is UNKNOWN in this process (a persisted _dc_* lineage with
-        # the code removed is fail-closed, indistinguishable-from-protected).
-        # Empty set ⇒ search() with snapshot=None stays byte-identical to pre-W4
-        # (zero cost, no principal, no filtering); a non-empty set makes the
-        # no-snapshot call fail closed.
+        # Read-fence trigger set (ADR-008 R13): typenames whose live class is protected or unknown
+        # (a persisted lineage without its code fails closed as protected).
+        # Empty: a search without snapshot costs nothing; non-empty: it raises.
         self._protected_typenames: frozenset[str] = frozenset(
             typename for typename in self._fulltext
             if (ti := TYPES_BY_NAME.get(typename)) is None or ti.protected
@@ -307,6 +244,12 @@ class FullTextIndex:
         return self._watermark
 
     def apply(self, delta: dict[str, Any]) -> bool:
+        """Index one delta; return False on an idempotent skip (§4.2), True when it advanced.
+
+        Raises DeltaFormatError for a foreign marker or a non-current version, and DeltaGapError
+        when the
+        TID skips the watermark (§5).
+        """
         if delta.get("f") != FORMAT_MARKER:
             raise DeltaFormatError(f"not a datacrystal delta: f={delta.get('f')!r}")
         version = delta.get("v")
@@ -361,27 +304,15 @@ class FullTextIndex:
     # -- bootstrap (the §5 mid-life attach recipe) -----------------------------
 
     @classmethod
-    def bootstrap(cls, path: str | Path, snapshot: "Snapshot", *,
+    def bootstrap(cls, path: str | Path, snapshot: Snapshot, *,
                   fulltext: Mapping[str, Mapping[str, str | None]] | None = None,
-                  ) -> "FullTextIndex":
-        """(Re)build the index from one ``store.snapshot()`` — the canonical
-        recipe for attaching to a store that already has history, and the
-        rebuild path after a detach/staleness refusal. Any existing file at
-        ``path`` is replaced: a sidecar that needed a rebuild is stale by
-        definition.
+                  ) -> FullTextIndex:
+        """Build the index from one ``store.snapshot()``, replacing any file at ``path``.
 
-        The FTS sidecar is a MIRROR of the indexed columns on disk, so a mirror
-        of protected data is protected data (ADR-008 R13). When the index covers
-        any protected class a bootstrap over a NON-root snapshot would build a
-        silently partial mirror (each ``snapshot.all(typename)`` honestly returns
-        only that principal's readable rows), so it is refused — a root-bound
-        snapshot is required (the audited-root build precedent, mirroring the
-        Phase-1 ``_stream``/``all(str)`` fail-closed guards). Indexes covering
-        only unprotected classes bootstrap under any snapshot.
-
-        Raises:
-            ReadDeniedError: the index covers a protected/label-bearing class and
-                ``snapshot`` is not root-bound (W4-5).
+        The mirror of protected data is protected data (ADR-008 R13): an index covering a protected
+        class
+        needs a root-bound snapshot, since any other would build a silently partial mirror.
+        Raises ReadDeniedError otherwise.
         """
         idx = cls(path, fulltext=fulltext, _wipe=True)
         if idx._protected_typenames and not is_root(snapshot.principal):
@@ -427,47 +358,15 @@ class FullTextIndex:
 
     def search(self, query: str, *, cls: type | str | None = None,
                limit: int = 20, match: str = "any",
-               snapshot: "Snapshot | None" = None,
+               snapshot: Snapshot | None = None,
                scan_cap: int = 2000) -> list[SearchHit]:
-        """BM25-ranked full-text matches for ``query``.
+        """Return the BM25-ranked matches for ``query``, best first.
 
-        ``match`` chooses how query terms combine (each term itself always
-        OR-ing its fold-normalized exact column against its per-language
-        Snowball-stemmed column, exact outranking stem-only via the 2.0/1.0
-        column weights):
-
-        * ``"any"`` (default) — **OR over terms**: BM25 ranks the union, and
-          a document missing some terms is naturally down-ranked rather than
-          dropped. This is what ranked retrieval wants — a natural-language
-          query ("Do statin drugs cause cancer?") must not require *every*
-          word in one document or recall collapses (#54).
-        * ``"all"`` — **AND over terms**: every term must appear, the precise
-          filter use case (faceting, "find the doc with exactly these words").
-
-        Quoted phrases stay phrases under either mode. ``cls`` narrows to one
-        entity type (class or typename string). Every term is quoted into the
-        FTS5 expression, so user input cannot inject MATCH operators.
-
-        **Read fence (ADR-008 R13).** ``snapshot`` is the readable context — a
-        PRINCIPAL-bound :class:`~datacrystal.Snapshot`. When given, every ranked
-        hit is resolved through that snapshot's fenced ``get_many`` and DROPPED
-        if it comes back ``None`` (deleted / no live class) or a
-        :class:`~datacrystal.Redacted` twin (denied) — denial, deletion and
-        unresolvability all fail closed through the one seam. Snippets then
-        render from the SURVIVING view's OWN text, never the sidecar's stored
-        copy, so existence, readability and excerpt all answer at one
-        (watermark, principal). A root-bound snapshot filters nothing.
-
-        Over-fetch is geometric (``4 × limit``, doubling each round) so that a
-        run of denied top hits does not under-fill the page, bounded by a hard
-        ``scan_cap`` (default 2000): an all-denied principal examines at most
-        ``scan_cap`` candidates, never a full-table walk.
-
-        When ``snapshot`` is ``None`` and the index covers ONLY unprotected
-        classes, the call is byte-identical to pre-W4 (zero cost). When
-        ``snapshot`` is ``None`` and the index covers ANY protected class this
-        RAISES :class:`ReadDeniedError` (fail-closed, the R12 doctrine) — pass a
-        ``snapshot=``; bind ``dc.root_principal(...)`` for an unfenced search.
+        ``match="any"`` (default) ORs the terms, so a missing term only down-ranks (#54); ``"all"``
+        ANDs.
+        ``snapshot`` must be principal-bound (ADR-008 R13): unreadable hits are dropped, within
+        ``scan_cap`` candidates; an index over protected classes raises ReadDeniedError without one.
+        See docs/how-to/search.md.
         """
         typename = self._typename_of(cls) if cls is not None else None
         expression = self._match_expression(query, typename, match)
@@ -489,10 +388,7 @@ class FullTextIndex:
 
     def _search_unfenced(self, expression: str, typename: str | None,
                          needles: _Needles, limit: int) -> list[SearchHit]:
-        """The pre-W4 path (snapshot is None, no protected class in the index):
-        BM25 + LIMIT with snippets rendered from the sidecar's own ``r_`` text.
-        Kept byte-identical to preserve zero-cost search over public indexes.
-        """
+        """Search the sidecar directly (no protected class), with snippets from its ``r_`` text."""
         weights = "0.0, " + ", ".join("2.0, 1.0, 0.0" for _ in self._fields)
         raws = ", ".join(f"r_{f}" for f in self._fields)
         sql = (
@@ -520,20 +416,13 @@ class FullTextIndex:
         return hits
 
     def _search_fenced(self, expression: str, typename: str | None,
-                       needles: _Needles, limit: int, snapshot: "Snapshot",
+                       needles: _Needles, limit: int, snapshot: Snapshot,
                        scan_cap: int) -> list[SearchHit]:
-        """The R13 post-filter path. Collect ranked (oid, typename, rank) ONLY,
-        resolve each through the snapshot's fenced ``get_many`` (dropping
-        None/Redacted), and build SearchHits — with snippets rendered from the
-        surviving view's own text — for SURVIVORS ONLY. A dropped row's stored
-        text is never read, so the sidecar's on-disk copy can never leak past
-        the fence (closes the watermark-skew leak).
+        """Resolve ranked hits through the snapshot's fenced ``get_many`` (ADR-008 R13).
 
-        BM25 + LIMIT under-returns once hits are filtered, so the scan window
-        widens geometrically (``limit*4`` then doubling) under the ``scan_cap``
-        hard bound. The SQL adds a ``rowid`` tiebreak to ``ORDER BY r`` so the
-        row order is stable across rounds and each wider round is a strict
-        superset-prefix of the last (only genuinely NEW oids are resolved).
+        Snippets come from the surviving view, never the sidecar copy: nothing leaks past the fence.
+        The scan window widens geometrically under ``scan_cap``; a ``rowid`` tiebreak keeps it
+        stable.
         """
         weights = "0.0, " + ", ".join("2.0, 1.0, 0.0" for _ in self._fields)
         sql = (
@@ -546,7 +435,7 @@ class FullTextIndex:
             params.append(typename)
         sql += " ORDER BY r, rowid LIMIT ?"
 
-        survivors: list[tuple[int, str, float, "EntityView"]] = []
+        survivors: list[tuple[int, str, float, EntityView]] = []
         examined = 0            # ranked rows already classified across rounds
         window = max(limit, 1) * 4
         while True:
@@ -576,7 +465,7 @@ class FullTextIndex:
             for oid, hit_typename, rank, view in survivors[:limit]
         ]
 
-    def _snippets_from_view(self, view: "EntityView", typename: str,
+    def _snippets_from_view(self, view: EntityView, typename: str,
                             needles: _Needles) -> dict[str, str]:
         """Render highlighted snippets from a SURVIVING snapshot view's OWN
         field text (never the sidecar's stored ``r_`` copy) — so the excerpt is
@@ -599,15 +488,19 @@ class FullTextIndex:
     # -- lifecycle ---------------------------------------------------------------
 
     def close(self) -> None:
+        """Close the sidecar connection."""
         self._conn.close()
 
-    def __enter__(self) -> "FullTextIndex":
+    def __enter__(self) -> Self:
+        """Return the index itself."""
         return self
 
-    def __exit__(self, *exc: Any) -> None:
+    def __exit__(self, *exc: object) -> None:
+        """Close the index."""
         self.close()
 
     def __repr__(self) -> str:
+        """Return the watermark and the indexed types."""
         return (
             f"<datacrystal.fts.FullTextIndex watermark={self._watermark} "
             f"types={sorted(self._fulltext)}>"
@@ -758,10 +651,7 @@ class FullTextIndex:
         return [tokens for tokens in units if tokens]
 
     def _needles(self, query: str) -> _Needles:
-        """What to highlight, per kind: the folded token sequences ("exact")
-        plus the folded stem sequences per language in use — exactly the
-        transforms the index applied.
-        """
+        """Return what to highlight: folded tokens ("exact") and folded stems per language."""
         units = self._query_units(query)
         needles: _Needles = {"exact": [
             [_fold_token(token) for token in unit] for unit in units
@@ -776,11 +666,10 @@ class FullTextIndex:
 
     def _highlight(self, text: str, language: str | None,
                    needles: _Needles) -> str | None:
-        """A ±~6-token excerpt of ``text`` around the first matched token,
-        matches marked ``[`` … ``]`` — or None when nothing in this text
-        matches (the row matched via another field). Phrase needles mark
-        only adjacent runs. The text is rendered in NFC so decomposed input
-        highlights exactly like the composed form it was indexed as.
+        """Return a +-6-token excerpt around the first match, or None if this text has no match.
+
+        Text is rendered in NFC, so decomposed input highlights like the composed form it was
+        indexed as.
         """
         display = unicodedata.normalize("NFC", text)
         spans = [(m.start(), m.end()) for m in _TOKEN.finditer(display)]

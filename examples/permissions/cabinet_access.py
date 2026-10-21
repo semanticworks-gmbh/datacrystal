@@ -188,7 +188,7 @@ def demonstrate(store: dc.Store) -> None:
                 # leaves the field alone — only a probe reads what it knows is
                 # denied, and the dynamic access says so out loud.
                 try:
-                    getattr(spec, "donor")
+                    getattr(spec, "donor")  # noqa: B009 - the redacted twin has no static field, the probe reads it dynamically
                     print("  !! LEAK: read a field off a redacted twin")
                 except dc.ReadDeniedError:
                     print("     reading .donor off the twin -> ReadDeniedError")

@@ -110,7 +110,7 @@ def stream_digest() -> str:
 
 def main() -> None:
     """Print the stream digest, the CLI output the replay-determinism gate compares."""
-    print(stream_digest())  # noqa: T201
+    print(stream_digest())  # noqa: T201 - CLI output, the replay-determinism gate compares it
 
 
 if __name__ == "__main__":  # pragma: no cover — fitness gate runs main() via -c

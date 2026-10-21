@@ -10,7 +10,10 @@ purely **additive** surface — the v0.1.0 freeze is never broken. PyPI publicat
 
 ## [Unreleased]
 
-_No unreleased changes yet._
+### Changed
+
+- The vector generator moved from the private `datacrystal.contract.vectors._generate` module to `scripts/generate_vectors.py`, so it no longer ships in the wheel (#191).
+  The vectors themselves are byte-identical.
 
 ## [0.10.0] — 2026-10-20
 

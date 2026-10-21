@@ -118,3 +118,24 @@ apply-once, gap refusal, and version refusal **in both directions** (§4.5).
   and would break v1's byte-pinned golden vectors silently. An honest
   version bump is affordable at the library's stage — and with the
   no-compat ruling it costs one hard cut instead of a compatibility matrix.
+
+## 8. Consumers: attach, DeltaLog, follower
+
+- **Attach.** Deltas are not retained (v1 section 5), so a consumer that is behind the store cannot be caught up; it rebuilds from `store.snapshot()`, whose `tid` and `types` are exactly the bootstrap it needs. A consumer ahead of the store means the store was restored to an older point: the sidecar is stale and must be rebuilt (fitness function 13).
+- **Prior payloads.** While consumers watch, the engine reads back the last durable payload of every already-persisted record, O(delta) reads, strictly before the TID is allocated, so a failed read rejects the commit without consuming a TID. Deletes always have a persisted record, and their tombstones carry it as `prior`.
+- **Indexes are not a delta consumer.** The KICKOFF plan sketched the indexes as the second consumer; they deliberately are not (decided at M4), because a consumer would force prior-payload reads and delta builds on every commit while an unwatched store must pay nothing. The index keeps its own `oid -> last-indexed-values` memory and is folded in directly at P3.
+- **Follower contribute.** A follower serializes its buffered NEW and DIRTY entities (a NEW one carries `base=None`, an edited one the SHA-256 of the payload it was read at) and POSTs them to `/v1/submit`. On success the local buffers clear and a `sync()` pulls the committed delta back; identity is by OID, so re-query for the coordinator-minted instance. A coordinator reject leaves the buffers intact. The payload digest reads the authoritative persisted bytes, not a re-encode of the live entity, whose lineage and defaults could diverge.
+- **Follower sync.** A live reference to a CLEAN entity read before a sync sees stale values afterwards; re-query. The OCC recovery loop is `discard()`, `sync()`, re-read, re-apply, `commit()` (#153); `discard()` re-derives the live store from the backend's committed records.
+- **Follower constructor.** `Store.open(path)` opens a local single writer, `Store.follower(url)` a replica of a remote coordinator; `api_key` is sent as `x-api-key`, and a custom `client` (an `httpx.Client`-compatible transport) takes over `url` and `api_key`.
+
+## 9. DeltaLog (the retained delta consumer)
+
+The engine never retains deltas (v1 section 5 stands); `datacrystal.deltalog.DeltaLog` is the consumer that does.
+It rides `store.attach()` like every sidecar, needs no engine change and no new contract version, and uses only the standard library and msgspec, so the core dependency budget is untouched.
+
+- **Storage.** Each flush appends the buffered deltas as length-prefixed frames (`>Q` byte count plus `encode_delta` bytes) to the current segment, which rolls once it passes `max_segment_bytes`.
+- **Commit point.** `manifest.json` (temp file plus `os.replace`) names the durable watermark and the live segments with each one's committed byte length. It is fsynced strictly after the segment bytes, so the watermark never names bytes that did not land (v1 section 4.3).
+- **Crash recovery.** A crash mid-flush leaves an unnamed orphan segment or trailing bytes past a named segment's committed length. The next open sweeps the orphans and truncates the trailing bytes, so the log is always an exact gapless commit prefix.
+- **Durability against the store.** With `flush_every=1` the log is as durable as the store. With `flush_every=N` the durable watermark trails the live one by up to N-1 commits, and a crash in that window means a rebuild (the engine refuses a behind-the-watermark re-attach, so `bootstrap()` again).
+- **Replay completeness.** A log that recorded from a fresh store (`watermark == 0` at attach) holds the whole history, and `replay()` plus the reference applier reproduce the committed state (`DeltaLog.replayed_state`). A log that bootstrap-attached to a lived-in store replays only the changes since it joined; a periodic checkpoint that would make it self-contained is a deliberate later enhancement.
+- **Owner confinement.** `apply()` and `replay()` run on the owner thread. A log directory has one owner process; opening it twice concurrently is unsupported, because the orphan sweep would treat the other instance's segments as crash debris.

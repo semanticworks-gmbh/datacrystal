@@ -1,27 +1,10 @@
 """Record codec: msgspec msgpack payloads with OID-swizzled references.
 
-A persisted record is ``(oid, cid, tid, payload, crc)``. The payload is the
-msgpack encoding of the entity's field values **in schema order** (the type
-dictionary pins the order), with every entity reference — direct or wrapped
-in ``Lazy`` — swizzled to a msgpack extension value carrying the 8-byte OID.
-
-Swizzling is an explicit pre-pass over the value tree, NOT an ``enc_hook``:
-msgspec encodes dataclasses natively, so a hook would never see an entity
-and would silently inline it as a map. The pre-pass also rejects the two
-silently-lossy shapes (non-entity dataclasses, sets) loudly.
-
-There is **no pickle anywhere** (DESIGN.md): decoding is structurally
-incapable of executing code. CRC32 per record guards against torn/corrupt
-blobs (stress-test mandate). Known v0.1 mapping: tuples round-trip as lists
-(msgpack has no tuple type).
-
-Temporal values (format v2, 2026-06-12 — the MaStR feedback found naive
-datetimes silently round-tripping as ISO strings): tz-*aware* ``datetime``
-rides msgpack's standard timestamp extension (msgspec native; converted to
-the UTC instant — the offset's identity is not preserved, the instant is).
-Naive ``datetime``, ``date`` and ``time`` get datacrystal extension codes
-carrying their ISO text — ``fromisoformat`` restores them exactly, and the
-ext code (vs a bare string) is what makes the type survive the round trip.
+A record is ``(oid, cid, tid, payload, crc)``; the payload is the msgpack encoding of the
+field values in schema order, every entity reference swizzled to an extension carrying its OID.
+Swizzling is an explicit pre-pass, not an ``enc_hook`` (msgspec would inline an entity as a map).
+There is no pickle, so decoding cannot execute code; tuples become lists; naive temporal values
+ride datacrystal ext codes (docs/design/DESIGN.md, "Record codec").
 """
 
 from __future__ import annotations
@@ -31,7 +14,8 @@ import datetime as _dt
 import decimal
 import struct
 import zlib
-from typing import Any, Callable, cast
+from collections.abc import Callable
+from typing import Any, cast
 
 import msgspec
 
@@ -80,18 +64,15 @@ def _ref_ext(oid: int) -> msgspec.msgpack.Ext:
 
 
 class BlobToken:
-    """A decoded out-of-line blob descriptor (ADR-007): the blob's own OID,
-    its byte size and its sha256, with the bytes themselves still on disk.
+    """A decoded out-of-line blob descriptor (ADR-007): OID, byte size and sha256.
 
-    Inert by construction (the RefToken precedent, invariant 1): it addresses
-    bytes but is structurally incapable of fetching or executing them — the
-    live engine maps it to a :class:`~datacrystal.Blob` handle, and decode-level
-    reads (``count``/``pluck``) match/skip a blob field by descriptor without
-    touching the ``blobs`` table. Equality is by ``blob_oid`` (a blob is
-    immutable: one OID, one content), mirroring ``RefToken``.
+    Inert like ``RefToken`` (invariant 1): it addresses the bytes but cannot fetch them.
+    The live engine maps it to a :class:`~datacrystal.Blob` handle; decode-level reads match or
+    skip it without touching the ``blobs`` table.
+    Equality is by ``blob_oid`` because a blob is immutable.
     """
 
-    __slots__ = ("blob_oid", "size", "hash")
+    __slots__ = ("blob_oid", "hash", "size")
 
     def __init__(self, blob_oid: int, size: int, hash: bytes) -> None:
         self.blob_oid = blob_oid
@@ -115,9 +96,9 @@ def _blob_ext(blob_oid: int, size: int, hash: bytes) -> msgspec.msgpack.Ext:
 
 
 def decimal_ext(value: decimal.Decimal) -> msgspec.msgpack.Ext:
-    """A ``Decimal`` as its exact text: ``str`` keeps sign, digits and exponent
-    (``Decimal("1.10")`` stays ``1.10``), so a reopened value compares and prints
-    identically (#184).
+    """Return a ``Decimal`` as its exact text, keeping sign, digits and exponent (#184).
+
+    ``Decimal("1.10")`` stays ``1.10``, so a reopened value prints identically.
     """
     return msgspec.msgpack.Ext(DECIMAL_EXT_CODE, str(value).encode())
 
@@ -154,7 +135,7 @@ def swizzle(value: Any, oid_for: Callable[[Any], int]) -> Any:
         return _ref_ext(oid_for(value))
     if isinstance(value, Lazy):
         lazy = cast("Lazy[Any]", value)
-        target = lazy._peek_unchecked()  # pyright: ignore[reportPrivateUsage]  # OID only
+        target = lazy._peek_unchecked()  # OID only
         if target is not None:
             return _ref_ext(oid_for(target))
         if lazy.oid is None:
@@ -201,15 +182,10 @@ def encode_payload(
 ) -> bytes:
     """Encode a field-value list (schema order) to a record payload.
 
-    ``dc.Blob`` fields are detected by **position**, not value type (ADR-007 §2):
-    a ``bytes`` value is an ordinary msgpack scalar in ``swizzle``, so the only
-    reliable signal that a field is out-of-line is its FieldSpec — the store
-    passes the blob field indices in ``blob_positions``. For each such position
-    holding a non-None value (raw ``bytes`` for a whole write, or a
-    ``dc.BlobSource`` for a streamed write), ``blob_sink`` allocates the blob OID
-    and records the value for storage, returning ``(blob_oid, size, hash)``; we
-    emit a tiny ``BLOB_EXT`` descriptor in the record instead of the bytes. A
-    None blob value encodes as msgpack None (the field is simply absent).
+    ``dc.Blob`` fields are found by **position** (``blob_positions``), not value type, because
+    ``bytes`` is an ordinary scalar to ``swizzle`` (ADR-007 §2).
+    For a non-None blob value ``blob_sink`` stores the bytes and returns ``(oid, size, hash)``,
+    and only a ``BLOB_EXT`` descriptor enters the record; a None blob encodes as None.
     """
     out: list[Any] = []
     for i, v in enumerate(values):
@@ -231,10 +207,9 @@ def encode_payload(
 
 
 def fingerprint_payload(values: list[Any], oid_for: Callable[[Any], int]) -> bytes:
-    """Encode a value list where any ``BlobToken`` is emitted as its descriptor
-    ext (oid/size/hash) and everything else swizzles normally — the debug
-    fingerprint path (ADR-007). A blob is presented as its already-known
-    descriptor so the net never fetches or re-stores its bytes.
+    """Encode a value list for the debug fingerprint, emitting a ``BlobToken`` as its descriptor.
+
+    The known descriptor keeps the net from fetching or re-storing blob bytes (ADR-007).
     """
     out: list[Any] = []
     for v in values:
@@ -275,22 +250,16 @@ def _no_oid(_value: Any) -> int:  # pragma: no cover - never reached on a ref-fr
 
 
 def encode_scalar_tree(tree: Any) -> bytes:
-    """Encode a ref-free value tree (dicts/lists of scalars) the SAME way record
-    payloads encode their temporal leaves — datetime/date/time ride the ext codes
-    (#106), not msgspec's default datetime handling, which silently round-trips a
-    **naive** datetime as a bare ISO ``str`` (losing the type and breaking the
-    SortedIndex run on reload). Used by the index cache (ADR-005), whose blob holds
-    index keys that may now be datetimes; ``swizzle`` is the shared pre-pass (it
-    converts the temporal leaves and rejects entities — none belong in a cache
-    blob).
+    """Encode a ref-free value tree with the record codec's temporal ext codes (#106).
+
+    msgspec's default would round-trip a naive datetime as a bare ``str`` and break the
+    SortedIndex run on reload; the index cache (ADR-005) uses this for keys that may be datetimes.
     """
     return _ENCODER.encode(swizzle(tree, _no_oid))
 
 
 def decode_scalar_tree(payload: bytes) -> Any:
-    """Inverse of :func:`encode_scalar_tree` — the ext codes decode back to the
-    original datetime/date/time via the shared :func:`_ext_hook` (#106).
-    """
+    """Decode what :func:`encode_scalar_tree` wrote, restoring datetime, date and time (#106)."""
     return _DECODER.decode(payload)
 
 

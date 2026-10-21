@@ -250,3 +250,8 @@ All live in `tests/fitness/` as pytest (AST checks included), markers `gate` / `
 - *Fitness*: #4 + daemon-principle demotion checks; #12 → same-run import ratio; #15 → structural assertion; #11 splits RSS-gating from tracemalloc; #9 → operation counts + cached reference stores; #1 fault plans as hypothesis data, logical-state equality, SIGKILL nightly-only; #18 added (forward-version, store + pipeline directions); #13 + sidecar-ahead/PITR scenario; #7 + append-only version→hash registry; #2 strict-decode positive check; #8 injectable clock + SIGSTOP scenario; #10 → counting-wrapper assertion, timing parked until ROADMAP item 14.
 
 **Critiques rejected**: none outright. Two fix branches chosen over their alternatives: (a) PR-scale bitmap-query overhead is **trend-only** rather than an absolute ≤ 100 µs budget — an absolute wall-clock gate would violate the suite's own core principle; (b) the COMMIT-DELTA lock moves to the tag *and* keeps the M3 spike rather than choosing one (the spike is cheap and de-risks M4 regardless).
+
+## Amendment note (added with #191)
+
+M2's `durability` triad and the F_FULLFSYNC measurement behind it are described in `DESIGN.md` ("Durability policy of the SQLite backend").
+The index-versus-delta-consumer decision made at M4 is in `COMMIT-DELTA-v2.md` section 8.

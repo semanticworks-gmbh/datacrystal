@@ -63,7 +63,7 @@ import time
 from collections.abc import Callable, Iterator
 from dataclasses import field
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Self
 
 import datacrystal as dc
 
@@ -83,15 +83,15 @@ except ImportError as exc:  # pragma: no cover - on-demand harness guard
         "  uv run --extra web python evals/proving_grounds/web_api.py"
     )
 
-from datacrystal._snapshot import Ref, Snapshot  # noqa: E402  (after the extra guard)
-from datacrystal._storage.memory import MemoryBackend  # noqa: E402
-from datacrystal._storage.protocol import (  # noqa: E402
+from datacrystal._snapshot import Ref, Snapshot
+from datacrystal._storage.memory import MemoryBackend
+from datacrystal._storage.protocol import (
     BootInfo,
     CommitBatch,
     StoredBlob,
     StoredRecord,
 )
-from datacrystal.web import (  # noqa: E402
+from datacrystal.web import (
     LOADER_CONTEXT_KEY,
     SNAPSHOT_CONTEXT_KEY,
     SnapshotLoader,
@@ -113,7 +113,7 @@ class Term:
     go_id: Annotated[str, dc.Unique]
     name: str
     namespace: Annotated[str | None, dc.Index] = None
-    parents: list[dc.Lazy["Term"]] = field(default_factory=list)  # is_a — lazy adjacency (#30)
+    parents: list[dc.Lazy[Term]] = field(default_factory=list)  # is_a — lazy adjacency (#30)
 
 
 # --- the load-counting storage harness (the N+1 oracle) -----------------------
@@ -131,7 +131,7 @@ class _CountingReadView:
     issues. Index builds go through ``scan_type`` and are deliberately NOT counted
     (the documented one-time cost), exactly like the fitness-gate wrapper."""
 
-    def __init__(self, inner: Any, counter: "CountingBackend") -> None:
+    def __init__(self, inner: Any, counter: CountingBackend) -> None:
         self._inner = inner
         self._counter = counter
 
@@ -215,14 +215,14 @@ class _PydanticConstructionCounter:
     validator and never touches ``__init__``). Catching only one would miss the
     other, so the oracle would falsely read zero on whichever path was used."""
 
-    __slots__ = ("count", "_orig_init", "_orig_validate")
+    __slots__ = ("_orig_init", "_orig_validate", "count")
 
     def __init__(self) -> None:
         self.count = 0
         self._orig_init: Any = None
         self._orig_validate: Any = None
 
-    def __enter__(self) -> "_PydanticConstructionCounter":
+    def __enter__(self) -> Self:
         counter = self
         self._orig_init = pydantic.BaseModel.__init__
         self._orig_validate = pydantic.BaseModel.model_validate.__func__  # the classmethod
@@ -282,11 +282,11 @@ def build_app(store: dc.Store) -> tuple[FastAPI, dict[str, Any]]:
 
     # --- REST: a list endpoint (the Pydantic/REST tax end to end) -------------
     @app.get("/terms", response_model=list[TermPublic])
-    def list_terms(  # noqa: ANN202
+    def list_terms(
+        snap: Annotated[Snapshot, Depends(read_snapshot)],
         namespace: str | None = None,
         limit: int = 50,
-        snap: Snapshot = Depends(read_snapshot),  # noqa: B008 - FastAPI dep marker
-    ):
+    ) -> list[TermPublic]:
         target = Term.namespace == namespace if namespace else Term
         views = snap.query(target, limit=limit)
         # model_validate validates one DTO per row off the EntityView — the REST
@@ -331,7 +331,7 @@ class TermGQL:
     namespace: str | None
 
     @strawberry.field
-    async def parents(self, info: Info[Any, Any]) -> list["TermGQL"]:
+    async def parents(self, info: Info[Any, Any]) -> list[TermGQL]:
         # ``self`` is the frozen EntityView (the default getattr resolver handed it
         # straight through); its ``parents`` field is a tuple of Ref tokens.
         refs = getattr(self, "parents", None) or ()
@@ -344,7 +344,7 @@ class TermGQL:
         return [v for v in views if v is not None]  # type: ignore[misc]
 
 
-def build_graphql_schema() -> "strawberry.Schema":
+def build_graphql_schema() -> strawberry.Schema:
     """A ``{ term(goId) { … parents { … } } }`` schema over the snapshot context.
 
     The ``term`` root reads the per-request snapshot off the context and returns
@@ -377,7 +377,7 @@ def percentiles(samples_ms: list[float]) -> tuple[float, float, float]:
     """Return ``(p50, p99, throughput-per-s)`` for a list of per-call ms."""
     p50 = statistics.median(samples_ms)
     ordered = sorted(samples_ms)
-    p99 = ordered[min(len(ordered) - 1, int(round(0.99 * (len(ordered) - 1))))]
+    p99 = ordered[min(len(ordered) - 1, round(0.99 * (len(ordered) - 1)))]
     total_s = sum(samples_ms) / 1000.0
     throughput = len(samples_ms) / total_s if total_s > 0 else float("inf")
     return p50, p99, throughput

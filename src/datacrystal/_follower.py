@@ -1,21 +1,10 @@
 """``open_follower`` — a local replica synced from a coordinator (ROADMAP item 21).
 
-A follower runs the **same codebase** as the coordinator; role is config. It
-bootstraps by pulling the coordinator's COMMIT-DELTA-v2 stream from TID 0
-(``GET /v1/deltas?after=0`` on the [FEDERATION-WIRE-v1](../../docs/design/FEDERATION-WIRE-v1.md)
-surface) and turning it into a **real local** :class:`~datacrystal._store.Store`
-it then reads at full speed — no snapshot encoder, no per-call round-trips.
-
-It is a *facade* over the engine: each delta is validated through the existing
-:class:`~datacrystal.contract.applier.ReferenceApplier` (gap refusal, idempotent
-skip and ``prior`` checks all come for free, fail-closed), reversed into a
-:class:`~datacrystal._storage.protocol.CommitBatch`, and persisted with the
-coordinator's own OIDs/TIDs via ``backend.apply`` — which accepts a batch from any
-source. No new engine surface, no new ADR.
-
-``httpx`` and ``sqlite3`` are imported **lazily** (only when actually fetching /
-when a disk path is given) so a bare ``import datacrystal`` stays inside the
-``{msgspec, pyroaring}`` budget (the dep-isolation fitness gate).
+A facade over the engine: it replays the coordinator's COMMIT-DELTA-v2 stream
+(``GET /v1/deltas``, see ``docs/design/FEDERATION-WIRE-v1.md``) through the
+``ReferenceApplier`` into a real local ``Store``, keeping the coordinator's own OIDs and TIDs.
+``httpx`` and ``sqlite3`` are imported lazily to keep a bare ``import datacrystal``
+inside the ``{msgspec, pyroaring}`` dependency budget.
 """
 
 from __future__ import annotations
@@ -67,12 +56,9 @@ def _iter_frames(blob: bytes) -> Iterator[dict[str, Any]]:
 def _delta_to_batch(
     delta: dict[str, Any], max_oid: int, max_cid: int, root: int | None
 ) -> tuple[CommitBatch, int, int, int | None]:
-    """Reverse one COMMIT-DELTA-v2 delta into a CommitBatch with the coordinator's
-    own OIDs/TIDs, advancing the OID/CID/root high-water marks.
+    """Reverse one COMMIT-DELTA-v2 delta into a CommitBatch, advancing the high-water marks.
 
-    The synthesized meta lands the follower's watermark (``next_tid - 1``,
-    invariant 5); the OID/CID marks keep boot consistent (a read-only follower
-    never allocates locally).
+    The synthesized meta sets the follower's watermark (``next_tid - 1``, invariant 5).
     """
     tid = int(delta["tid"])
     records: list[StoredRecord] = []
@@ -110,12 +96,8 @@ def _bootstrap_backend(
 ) -> ReferenceApplier:
     """Validate ``deltas`` from genesis and persist each advancing one into ``backend``.
 
-    Every delta is fed to a :class:`ReferenceApplier` first — so an out-of-order
-    delta raises :class:`~datacrystal.contract.applier.DeltaGapError`, an
-    already-seen one is a no-op (``apply`` returns ``False``), and the ``prior``
-    payload is checked — all **before** the backend is touched: a gap never
-    half-applies. The returned applier's ``watermark`` / ``state_digest`` are the
-    authoritative replayed state.
+    Each delta passes the ``ReferenceApplier`` before the backend is touched,
+    so a gap never half-applies.
     """
     applier = ReferenceApplier()
     max_oid, max_cid, root = OID_BASE - 1, CID_BASE - 1, None
@@ -128,17 +110,11 @@ def _bootstrap_backend(
 
 
 def _apply_catchup(backend: StorageBackend, deltas: Iterable[dict[str, Any]]) -> int:
-    """Apply deltas *after* the backend's current watermark — follower catch-up.
+    """Apply deltas after the backend's current watermark and return the new watermark.
 
-    Unlike :func:`_bootstrap_backend` (which replays from genesis with the full
-    ``prior`` check), catch-up has no prior state loaded, so it validates
-    **marker + exact contract version** (COMMIT-DELTA-v2 §4.5 — the sync path
-    must fail as loudly as the bootstrap path; pre-W1 it silently applied any
-    version) and **gapless ordering** (a skip raises ``DeltaGapError``; an
-    already-seen delta is skipped) — the single-writer source plus the
-    bootstrap-validated prefix make that sufficient. The OID/CID/root bases
-    come from the backend's current meta, so a re-applied delta never
-    regresses them. Returns the new watermark.
+    No prior state is loaded, so it checks the marker, the exact contract version
+    (COMMIT-DELTA-v2 §4.5) and gapless ordering instead of the full ``prior`` check.
+    The OID/CID/root bases come from the backend's meta, so a re-applied delta never regresses them.
     """
     meta = backend.boot().meta
     watermark = int(meta.get("next_tid", TID_BASE)) - 1
@@ -219,9 +195,7 @@ def _post_submit(
 
 
 def _holds_entity(value: Any) -> bool:
-    """True if ``value`` is or (recursively) contains a live ``@entity`` / ``Lazy``
-    ref — used to detect an entity nested inside a container field.
-    """
+    """Report whether ``value`` is or recursively contains a live ``@entity`` or ``Lazy`` ref."""
     if is_entity(value) or isinstance(value, Lazy):
         return True
     if isinstance(value, (list, tuple, set, frozenset)):
@@ -232,16 +206,11 @@ def _holds_entity(value: Any) -> bool:
 
 
 def _container_holds_entity(value: Any) -> bool:
-    """True if ``value`` is a *container* (list/dict/tuple/set) holding an ``@entity``.
+    """Report whether ``value`` is a container (list/dict/tuple/set) holding an ``@entity``.
 
-    A reference nested in a bare/untyped container (a bare ``list``/``dict``, a
-    ``dict[str, Entity]``) is the shape the OID-int boundary cannot rebind on the
-    coordinator — :func:`~datacrystal.web._pydantic.to_pydantic` projects each
-    entity to its OID, but ``from_pydantic`` only resolves scalar refs and
-    ``list``-edge fields, so the ref would land as a bare int (silent corruption).
-    A scalar ref field (a ``Lazy``/``@entity`` value, not in a container) is
-    handled and returns ``False`` here; a ``list[Lazy[T]]``/``list[T]`` edge is
-    excluded by the caller via ``list_ref_target`` before this is reached.
+    ``from_pydantic`` rebinds only scalar refs and ``list`` edges, so such a ref
+    would land as a bare OID int on the coordinator.
+    The caller excludes list edges via ``list_ref_target``; a scalar ref returns ``False``.
     """
     if isinstance(value, (list, tuple, set, frozenset)):
         return any(_holds_entity(item) for item in cast("Iterable[Any]", value))
@@ -251,9 +220,7 @@ def _container_holds_entity(value: Any) -> bool:
 
 
 def _refs_local_new(value: Any, new_oids: set[int]) -> bool:
-    """True if ``value`` (a serialized create-face field, walked recursively)
-    references an OID in ``new_oids`` — a ref to a not-yet-committed local entity.
-    """
+    """Report whether a serialized create-face field references an OID in ``new_oids``."""
     if isinstance(value, bool):  # bool is an int subclass — never an OID
         return False
     if isinstance(value, int):
@@ -273,22 +240,12 @@ def _contribute(
     api_key: str | None,
     client: Any | None,
 ) -> int | None:
-    """Serialize buffered ``(entity, base)`` items and fan them into the coordinator.
+    """Send buffered ``(entity, base)`` items to the coordinator and return its applied TID.
 
-    Each entity is projected to its create-face wire shape via
-    :func:`~datacrystal.web.to_pydantic` (refs as OID ints) — lazily imported, so
-    a contribution needs ``datacrystal[follower]``'s pydantic, never a bare
-    ``import datacrystal``. A coordinator reject (HTTP 409) is translated to the
-    faithful typed local exception (``ConflictError`` / ``SchemaSkewError`` /
-    ``DanglingRefError``) so the caller can re-read and retry.
-
-    Two v0 shapes fail loud here BEFORE the wire (FEDERATION-WIRE-v1 §5 cuts), so
-    an unfederatable value can never silently corrupt the coordinator: a
-    ``dc.Blob`` field (out-of-line bytes have no create-face wire shape), and an
-    ``@entity`` reference nested in an unsupported container (a bare ``list``/
-    ``dict``, ``dict[str, Entity]`` — only scalar refs and ``list``-edges
-    round-trip). Returns the coordinator's applied TID, or ``None`` if the batch
-    committed nothing (an idempotent re-send / value-equal no-op).
+    Returns ``None`` when the batch committed nothing (an idempotent re-send).
+    A coordinator 409 becomes the matching typed local exception, to re-read and retry.
+    The v0 cuts (blob field, unsupported container ref, new-to-new ref) fail loud before the wire:
+    see ``docs/how-to/federation.md`` (The v0 limits) and FEDERATION-WIRE-v1 §5.
     """
     # lazy: needs pydantic (to_pydantic) — _reflect is framework-free. Both reach
     # through the web package, which lazy-imports its fastapi/strawberry submodules
@@ -383,28 +340,10 @@ def open_follower(
 ) -> Store:
     """Open a local replica synced from a coordinator's federation endpoint.
 
-    The function form of :meth:`Store.follower` (identical behaviour) — use
-    whichever reads better; ``Store.follower`` sits beside ``Store.open`` as the
-    sibling constructor, this is the top-level convenience.
-
-    Bootstraps replay-from-0 (``GET /v1/deltas?after=0``) into a real local store
-    and returns it; reads then hit the local store at full speed.
-
-    Args:
-        url: the coordinator base URL (e.g. ``"https://coordinator"``).
-        api_key: sent as the ``x-api-key`` header (your auth seam; optional).
-        path: where the replica lives on disk (a sqlite-backed store). ``None``
-            (default) keeps it in memory.
-        client: an ``httpx.Client``-compatible object (advanced/testing — e.g. a
-            ``fastapi.testclient.TestClient`` over the coordinator app). When
-            given, ``url``/``api_key`` are the client's responsibility.
-
-    Returns:
-        A :class:`~datacrystal._store.Store` holding the coordinator's committed
-        state at bootstrap time. Call :meth:`~datacrystal._store.Store.sync` to
-        catch up; ``upsert`` + ``commit`` to contribute (fanned into the
-        coordinator — contribute serialization needs ``datacrystal[follower]``'s
-        pydantic).
+    The function form of :meth:`Store.follower`; it bootstraps by replaying from TID 0.
+    ``api_key`` is sent as ``x-api-key``; a ``path`` makes the replica sqlite-backed.
+    ``client`` is an ``httpx.Client``-compatible object (e.g. a ``TestClient``) that owns ``url``.
+    ``sync`` catches up; ``upsert`` + ``commit`` contribute (needs ``datacrystal[follower]``).
     """
     if path is None:
         backend: StorageBackend = MemoryBackend()
@@ -419,7 +358,7 @@ def open_follower(
     _bootstrap_backend(backend, _iter_frames(blob))
     # same-package engine cooperation: the no-lock backend constructor is the
     # right entry for a replica we have already populated via backend.apply.
-    store = Store._from_backend(backend)  # pyright: ignore[reportPrivateUsage]
+    store = Store._from_backend(backend)
 
     def _sync(after: int) -> int:
         """Fetch + apply the coordinator's deltas after ``after`` (Store.sync)."""
@@ -433,6 +372,6 @@ def open_follower(
         return _contribute(items, url=url, api_key=api_key, client=client)
 
     # the follower hooks Store.sync()/commit() call (#151/#153); same-package.
-    store._sync_fn = _sync  # pyright: ignore[reportPrivateUsage]
-    store._contribute_fn = _contribute_fn  # pyright: ignore[reportPrivateUsage]
+    store._sync_fn = _sync
+    store._contribute_fn = _contribute_fn
     return store

@@ -1,17 +1,10 @@
-"""Author the COMMIT-DELTA-v2 replay vectors.
+"""Author the COMMIT-DELTA-v2 replay vectors (`uv run scripts/generate_vectors.py`).
 
-Run once per contract version (`uv run python src/datacrystal/contract/vectors/_generate.py`)
-and commit the outputs. The vectors are BYTE-PINNED: regenerating them is a
-contract-version bump with a new spec, never a quiet refresh (spec §6). The
-v2 regeneration (epic #168 W1) replaced the retired v1 set wholesale under
-the no-compat ruling — the state DIGESTS are unchanged by construction
-(``state_digest`` excludes the ``actor``/``at`` stamps; only the bytes moved).
-
-Deterministic by construction — fixed OIDs/strings, a PINNED ``at`` clock
-value, fixed actors, no randomness. The payloads are hand-built record
-encodings (msgpack value lists with entity refs as ext-type-1 8-byte OIDs),
-independent of the engine on purpose: the contract defines what the engine
-must emit, not the other way around.
+Run once per contract version and commit the outputs.
+The vectors are byte-pinned: regenerating them is a contract-version bump with a new spec, never a
+quiet refresh (COMMIT-DELTA-v2.md §6).
+The payloads are hand-built and deterministic (fixed OIDs, a pinned ``at``, no randomness),
+independent of the engine on purpose.
 """
 
 from __future__ import annotations
@@ -24,11 +17,12 @@ import msgspec
 
 from datacrystal.contract.applier import ReferenceApplier, encode_delta
 
-HERE = Path(__file__).parent
+HERE = Path(__file__).resolve().parent.parent / "src" / "datacrystal" / "contract" / "vectors"
 _enc = msgspec.msgpack.Encoder()
 
 
 def ref(oid: int) -> msgspec.msgpack.Ext:
+    """Return an entity reference: ext type 1 carrying the 8-byte OID."""
     return msgspec.msgpack.Ext(1, struct.pack(">q", oid))
 
 
@@ -95,13 +89,10 @@ DELTAS = [
         ],
         "root": ROOT,
     }),
-    # 004 (authored at M4, when store.delete() activated the shape §3.1
-    # reserved in rev 1 — additive authoring, NOT a regeneration: 001–003
-    # stay byte-identical). The tombstone carries the last payload as prior.
-    # Deliberately, the root keeps referencing the deleted AZURITE: that is
-    # the unchecked-delete contract (ADR-003), documented in bytes — a
-    # consumer must apply this without complaint; only *following* the
-    # dangle is an error, and that happens outside the stream.
+    # 004 was authored at M4 when store.delete() activated the shape reserved in spec §3.1
+    # (additive; 001-003 stay byte-identical). The tombstone carries the last payload as prior.
+    # The root still references the deleted AZURITE (unchecked delete, ADR-003): a consumer applies
+    # it without complaint, and only following the dangle is an error.
     ("004-delete", {
         "f": "datacrystal-delta", "v": 2, "tid": 4,
         "actor": 2, "at": AT_NS + 4,
@@ -129,6 +120,7 @@ DELTAS = [
 
 
 def main() -> None:
+    """Write the vector files and ``expected.json`` next to the contract package."""
     applier = ReferenceApplier()
     digests: dict[str, str] = {}
     for name, delta in DELTAS:

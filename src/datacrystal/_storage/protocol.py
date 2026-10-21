@@ -1,23 +1,15 @@
 """The storage protocol: the seam every backend implements.
 
-SQLite-as-blob-store is the only durable backend in v0.x (ROADMAP item 2);
-the in-memory fake exists for fast tests. The custom append-only log
-(ROADMAP punt 14) and a future Rust turbo wheel slot in behind this same
-protocol — that is the whole point of keeping it this small:
-
-* ``boot()``       — open/create, verify format version, return meta + types
-* ``load_many()``  — batch-read records by OID
-* ``scan_type()``  — stream all records of one type (index builds)
-* ``apply()``      — atomically persist one commit batch
-* ``read_view()``  — a stable read view at the latest durable commit
-  (M3 addition, ratified by ADR-002: ``store.snapshot()`` needs reads that
-  are isolated from a concurrently running commit P2)
+SQLite is the only durable backend in v0.x (ROADMAP item 2); the in-memory fake is for fast tests.
+A later append-only log (ROADMAP punt 14) or Rust wheel slots in behind the same small protocol.
+Growing it needs an ADR (ADR-002 added ``read_view()`` for snapshot reads isolated from commit P2).
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
-from typing import BinaryIO, Callable, Iterable, Iterator, Protocol
+from typing import BinaryIO, Protocol
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,15 +39,13 @@ class StoredBlob:
 
 @dataclass(frozen=True, slots=True)
 class StreamedBlob:
-    """A blob written by STREAMING (ADR-007 §4): the bytes are NOT resident.
+    """A blob written by streaming (ADR-007 §4); the bytes are not resident.
 
-    ``open_chunks()`` yields them on demand, and the backend fills a
-    ``zeroblob(size)`` cell in place inside ``apply()``'s transaction — so a
-    100 MB PDF is committed without ever holding it whole in RAM. ``size`` and
-    ``hash`` (sha256) are already final (computed in the engine's pre-TID
-    hashing pass); the backend recomputes only the ``crc`` as it fills. The
-    in-memory fake, which has no ``blobopen``, materializes the chunks instead
-    (the one backend difference for streaming).
+    ``open_chunks()`` yields them on demand and the backend fills a ``zeroblob(size)`` cell in place
+    inside ``apply()``.
+    ``size`` and ``hash`` are final from the engine's pre-TID hashing pass; the backend recomputes
+    only the ``crc``.
+    The in-memory fake has no ``blobopen`` and materializes the chunks instead.
     """
 
     oid: int
@@ -121,13 +111,12 @@ class StorageReadView(Protocol):
     def open_blob_stream(
         self, oid: int, on_close: Callable[[], None] | None = None
     ) -> BinaryIO:
-        """A file-like reader over one blob's raw bytes (ADR-007 §3 streamed
-        read): ``read(n)``/``seek``/``tell`` touch only the spanned bytes, so a
-        range read of a big blob is RSS-bounded. ``on_close`` (if given) runs
-        when the stream closes — the engine passes a dedicated read view's
-        ``close`` so the pinned read transaction is released with the stream.
-        Raises :class:`~datacrystal._errors.DanglingRefError` if the blob OID is
-        absent (deleted per ADR-003, or never committed).
+        """Open a file-like reader over one blob's raw bytes (ADR-007 §3).
+
+        ``read``/``seek``/``tell`` touch only the spanned bytes, so a range read is RSS-bounded.
+        ``on_close`` runs when the stream closes; the engine passes a read view's ``close`` to
+        release its pinned transaction.
+        Raises :class:`~datacrystal._errors.DanglingRefError` if the blob OID is absent.
         """
         ...
 

@@ -1,33 +1,9 @@
-"""The ``@entity`` decorator — datacrystal's canonical entity form.
+"""The ``@entity`` decorator, datacrystal's canonical entity form (ROADMAP item 1, DESIGN.md).
 
-Per ROADMAP item 1 / DESIGN.md, an entity is a **slots dataclass with a
-weakref slot** (so the WeakValueDictionary registry can hold it without
-keeping it alive), extended with three engine slots:
-
-* ``__dc_oid__``   — the object id, stamped when the entity is registered
-* ``__dc_state__`` — NEW / CLEAN / DIRTY (tri-state dirty tracking, item 1)
-* ``__dc_store__`` — weakref to the owning store (lets the write hook report)
-
-Dirty tracking is a **one-shot ``__setattr__`` hook**: the first write to a
-CLEAN entity notifies the store (and enforces the ADR-001 owner-thread check
-*before* mutating); subsequent writes take the fast path. ``frozen=True``
-entities never arm the hook at all — mutation always raises (SDA delta 2).
-
-Class-level field access (``Mineral.crystal_system``) is intercepted by the
-metaclass and returns a :class:`~datacrystal._conditions.FieldExpr` for the
-query AST. Instance attribute access does **not** go through the metaclass,
-so reads keep plain-slots speed (fitness function #15 is structural).
-
-Field markers are declared via ``typing.Annotated``::
-
-    @dc.entity
-    class Mineral:
-        qid: Annotated[str, dc.Unique]
-        crystal_system: Annotated[str | None, dc.Index] = None
-        type_locality: dc.Lazy[Locality] | None = None
-
-Marker harvesting is deferred to first use (PEP 649 lazy annotations make
-forward references resolve once all classes exist).
+An entity is a slots dataclass with a weakref slot plus three engine slots (``__dc_*__``).
+Dirty tracking is a one-shot ``__setattr__`` hook enforcing the ADR-001 owner-thread check.
+Class-level field access returns a :class:`~datacrystal._conditions.FieldExpr` (fitness #15).
+Markers (``Annotated[str, dc.Unique]``) are harvested at first use, after forward refs resolve.
 """
 
 from __future__ import annotations
@@ -37,12 +13,10 @@ import datetime as _dt
 import decimal as _decimal
 import types
 import weakref
+from collections.abc import Callable, Mapping
 from typing import (
     Annotated,
     Any,
-    Callable,
-    Mapping,
-    TypeVar,
     Union,
     cast,
     dataclass_transform,
@@ -79,18 +53,12 @@ Blob = _Marker("Blob")        # out-of-line raw bytes, lazy handle on read (ADR-
 
 
 class _FullText(_Marker):
-    """The ``dc.FullText`` marker — bare, or parameterized by calling it:
-    ``Annotated[str, dc.FullText]`` / ``Annotated[str, dc.FullText(language="de")]``.
+    """The ``dc.FullText`` marker, bare or called with a language: ``dc.FullText(language="de")``.
 
-    Deliberately **inert in the core engine** (ROADMAP item 10: indexing
-    and stemming are ``datacrystal[fts]``'s job). The engine only records
-    the declaration in the FieldSpec so consumers can read field + language
-    straight from the model — the M3 FTS5 contract spike does today, the
-    extra will. The parameterized form exists in core because the API
-    freezes at the v0.1.0 tag, before the extra ships (decided 2026-06-12).
-
-    ``language`` is a lowercase short code ("de", "en", …); which codes are
-    supported (and the default for ``None``) is the extra's contract.
+    Inert in the core engine (ROADMAP item 10): it only records the declaration in the FieldSpec for
+    ``datacrystal[fts]`` to read.
+    The parameterized form is in core because the API freezes at the v0.1.0 tag, before the extra
+    ships (decided 2026-06-12).
     """
 
     __slots__ = ("language",)
@@ -99,7 +67,7 @@ class _FullText(_Marker):
         super().__init__("FullText")
         self.language = language
 
-    def __call__(self, *, language: str) -> "_FullText":
+    def __call__(self, *, language: str) -> _FullText:
         if not language:
             raise TypeError(
                 "FullText(language=...) takes a non-empty language code, e.g. "
@@ -119,15 +87,11 @@ FullText = _FullText()  # the bare marker; call it to declare a language
 class RenamedFrom(_Marker):
     """Field marker: this field was persisted under a different name (#26 (a)).
 
-    ``mohs: Annotated[float | None, dc.RenamedFrom("hardness")]`` — on decode, a
-    record that lacks ``mohs`` but has ``hardness`` binds the old column, so the
-    rename follows the code without rewriting old records (additive, invariant
-    8; the rename heuristic stays OFF — you name the old field explicitly).
-
-    Scoped to **non-indexed fields read through live hydration** in v0.2;
-    combining it with ``Index``/``Unique`` raises (the index/snapshot/arrow
-    decode paths don't honor renames yet — that is a follow-on). Rewriting old
-    records to the new name is the ``migrate`` story, not this marker.
+    On decode, a record that lacks ``mohs`` but has ``hardness`` binds the old column, so the rename
+    follows the code without rewriting records (invariant 8).
+    Scoped in v0.2 to non-indexed fields read through live hydration; combining it with
+    ``Index``/``Unique`` raises.
+    Rewriting old records is the ``migrate`` story.
     """
 
     __slots__ = ("old_name",)
@@ -143,28 +107,13 @@ class RenamedFrom(_Marker):
 
 
 class Glue(_Marker):
-    """Field marker: derive this field from an OLD record when it is absent from
-    a persisted record (#26 (b)) — the declarative reshape hook for schema
-    evolution that needs data *moved*, not just renamed.
+    """Field marker: derive this field from the old record when it is absent from a persisted one
+    (#26 (b)).
 
-    ``Glue(fn)`` calls ``fn(old)`` where ``old`` is the persisted record as a
-    read-only ``{field_name: value}`` mapping, and uses the result as this
-    field's value. It fires **only when the field is absent** from the record's
-    own persisted shape — exactly like a default that can read its siblings — so
-    once data is written in the new shape the glue is a no-op (it never rewrites
-    a record, invariant 8). Split / merge / derive across fields::
-
-        @dc.entity
-        class Locality:
-            lat: Annotated[float, dc.Glue(lambda old: float(old["coords"].split(",")[0]))]
-            lon: Annotated[float, dc.Glue(lambda old: float(old["coords"].split(",")[1]))]
-            # old records persisted `coords="48.1,11.5"`; lat/lon follow the code
-
-    Scoped (v0.2, like :class:`RenamedFrom`) to **non-indexed fields read through
-    live hydration / decode** (``get``/``query``/``pluck``); the index, snapshot
-    and arrow decode paths are a follow-on. Combining it with ``Index``/``Unique``
-    or with ``RenamedFrom`` raises. Rewriting old records to the new shape on disk
-    is the ``migrate`` story (#26 (c)), not this marker.
+    ``Glue(fn)`` calls ``fn(old)`` with the persisted record as a read-only mapping.
+    It fires only when the field is absent, so it never rewrites a record (invariant 8).
+    Scoped like :class:`RenamedFrom`; combining it with ``Index``, ``Unique`` or ``RenamedFrom``
+    raises.
     """
 
     __slots__ = ("fn",)
@@ -179,15 +128,10 @@ class Glue(_Marker):
         return "datacrystal.Glue(...)"
 
 
-# Orderable scalar leaf types admitted as Index/Unique/SortedIndex keys.
-# datetime/date join the original str/int/float/bool set (#106, amending
-# ADR-004 §1 which pre-authorized naive date/time as range keys): both are
-# total-ordered and round-trip natively through the msgpack codec (_records.py
-# — aware datetimes ride msgspec's timestamp ext as a UTC instant, naive ones
-# an ISO-text ext). The aware-vs-naive comparability fork is handled in the
-# sorted run (_indexes.py), not here at the type gate.
-# Decimal joins them (#184): exact, total-ordered against Decimal and int, and
-# round-tripped as its exact text by DECIMAL_EXT_CODE.
+# Orderable scalar leaf types admitted as Index/Unique/SortedIndex keys (#106 amends ADR-004 section
+# 1; Decimal joined in #184).
+# The aware-vs-naive datetime comparability fork is handled in the sorted run (_indexes.py), not at
+# this type gate.
 _INDEXABLE_TYPES = (str, int, float, bool, _dt.datetime, _dt.date, _decimal.Decimal)
 
 
@@ -216,8 +160,18 @@ class FieldSpec:
 class TypeInfo:
     """Engine-side metadata for one entity class."""
 
-    __slots__ = ("cls", "typename", "field_names", "frozen", "protected", "_specs",
-                 "_defaults", "_spec_by_name", "_has_entity_refs", "_data_field_names")
+    __slots__ = (
+        "_data_field_names",
+        "_defaults",
+        "_has_entity_refs",
+        "_spec_by_name",
+        "_specs",
+        "cls",
+        "field_names",
+        "frozen",
+        "protected",
+        "typename",
+    )
 
     def __init__(self, cls: type, typename: str, field_names: tuple[str, ...],
                  frozen: bool, protected: bool = False) -> None:
@@ -260,8 +214,8 @@ class TypeInfo:
         return self._specs
 
     def spec(self, name: str) -> FieldSpec | None:
-        """O(1) FieldSpec lookup — ``get()``/``get_many()`` hit this on
-        every natural-key call (perf gate ``unique_key_lookup``).
+        """Return the FieldSpec for ``name`` in O(1); ``get()`` and ``get_many()`` hit this on every
+        natural-key call.
         """
         by_name = self._spec_by_name
         if by_name is None:
@@ -270,11 +224,10 @@ class TypeInfo:
 
     @property
     def defaults(self) -> dict[str, Any]:
-        """name → zero-arg factory, for the fields that HAVE a default.
+        """Map field name to a zero-arg factory for the fields that have a default.
 
-        Additive schema evolution fills fields missing from old records from
-        here; a field absent from this map cannot be added to a class that
-        has persisted records (SchemaMismatchError names it).
+        Additive schema evolution fills missing fields from here; a field absent from it cannot be
+        added to a class with persisted records.
         """
         if self._defaults is None:
             out: dict[str, Any] = {}
@@ -355,13 +308,10 @@ _PERM_FIELD_SET = frozenset(PERM_FIELDS)
 
 
 def _check_reserved(cls: type, name: str) -> None:
-    """The ``_dc_*`` prefix and ``dc_permissions`` are lib-reserved on EVERY
-    entity class (ADR-008 Context) — not just protected ones: an unprotected
-    class with a user ``_dc_owner`` field would be a silent landmine the
-    moment ``protected=True`` retrofits it (R7 makes retrofit a first-class
-    scenario). NB the deliberate, unrelated overload: PersistentList/Dict
-    carry a ``_dc_owner`` *slot* (the container's owning-entity backref) —
-    containers are not entities and are unaffected by this guard.
+    """Reject the ``_dc_`` prefix and ``dc_permissions`` as field names on every entity class
+    (ADR-008 Context).
+
+    Unprotected classes are checked too, so ``protected=True`` can be retrofitted later (R7).
     """
     if name.startswith("_dc_") or name == "dc_permissions":
         raise TypeError(
@@ -372,39 +322,27 @@ def _check_reserved(cls: type, name: str) -> None:
 
 
 def _inject_perm_columns(cls: type, annotations: dict[str, Any]) -> None:
-    """Add the four lib-managed label columns (ADR-008 Context) to the raw
-    class BEFORE ``dataclasses.dataclass()`` runs, so encoding, schema
-    lineage, indexes and snapshots all see them through existing machinery.
+    """Add the four lib-managed label columns to the raw class before ``dataclasses.dataclass()``
+    runs (ADR-008 Context).
 
-    All four are ``init=False`` with defaults — the constructor signature is
-    untouched, and the defaults are the R6 BIRTH values (owner=0 'nobody'
-    until store()-time stamping, groups=∅, floors VIEWER — inert by
-    construction: with no groups, every non-owner's authority is NO_STANDING).
-    The R7 LEGACY fill (groups={WORLD}, write=ADMIN) is deliberately
-    DIFFERENT and lives in the decode-fill sites, never here.
-    ``_dc_read_floor`` carries SortedIndex (ADR-004 rule 3) so W3's ``<=``
-    composition stays bitmap-answerable. ``_dc_owner``/``_dc_groups`` carry
-    Index (ADR-008 W3-1 / D3) so :func:`datacrystal._indexes.readable_bitmap`
-    can compile owner postings and per-group postings — ``_dc_groups`` is a
-    multi-valued (#13) index, one posting per held group id. ``_dc_write_floor``
-    is deliberately NOT indexed: the write gate always decodes it from the
-    prior record, never from a bitmap.
+    All are ``init=False`` with the R6 birth defaults; the R7 legacy fill lives in the decode sites.
+    ``_dc_read_floor`` carries SortedIndex (ADR-004 rule 3), ``_dc_owner`` and ``_dc_groups`` carry
+    Index (W3-1 / D3), and ``_dc_write_floor`` is unindexed because the gate decodes it from the
+    prior record.
     """
     annotations["_dc_owner"] = Annotated[int, Index]
-    setattr(cls, "_dc_owner", dataclasses.field(default=0, init=False))
+    cls._dc_owner = dataclasses.field(default=0, init=False)
     annotations["_dc_groups"] = Annotated[list[int], Index]
-    setattr(cls, "_dc_groups", dataclasses.field(default_factory=list[int], init=False))
+    cls._dc_groups = dataclasses.field(default_factory=list[int], init=False)
     annotations["_dc_read_floor"] = Annotated[int, SortedIndex]
-    setattr(cls, "_dc_read_floor", dataclasses.field(default=VIEWER, init=False))
+    cls._dc_read_floor = dataclasses.field(default=VIEWER, init=False)
     annotations["_dc_write_floor"] = int
-    setattr(cls, "_dc_write_floor", dataclasses.field(default=VIEWER, init=False))
+    cls._dc_write_floor = dataclasses.field(default=VIEWER, init=False)
 
 
 def _permissions_view(self: Any) -> Permissions:
-    """The injected ``dc_permissions`` getter (protected classes only): the
-    four columns packaged as one frozen :class:`Permissions`. ``groups``
-    copies to a tuple — the live owner-bound list never leaks through the
-    view.
+    """Return the injected ``dc_permissions`` getter value: the four columns as one frozen
+    :class:`Permissions`.
     """
     return Permissions(
         owner=self._dc_owner,
@@ -415,54 +353,40 @@ def _permissions_view(self: Any) -> Permissions:
 
 
 def _permissions_assign(self: Any, value: Any) -> None:
-    """The injected ``dc_permissions`` setter — write-time inheritance:
-    ``child.dc_permissions = parent.dc_permissions`` copies ALL FOUR columns
-    verbatim, owner included (the study: "the property packages the columns
-    on read and writes them back on assignment"). The gate rules on legality
-    of the staged result at commit (W2-5), never here. Groups copy into a
-    FRESH list — no aliasing between records. Validation runs before the
-    first column write so a raise never leaves half a struct staged (the
-    dirty flip the failed outer setattr already caused is the pre-existing
-    invalid-slot-assignment wart, accepted).
+    """Set the four label columns from a :class:`Permissions`, as the injected setter.
 
-    Reached via the data-descriptor protocol: user assignment goes through
-    ``_tracked_setattr`` (touch + frozen guard) and ``object.__setattr__``
-    then invokes this setter.
+    ``child.dc_permissions = parent.dc_permissions`` copies all four columns verbatim, owner
+    included, with groups in a fresh list.
+    Legality is judged by the commit gate (W2-5), not here; validation runs before the first column
+    write, so a raise stages nothing.
     """
     if not isinstance(value, Permissions):
         raise TypeError(
             f"dc_permissions must be assigned a dc.Permissions, got "
             f"{type(value).__name__}"
         )
-    setattr(self, "_dc_owner", value.owner)
-    setattr(self, "_dc_groups", list(value.groups))  # wraps owner-bound (copy)
-    setattr(self, "_dc_read_floor", value.read_floor)
-    setattr(self, "_dc_write_floor", value.write_floor)
-
-
-_TEntity = TypeVar("_TEntity")
+    self._dc_owner = value.owner
+    self._dc_groups = list(value.groups)  # wraps owner-bound (copy)
+    self._dc_read_floor = value.read_floor
+    self._dc_write_floor = value.write_floor
 
 
 @overload
-def entity(cls: type[_TEntity], /) -> type[_TEntity]: ...
+def entity[TEntity](cls: type[TEntity], /) -> type[TEntity]: ...
 @overload
-def entity(*, frozen: bool = False,
-           protected: bool = False) -> Callable[[type[_TEntity]], type[_TEntity]]: ...
+def entity[TEntity](*, frozen: bool = False,
+           protected: bool = False) -> Callable[[type[TEntity]], type[TEntity]]: ...
 
 
 @dataclass_transform(eq_default=False, field_specifiers=(dataclasses.field, dataclasses.Field))
 def entity(cls: type | None = None, /, *, frozen: bool = False,
            protected: bool = False) -> Any:
-    """Class decorator declaring a datacrystal entity.
+    """Declare a datacrystal entity (class decorator).
 
-    Applies ``@dataclass(slots=True, weakref_slot=True, eq=False)`` (entity
-    equality is identity — there is exactly one live instance per OID), adds
-    the engine slots and the dirty-tracking hook, and registers the type.
-
-    ``protected=True`` (ADR-008, epic #168) additionally injects the four
-    lib-managed permission columns (``init=False`` — the constructor is
-    untouched) and the read-only ``dc_permissions`` view. Everything else
-    about the class is unchanged; unprotected classes pay exactly nothing.
+    Applies ``@dataclass(slots=True, weakref_slot=True, eq=False)`` (equality is identity, one live
+    instance per OID), adds the engine slots and dirty-tracking hook, and registers the type.
+    ``protected=True`` (ADR-008, epic #168) also injects the four permission columns and the
+    read-only ``dc_permissions`` view; unprotected classes pay nothing.
     """
 
     def wrap(c: type) -> type:
@@ -491,7 +415,7 @@ def _make_entity(cls: type, frozen: bool, protected: bool = False) -> type:
         _inject_perm_columns(cls, annotations)
     base = cast(
         "Any",
-        dataclasses.dataclass(  # type: ignore[call-overload]
+        dataclasses.dataclass(
             slots=True, weakref_slot=True, eq=False, frozen=frozen
         )(cls),
     )
@@ -549,7 +473,7 @@ def type_info(cls_or_obj: Any) -> TypeInfo:
 
 
 def oid_of(obj: Any) -> int | None:
-    """The entity's OID, or None if it was never registered with a store."""
+    """Return the entity's OID, or ``None`` if it was never registered with a store."""
     try:
         return object.__getattribute__(obj, "__dc_oid__")
     except AttributeError:
@@ -710,25 +634,13 @@ def _contains_lazy(hint: Any) -> bool:
 
 
 def _check_r11_lazy_only(cls: type, field_name: str, hint: Any) -> None:
-    """R11 (ADR-008): a protected class may appear in a field only inside a
-    ``Lazy[...]`` — the legal forms are ``Lazy[X]``, ``Lazy[X] | None``, and
-    ``list[Lazy[X]]``. Any DIRECT (eager) reference to a protected class —
-    a bare field, a union member, or a list/tuple/set/dict element that is
-    not behind ``Lazy`` — is a decorator-time ``TypeError``.
+    """Reject a direct reference to a protected class outside ``Lazy[...]``.
 
-    Structural walk mirroring :func:`_may_hold_entity`, except recursion
-    STOPS at a ``Lazy[...]`` node (the exemption R11 grants) instead of
-    descending into it — this is the rule that makes ``Lazy.get()``/
-    :meth:`~datacrystal._store.Store._load_oid_deref` the ONE read
-    checkpoint (epic #168 W3-4): hydration, eager graph materialization and
-    the identity map stay principal-free because an eager protected edge
-    can never be created in the first place.
-
-    Runs from :func:`_resolve_specs`, so it fires as early as the type hints
-    resolve — at ``@entity`` decoration when possible, or at first
-    persistence via the same ``NameError``-deferred fallback every other
-    per-field validation here already follows (self- and mutually-
-    referencing classes cannot resolve their own forward refs yet).
+    ADR-008 R11.
+    Legal forms are ``Lazy[X]``, ``Lazy[X] | None`` and ``list[Lazy[X]]``; this keeps ``Lazy.get()``
+    the one read checkpoint.
+    The walk mirrors :func:`_may_hold_entity` but stops at ``Lazy``.
+    It runs from :func:`_resolve_specs`, deferred on ``NameError`` like the other per-field checks.
     """
     origin = get_origin(hint)
     if origin is Annotated:
@@ -761,18 +673,11 @@ def _is_union(hint: Any) -> bool:
 
 
 def _is_indexable(hint: Any) -> bool:
-    """A scalar (str/int/float/bool/datetime/date/Decimal) or optional scalar (``| None``).
+    """Return whether ``hint`` is a scalar (str/int/float/bool/datetime/date/Decimal) or optional
+    scalar.
 
-    datetime/date are admitted because they are total-ordered and round-trip
-    natively (#106 / ADR-004 §1) — the same key set Index/Unique/SortedIndex and
-    the web extra's ``_is_scalar_field`` all read.
-
-    Deliberately rejects ``list[scalar]`` — that is a *multi-valued* index
-    (:func:`_is_list_of_scalar`), maintained with element-wise postings, not a
-    single scalar key. This must key off the Union origin, not args alone:
-    ``get_args(list[str])`` is also ``(str,)``, so an args-only check would
-    wrongly accept a list as a scalar (and then crash on the unhashable list
-    key at insert).
+    ``list[scalar]`` is a multi-valued index (:func:`_is_list_of_scalar`), so this checks the Union
+    origin, not ``get_args`` alone.
     """
     if hint in _INDEXABLE_TYPES:
         return True
@@ -782,22 +687,18 @@ def _is_indexable(hint: Any) -> bool:
     return False
 
 
-# The leaf types _walk_value treats as referencing nothing (None handled via
-# NoneType). The flat-entity fast-path (#52) is the static twin of that runtime
-# check: a field is ref-free iff its type is built solely from these, optionally
-# inside list/tuple/set/dict/union. Everything else — an @entity class, Lazy,
-# Any, object, a bare/unparameterised container, an unknown type — is treated as
-# possibly ref-bearing, so the walk is never wrongly skipped.
+# Leaf types _walk_value treats as referencing nothing; the flat-entity fast path (#52) is its
+# static twin.
+# Anything else (an @entity class, Lazy, Any, a bare container, an unknown type) counts as possibly
+# ref-bearing.
 _REF_FREE_LEAVES = (str, int, float, bool, bytes, _dt.datetime, _dt.date, _dt.time,
                     _decimal.Decimal, type(None))
 
 
 def _may_hold_entity(hint: Any) -> bool:
-    """Conservatively True unless ``hint`` is provably ref-free (#52).
+    """Return True unless ``hint`` is provably ref-free (#52).
 
-    Mirrors :meth:`Store._walk_value`'s leaf set so the static per-type flag and
-    the runtime graph walk agree by construction. Used only to *skip* work, so
-    it must never return False for a type that could carry an entity ref.
+    Only used to skip work, so it must never return False for a type that could carry an entity ref.
     """
     if get_origin(hint) is Annotated:
         return _may_hold_entity(get_args(hint)[0])
@@ -815,9 +716,8 @@ def _may_hold_entity(hint: Any) -> bool:
 
 
 def _is_list_of_scalar(hint: Any) -> bool:
-    """``list[scalar]`` or ``list[scalar] | None`` — an inverted (multi-valued)
-    index over the list's elements (#13). Rejects bare ``list`` (no element
-    type), ``list[Ref]``, nested ``list[list[...]]``, and ``dict``.
+    """Return whether ``hint`` is ``list[scalar]`` or ``list[scalar] | None``, an inverted
+    multi-valued index (#13).
     """
     if _is_union(hint):
         args = [a for a in get_args(hint) if a is not type(None)]

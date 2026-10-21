@@ -69,7 +69,7 @@ class PackageVersion:
     system: Annotated[str, dc.Index]
     name: Annotated[str, dc.Index]
     version: str
-    dependencies: list[dc.Lazy["PackageVersion"]] = field(default_factory=list)  # the adjacency
+    dependencies: list[dc.Lazy[PackageVersion]] = field(default_factory=list)  # the adjacency
 
 
 def peak_rss_mb() -> float:
@@ -86,7 +86,7 @@ def fetch_dependencies(system: str, name: str, version: str) -> dict[str, Any]:
         return json.loads(cache.read_text())
     url = (f"{API}/systems/{system}/packages/"
            f"{urllib.parse.quote(name, safe='')}/versions/{version}:dependencies")
-    with urllib.request.urlopen(url, timeout=30) as resp:  # noqa: S310 (trusted host)
+    with urllib.request.urlopen(url, timeout=30) as resp:
         data = json.loads(resp.read())
     DATA.mkdir(parents=True, exist_ok=True)
     cache.write_text(json.dumps(data))
@@ -99,10 +99,10 @@ def find_cycle(adj: dict[int, list[int]]) -> list[int] | None:
     itself can't overflow on the deep graph it's inspecting."""
     WHITE, GRAY, BLACK = 0, 1, 2
     color = dict.fromkeys(adj, WHITE)
-    for root in adj:
+    for root, children in adj.items():
         if color[root] != WHITE:
             continue
-        stack = [(root, iter(adj[root]))]
+        stack = [(root, iter(children))]
         path = [root]
         color[root] = GRAY
         while stack:

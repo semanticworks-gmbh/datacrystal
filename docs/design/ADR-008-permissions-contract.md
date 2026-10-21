@@ -435,3 +435,56 @@ until followers have principals.
   phrasing ("two optional top-level keys") predates R4 — v2 as locked makes
   the stamps REQUIRED. Further permission rulings amend THIS ADR (dated
   amendments, never silent edits).
+
+## Implementation notes (added with #191; no ruling changes)
+
+These are the reasons the code carried as comments before they were trimmed.
+
+### Ladder and Actor (R3, R6, R7)
+
+- AGENT sits below AUTOMATION deliberately: an LLM agent is the least predictable writer, and competence is not clearance.
+- `NO_STANDING` is not a grantable level; it is the absence of any shared group, kept distinct from `VIEWER` so a floor of `VIEWER` reads "any member may view".
+- Read fences are enforced (`_redacted`, `Lazy.get`, `can_read_row`), and `Actor` is born `protected=True`.
+- `Actor.sponsor` is a natural person's uid and is required for every non-human actor, enforced in core by `acting_as()`: accountability diffuses in groups, and incident response needs a person.
+- The R7 legacy fill comes from one shared constant used by every decode site, never the R6 birth defaults, which would read legacy write floors as `VIEWER` (world-writable) and invert R7.
+
+### Birth labels and the write fence (R6, R8, R10)
+
+- `_dc_owner` is the acting uid and is never inherited, so a legacy container cannot mint owner=0 children. Groups and both floors copy from the enqueuing protected container at write time and then stay stable (tranquility); a record with no protected container keeps the inert R6 defaults.
+- Inheritance applies only to the untouched birth shape: non-default labels staged before `store()` (`dc.share`, `dc.protect`) win. A child left at the birth defaults is indistinguishable from untouched, so relabel after `store()` to force owner-only inside a shared container.
+- The gate's baseline for a new record is the birth or inherited labels, which are library policy and not the principal's grant, so only explicit verb changes on top are ceiling-checked. The baseline is keyed by OID, cleared with the buffer, and survives a denied commit so a fixed-up retry still has it.
+- F2: setting `_dc_owner` between `store()` and `commit()` would forge the birth owner and plant a record in a victim's space, so the birth owner is pinned as the persisted branch already pins ownership.
+- Ownership is immutable after birth except for root (R9). Otherwise any writer that clears the write floor could stage itself as owner, gain a permanent owner-read bypass, and mint its personal-best level into the R8 ceiling, which reads the staged owner.
+- F1: an Actor's `memberships` is authority, because `acting_as(uid)` turns a stored level into a live Principal. Every changed membership must therefore be at most the level the committer holds in that group, so minting `WORLD:EXECUTIVE` needs root. Lowering or removing never blocks.
+- Unchanged floors never block a pure content edit, which keeps `migrate()`'s verbatim re-stages legal. Root is decided from the principal alone and short-circuits before any prior I/O, but root commits still stamp.
+- Denial raises `WriteDeniedError` with the buffers intact (`discard()` or fix and retry); `committing()` never retries it, since denial is deterministic and not OCC.
+
+### R11 write boundary and read backstop
+
+- The decorator-time check cannot see an `Any`-typed field, a bare container or `store.root`, so a runtime check at the write boundary closes the same rule.
+- The exemption keys on the field position's decode mode, not on a runtime `Lazy` wrapper: `swizzle` collapses `Lazy.of(x)` to a bare ref token for any non-`Lazy[...]` field, which then re-decodes eagerly and would materialize the protected child into a shared parent for every principal. A protected ref in any eager-decoding position is a violation; only a genuinely lazy position (`spec.lazy_refs`) is exempt.
+- A `Redacted` twin is exempt from the eager-ref check and is caught by the never-committable-twin check at the top of the register loop.
+- The read path backstops records from other sources (federation, migration, a pre-R11 store); root is exempt because the deref already authorised it.
+
+### R14 deref checkpoint
+
+- Deref judges committed labels only (W3 D1), because a staged `share()` or `protect()` is unvalidated until the commit gate rules, and judging it would let a principal pre-grant itself visibility.
+- `_load_oid` stays principal-free on purpose (hydration and eager graph materialization never need to know who asks); only deref surfaces use the checked variant. A registry hit is checked too, so an earlier readable load never leaks the live instance to a later unreadable principal. A twin is built fresh and never registered.
+- Pre-commit window: a just-`store()`d target has an OID but no committed labels, so the deref judges its live birth labels instead, and the creating principal reads its own uncommitted work while an outsider still gets a twin.
+- A protected target is never cached on an engine `Lazy` handle, twins included, because caching either outcome would pin the first principal's result across later `acting_as()` scopes. A user `Lazy.of(protected)` handle keeps its target, so `get()` re-derives through the checked deref from the target's own registration; an unbound target (never stored) is reachable only by its creator and returns as is.
+- `Lazy.peek()` never exposes a protected target, since it is principal-free; readers go through `get()` and engine plumbing that needs only the OID uses the unchecked peek.
+- A registry hit is pre-loadable into a handle only when the target is unprotected (W3-4); a loaded handle inside a shared parent is a cross-principal cache.
+- A twin has no engine state slot, so it is rejected before `state_of()`, whether it arrives as the top-level argument or smuggled into another entity's field.
+- A blob is readable only if its owning record is: the gate runs on every `BlobHandle.bytes()` and `open_blob` call, before the cache check, and only for a protected owner (zero cost otherwise).
+- `Actor` lookups for `acting_as(uid)` are unfenced, since a W2-born row is owner-only and the anonymous session could not read its own registry row. Identity must be committed before it acts, and a non-human's sponsor must resolve to a committed human actor.
+
+### Read surfaces (R12, R15)
+
+- Found-but-denied is indistinguishable from absent, counts are post-filtered, and root sees everything; the query plan (`condition`, `residual`, `indexed`, `__str__`) reports the query as given, never a readable rule (D8).
+- The iterable form of `get_many` is a deref surface and not a filter (R14): you already hold the reference, so it mirrors `lazy_ref.get()` and never drops it.
+- `snapshot(principal=None)` captures the acting principal now; an explicit Principal binds that identity and is never resolved through the Actor registry.
+- Read-set compiler (W3-1): `readable_bitmap` computes owner postings united with, per membership, group postings intersected with `read_floor <= level`. A group outside the principal's memberships contributes `NO_STANDING`, below every floor, so iterating only held memberships plus the implicit `WORLD` one is exact. An explicit `memberships[WORLD]` entry overrides the implicit `VIEWER` as `level()` does. Anonymous (`uid=0`) skips the owner branch (R7a) and reads only WORLD-at-VIEWER rows.
+- `Snapshot` is deliberately un-slotted: the `datacrystal[web]` DataLoader tier monkeypatches `get_many` on a live handle, which needs an instance `__dict__`; `_readable` is keyed on the class, not the Principal (TRAP 1).
+- Web edge (W4-4): a `Redacted` source projects to `None` in `to_pydantic`, never a DTO and never a 500, and `from_pydantic` builds its constructor arguments only from declared data fields, so a client-supplied `_dc_owner` or `_dc_read_floor` can never reach the constructor.
+- Protected-class bootstrap of the Arrow mirror and the `pluck(C, "_dc_owner")` exception are covered in `DESIGN.md` ("Arrow mirror") and `docs/reference.md` ("Reading API").
+- Migration (`Store.migrate`) rides the normal commit machine, so the write gate applies per chunk; legacy records carry the R7 `ADMIN` floor, so run a migration as a store-wide admin or root. A mid-run denial leaves earlier chunks durable and the run resumes idempotently.

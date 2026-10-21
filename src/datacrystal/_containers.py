@@ -1,38 +1,28 @@
 """Owner-bound persistent containers (M2 deliverable, KICKOFF risk 1).
 
-In-place mutation of a list/dict inside a CLEAN entity used to be invisible
-to the one-shot ``__setattr__`` hook — the #1 silent-lost-write footgun in
-both ancestor systems (ZODB, EclipseStore). The fix: every list/dict that
-enters an entity field (by assignment, construction or hydration) is wrapped
-in a :class:`PersistentList`/:class:`PersistentDict` bound to its owning
-entity. Every mutator flips the owner to DIRTY *before* mutating (so the
-ADR-001 owner-thread check still raises pre-mutation); mutating a container
-owned by an ``@entity(frozen=True)`` record raises ``FrozenEntityError``.
-
-Semantics: wrapping COPIES the container — containers are by-value parts of
-their owner (they round-trip by value, never by reference). After assigning
-``e.tags = data``, mutate through ``e.tags``, not through ``data``.
-
-Containers hold a strong reference to their owner: as long as you can reach
-a container, its owner cannot be collected out from under it.
+An in-place mutation of a list or dict inside a CLEAN entity would bypass the one-shot
+``__setattr__`` hook, so every list/dict entering an entity field is wrapped in a
+:class:`PersistentList`/:class:`PersistentDict` bound to its owner.
+Every mutator flips the owner to DIRTY *before* mutating, or raises ``FrozenEntityError``.
+Wrapping COPIES: after ``e.tags = data``, mutate through ``e.tags``, not ``data``.
 """
 
 from __future__ import annotations
 
-from typing import Any, Iterable, Mapping, SupportsIndex, cast
+from collections.abc import Iterable, Mapping
+from typing import Any, Self, SupportsIndex, cast
 
 from datacrystal._errors import FrozenEntityError
 from datacrystal._state import touch
 
 
 def wrap_value(value: Any, owner: Any) -> Any:
-    """Wrap lists/dicts (recursively) as persistent containers bound to
-    ``owner``. Already-bound containers of the same owner pass through;
-    everything else is copied into a fresh bound wrapper.
+    """Wrap lists and dicts (recursively) as persistent containers bound to ``owner``.
+
+    Containers already bound to the same owner pass through; everything else is copied.
     """
     if isinstance(value, (PersistentList, PersistentDict)):
-        # reportPrivateUsage: same-module wrap_value/owner cooperation
-        if value._dc_owner is owner:  # pyright: ignore[reportPrivateUsage]
+        if value._dc_owner is owner:
             return value
         return type(value)(value, owner=owner)
     if isinstance(value, list):
@@ -55,7 +45,7 @@ def _is_frozen_owner(owner: Any) -> bool:
 class PersistentList(list[Any]):
     """A list that marks its owning entity dirty on every mutation."""
 
-    __slots__ = ("_dc_owner", "_dc_frozen")
+    __slots__ = ("_dc_frozen", "_dc_owner")
 
     def __init__(self, iterable: Iterable[Any] = (), *, owner: Any = None) -> None:
         self._dc_owner = owner
@@ -120,11 +110,11 @@ class PersistentList(list[Any]):
         self._touch()
         super().__delitem__(index)
 
-    def __iadd__(self, other: Iterable[Any]) -> "PersistentList":
+    def __iadd__(self, other: Iterable[Any]) -> Self:
         self.extend(other)
         return self
 
-    def __imul__(self, count: SupportsIndex) -> "PersistentList":
+    def __imul__(self, count: SupportsIndex) -> Self:
         self._touch()
         super().__imul__(count)
         return self
@@ -133,7 +123,7 @@ class PersistentList(list[Any]):
 class PersistentDict(dict[Any, Any]):
     """A dict that marks its owning entity dirty on every mutation."""
 
-    __slots__ = ("_dc_owner", "_dc_frozen")
+    __slots__ = ("_dc_frozen", "_dc_owner")
 
     def __init__(self, mapping: Mapping[Any, Any] | Iterable[Any] = (),
                  *, owner: Any = None) -> None:
@@ -193,6 +183,6 @@ class PersistentDict(dict[Any, Any]):
         super().__setitem__(key, wrapped)
         return wrapped
 
-    def __ior__(self, other: Any) -> "PersistentDict":
+    def __ior__(self, other: Any) -> Self:
         self.update(other)
         return self

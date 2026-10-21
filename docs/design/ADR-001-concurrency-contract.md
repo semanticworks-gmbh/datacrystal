@@ -79,3 +79,10 @@ conflict/retry failure classes to serve a primary persona that is single-threade
 C's ambient-session mode is operationally D with extra machinery underneath. If agent platforms
 trend multi-tenant/server-ward, the actor→server door (command transport swap) is the escape
 hatch, not a session rewrite.
+
+## Implementation notes (added with #191)
+
+- **Commit pipeline.** P1 captures, encodes, flips the captured set back to CLEAN and re-arms the hooks, all await-free on the owner, so a write racing P2 re-dirties and lands in the next commit. P2 applies the batch (bytes only) on the store's single IO worker thread. P3 finalizes indexes and the watermark on the owner. A failed P2 compensates: captured entities return to their buffers unless a racing write already re-buffered them, and the TID is reused, so a rejected commit leaves the sequence gapless. The sync `commit()` blocks until P3; the `aopen()` commit awaits P2 so the loop stays free.
+- **Write model.** `store.store(obj)` registers an object graph; mutating a CLEAN entity buffers it through the one-shot hook; in-place mutation of a list or dict field buffers its owner through the owner-bound persistent containers; nothing touches storage until `commit()`.
+- **Submit pump.** The owner runs pending `submit` closures whenever it next calls into the store, or explicitly via `run_pending`; under `aopen()` the loop is woken instead. The pump piggybacks on owner API calls that may sit inside an `acting_as` scope, so queued work always runs as the ambient principal and never inherits a scoped identity (epic #168 W1); a closure that should act as someone opens its own `acting_as`.
+- **Lock file.** The directory lock is a port of EclipseStore's `StorageLockFileManager` idea: `uvicorn --workers 4` silently corrupting a store is the most foreseeable user error, and docs alone do not prevent it.

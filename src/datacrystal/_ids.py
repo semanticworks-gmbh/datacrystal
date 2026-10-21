@@ -1,18 +1,10 @@
 """Partitioned 64-bit id space (ROADMAP item 1) and the format version.
 
-Three id families share one signed-64-bit space, partitioned so any id is
-self-classifying:
-
-* **CID** — class/type ids, small integers starting at ``CID_BASE``. Assigned
-  per store (the same class may have different CIDs in different stores).
-* **OID** — object ids, starting at ``OID_BASE`` (above 2**32 so they can
-  never collide with CIDs, and EclipseStore-style obviously "not a count").
-* **TID** — transaction ids / commit watermarks, a separate sequence starting
-  at 1. **Sequence-derived, never wall-clock** (recorded decision in
-  KICKOFF.md: deterministic stores, replayable commit streams).
-
-Allocation state is plain in-memory counters; the high-water marks are
-persisted in the store's meta table at every commit and restored at boot.
+CID (class ids, assigned per store) and OID (object ids, above 2**32 so they never collide with
+a CID) share one signed-64-bit space, so any id is self-classifying.
+TID (commit watermarks) is a separate sequence, sequence-derived and never wall-clock
+(KICKOFF.md: deterministic stores, replayable commit streams).
+The high-water marks are persisted in the store's meta table at every commit and restored at boot.
 """
 
 from __future__ import annotations
@@ -34,17 +26,19 @@ TID_BASE = 1
 
 
 def is_oid(value: int) -> bool:
+    """Return whether ``value`` lies in the OID range."""
     return value >= OID_BASE
 
 
 def is_cid(value: int) -> bool:
+    """Return whether ``value`` lies in the CID range."""
     return CID_BASE <= value < OID_BASE
 
 
 class IdAllocator:
     """Hands out fresh OIDs/CIDs/TIDs; restored from persisted high-water marks."""
 
-    __slots__ = ("_next_oid", "_next_cid", "_next_tid")
+    __slots__ = ("_next_cid", "_next_oid", "_next_tid")
 
     def __init__(self, next_oid: int = OID_BASE, next_cid: int = CID_BASE,
                  next_tid: int = TID_BASE) -> None:

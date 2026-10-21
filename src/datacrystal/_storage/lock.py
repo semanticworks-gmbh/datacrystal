@@ -1,19 +1,10 @@
 """Single-writer lease lock file (ROADMAP item 2).
 
-A port of EclipseStore's ``StorageLockFileManager`` idea: a ``used.lock``
-file in the store directory holds ``{pid, token, ts}``; a daemon thread
-refreshes the timestamp. A second opener finds a *fresh* lock and fails
-loudly with ``StoreLockedError`` — ``uvicorn --workers 4`` silently
-corrupting is the #1 foreseeable user error, and docs alone don't prevent
-it. A *stale* lock (holder crashed) is taken over.
-
-If the refresher ever finds the file owned by someone else (this process was
-SIGSTOPped/slept past the TTL and another process took over), it flags the
-lease as lost; the next commit raises ``LeaseLostError`` instead of risking
-two-writer corruption.
-
-TTL and clock are injectable (fitness function #8: the lock suite runs with
-a sub-second TTL and no real-time sleeps).
+``used.lock`` holds ``{pid, token, ts}``; a daemon thread refreshes ``ts``.
+A fresh lock makes a second opener fail with ``StoreLockedError``; a stale lock is taken over.
+A refresher that finds another owner flags the lease lost, so the next commit raises
+``LeaseLostError``; why a lock at all: ADR-001, "Implementation notes".
+TTL and clock are injectable, so the lock suite needs no real-time sleeps (fitness function #8).
 """
 
 from __future__ import annotations
@@ -24,8 +15,9 @@ import socket
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable, cast
+from typing import cast
 
 from datacrystal._errors import StoreLockedError
 

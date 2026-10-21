@@ -1,21 +1,10 @@
 """SQLite-as-blob-store: the durable v0.x backend (ROADMAP item 2).
 
-datacrystal writes object records as opaque msgpack blobs into a single
-SQLite file and rides SQLite's journal for crash atomicity — we add no
-custom on-disk format in v0.x, which is exactly why the crash-consistency
-story is honest from day one (KICKOFF risk 4). The boot index *is* the
-B-tree (ROADMAP punt 14: no boot problem to solve).
-
-Durability is the KICKOFF M2 fsync triad (per-commit / interval / never):
-* ``durability="commit"`` — ``synchronous=FULL`` plus ``fullfsync=ON`` on
-  macOS (the ~4 ms F_FULLFSYNC floor measured in the feasibility study;
-  honesty over speed). Every acked commit survives power loss.
-* ``durability="interval"`` (default) — WAL group-commit:
-  ``synchronous=NORMAL`` fsyncs at WAL checkpoints, so commits between
-  checkpoints may be lost on OS crash/power loss but the file is never
-  corrupted. Process crash (kill -9) loses nothing under any policy.
-* ``durability="never"`` — ``synchronous=OFF``; benchmarks and scratch
-  stores only. OS crash/power loss can corrupt the file.
+Records are opaque msgpack blobs; SQLite's journal gives crash atomicity (KICKOFF risk 4).
+``durability`` is the fsync triad (docs/design/DESIGN.md, "Durability policy"):
+``"commit"`` is FULL plus fullfsync on macOS, so every acked commit survives power loss;
+``"interval"`` (default) is WAL group-commit, losing at most the commits since the last checkpoint
+on OS crash; ``"never"`` is for scratch stores, where OS crash can corrupt the file.
 """
 
 from __future__ import annotations
@@ -25,8 +14,9 @@ import io
 import sqlite3
 import sys
 import zlib
+from collections.abc import Callable, Iterator
 from pathlib import Path
-from typing import Any, BinaryIO, Callable, Iterator, cast
+from typing import Any, BinaryIO, cast
 
 from datacrystal._errors import (
     CorruptRecordError,
@@ -38,12 +28,9 @@ from datacrystal._ids import FORMAT_VERSION
 from datacrystal._records import crc as _crc
 from datacrystal._storage.protocol import BootInfo, CommitBatch, StoredBlob, StoredRecord
 
-# A plain rowid table (NOT WITHOUT ROWID): a future streamed read uses
-# sqlite3.Connection.blobopen, which needs the oid to be a rowid alias
-# (ADR-007 §2). Blobs are TYPELESS — no cid column (a blob has no class or
-# lineage; this is a deliberate deviation from the schema listed in ADR-007,
-# whose `cid` column is meaningless for an opaque value). crc is the torn-blob
-# guard, mirroring the objects table.
+# The blobs table is a plain rowid table: blobopen needs the oid as a rowid alias (ADR-007 §2).
+# It has no cid column, a deliberate deviation from ADR-007's listed schema (a blob has no class).
+# crc is the torn-blob guard, as in the objects table.
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
@@ -136,19 +123,12 @@ def _closed_underneath() -> StoreClosedError:
 
 
 class _SqliteBlobReader(io.RawIOBase):
-    """A raw reader over a ``sqlite3.Blob`` (ADR-007 §3 streamed read).
+    """A raw reader over a ``sqlite3.Blob`` (ADR-007 §3).
 
-    ``readinto``/``seek``/``tell`` delegate to the open blob handle, so wrapped
-    in an ``io.BufferedReader`` a ``read(n)``/range read pulls only the spanned
-    bytes off disk — peak RSS is the buffer, never the blob size. ``seek`` past
-    EOF is allowed (standard file semantics, matching the memory fallback's
-    ``BytesIO``): the cursor parks at EOF and reads return ``b""``. Closing also
-    runs ``on_close`` (the engine passes its dedicated read view's ``close``, so
-    the pinned WAL read transaction is released exactly when the stream is).
-
-    If the connection is closed out from under the stream (a stream that outlived
-    its snapshot), every op translates the raw ``sqlite3.ProgrammingError`` to
-    :class:`StoreClosedError` — the public surface stays DataCrystalError-only.
+    Behind an ``io.BufferedReader`` a range read pulls only the spanned bytes (RSS = the buffer).
+    ``seek`` past EOF parks the cursor at EOF like ``BytesIO``; reads return ``b""``.
+    Closing runs ``on_close``, which releases the pinned WAL read transaction.
+    Once its connection closes, every op raises :class:`StoreClosedError`, not ``ProgrammingError``.
     """
 
     def __init__(self, blob: sqlite3.Blob, on_close: Callable[[], None] | None) -> None:
@@ -163,7 +143,7 @@ class _SqliteBlobReader(io.RawIOBase):
     def seekable(self) -> bool:
         return True
 
-    def readinto(self, b: Any) -> int:  # type: ignore[override]  # buffer protocol
+    def readinto(self, b: Any) -> int:  # buffer protocol
         if self._overshoot:  # cursor parked past EOF → no bytes (file semantics)
             return 0
         try:
@@ -350,9 +330,10 @@ class SqliteBackend:
 
     @staticmethod
     def _drop_types_unique_constraint(conn: sqlite3.Connection) -> None:
-        """Stores created before additive schema evolution carry a UNIQUE
-        constraint on types.name; the type lineage needs several rows per
-        name. One-time, idempotent table rebuild.
+        """Rebuild ``types`` without the legacy UNIQUE(name), which type lineage (several rows per
+        name) forbids.
+
+        Idempotent: a table without the constraint is left alone.
         """
         row = conn.execute(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='types'"
@@ -383,9 +364,9 @@ class SqliteBackend:
         return _load_blob(self._conn, oid)
 
     def read_view(self) -> SqliteReadView:
-        """A snapshot-isolated read view (own connection, pinned WAL read
-        transaction). Safe to call from any thread — it never touches the
-        backend's shared connection (ADR-002).
+        """Return a snapshot-isolated read view on its own connection (ADR-002).
+
+        Safe from any thread: it never touches the backend's shared connection.
         """
         return SqliteReadView(self._path)
 

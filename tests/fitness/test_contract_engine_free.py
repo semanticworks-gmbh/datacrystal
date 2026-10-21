@@ -14,6 +14,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 CONTRACT = Path("src/datacrystal/contract")
+VECTORS_GENERATOR = Path("scripts/generate_vectors.py")
 
 # stdlib used by the contract, plus msgspec, plus the error taxonomy leaf
 # (imported in a try/except so a copied-out file degrades to Exception).
@@ -34,7 +35,7 @@ def _imports(tree: ast.AST) -> Iterator[str]:
 
 def _engine_imports() -> list[str]:
     offenders = []
-    for path in CONTRACT.rglob("*.py"):
+    for path in [*CONTRACT.rglob("*.py"), VECTORS_GENERATOR]:
         tree = ast.parse(path.read_text(), filename=str(path))
         offenders.extend(
             f"{path.name}: import {name}" for name in _imports(tree) if name not in _ALLOWED
