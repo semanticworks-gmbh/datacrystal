@@ -20,11 +20,11 @@ from typing import Any, Self
 from datacrystal._errors import DataCrystalError
 from datacrystal.contract.applier import (
     CONTRACT_VERSION,
-    FORMAT_MARKER,
     REQUIRED_KEYS,
     DeltaFormatError,
     DeltaGapError,
     ReferenceApplier,
+    check_delta_header,
     decode_delta,
     encode_delta,
 )
@@ -154,20 +154,12 @@ class DeltaLog:
         unknown op (a consumer is total over ops, §3), and DeltaGapError when the TID skips the
         watermark (§5).
         """
-        if delta.get("f") != FORMAT_MARKER:
-            raise DeltaFormatError(f"not a datacrystal delta: f={delta.get('f')!r}")
-        version = delta.get("v")
-        if version != CONTRACT_VERSION:
-            if isinstance(version, int) and version > CONTRACT_VERSION:
-                raise DeltaFormatError(
-                    f"delta version {version} is newer than this log "
-                    f"supports ({CONTRACT_VERSION}); upgrade datacrystal"
-                )
-            raise DeltaFormatError(
-                f"delta version {version!r} predates v{CONTRACT_VERSION} — "
-                "incompatible (COMMIT-DELTA-v2 §7, no-compat): pre-v2 delta "
-                "logs are recreated from the live store, never migrated"
-            )
+        check_delta_header(
+            delta,
+            consumer="log",
+            upgrade="upgrade datacrystal",
+            remedy="pre-v2 delta logs are recreated from the live store, never migrated",
+        )
         # Validate the full required-key shape BEFORE buffering: a frame
         # missing a required key would fsync fine but poison every later
         # replay (the failure must land at write time, not read time).

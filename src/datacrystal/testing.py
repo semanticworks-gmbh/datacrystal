@@ -19,6 +19,7 @@ from datacrystal.contract.applier import (
     FORMAT_MARKER,
     DeltaFormatError,
     DeltaGapError,
+    check_delta_header,
 )
 
 __all__ = [
@@ -312,19 +313,12 @@ class CountingConsumer:
         """Apply one delta and return whether it changed anything; a replayed tid is a no-op (spec
         section 4).
         """
-        if delta.get("f") != FORMAT_MARKER:
-            raise DeltaFormatError(f"not a datacrystal delta: f={delta.get('f')!r}")
-        version = delta.get("v")
-        if version != CONTRACT_VERSION:
-            if isinstance(version, int) and version > CONTRACT_VERSION:
-                raise DeltaFormatError(
-                    f"delta version {version} is newer than this consumer "
-                    f"supports ({CONTRACT_VERSION}); upgrade the consumer"
-                )
-            raise DeltaFormatError(
-                f"delta version {version!r} predates v{CONTRACT_VERSION} — "
-                "incompatible (COMMIT-DELTA-v2 §7, no-compat): recreate the stream"
-            )
+        check_delta_header(
+            delta,
+            consumer="consumer",
+            upgrade="upgrade the consumer",
+            remedy="recreate the stream",
+        )
         tid = delta["tid"]
         if tid <= self.watermark:
             return False  # §4.2: apply-twice ≡ apply-once

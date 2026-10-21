@@ -28,11 +28,9 @@ from datacrystal._storage.memory import MemoryBackend
 from datacrystal._storage.protocol import CommitBatch, StorageBackend, StoredRecord
 from datacrystal._store import Store
 from datacrystal.contract.applier import (
-    CONTRACT_VERSION,
-    FORMAT_MARKER,
-    DeltaFormatError,
     DeltaGapError,
     ReferenceApplier,
+    check_delta_header,
     decode_delta,
 )
 
@@ -156,20 +154,12 @@ def _apply_catchup(backend: StorageBackend, deltas: Iterable[dict[str, Any]]) ->
     root_meta = meta.get("root_oid", "")
     root: int | None = int(root_meta) if root_meta else None
     for delta in deltas:
-        if delta.get("f") != FORMAT_MARKER:
-            raise DeltaFormatError(f"not a datacrystal delta: f={delta.get('f')!r}")
-        version = delta.get("v")
-        if version != CONTRACT_VERSION:
-            if isinstance(version, int) and version > CONTRACT_VERSION:
-                raise DeltaFormatError(
-                    f"delta version {version} is newer than this follower "
-                    f"supports ({CONTRACT_VERSION}); upgrade datacrystal"
-                )
-            raise DeltaFormatError(
-                f"delta version {version!r} predates v{CONTRACT_VERSION} — "
-                "incompatible (COMMIT-DELTA-v2 §7, no-compat): re-bootstrap "
-                "this follower from a v2 coordinator"
-            )
+        check_delta_header(
+            delta,
+            consumer="follower",
+            upgrade="upgrade datacrystal",
+            remedy="re-bootstrap this follower from a v2 coordinator",
+        )
         tid = int(delta["tid"])
         if tid <= watermark:
             continue  # idempotent skip (apply-twice ≡ apply-once)

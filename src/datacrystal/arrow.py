@@ -39,9 +39,9 @@ from datacrystal._records import (
 from datacrystal._snapshot import Ref
 from datacrystal.contract.applier import (
     CONTRACT_VERSION,
-    FORMAT_MARKER,
     DeltaFormatError,
     DeltaGapError,
+    check_delta_header,
 )
 
 try:
@@ -379,19 +379,12 @@ class ArrowMirror:
         Raises DeltaFormatError for a foreign marker or a non-current version, DeltaGapError on a
         TID gap.
         """
-        if delta.get("f") != FORMAT_MARKER:
-            raise DeltaFormatError(f"not a datacrystal delta: f={delta.get('f')!r}")
-        version = delta.get("v")
-        if version != CONTRACT_VERSION:
-            if isinstance(version, int) and version > CONTRACT_VERSION:
-                raise DeltaFormatError(
-                    f"delta version {version} is newer than this mirror "
-                    f"supports ({CONTRACT_VERSION}); upgrade datacrystal[arrow]"
-                )
-            raise DeltaFormatError(
-                f"delta version {version!r} predates v{CONTRACT_VERSION} — "
-                "incompatible (COMMIT-DELTA-v2 §7, no-compat): rebuild the mirror"
-            )
+        check_delta_header(
+            delta,
+            consumer="mirror",
+            upgrade="upgrade datacrystal[arrow]",
+            remedy="rebuild the mirror",
+        )
         tid = delta["tid"]
         if tid <= self._watermark:
             return False  # §4.2: apply-twice ≡ apply-once
