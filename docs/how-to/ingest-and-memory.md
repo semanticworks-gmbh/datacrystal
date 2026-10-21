@@ -48,6 +48,7 @@ if __name__ == "__main__":
 - `query_iter(target)` yields chunk by chunk, so peak memory is O(chunk); `limit=` and `offset=` on `query()` and `pluck()` load only the slice for a fully indexed read.
 - `lazy_timeout=<seconds>` demotes loaded `Lazy` handles idle for that long back to unloaded; the next `.get()` reloads them with the same identity.
   There is no hard per-store memory cap and no RSS-based demotion.
+- There is no bulk helper (`writer()`, `bulk_load()`): call `store()` and `commit()` in batches, because a batching sink would reintroduce a session.
 - `tests/fitness/test_memory_bounded.py` gates the peak-RSS budget, collectability of results and that `get()` hydrates exactly one object.
 
 Reference: [Concurrency primitives](../reference.md#concurrency-primitives), [Reading API](../reference.md#reading-api).

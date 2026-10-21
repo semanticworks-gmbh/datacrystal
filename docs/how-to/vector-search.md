@@ -76,7 +76,7 @@ store.close()
 - Read through a [`snapshot()`](../reference.md#snapshots) so the ranking is exact and callable from any thread.
 - Reciprocal Rank Fusion combines the two lists on rank rather than score, so BM25 and cosine need no normalization; `k=60` is the community default.
   A library helper `fuse_rrf` is `[planned — theme:search]`, and `rrf` above is the whole of it until then.
-- Exact brute force is the baseline of comparable embedded tools (LanceDB, sqlite-vec, `llm`) and holds up to about 100K vectors or 100 ms per query; a tight prefilter reaches much larger corpora.
+- Exact brute force needs no index, and a tight prefilter keeps the ranked set small.
 - Beyond that there are two paths, and neither is in core.
   An in-process approximate index, the `datacrystal[vector]` extra (a usearch sidecar with a `dc.Vector` marker, GitHub #22), is `[planned — item 11]`.
   The analytics tier mirrors entities to parquet with [`datacrystal[arrow]`](analytics.md) and searches there with DuckDB's VSS extension, because the core planner never grows a cost model ([why](../explanation.md#query-semantics-the-planner-the-residual-and-the-candidate-set)).

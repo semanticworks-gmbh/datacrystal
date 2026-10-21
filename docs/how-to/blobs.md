@@ -35,6 +35,9 @@ with dc.Store.open("cabinet.store") as store:
     print(photo.jpeg.size)
 ```
 
+Run once it prints `5002 faaa8f98`, `5002`, `b'\xff\xd8'`, `4` and `10000`.
+The script replaces the blob at the end, so a second run reads the 10,000 zero bytes and prints `10000 95b532cc`, `10000`, `b'\x00\x00'`, `4` and `10000`.
+
 - A plain `bytes` field is stored inline, so every hydration, commit and scan of that type carries the bytes; use it for a few hundred KB at most.
   There is no automatic spill threshold: mark the field `dc.Blob` when the bytes would bloat a scan of the owning type.
 - A `dc.Blob` field keeps a 48-byte descriptor (`blob_oid`, size, sha256) in the record, and the bytes go to a sibling `blobs` table in the same commit transaction.

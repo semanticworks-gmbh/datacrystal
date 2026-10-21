@@ -1,6 +1,6 @@
 # How-to: run analytics on Arrow mirrors
 
-After this page you can aggregate over millions of records in DuckDB without hydrating a single entity.
+After this page you can aggregate a store's records in DuckDB without hydrating entities.
 
 ```bash
 pip install 'datacrystal[arrow]' duckdb

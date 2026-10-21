@@ -67,6 +67,7 @@ print(edge.sync(), edge.get(Mineral, qid="Q3").name, edge.get(Mineral, qid="Q1")
 edge.close()
 ```
 
+- On a fresh coordinator the follower prints `7.0`, then `3 topaz 7.5`; each further run reads the raised value, adds 0.5 again and re-sends the Q3 upsert, so the second run prints `7.5`, then `4 topaz 8.0`.
 - Both scripts define the same `@entity` classes and run as scripts, because a follower resolves only types that exist under the same module path.
 - The wire is three HTTP shapes under `/v1`: `GET /v1/head` (watermark probe), `GET /v1/deltas?after=<tid>` (the COMMIT-DELTA-v2 change-feed) and `POST /v1/submit` (contribute); the spec is [FEDERATION-WIRE-v1](../design/FEDERATION-WIRE-v1.md).
 - Run the coordinator with one worker.

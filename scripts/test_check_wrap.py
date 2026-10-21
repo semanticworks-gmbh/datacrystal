@@ -40,6 +40,19 @@ def test_a_line_ending_in_a_colon_may_introduce_the_next_line() -> None:
     assert check_wrap.wrap_errors("Run it:\nuv run x\n") == []
 
 
+def test_a_line_holding_two_sentences_is_reported_in_prose_and_bullets() -> None:
+    """Given two sentences on one line, When checked, Then the line is named, bullets included."""
+    expected = ["line 1: several sentences — write one sentence per line"]
+    assert check_wrap.wrap_errors("First one. Second one.\n") == expected
+    assert check_wrap.wrap_errors("- First one. Second one.\n") == expected
+
+
+def test_code_spans_abbreviations_and_decimals_do_not_count_as_sentence_ends() -> None:
+    """Given dots inside code, e.g. and version numbers, When checked, Then nothing is reported."""
+    assert check_wrap.wrap_errors("Call `store.get(X). Y` here, e.g. Mohs 7.5 or v0.10 as a tag.\n") == []
+    assert check_wrap.wrap_errors("| Cell. Another. |\n> Quote. Two.\n") == []
+
+
 def test_the_since_gate_counts_only_the_lines_a_branch_added() -> None:
     """Given a diff adding line 42, When a wrap is judged, Then it counts at 41 and 42, not at 5."""
     diff = "@@ -10,0 +11,2 @@\n+new one\n+new two\n@@ -40 +42 @@\n-old\n+changed\n@@ -50,3 +53,0 @@\n"

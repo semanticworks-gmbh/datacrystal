@@ -1,6 +1,6 @@
 # Explanation: how datacrystal thinks
 
-After this page you can predict what stays in memory, what a query costs, what a delete leaves behind and who may read a record.
+After this page you can predict what stays in memory and what a query costs, and you know where to read about deletes, permissions and followers.
 
 ```python
 from typing import Annotated
@@ -49,7 +49,7 @@ store.close()
 - [Why deletes are unchecked in v0.x](#why-deletes-are-unchecked-in-v0x)
 - [Permissions: read floors, write floors, and the masked deref](#permissions-read-floors-write-floors-and-the-masked-deref)
 - [Why followers are real local stores (the fractal contract)](#why-followers-are-real-local-stores-the-fractal-contract)
-- [The design philosophy](#the-design-philosophy)
+- [Design consequences](#design-consequences)
 
 ## Identity and memory
 
@@ -144,17 +144,16 @@ The coordinator is an ordinary single-writer store with its change-feed served o
 How to: [federation](how-to/federation.md).
 Rationale: [SCALING.md](design/SCALING.md), [FEDERATION-WIRE-v1](design/FEDERATION-WIRE-v1.md).
 
-## The design philosophy
+## Design consequences
 
-Every other persistence path makes you translate: an ORM flattens your graph into tables, JSON throws away your types, pickle trusts arbitrary code on load.
-datacrystal's thesis is that your data follows your code, with typed dataclasses and a place to put bytes ([VISION.md](design/VISION.md)).
+The thesis is that your data follows your code ([VISION.md](design/VISION.md)); these are what it fixes in the engine.
 
 - No translation layer: slots dataclasses are the canonical form, records are msgspec msgpack, and decoding cannot execute code (no pickle, invariant 1).
   Schema, indexes and search config live in the type through `Annotated[...]`, so there is no schema file to drift.
 - No session and no `save()`: you mutate objects and `commit()`, with transparent dirty tracking including in-place `list` and `dict` mutation.
   With a session, the objects would be a cache in front of the database instead of the database.
-- Predictable beats fast-but-mysterious: the rule-based planner, the explicit `dc.Lazy` cut point instead of a guessing pre-fetcher, and durability as a triad you pick, each with a stated loss window.
-- Honest scope: single-writer by design (owner-confined plus a process lease), scaling within one process and out to many readers through snapshots ([SCALING.md](design/SCALING.md)).
+- Predictable costs: the rule-based planner, the explicit `dc.Lazy` cut point instead of a pre-fetcher, and durability as a triad you pick, each with a stated loss window.
+- Scope: single-writer by design (owner-confined plus a process lease), scaling within one process and out to many readers through snapshots ([SCALING.md](design/SCALING.md)).
   Each ACID letter is stated as strongly as a cited test or setting backs it ([Transactional guarantees](reference.md#transactional-guarantees-acid)), and a feature that does not exist is marked planned.
 - Derived data is rebuildable, never authoritative: indexes, the reverse-reference index, the FTS sidecar and the Arrow mirror are watermark-validated and rebuilt from the records (invariant 11, amended by [ADR-005](design/ADR-005-index-cache.md)).
 

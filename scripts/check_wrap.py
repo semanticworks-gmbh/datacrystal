@@ -25,6 +25,12 @@ FENCE = re.compile(r"^```.*?^```[ \t]*$", re.MULTILINE | re.DOTALL)
 SENTENCE_END = re.compile(r"[.!?:;…][)\"'`*_\]]*$")
 # headings, tables, quotes, lists, HTML, fences
 NOT_PROSE = re.compile(r"^(\s|[#|>*<@-]|\d+\. |```)")
+NOT_SENTENCES = re.compile(r"^\s*([#|>]|<|```)")
+BULLET = re.compile(r"^\s*([-*]|\d+\.) ")
+CODE_SPAN = re.compile(r"`[^`]*`")
+LINK_TARGET = re.compile(r"\]\([^)]*\)")
+ABBREVIATION = re.compile(r"(?:\be\.g|\bi\.e|\bvs|\betc|\bcf|\bNo)$")
+SENTENCE_BREAK = re.compile(r"[.!?][)\"'*_\]]*(?= +[A-Z*_(\[\"'])")
 
 
 def wrap_errors(text: str) -> list[str]:
@@ -33,11 +39,23 @@ def wrap_errors(text: str) -> list[str]:
     body, offset = (match.group(2), text.count("\n", 0, match.start(2))) if match else (text, 0)
     lines = FENCE.sub(lambda m: "\n" * m.group(0).count("\n"), body).splitlines()
     prose = [bool(line.strip()) and not NOT_PROSE.match(line) for line in lines]
-    return [
+    wrapped = [
         f"line {i + 1 + offset}: hard-wrapped — write one sentence per line"
         for i in range(len(lines) - 1)
         if prose[i] and prose[i + 1] and not SENTENCE_END.search(lines[i].rstrip())
     ]
+    crowded = [
+        f"line {i + 1 + offset}: several sentences — write one sentence per line"
+        for i, line in enumerate(lines)
+        if line.strip() and not NOT_SENTENCES.match(line) and holds_two_sentences(line)
+    ]
+    return sorted(wrapped + crowded, key=lambda problem: int(re.match(r"line (\d+):", problem)[1]))  # pyrefly: ignore[unsupported-operation] - problem always starts with "line N:"
+
+
+def holds_two_sentences(line: str) -> bool:
+    """Tell whether a sentence ends mid-line and another begins, outside code spans and links."""
+    text = LINK_TARGET.sub("]", CODE_SPAN.sub("`x`", BULLET.sub("", line, count=1)))
+    return any(not ABBREVIATION.search(text[: match.start()]) for match in SENTENCE_BREAK.finditer(text))
 
 
 def added_lines(diff: str) -> set[int]:
@@ -60,7 +78,7 @@ def git(*args: str) -> str:
 def check(paths: list[Path], since: str | None = None) -> int:
     """Print every finding to stderr and return the exit code."""
     if since:
-        names = git("diff", "--name-only", "--diff-filter=d", f"{since}...HEAD", "--", "*.md").split()
+        names = git("diff", "--name-only", "--diff-filter=d", f"{since}...HEAD", "--", "*.md", "llms.txt").split()
         paths = [Path(name) for name in names]
     found = [
         f"{path}: {problem}"
@@ -77,7 +95,7 @@ def main() -> int:
     """Parse the command line and run the check."""
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("paths", nargs="*", type=Path)
-    parser.add_argument("--since", help="check only the lines added since this ref, in every Markdown file changed")
+    parser.add_argument("--since", help="check only the lines added since this ref, in every Markdown file and llms.txt changed")
     args = parser.parse_args()
     if not args.paths and not args.since:
         parser.error("needs files or --since <ref>")

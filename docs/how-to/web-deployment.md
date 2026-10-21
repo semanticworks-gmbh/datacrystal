@@ -3,8 +3,10 @@
 After this page you can expose a store through REST and GraphQL routes without learning the threading rules.
 
 ```bash
-pip install 'datacrystal[web]'
+pip install 'datacrystal[web]' uvicorn
 ```
+
+Save it as `app.py`.
 
 ```python
 from typing import Annotated, Any
@@ -58,15 +60,16 @@ async def create(body: MineralCreate, write=Depends(submit_write)):
         return store.commit()
     return {"committed_tid": await write(on_owner)}
 
-with TestClient(app) as client:
-    print(client.post("/minerals", json={"qid": "Q43010", "name": "quartz", "mohs": 7.0}).json())
-    print(client.get("/minerals/Q43010").json())
-    print(client.get("/minerals/missing").status_code)
-    query = '{ mineral(qid: "Q43010") { name mohs } }'
-    print(client.post("/graphql", json={"query": query}).json())
+if __name__ == "__main__":
+    with TestClient(app) as client:
+        print(client.post("/minerals", json={"qid": "Q43010", "name": "quartz", "mohs": 7.0}).json())
+        print(client.get("/minerals/Q43010").json())
+        print(client.get("/minerals/missing").status_code)
+        query = '{ mineral(qid: "Q43010") { name mohs } }'
+        print(client.post("/graphql", json={"query": query}).json())
 ```
 
-Serve it for real with `uvicorn app:app --workers 1`.
+Run `python app.py` to see the four calls answered, or serve it with `uvicorn app:app --workers 1`; the `__main__` guard keeps uvicorn's import from running the calls.
 
 - The extra is glue over `store.snapshot()` for reads, `store.submit()` and `aopen()` for writes and a per-request DataLoader; it adds no engine.
 - Run `workers=1`.
@@ -98,7 +101,7 @@ Serve it for real with `uvicorn app:app --workers 1`.
 ## Identity for web writes
 
 Every write through `submit_write` runs under the request principal, anonymous by default and never the identity the store was opened with.
-Wire your auth with a dependency override:
+Add this to `app.py` before the `__main__` block to wire your auth with a dependency override:
 
 ```python
 from fastapi import Request
