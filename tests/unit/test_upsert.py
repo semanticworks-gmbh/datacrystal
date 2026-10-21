@@ -674,31 +674,12 @@ def test_retry_after_a_failed_commit_persists_the_upserted_name(
     assert names == ["rock crystal"]
 
 
-def test_failed_commit_of_an_upsert_leaves_the_committed_name_on_disk(
-    flaky_cabinet_with_quartz: _FlakyCabinet,
-) -> None:
-    """Given quartz committed and "rock crystal" upserted onto it
-    When the commit fails in P2 and the store closes without a retry and reopens
-    Then the only name in the reopened store is "quartz"
-    """
-    cabinet = flaky_cabinet_with_quartz
-    cabinet.store.upsert(Mineral(qid="Q43010", name="rock crystal"))
-    cabinet.backend.failures = 1
-    with pytest.raises(OSError, match="injected"):
-        cabinet.store.commit()
-    cabinet.store.close()
-
-    names = cabinet.reopen().pluck(Mineral, "name")
-
-    assert names == ["quartz"]
-
-
-def test_retry_after_a_failed_commit_keeps_the_live_instance(
+def test_retry_after_a_failed_commit_still_hands_out_the_upserted_instance(
     flaky_cabinet_with_quartz: _FlakyCabinet,
 ) -> None:
     """Given quartz committed, "rock crystal" upserted onto it and its commit failed in P2
     When the store retries the commit
-    Then the store still hands out the instance the upsert returned
+    Then the store still hands out the instance the upsert returned (identity map, not disk)
     """
     cabinet = flaky_cabinet_with_quartz
     survivor = cabinet.store.upsert(Mineral(qid="Q43010", name="rock crystal"))
@@ -741,6 +722,19 @@ def test_upsert_after_a_rejected_commit_merges_into_the_committed_record(
 
 
 @pytest.mark.usefixtures("quartz_with_rejected_duplicate")
+def test_upsert_after_a_rejected_commit_applies_the_new_name_to_the_committed_record(
+    store: dc.Store, committed_quartz: Mineral
+) -> None:
+    """Given quartz committed and a plain-stored duplicate qid whose commit was rejected
+    When a same-qid Mineral named "rock crystal" is upserted
+    Then the committed record is named "rock crystal"
+    """
+    survivor = store.upsert(Mineral(qid="Q43010", name="rock crystal"))
+
+    assert survivor.name == "rock crystal"
+
+
+@pytest.mark.usefixtures("quartz_with_rejected_duplicate")
 def test_commit_after_an_upsert_still_rejects_the_kept_duplicate(store: dc.Store) -> None:
     """A rejected commit keeps its buffers, so the duplicate fails the next commit as well.
 
@@ -756,16 +750,18 @@ def test_commit_after_an_upsert_still_rejects_the_kept_duplicate(store: dc.Store
 
 @pytest.mark.usefixtures("quartz_with_rejected_duplicate")
 def test_commit_after_discarding_the_rejected_duplicate_persists_the_upsert(
-    store: dc.Store,
+    store: dc.Store, store_factory: Callable[[], dc.Store]
 ) -> None:
     """Given quartz committed and a plain-stored duplicate qid whose commit was rejected
-    When the store discards, upserts "rock crystal" onto quartz and commits
-    Then the only name in the store is "rock crystal"
+    When the store discards, upserts "rock crystal" onto quartz, commits, closes and reopens
+    Then the only name in the reopened store is "rock crystal"
     """
     store.discard()
     store.upsert(Mineral(qid="Q43010", name="rock crystal"))
     store.commit()
+    store.close()
 
-    names = store.pluck(Mineral, "name")
+    with store_factory() as reopened:
+        names = reopened.pluck(Mineral, "name")
 
     assert names == ["rock crystal"]

@@ -933,8 +933,8 @@ class Store:
             del self._pending_upserts[(ti.cls, field, value)]
         return None
 
-    # Commit path, in order: _p1_capture (validate, take the TID), _run_p2 (backend I/O,
-    # _p2_rollback on failure), _p3_finalize (flip state, build the delta), _deliver (consumers).
+    # Commit: _p1_capture (validate, TID, flip state clean, build delta), _run_p2 (backend I/O,
+    # _p2_rollback on failure), _p3_finalize (indexes, fingerprints, last_tid), _deliver (consumers).
     def commit(self) -> int | None:
         """Atomically persist all buffered changes; return the new TID, or ``None`` if none.
 
