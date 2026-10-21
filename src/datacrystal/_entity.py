@@ -496,7 +496,7 @@ def _make_entity(cls: type, frozen: bool, protected: bool = False) -> type:
         _inject_perm_columns(cls, annotations)
     base = cast(
         "Any",
-        dataclasses.dataclass(  # type: ignore[call-overload]
+        dataclasses.dataclass(
             slots=True, weakref_slot=True, eq=False, frozen=frozen
         )(cls),
     )

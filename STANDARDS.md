@@ -20,7 +20,6 @@ Gates that switch on in a later wave say so by issue: D401, docstring form and l
 - **Enforced by:** ci — `uv run pyrefly check` at 0 on `src`, `examples`, `benchmarks`, `tests`; `uvx ruff check .` selects ANN001–ANN003 and ANN2xx for `src`, `examples` and `scripts`, ANN401 (`Any`) from #192 and ANN for `tests`, `benchmarks` and `evals`; cannot see: an `Any` that hides a real type, a suppression without a reason.
 - **Example:** `src/datacrystal/web/_pydantic.py` (the one `bad-return` suppression, with its reason)
 - **Source:** tetrahedron decision 552, copied 2026-10-20 (#186); pyright leaves `src/` CI here.
-- **Exceptions:** the 9 `# type: ignore` in `src/` (7 without a reason), the 31 stale `# pyright: ignore` and 2 dead `# noqa` stay until #191 converts or deletes them.
 
 ### readable-tests
 - **Rule:** A test names its behaviour and outcome, reads Given / When / Then, is straight-line code — no `if`, `for`, `while`, `try` or lambda in a test, no comprehension outside an `assert` — calls the system and asserts in its own body with the values stated, one fact per assert, through the public API, any fixture function-scoped — except a session-scoped process handle that only a function-scoped fixture requests — no `sleep()`; a helper builds data only; `parametrize` rows hold plain values only.

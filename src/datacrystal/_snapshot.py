@@ -224,7 +224,7 @@ def _view_value(value: Any) -> Any:
         return Ref(oid)
     if isinstance(value, Lazy):
         handle = cast("Lazy[Any]", value)
-        target = handle._peek_unchecked()  # pyright: ignore[reportPrivateUsage]  # OID only (predicate→Ref)
+        target = handle._peek_unchecked()  # OID only (predicate→Ref)
         if target is not None:
             return _view_value(target)
         if handle.oid is None:
@@ -725,7 +725,7 @@ class Snapshot:
         if isinstance(cls_or_typename, str):
             typename = cls_or_typename
         # runtime guard: callers may pass non-type/str (test all(42)); annotation advisory
-        elif isinstance(cls_or_typename, type):  # pyright: ignore[reportUnnecessaryIsInstance]
+        elif isinstance(cls_or_typename, type):
             typename = type_info(cls_or_typename).typename  # loud if not @entity
         else:
             raise TypeError(

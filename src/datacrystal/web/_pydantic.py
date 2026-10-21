@@ -520,7 +520,7 @@ def _strip_optional(hint: Any) -> tuple[Any, bool]:
     if get_origin(hint) in (Union, types.UnionType):
         args = [a for a in get_args(hint) if a is not type(None)]
         if len(args) < len(get_args(hint)):
-            inner = args[0] if len(args) == 1 else Union[tuple(args)]  # type: ignore[valid-type]  # noqa: UP007 - Union[...] over a runtime tuple has no | spelling
+            inner = args[0] if len(args) == 1 else Union[tuple(args)]  # noqa: UP007 - Union[...] over a runtime tuple has no | spelling  # pyrefly: ignore[invalid-annotation]
             return inner, True
     return hint, False
 

@@ -74,13 +74,13 @@ from datacrystal._entity import TYPES_BY_NAME, type_info
 from datacrystal._errors import DataCrystalError, ReadDeniedError
 from datacrystal._permissions import PERM_FIELDS, is_root
 from datacrystal._records import (
-    _OID_STRUCT,  # pyright: ignore[reportPrivateUsage]  # codec primitive, parquet mirror
+    _OID_STRUCT,  # codec primitive, parquet mirror
     DATE_EXT_CODE,
     NAIVE_DATETIME_EXT_CODE,
     REF_EXT_CODE,
     TIME_EXT_CODE,
     RefToken,
-    _ext_hook,  # pyright: ignore[reportPrivateUsage]  # codec primitive, parquet mirror
+    _ext_hook,  # codec primitive, parquet mirror
     decimal_ext,
     decode_payload,
 )

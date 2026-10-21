@@ -128,7 +128,7 @@ from datacrystal._registry import ObjectRegistry
 from datacrystal._snapshot import (
     Ref,
     Snapshot,
-    _SnapshotCore,  # pyright: ignore[reportPrivateUsage]  # the per-watermark core ctor
+    _SnapshotCore,  # the per-watermark core ctor
 )
 from datacrystal._state import STATE_CLEAN, STATE_DELETED, STATE_DIRTY, STATE_NEW
 from datacrystal._storage.protocol import (
@@ -1759,7 +1759,7 @@ class Store:
         a racing write already re-buffered an entity) and reuse the TID —
         the sequence stays gapless (invariant 5).
         """
-        self._alloc._next_tid = capture.tid  # pyright: ignore[reportPrivateUsage]  # gapless TID reuse, invariant 5
+        self._alloc._next_tid = capture.tid  # gapless TID reuse, invariant 5
         for oid, obj, prior in capture.flipped:
             if prior == STATE_NEW:
                 set_state(obj, STATE_NEW)
@@ -1795,7 +1795,7 @@ class Store:
         # plain bytes value is left as-is (it stays readable as itself).
         for obj, field, boid, size, digest in capture.blob_swaps:
             # engine-only BlobHandle constructor (users never call _bind)
-            handle = BlobHandle._bind(boid, size, digest, self)  # pyright: ignore[reportPrivateUsage]
+            handle = BlobHandle._bind(boid, size, digest, self)
             set_field(obj, field, handle)
         if self._debug:
             # For a blob-bearing entity the stored payload carries the real
@@ -2147,7 +2147,7 @@ class Store:
         if self._closed:
             raise StoreClosedError("this store has been closed")
         bound = principal if principal is not None else self.principal
-        core = _SnapshotCore(self._backend.read_view())  # pyright: ignore[reportPrivateUsage]
+        core = _SnapshotCore(self._backend.read_view())
         return Snapshot(core, bound)
 
     def open_blob(self, entity: Any, field: str) -> BinaryIO:
@@ -2299,7 +2299,7 @@ class Store:
                     "class as its first argument"
                 )
             return self._get_many_by_key(refs, unique_key)
-        items: list[Any] = list(refs)  # type: ignore[arg-type]  # a class without kwargs falls through
+        items: list[Any] = list(refs)  # a class without kwargs falls through
         wanted: list[int] = []
         for item in items:
             if isinstance(item, Lazy):
@@ -3084,7 +3084,7 @@ class Store:
                         self._walk_value(getattr(current, spec.name), queue,
                                          child_container,
                                          eager_position=not spec.lazy_refs)
-        return oid_of(obj)  # type: ignore[return-value]
+        return oid_of(obj)  # pyrefly: ignore[bad-return]  # the walk above stamped obj, so it has an oid
 
     def _stamp_perm_labels(self, obj: Any, container: Any) -> None:
         """Birth labels for a fresh protected record (ADR-008 R6, first
@@ -3170,7 +3170,7 @@ class Store:
             if oid is None or oid in self._new or oid in self._dirty:
                 queue.append((value, container))
         elif isinstance(value, Lazy):
-            target = cast("Lazy[Any]", value)._peek_unchecked()  # pyright: ignore[reportPrivateUsage]
+            target = cast("Lazy[Any]", value)._peek_unchecked()
             if target is not None:
                 # Propagate the field's decode mode, NOT an unconditional
                 # exemption: a Lazy wrapper in a lazy-typed field stays lazy
@@ -3210,7 +3210,7 @@ class Store:
                 # _walk_value, which follows peek()).
                 vid = lz.oid
                 if vid is None:
-                    target = lz._peek_unchecked()  # pyright: ignore[reportPrivateUsage]
+                    target = lz._peek_unchecked()
                     vid = oid_of(target) if target is not None else None
                 if vid is not None:
                     out.add(vid)
@@ -3557,7 +3557,7 @@ class Store:
             existing = self._registry.get(child_oid)
             if existing is not None:
                 if not root and type_info(existing).protected:
-                    return Lazy._unloaded(child_oid, self)  # pyright: ignore[reportPrivateUsage]
+                    return Lazy._unloaded(child_oid, self)
                 return existing
             rec = cache.get(child_oid) if cache else None
             if rec is None:
@@ -3570,7 +3570,7 @@ class Store:
                 )
             child_ti = self._ti_for_cid(rec.cid)
             if not root and child_ti.protected:
-                return Lazy._unloaded(child_oid, self)  # pyright: ignore[reportPrivateUsage]
+                return Lazy._unloaded(child_oid, self)
             shell = cast("Any", object.__new__(child_ti.cls))
             stamp(shell, child_oid, self, STATE_CLEAN)
             self._registry.add(child_oid, shell)  # before fill: breaks cycles
@@ -3641,7 +3641,7 @@ class Store:
             # so .bytes() can re-gate the read under the current principal; an
             # unprotected owner stays byte-identical (owner_oid=None → no gate).
             owner_oid = oid_of(owner) if type_info(owner).protected else None
-            return BlobHandle._bind(value.blob_oid, value.size, value.hash, self,  # pyright: ignore[reportPrivateUsage]
+            return BlobHandle._bind(value.blob_oid, value.size, value.hash, self,
                                     owner_oid=owner_oid)
         if isinstance(value, RefToken):
             if lazy:
@@ -3654,14 +3654,14 @@ class Store:
                 # .get() re-derives through the checked deref.
                 if existing is not None and not type_info(existing).protected:
                     # engine-only Lazy constructors (users use Lazy.of)
-                    handle: Lazy[Any] = Lazy[Any]._loaded(  # pyright: ignore[reportPrivateUsage]
+                    handle: Lazy[Any] = Lazy[Any]._loaded(
                         existing, value.oid, self
                     )
                     if self._lazyman is not None:
                         self._lazyman.track(handle)
                     return handle
                 # engine-only Lazy constructors (users use Lazy.of)
-                unloaded: Lazy[Any] = Lazy._unloaded(value.oid, self)  # pyright: ignore[reportPrivateUsage]
+                unloaded: Lazy[Any] = Lazy._unloaded(value.oid, self)
                 return unloaded
             return link(value.oid)  # eager: hand off to the iterative driver (#29)
         if isinstance(value, list):
@@ -3712,7 +3712,7 @@ def _ref_target_oid(value: Any) -> int | None:
     if isinstance(value, Lazy):
         if value.oid is not None:
             return value.oid
-        target = cast("Lazy[Any]", value)._peek_unchecked()  # pyright: ignore[reportPrivateUsage]
+        target = cast("Lazy[Any]", value)._peek_unchecked()
         return oid_of(target) if target is not None else None
     return None
 
@@ -3774,7 +3774,7 @@ def _raw_value(value: Any) -> Any:
             )
         return RefToken(oid)
     if isinstance(value, Lazy):
-        target = cast("Lazy[Any]", value)._peek_unchecked()  # pyright: ignore[reportPrivateUsage]  # OID only, loaded handle knows best
+        target = cast("Lazy[Any]", value)._peek_unchecked()  # OID only, loaded handle knows best
         if target is not None:
             return _raw_value(target)
         if value.oid is None:
@@ -3849,7 +3849,7 @@ def _find_escapee(value: Any) -> str | None:
     if is_entity(value):
         return type(value).__name__
     if isinstance(value, Lazy):
-        target = cast("Lazy[Any]", value)._peek_unchecked()  # pyright: ignore[reportPrivateUsage]
+        target = cast("Lazy[Any]", value)._peek_unchecked()
         return f"Lazy[{type(target).__name__}]" if target is not None else "Lazy"
     if isinstance(value, (list, tuple, set, frozenset)):
         for item in cast("frozenset[object]", value):

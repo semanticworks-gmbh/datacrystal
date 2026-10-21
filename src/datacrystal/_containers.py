@@ -33,7 +33,7 @@ def wrap_value(value: Any, owner: Any) -> Any:
     """
     if isinstance(value, (PersistentList, PersistentDict)):
         # reportPrivateUsage: same-module wrap_value/owner cooperation
-        if value._dc_owner is owner:  # pyright: ignore[reportPrivateUsage]
+        if value._dc_owner is owner:
             return value
         return type(value)(value, owner=owner)
     if isinstance(value, list):

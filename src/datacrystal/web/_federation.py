@@ -154,7 +154,7 @@ def federation_router(
         # documented deployment (open the store on the serving thread, ADR-001).
         # A misdeployment would otherwise queue the fan-in with no pump and await
         # forever; fail loud instead of a silent hang (#155 peer-review fix).
-        if threading.get_ident() != store._owner:  # pyright: ignore[reportPrivateUsage]
+        if threading.get_ident() != store._owner:
             raise HTTPException(
                 500,
                 detail="coordinator store is not owned by the serving thread — open "
@@ -252,7 +252,7 @@ def federation_router(
                         # OCC (#155): the carried base must equal the current payload hash.
                         # current is None ⇔ key absent; this single check covers all cases —
                         # stale update, insert of an existing key, and update with no base.
-                        current = store._payload_digest(info, key, value)  # pyright: ignore[reportPrivateUsage]
+                        current = store._payload_digest(info, key, value)
                         if current != base:
                             raise ConflictError(
                                 f"{info.typename}.{key}={value!r}: base {base!r} does not "

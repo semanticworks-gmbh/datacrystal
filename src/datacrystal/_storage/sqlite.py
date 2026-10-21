@@ -164,7 +164,7 @@ class _SqliteBlobReader(io.RawIOBase):
     def seekable(self) -> bool:
         return True
 
-    def readinto(self, b: Any) -> int:  # type: ignore[override]  # buffer protocol
+    def readinto(self, b: Any) -> int:  # buffer protocol
         if self._overshoot:  # cursor parked past EOF → no bytes (file semantics)
             return 0
         try:

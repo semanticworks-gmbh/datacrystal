@@ -419,7 +419,7 @@ def open_follower(
     _bootstrap_backend(backend, _iter_frames(blob))
     # same-package engine cooperation: the no-lock backend constructor is the
     # right entry for a replica we have already populated via backend.apply.
-    store = Store._from_backend(backend)  # pyright: ignore[reportPrivateUsage]
+    store = Store._from_backend(backend)
 
     def _sync(after: int) -> int:
         """Fetch + apply the coordinator's deltas after ``after`` (Store.sync)."""
@@ -433,6 +433,6 @@ def open_follower(
         return _contribute(items, url=url, api_key=api_key, client=client)
 
     # the follower hooks Store.sync()/commit() call (#151/#153); same-package.
-    store._sync_fn = _sync  # pyright: ignore[reportPrivateUsage]
-    store._contribute_fn = _contribute_fn  # pyright: ignore[reportPrivateUsage]
+    store._sync_fn = _sync
+    store._contribute_fn = _contribute_fn
     return store

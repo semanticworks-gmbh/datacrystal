@@ -155,7 +155,7 @@ def swizzle(value: Any, oid_for: Callable[[Any], int]) -> Any:
         return _ref_ext(oid_for(value))
     if isinstance(value, Lazy):
         lazy = cast("Lazy[Any]", value)
-        target = lazy._peek_unchecked()  # pyright: ignore[reportPrivateUsage]  # OID only
+        target = lazy._peek_unchecked()  # OID only
         if target is not None:
             return _ref_ext(oid_for(target))
         if lazy.oid is None:

@@ -78,7 +78,7 @@ from strawberry.types.fields.resolver import StrawberryResolver
 
 from datacrystal._entity import (
     TypeInfo,
-    _is_list_of_scalar,  # pyright: ignore[reportPrivateUsage]  # engine leaf-set predicate, no second "scalar" definition
+    _is_list_of_scalar,  # engine leaf-set predicate, no second "scalar" definition
 )
 from datacrystal._redacted import Redacted
 from datacrystal._snapshot import EntityView, Ref, Snapshot
@@ -285,7 +285,7 @@ def _is_scalar_field(desc: FieldDescriptor) -> bool:
     no second definition of "scalar" to drift.
     """
     from datacrystal._entity import (
-        _is_indexable,  # pyright: ignore[reportPrivateUsage]  # engine leaf-set predicate, no second "scalar" definition
+        _is_indexable,  # engine leaf-set predicate, no second "scalar" definition
     )
 
     return _is_indexable(desc.core_type) or _is_list_of_scalar(desc.core_type)

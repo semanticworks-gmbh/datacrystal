@@ -71,16 +71,16 @@ class AsyncStore:
         self._commit_lock = asyncio.Lock()
         # submit() from foreign threads wakes the loop instead of waiting
         # for an owner API call (the async flavor of the sync piggyback).
-        store._wake = self._wake  # pyright: ignore[reportPrivateUsage]  # ADR-001: async facade binds to the sync engine
+        store._wake = self._wake  # ADR-001: async facade binds to the sync engine
         # LazyReferenceManager as an owner task (ADR-001 bound decision 3):
         # the sweep runs ON the loop — the owner's thread by construction.
         self._sweeper: asyncio.Task[None] | None = None
-        manager = store._lazyman  # pyright: ignore[reportPrivateUsage]  # ADR-001: async facade binds to the sync engine
+        manager = store._lazyman  # ADR-001: async facade binds to the sync engine
         if manager is not None:
             self._sweeper = self._loop.create_task(self._sweep_forever(manager))
 
     def _wake(self) -> None:
-        self._loop.call_soon_threadsafe(self._store._pump)  # pyright: ignore[reportPrivateUsage]  # ADR-001: async facade binds to the sync engine
+        self._loop.call_soon_threadsafe(self._store._pump)  # ADR-001: async facade binds to the sync engine
 
     async def _sweep_forever(self, manager: Any) -> None:
         while True:
@@ -184,24 +184,24 @@ class AsyncStore:
 
     async def _commit_unlocked(self) -> int | None:
         store = self._store
-        store._guard()  # pyright: ignore[reportPrivateUsage]  # ADR-001: async commit drives the sync engine's three phases
-        store._pump()  # pyright: ignore[reportPrivateUsage]  # ADR-001: async commit drives the sync engine's three phases
-        capture = store._p1_capture()  # P1: strictly before the first await  # pyright: ignore[reportPrivateUsage]  # ADR-001: async commit drives the sync engine's three phases
+        store._guard()  # ADR-001: async commit drives the sync engine's three phases
+        store._pump()  # ADR-001: async commit drives the sync engine's three phases
+        capture = store._p1_capture()  # P1: strictly before the first await  # ADR-001: async commit drives the sync engine's three phases
         if capture is None:
             return None
         try:
-            if store._p2_inline:  # pyright: ignore[reportPrivateUsage]  # ADR-001: async commit drives the sync engine's three phases
+            if store._p2_inline:  # ADR-001: async commit drives the sync engine's three phases
                 # degenerate fallback (non-serialized sqlite3 build): same
                 # phases, loop-blocking I/O — loud in docs, rare in practice
-                store._backend.apply(capture.batch)  # pyright: ignore[reportPrivateUsage]  # ADR-001: async commit drives the sync engine's three phases
+                store._backend.apply(capture.batch)  # ADR-001: async commit drives the sync engine's three phases
             else:
                 await self._loop.run_in_executor(
-                    store._io_executor(), store._backend.apply, capture.batch  # pyright: ignore[reportPrivateUsage]  # ADR-001: async commit drives the sync engine's three phases
+                    store._io_executor(), store._backend.apply, capture.batch  # ADR-001: async commit drives the sync engine's three phases
                 )
         except BaseException:
-            store._p2_rollback(capture)  # pyright: ignore[reportPrivateUsage]  # ADR-001: async commit drives the sync engine's three phases
+            store._p2_rollback(capture)  # ADR-001: async commit drives the sync engine's three phases
             raise
-        return store._p3_finalize(capture)  # pyright: ignore[reportPrivateUsage]  # ADR-001: async commit drives the sync engine's three phases
+        return store._p3_finalize(capture)  # ADR-001: async commit drives the sync engine's three phases
 
     def transaction(self) -> _Transaction:
         """``async with store.transaction():`` — serialize this scope against
@@ -237,7 +237,7 @@ class _Transaction:
         self._astore = astore
 
     async def __aenter__(self) -> AsyncStore:
-        await self._astore._commit_lock.acquire()  # pyright: ignore[reportPrivateUsage]  # tightly-coupled same-module transaction helper
+        await self._astore._commit_lock.acquire()  # tightly-coupled same-module transaction helper
         return self._astore
 
     async def __aexit__(
@@ -248,7 +248,7 @@ class _Transaction:
     ) -> bool:
         try:
             if exc_type is None:
-                await self._astore._commit_unlocked()  # pyright: ignore[reportPrivateUsage]  # tightly-coupled same-module transaction helper
+                await self._astore._commit_unlocked()  # tightly-coupled same-module transaction helper
         finally:
-            self._astore._commit_lock.release()  # pyright: ignore[reportPrivateUsage]  # tightly-coupled same-module transaction helper
+            self._astore._commit_lock.release()  # tightly-coupled same-module transaction helper
         return False

@@ -88,7 +88,7 @@ def _require_condition(other: object) -> None:
 
 def _flatten(kind: type, cond: Condition) -> tuple[Condition, ...]:
     if type(cond) is kind:
-        return cond.parts  # type: ignore[attr-defined]
+        return cond.parts
     return (cond,)
 
 
@@ -374,10 +374,10 @@ class FieldExpr:
         self.cls = cls
         self.name = name
 
-    def __eq__(self, value: object) -> Pred:  # type: ignore[override]
+    def __eq__(self, value: object) -> Pred:  # pyrefly: ignore[bad-override]  # builds a predicate, not a bool
         return Pred(self.cls, self.name, "==", value)
 
-    def __ne__(self, value: object) -> Pred:  # type: ignore[override]
+    def __ne__(self, value: object) -> Pred:  # pyrefly: ignore[bad-override]  # builds a predicate, not a bool
         return Pred(self.cls, self.name, "!=", value)
 
     def __lt__(self, value: Any) -> Pred:
@@ -409,7 +409,7 @@ class FieldExpr:
         _require_str(self.cls, self.name, "startswith", prefix)
         return Pred(self.cls, self.name, "startswith", prefix)
 
-    __hash__ = None  # type: ignore[assignment]
+    __hash__ = None
 
     def __repr__(self) -> str:
         return f"<field {self.cls.__name__}.{self.name}>"
