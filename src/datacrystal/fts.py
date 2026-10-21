@@ -161,6 +161,36 @@ def _registry_fulltext() -> dict[str, dict[str, str | None]]:
 _Needles = dict[str, list[list[str]]]
 
 
+def _matched_mask(count: int, sources: dict[str, list[str]], needles: _Needles) -> list[bool]:
+    """Flag each of ``count`` tokens that any needle sequence covers in its matching source."""
+    matched = [False] * count
+    for kind, sequences in needles.items():
+        source = sources.get(kind)
+        if source is None:
+            continue
+        for sequence in sequences:
+            width = len(sequence)
+            for i in range(len(source) - width + 1):
+                if source[i:i + width] == sequence:
+                    for j in range(i, i + width):
+                        matched[j] = True
+    return matched
+
+
+def _excerpt(display: str, spans: list[tuple[int, int]], matched: list[bool], first: int) -> str:
+    """Render the +-6-token window around the ``first`` match with each hit in brackets."""
+    lo, hi = max(0, first - 5), min(len(spans), first + 7)
+    out: list[str] = ["…" if lo > 0 else ""]
+    cursor = spans[lo][0]
+    for (start, end), hit in zip(spans[lo:hi], matched[lo:hi]):
+        out.append(display[cursor:start])
+        token = display[start:end]
+        out.append(f"[{token}]" if hit else token)
+        cursor = end
+    out.append("…" if hi < len(spans) else display[spans[hi - 1][1]:])
+    return "".join(out)
+
+
 class FullTextIndex:
     """A COMMIT-DELTA-v2 consumer indexing ``dc.FullText`` fields into FTS5.
 
@@ -680,30 +710,11 @@ class FullTextIndex:
         sources: dict[str, list[str]] = {"exact": folded}
         if language is not None:
             sources[language] = self._stem_folded(words, language)
-        matched = [False] * len(spans)
-        for kind, sequences in needles.items():
-            source = sources.get(kind)
-            if source is None:
-                continue
-            for sequence in sequences:
-                width = len(sequence)
-                for i in range(len(source) - width + 1):
-                    if source[i:i + width] == sequence:
-                        for j in range(i, i + width):
-                            matched[j] = True
+        matched = _matched_mask(len(spans), sources, needles)
         first = next((i for i, hit in enumerate(matched) if hit), None)
         if first is None:
             return None
-        lo, hi = max(0, first - 5), min(len(spans), first + 7)
-        out: list[str] = ["…" if lo > 0 else ""]
-        cursor = spans[lo][0]
-        for (start, end), hit in zip(spans[lo:hi], matched[lo:hi]):
-            out.append(display[cursor:start])
-            token = display[start:end]
-            out.append(f"[{token}]" if hit else token)
-            cursor = end
-        out.append("…" if hi < len(spans) else display[spans[hi - 1][1]:])
-        return "".join(out)
+        return _excerpt(display, spans, matched, first)
 
     def _match_expression(self, query: str, typename: str | None,
                           match: str = "any") -> str | None:
@@ -728,20 +739,7 @@ class FullTextIndex:
             return None
         clauses: list[str] = []
         for tokens in units:
-            exact = " ".join(_fold_token(token) for token in tokens)
-            alternatives: list[str] = []
-            for field in self._fields:
-                declaring = [
-                    fields[field] for fields in scope.values() if field in fields
-                ]
-                if not declaring:
-                    continue
-                alternatives.append(f'f_{field} : "{exact}"')
-                for language in self._languages_by_field[field]:
-                    if language not in declaring:
-                        continue
-                    stemmed = " ".join(self._stem_folded(tokens, language))
-                    alternatives.append(f's_{field} : "{stemmed}"')
+            alternatives = self._term_alternatives(tokens, scope)
             if not alternatives:
                 # under "all" a term with no searchable column can never
                 # match; under "any" it simply contributes nothing.
@@ -755,3 +753,23 @@ class FullTextIndex:
             return None
         joiner = " AND " if match == "all" else " OR "
         return joiner.join(clauses)
+
+    def _term_alternatives(
+        self, tokens: list[str], scope: dict[str, dict[str, str | None]]
+    ) -> list[str]:
+        """List one query term's (exact column, per-language stemmed column) MATCH alternatives."""
+        exact = " ".join(_fold_token(token) for token in tokens)
+        alternatives: list[str] = []
+        for field in self._fields:
+            declaring = [
+                fields[field] for fields in scope.values() if field in fields
+            ]
+            if not declaring:
+                continue
+            alternatives.append(f'f_{field} : "{exact}"')
+            for language in self._languages_by_field[field]:
+                if language not in declaring:
+                    continue
+                stemmed = " ".join(self._stem_folded(tokens, language))
+                alternatives.append(f's_{field} : "{stemmed}"')
+        return alternatives
