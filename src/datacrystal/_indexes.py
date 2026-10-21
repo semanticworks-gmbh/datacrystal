@@ -13,7 +13,7 @@ import datetime as _dt
 import decimal as _decimal
 from bisect import bisect_left, bisect_right, insort
 from collections.abc import Callable, Iterable, Iterator
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from pyroaring import BitMap64
 
@@ -28,8 +28,13 @@ from datacrystal._permissions import PERM_LEGACY_FILLS, VIEWER, WORLD, is_root
 from datacrystal._records import RefToken, decode_payload
 from datacrystal._storage.protocol import StorageBackend, StoredRecord
 
+if TYPE_CHECKING:
+    from _typeshed import SupportsRichComparison
 
-def _guard_temporal_comparable(field: str, new_key: Any, existing_key: Any) -> None:
+    from datacrystal._actors import Principal
+
+
+def _guard_temporal_comparable(field: str, new_key: object, existing_key: object) -> None:
     """Reject a SortedIndex datetime field that mixes naive and aware values (#106, ADR-004 §4).
 
     A mixed run would raise a bare ``TypeError`` deep in ``bisect``; this names it at the door.
@@ -260,37 +265,49 @@ class ClassIndexes:
         snapshot: dict[str, Any] = {}
         for field, value in values.items():
             if field in self.list_fields:
-                if value is not None:
-                    postings_map = self.eq[field]
-                    for elem in set(value):
-                        postings_map.setdefault(elem, BitMap64()).add(oid)
+                self._index_list_field(oid, field, value)
                 snapshot[field] = None if value is None else list(value)
-                continue
-            # A pure-Unique field (Unique, not also Index/SortedIndex) carries NO
-            # eq postings (#12): its ==/in_ are answered from the unique map, so
-            # the per-key single-element bitmaps were dead weight. Route it to the
-            # unique map only; Index/SortedIndex (incl. Unique+Index) keep eq.
-            eq_col = self.eq.get(field)
-            if eq_col is not None:
-                postings = eq_col.get(value)
-                if postings is None:
-                    # a new key on a sorted field enters the sorted run (None never does);
-                    # a bulk build defers the insort to finalize_build() (O(K^2) → one sort).
-                    # A datetime field mixing naive and aware values is rejected before
-                    # insort's comparison fails (#106 / ADR-004 §4).
-                    if (field in self.sorted_fields and value is not None
-                            and not self._building):
-                        run = self.sorted_keys[field]
-                        if run:
-                            _guard_temporal_comparable(field, value, run[0])
-                        insort(run, value)
-                    postings = BitMap64()
-                    eq_col[value] = postings
-                postings.add(oid)
-            if field in self._unique_fields and value is not None:
-                self.unique[field][value] = oid
-            snapshot[field] = value
+            else:
+                self._index_scalar_field(oid, field, value)
+                snapshot[field] = value
         self._last_values[oid] = snapshot
+
+    def _index_list_field(self, oid: int, field: str, value: list[Any] | None) -> None:
+        if value is None:
+            return
+        postings_map = self.eq[field]
+        for elem in set(value):
+            postings_map.setdefault(elem, BitMap64()).add(oid)
+
+    def _index_scalar_field(
+        self, oid: int, field: str, value: SupportsRichComparison | None
+    ) -> None:
+        # A pure-Unique field (Unique, not also Index/SortedIndex) carries NO
+        # eq postings (#12): its ==/in_ are answered from the unique map, so
+        # the per-key single-element bitmaps were dead weight. Route it to the
+        # unique map only; Index/SortedIndex (incl. Unique+Index) keep eq.
+        eq_col = self.eq.get(field)
+        if eq_col is not None:
+            postings = eq_col.get(value)
+            if postings is None:
+                self._enter_sorted_run(field, value)
+                postings = BitMap64()
+                eq_col[value] = postings
+            postings.add(oid)
+        if field in self._unique_fields and value is not None:
+            self.unique[field][value] = oid
+
+    def _enter_sorted_run(self, field: str, value: SupportsRichComparison | None) -> None:
+        # a new key on a sorted field enters the sorted run (None never does);
+        # a bulk build defers the insort to finalize_build() (O(K^2) → one sort).
+        # A datetime field mixing naive and aware values is rejected before
+        # insort's comparison fails (#106 / ADR-004 §4).
+        if field not in self.sorted_fields or value is None or self._building:
+            return
+        run = self.sorted_keys[field]
+        if run:
+            _guard_temporal_comparable(field, value, run[0])
+        insort(run, value)
 
     def remove(self, oid: int) -> None:
         """Un-index a committed delete (ADR-003) from the index's own
@@ -385,6 +402,40 @@ def _maintained_fields(ti: TypeInfo) -> list[str]:
     return [s.name for s in ti.specs if s.indexed or s.sorted or s.unique]
 
 
+def _schema_evolution_fill(
+    ti: TypeInfo, persisted: list[str], maintained: list[str], unique: frozenset[str]
+) -> tuple[dict[str, Any], str | None]:
+    """Fill the maintained fields an old record shape lacks; also name a colliding Unique one.
+
+    The colliding field is a Unique one that defaults to non-None: an error only if old
+    records exist, so the caller raises it on the first scanned record.
+    """
+    fill: dict[str, Any] = {}
+    colliding: str | None = None
+    for name in maintained:
+        if name in persisted:
+            continue
+        if ti.protected and name in PERM_LEGACY_FILLS:
+            # R7 legacy fill (ADR-008): index maintained _dc_ columns of
+            # pre-protection records with the legacy values (the sorted
+            # _dc_read_floor run would otherwise be poisoned for legacy
+            # rows). Same shared constant as the two decode sites.
+            fill[name] = PERM_LEGACY_FILLS[name]()
+            continue
+        factory = ti.defaults.get(name)
+        if factory is None:
+            raise SchemaMismatchError(
+                f"{ti.typename}.{name} does not exist in records "
+                f"persisted with fields {persisted} and has no default "
+                "— give the new field a default value to enable "
+                "additive schema evolution"
+            )
+        fill[name] = factory()
+        if name in unique and fill[name] is not None:
+            colliding = name  # only an error if old records exist
+    return fill, colliding
+
+
 def build_class_indexes(
     ti: TypeInfo,
     lineage: list[tuple[int, list[str]]],
@@ -410,29 +461,7 @@ def build_class_indexes(
                 ci.extent.add(rec.oid)
             continue
         position = {n: persisted.index(n) for n in maintained if n in persisted}
-        fill: dict[str, Any] = {}
-        colliding: str | None = None
-        for name in maintained:
-            if name in position:
-                continue
-            if ti.protected and name in PERM_LEGACY_FILLS:
-                # R7 legacy fill (ADR-008): index maintained _dc_ columns of
-                # pre-protection records with the legacy values (the sorted
-                # _dc_read_floor run would otherwise be poisoned for legacy
-                # rows). Same shared constant as the two decode sites.
-                fill[name] = PERM_LEGACY_FILLS[name]()
-                continue
-            factory = ti.defaults.get(name)
-            if factory is None:
-                raise SchemaMismatchError(
-                    f"{ti.typename}.{name} does not exist in records "
-                    f"persisted with fields {persisted} and has no default "
-                    "— give the new field a default value to enable "
-                    "additive schema evolution"
-                )
-            fill[name] = factory()
-            if name in unique and fill[name] is not None:
-                colliding = name  # only an error if old records exist
+        fill, colliding = _schema_evolution_fill(ti, persisted, maintained, unique)
         for rec in scan_type(cid):
             if colliding is not None:
                 raise SchemaMismatchError(
@@ -736,7 +765,9 @@ class IndexManager:
                         posting.discard(d)
 
 
-def _range_slice(ci: ClassIndexes, field: str, op: str, value: Any) -> BitMap64:
+def _range_slice(
+    ci: ClassIndexes, field: str, op: str, value: SupportsRichComparison | None
+) -> BitMap64:
     """Return the OIDs whose SortedIndex ``field`` key satisfies ``op value`` (ADR-004, #18).
 
     Bisect the sorted run and union the matching eq postings.
@@ -760,7 +791,7 @@ def _range_slice(ci: ClassIndexes, field: str, op: str, value: Any) -> BitMap64:
     return acc
 
 
-def readable_bitmap(p: Any, ci: ClassIndexes) -> BitMap64 | None:
+def readable_bitmap(p: Principal, ci: ClassIndexes) -> BitMap64 | None:
     """Return the OIDs of ``ci``'s extent readable by ``p`` (ADR-008 W3-1), None for root (R9).
 
     The bitmap twin of :func:`datacrystal._permissions.can_read_row`: owner postings, union
@@ -788,6 +819,134 @@ def readable_bitmap(p: Any, ci: ClassIndexes) -> BitMap64 | None:
     return acc
 
 
+_ORDERING_OPS = (">=", ">", "<=", "<")
+_STRING_MATCH_OPS = ("contains", "startswith")
+
+_Planned = tuple[BitMap64 | None, Condition | None]
+
+
+def _matches_string_key(op: str, needle: str, key: object) -> bool:
+    """Report whether an index key is a string that contains / starts with ``needle``."""
+    if not isinstance(key, str):
+        return False
+    return needle in key if op == "contains" else key.startswith(needle)
+
+
+def _plan_list_field(cond: Pred, ci: ClassIndexes) -> _Planned:
+    # Multi-valued (inverted) index (#13): eq[field] keys are the
+    # list's elements, so `.contains(x)` is exact element membership
+    # — an O(1) posting lookup, no record reads, no residual. ==/in/
+    # startswith over a whole list can't be answered from an element
+    # index → residual (evaluate() compares the actual list).
+    if cond.op == "contains":
+        postings = ci.eq[cond.field].get(cond.value)
+        return (postings.copy() if postings is not None else BitMap64()), None
+    return None, cond
+
+
+def _plan_eq_indexed(cond: Pred, ci: ClassIndexes) -> _Planned | None:
+    """Answer ``cond`` from the eq postings of an Index / SortedIndex field, or ``None``."""
+    if cond.op in _ORDERING_OPS and cond.field in ci.sorted_fields:
+        # ADR-004 (#18): the THIRD rule — an ordering comparison on a
+        # SortedIndex field answers from the sorted run as a range slice
+        # (a `between` is an And of two of these, composed below). Still
+        # deterministic and rule-based: no cost model, no plan search.
+        return _range_slice(ci, cond.field, cond.op, cond.value), None
+    if cond.field in ci.list_fields:
+        return _plan_list_field(cond, ci)
+    if cond.op == "==":
+        postings = ci.eq[cond.field].get(cond.value)
+        return (postings.copy() if postings is not None else BitMap64()), None
+    if cond.op == "in":
+        acc = BitMap64()
+        for value in cond.value:
+            postings = ci.eq[cond.field].get(value)
+            if postings is not None:
+                acc |= postings
+        return acc, None
+    if cond.op in _STRING_MATCH_OPS:
+        # KICKOFF M4: string matching on an indexed field iterates
+        # the index's DISTINCT keys and ORs the matching postings —
+        # O(distinct values), never a record load.
+        acc = BitMap64()
+        for key, postings in ci.eq[cond.field].items():
+            if _matches_string_key(cond.op, cond.value, key):
+                acc |= postings
+        return acc, None
+    return None
+
+
+def _plan_unique_only(cond: Pred, ci: ClassIndexes) -> _Planned | None:
+    """Answer ``cond`` from the value→oid map of a pure-Unique field, or ``None``.
+
+    A pure-Unique field has no eq postings (#12); ``contains`` / ``startswith`` iterate the
+    distinct keys (O(distinct), no record load).
+    A Unique+Index or Unique+SortedIndex field is in ``ci.eq`` and takes the other path.
+    """
+    holder = ci.unique[cond.field]
+    if cond.op == "==":
+        oid = holder.get(cond.value)
+        return (BitMap64([oid]) if oid is not None else BitMap64()), None
+    if cond.op == "in":
+        acc = BitMap64()
+        for value in cond.value:
+            oid = holder.get(value)
+            if oid is not None:
+                acc.add(oid)
+        return acc, None
+    if cond.op in _STRING_MATCH_OPS:
+        acc = BitMap64()
+        for key, oid in holder.items():
+            if _matches_string_key(cond.op, cond.value, key):
+                acc.add(oid)
+        return acc, None
+    return None
+
+
+def _plan_pred(cond: Pred, ci: ClassIndexes) -> _Planned:
+    if cond.field in ci.eq:
+        planned = _plan_eq_indexed(cond, ci)
+        if planned is not None:
+            return planned
+    if cond.field in ci.unique:
+        planned = _plan_unique_only(cond, ci)
+        if planned is not None:
+            return planned
+    return None, cond
+
+
+def _plan_and(cond: And, ci: ClassIndexes) -> _Planned:
+    bitmap: BitMap64 | None = None
+    residuals: list[Condition] = []
+    for part in cond.parts:
+        sub_bm, sub_resid = plan(part, ci)
+        if sub_bm is not None:
+            bitmap = sub_bm if bitmap is None else bitmap & sub_bm
+        if sub_resid is not None:
+            residuals.append(sub_resid)
+    residual: Condition | None
+    if not residuals:
+        residual = None
+    elif len(residuals) == 1:
+        residual = residuals[0]
+    else:
+        residual = And(tuple(residuals))
+    return bitmap, residual
+
+
+def _plan_or(cond: Or, ci: ClassIndexes) -> _Planned:
+    branch_bitmaps: list[BitMap64] = []
+    for part in cond.parts:
+        sub_bm, sub_resid = plan(part, ci)
+        if sub_bm is None or sub_resid is not None:
+            return None, cond
+        branch_bitmaps.append(sub_bm)
+    acc = BitMap64()
+    for bm in branch_bitmaps:
+        acc |= bm
+    return acc, None
+
+
 def plan(cond: Condition, ci: ClassIndexes) -> tuple[BitMap64 | None, Condition | None]:
     """Split a condition into (bitmap candidates, residual predicate).
 
@@ -797,102 +956,11 @@ def plan(cond: Condition, ci: ClassIndexes) -> tuple[BitMap64 | None, Condition 
     hydrated candidates.
     """
     if isinstance(cond, Pred):
-        if cond.field in ci.eq:
-            if cond.op in (">=", ">", "<=", "<") and cond.field in ci.sorted_fields:
-                # ADR-004 (#18): the THIRD rule — an ordering comparison on a
-                # SortedIndex field answers from the sorted run as a range slice
-                # (a `between` is an And of two of these, composed below). Still
-                # deterministic and rule-based: no cost model, no plan search.
-                return _range_slice(ci, cond.field, cond.op, cond.value), None
-            if cond.field in ci.list_fields:
-                # Multi-valued (inverted) index (#13): eq[field] keys are the
-                # list's elements, so `.contains(x)` is exact element membership
-                # — an O(1) posting lookup, no record reads, no residual. ==/in/
-                # startswith over a whole list can't be answered from an element
-                # index → residual (evaluate() compares the actual list).
-                if cond.op == "contains":
-                    postings = ci.eq[cond.field].get(cond.value)
-                    return (postings.copy() if postings is not None
-                            else BitMap64()), None
-                return None, cond
-            if cond.op == "==":
-                postings = ci.eq[cond.field].get(cond.value)
-                return (postings.copy() if postings is not None else BitMap64()), None
-            if cond.op == "in":
-                acc = BitMap64()
-                for value in cond.value:
-                    postings = ci.eq[cond.field].get(value)
-                    if postings is not None:
-                        acc |= postings
-                return acc, None
-            if cond.op in ("contains", "startswith"):
-                # KICKOFF M4: string matching on an indexed field iterates
-                # the index's DISTINCT keys and ORs the matching postings —
-                # O(distinct values), never a record load.
-                needle = cond.value
-                acc = BitMap64()
-                for key, postings in ci.eq[cond.field].items():
-                    if not isinstance(key, str):
-                        continue
-                    if (needle in key if cond.op == "contains"
-                            else key.startswith(needle)):
-                        acc |= postings
-                return acc, None
-        if cond.field in ci.unique:
-            # A pure-Unique field has no eq postings (#12): answer from the value→oid map,
-            # with contains/startswith iterating the distinct keys (O(distinct), no record
-            # load). A Unique+Index or Unique+SortedIndex field is in ci.eq and took the
-            # branch above, so this runs only for Unique-only fields.
-            holder = ci.unique[cond.field]
-            if cond.op == "==":
-                oid = holder.get(cond.value)
-                return (BitMap64([oid]) if oid is not None else BitMap64()), None
-            if cond.op == "in":
-                acc = BitMap64()
-                for value in cond.value:
-                    oid = holder.get(value)
-                    if oid is not None:
-                        acc.add(oid)
-                return acc, None
-            if cond.op in ("contains", "startswith"):
-                needle = cond.value
-                acc = BitMap64()
-                for key, oid in holder.items():
-                    if not isinstance(key, str):
-                        continue
-                    if (needle in key if cond.op == "contains"
-                            else key.startswith(needle)):
-                        acc.add(oid)
-                return acc, None
-        return None, cond
+        return _plan_pred(cond, ci)
     if isinstance(cond, And):
-        bitmap: BitMap64 | None = None
-        residuals: list[Condition] = []
-        for part in cond.parts:
-            sub_bm, sub_resid = plan(part, ci)
-            if sub_bm is not None:
-                bitmap = sub_bm if bitmap is None else bitmap & sub_bm
-            if sub_resid is not None:
-                residuals.append(sub_resid)
-        residual: Condition | None
-        if not residuals:
-            residual = None
-        elif len(residuals) == 1:
-            residual = residuals[0]
-        else:
-            residual = And(tuple(residuals))
-        return bitmap, residual
+        return _plan_and(cond, ci)
     if isinstance(cond, Or):
-        branch_bitmaps: list[BitMap64] = []
-        for part in cond.parts:
-            sub_bm, sub_resid = plan(part, ci)
-            if sub_bm is None or sub_resid is not None:
-                return None, cond
-            branch_bitmaps.append(sub_bm)
-        acc = BitMap64()
-        for bm in branch_bitmaps:
-            acc |= bm
-        return acc, None
+        return _plan_or(cond, ci)
     return None, cond
 
 

@@ -11,9 +11,10 @@ from __future__ import annotations
 
 import struct
 from collections.abc import Iterable, Iterator
-from typing import TYPE_CHECKING, Any, cast
+from http import HTTPStatus
+from typing import TYPE_CHECKING, Any, NoReturn, Protocol, cast
 
-from datacrystal._entity import is_entity, oid_of, type_info
+from datacrystal._entity import TypeInfo, is_entity, oid_of, type_info
 from datacrystal._errors import (
     ERROR_DANGLING_REF,
     ERROR_SCHEMA_SKEW,
@@ -27,11 +28,9 @@ from datacrystal._storage.memory import MemoryBackend
 from datacrystal._storage.protocol import CommitBatch, StorageBackend, StoredRecord
 from datacrystal._store import Store
 from datacrystal.contract.applier import (
-    CONTRACT_VERSION,
-    FORMAT_MARKER,
-    DeltaFormatError,
     DeltaGapError,
     ReferenceApplier,
+    check_delta_header,
     decode_delta,
 )
 
@@ -39,8 +38,40 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 _FRAME = struct.Struct(">Q")
+_FRAME_HEADER_SIZE = _FRAME.size
 
-__all__ = ["open_follower"]
+
+class _PostResponse(Protocol):
+    """The slice of ``httpx.Response`` that a ``/v1/submit`` reply is read through."""
+
+    @property
+    def content(self) -> bytes: ...
+
+    @property
+    def status_code(self) -> int: ...
+
+    def json(self) -> object: ...
+
+
+class _GetResponse(Protocol):
+    """The slice of ``httpx.Response`` that a ``/v1/deltas`` reply is read through."""
+
+    @property
+    def content(self) -> bytes: ...
+
+    def raise_for_status(self) -> object: ...
+
+
+class _Getter(Protocol):
+    def get(self, url: str, /, *, params: dict[str, int]) -> _GetResponse: ...
+
+
+class _Poster(Protocol):
+    def post(self, url: str, /, *, json: dict[str, Any]) -> _PostResponse: ...
+
+
+class HttpClient(_Getter, _Poster, Protocol):
+    """An ``httpx.Client``-compatible object (e.g. a ``TestClient``) that owns the base URL."""
 
 
 def _iter_frames(blob: bytes) -> Iterator[dict[str, Any]]:
@@ -48,7 +79,7 @@ def _iter_frames(blob: bytes) -> Iterator[dict[str, Any]]:
     offset = 0
     while offset < len(blob):
         (size,) = _FRAME.unpack_from(blob, offset)
-        offset += 8
+        offset += _FRAME_HEADER_SIZE
         yield decode_delta(blob[offset : offset + size])
         offset += size
 
@@ -123,20 +154,12 @@ def _apply_catchup(backend: StorageBackend, deltas: Iterable[dict[str, Any]]) ->
     root_meta = meta.get("root_oid", "")
     root: int | None = int(root_meta) if root_meta else None
     for delta in deltas:
-        if delta.get("f") != FORMAT_MARKER:
-            raise DeltaFormatError(f"not a datacrystal delta: f={delta.get('f')!r}")
-        version = delta.get("v")
-        if version != CONTRACT_VERSION:
-            if isinstance(version, int) and version > CONTRACT_VERSION:
-                raise DeltaFormatError(
-                    f"delta version {version} is newer than this follower "
-                    f"supports ({CONTRACT_VERSION}); upgrade datacrystal"
-                )
-            raise DeltaFormatError(
-                f"delta version {version!r} predates v{CONTRACT_VERSION} — "
-                "incompatible (COMMIT-DELTA-v2 §7, no-compat): re-bootstrap "
-                "this follower from a v2 coordinator"
-            )
+        check_delta_header(
+            delta,
+            consumer="follower",
+            upgrade="upgrade datacrystal",
+            remedy="re-bootstrap this follower from a v2 coordinator",
+        )
         tid = int(delta["tid"])
         if tid <= watermark:
             continue  # idempotent skip (apply-twice ≡ apply-once)
@@ -152,13 +175,13 @@ def _apply_catchup(backend: StorageBackend, deltas: Iterable[dict[str, Any]]) ->
 
 
 def _fetch_deltas(
-    url: str, *, after: int, api_key: str | None, client: Any | None
+    url: str, *, after: int, api_key: str | None, client: _Getter | None
 ) -> bytes:
     """GET the ``/v1/deltas`` body (lazy ``httpx`` unless a ``client`` is given)."""
     if client is not None:
         resp = client.get("/v1/deltas", params={"after": after})
         resp.raise_for_status()
-        return bytes(resp.content)
+        return resp.content
     try:
         import httpx  # lazy: kept out of a bare ``import datacrystal`` (dep budget)
     except ImportError as exc:  # pragma: no cover — exercised only without httpx
@@ -171,12 +194,12 @@ def _fetch_deltas(
     with httpx.Client(base_url=url, headers=headers) as owned:
         resp = owned.get("/v1/deltas", params={"after": after})
         resp.raise_for_status()
-        return bytes(resp.content)
+        return resp.content
 
 
 def _post_submit(
-    url: str, ops: list[dict[str, Any]], *, api_key: str | None, client: Any | None
-) -> tuple[int, Any]:
+    url: str, ops: list[dict[str, Any]], *, api_key: str | None, client: _Poster | None
+) -> tuple[int, object]:
     """POST a contribution batch to ``/v1/submit``; return ``(status, json)``."""
     body = {"ops": ops}
     if client is not None:
@@ -194,7 +217,7 @@ def _post_submit(
         return resp.status_code, (resp.json() if resp.content else None)
 
 
-def _holds_entity(value: Any) -> bool:
+def _holds_entity(value: object) -> bool:
     """Report whether ``value`` is or recursively contains a live ``@entity`` or ``Lazy`` ref."""
     if is_entity(value) or isinstance(value, Lazy):
         return True
@@ -205,7 +228,7 @@ def _holds_entity(value: Any) -> bool:
     return False
 
 
-def _container_holds_entity(value: Any) -> bool:
+def _container_holds_entity(value: object) -> bool:
     """Report whether ``value`` is a container (list/dict/tuple/set) holding an ``@entity``.
 
     ``from_pydantic`` rebinds only scalar refs and ``list`` edges, so such a ref
@@ -219,7 +242,7 @@ def _container_holds_entity(value: Any) -> bool:
     return False
 
 
-def _refs_local_new(value: Any, new_oids: set[int]) -> bool:
+def _refs_local_new(value: object, new_oids: set[int]) -> bool:
     """Report whether a serialized create-face field references an OID in ``new_oids``."""
     if isinstance(value, bool):  # bool is an int subclass — never an OID
         return False
@@ -233,12 +256,111 @@ def _refs_local_new(value: Any, new_oids: set[int]) -> bool:
     return False
 
 
+def _natural_key_of(ti: TypeInfo) -> str:
+    """Return the ``dc.Unique`` field name that anchors idempotency, or fail loud."""
+    key = next((spec.name for spec in ti.specs if spec.unique), None)
+    if key is None:
+        raise ValueError(
+            f"{ti.typename} has no dc.Unique natural key — cannot contribute it "
+            "(the natural key is the idempotency anchor; add a dc.Unique field)"
+        )
+    return key
+
+
+def _reject_blob_fields(ti: TypeInfo) -> None:
+    """Fail loud on a ``dc.Blob`` field: its out-of-line bytes have no ``/v1/submit`` shape."""
+    if any(spec.blob for spec in ti.specs):  # §5 cut: out-of-line bytes
+        raise NotImplementedError(
+            f"{ti.typename} has a dc.Blob field — blob bytes live out-of-line "
+            "and have no /v1/submit wire shape (v0); contribute on the "
+            "coordinator, or model the bytes inline"
+        )
+
+
+def _scanned_field_names(ti: TypeInfo) -> tuple[str, ...]:
+    """Return the field names whose container content must be scanned for entities.
+
+    That is every field except a handled ``list[Lazy[T]]`` / ``list[T]`` edge, which round-trips.
+    """
+    # lazy: needs pydantic — _reflect is framework-free, but the web package it lives in
+    # lazy-imports fastapi/strawberry, so a datacrystal[follower] install suffices.
+    from datacrystal.web._reflect import list_ref_target, reflect
+
+    _, descriptors = reflect(ti.cls)
+    return tuple(d.name for d in descriptors if list_ref_target(d.core_type) is None)
+
+
+def _reject_unsupported_containers(
+    obj: object, ti: TypeInfo, scan_fields: dict[type, tuple[str, ...]]
+) -> None:
+    """Fail loud on an ``@entity`` nested in a container the OID-int boundary cannot rebind.
+
+    It would land as a bare int on the coordinator (silent corruption, §5 cut).
+    ``scan_fields`` memoizes the names per class: ``reflect`` is uncached and not free.
+    """
+    names = scan_fields.get(ti.cls)
+    if names is None:
+        names = _scanned_field_names(ti)
+        scan_fields[ti.cls] = names
+    for name in names:
+        if _container_holds_entity(getattr(obj, name)):
+            raise NotImplementedError(
+                f"{ti.typename}.{name} holds an @entity inside an unsupported "
+                "container shape — only scalar refs (Lazy[T] / @entity) and "
+                "list edges (list[Lazy[T]] / list[T]) federate (v0)"
+            )
+
+
+def _submit_op(
+    obj: object,
+    base: str | None,
+    new_oids: set[int],
+    scan_fields: dict[type, tuple[str, ...]],
+) -> dict[str, Any]:
+    """Build one ``/v1/submit`` op from a buffered entity, failing loud on the v0 cuts."""
+    from datacrystal.web._pydantic import to_pydantic  # lazy: needs pydantic (to_pydantic)
+
+    ti = type_info(obj)
+    key = _natural_key_of(ti)
+    _reject_blob_fields(ti)
+    _reject_unsupported_containers(obj, ti, scan_fields)
+    fields = to_pydantic(obj, face="create").model_dump(mode="json")
+    if _refs_local_new(fields, new_oids):
+        raise NotImplementedError(
+            f"{ti.typename} references a not-yet-committed entity — intra-batch "
+            "new→new references are unsupported (v0); contribute the referenced "
+            "entity first, then reference it by its coordinator OID"
+        )
+    return {"type": ti.typename, "key": key, "fields": fields, "base": base}
+
+
+def _raise_rejection(body: dict[str, Any]) -> NoReturn:
+    """Raise the typed local exception for a coordinator 409 body."""
+    raw = body.get("detail", body)
+    detail = cast("dict[str, Any]", raw) if isinstance(raw, dict) else {}
+    message = str(detail.get("message", "rejected"))
+    error = detail.get("error")
+    if error == ERROR_SCHEMA_SKEW:
+        raise SchemaSkewError(message)
+    if error == ERROR_DANGLING_REF:  # faithful, not folded into ConflictError
+        raise DanglingRefError(message)
+    # carry the LOCKED conflict envelope into the typed error so a caller can
+    # read exc.actual_base/expected_base to drive its re-read (the fields the
+    # coordinator sent — ConflictError's documented contract).
+    raise ConflictError(
+        message,
+        key=detail.get("key"),
+        expected_base=detail.get("expected_base"),
+        actual_base=detail.get("actual_base"),
+    )
+
+
 def _contribute(
     items: list[tuple[Any, str | None]],
     *,
     url: str,
     api_key: str | None,
-    client: Any | None,
+    client: _Poster | None,
 ) -> int | None:
     """Send buffered ``(entity, base)`` items to the coordinator and return its applied TID.
 
@@ -247,12 +369,6 @@ def _contribute(
     The v0 cuts (blob field, unsupported container ref, new-to-new ref) fail loud before the wire:
     see ``docs/how-to/federation.md`` (The v0 limits) and FEDERATION-WIRE-v1 §5.
     """
-    # lazy: needs pydantic (to_pydantic) — _reflect is framework-free. Both reach
-    # through the web package, which lazy-imports its fastapi/strawberry submodules
-    # so a datacrystal[follower] install (pydantic + httpx, no fastapi) suffices.
-    from datacrystal.web._pydantic import to_pydantic
-    from datacrystal.web._reflect import list_ref_target, reflect
-
     # the local OIDs of the NEW entities in this batch (base is None). A ref to
     # one of these is an intra-batch new→new ref — its follower-local OID is
     # meaningless on the coordinator (it could collide with an unrelated entity),
@@ -260,70 +376,14 @@ def _contribute(
     new_oids = {
         oid for obj, base in items if base is None and (oid := oid_of(obj)) is not None
     }
-    ops: list[dict[str, Any]] = []
-    # per-class memo of the field names whose container content must be scanned
-    # (everything that is NOT a handled list edge) — reflect() runs once per class
-    # in the batch, not once per item (reflect is uncached, get_type_hints is not free).
     scan_fields: dict[type, tuple[str, ...]] = {}
-    for obj, base in items:
-        ti = type_info(obj)
-        key = next((spec.name for spec in ti.specs if spec.unique), None)
-        if key is None:
-            raise ValueError(
-                f"{ti.typename} has no dc.Unique natural key — cannot contribute it "
-                "(the natural key is the idempotency anchor; add a dc.Unique field)"
-            )
-        if any(spec.blob for spec in ti.specs):  # §5 cut: out-of-line bytes
-            raise NotImplementedError(
-                f"{ti.typename} has a dc.Blob field — blob bytes live out-of-line "
-                "and have no /v1/submit wire shape (v0); contribute on the "
-                "coordinator, or model the bytes inline"
-            )
-        # §5 cut: an @entity nested in a container the OID-int boundary cannot
-        # rebind would land as a bare int on the coordinator (silent corruption).
-        names = scan_fields.get(ti.cls)
-        if names is None:
-            _, descriptors = reflect(ti.cls)
-            # a list[Lazy[T]] / list[T] edge round-trips (handled) — skip it
-            names = tuple(d.name for d in descriptors if list_ref_target(d.core_type) is None)
-            scan_fields[ti.cls] = names
-        for name in names:
-            if _container_holds_entity(getattr(obj, name)):
-                raise NotImplementedError(
-                    f"{ti.typename}.{name} holds an @entity inside an unsupported "
-                    "container shape — only scalar refs (Lazy[T] / @entity) and "
-                    "list edges (list[Lazy[T]] / list[T]) federate (v0)"
-                )
-        fields = to_pydantic(obj, face="create").model_dump(mode="json")
-        if _refs_local_new(fields, new_oids):
-            raise NotImplementedError(
-                f"{ti.typename} references a not-yet-committed entity — intra-batch "
-                "new→new references are unsupported (v0); contribute the referenced "
-                "entity first, then reference it by its coordinator OID"
-            )
-        ops.append({"type": ti.typename, "key": key, "fields": fields, "base": base})
+    ops = [_submit_op(obj, base, new_oids, scan_fields) for obj, base in items]
 
     status, payload = _post_submit(url, ops, api_key=api_key, client=client)
     body = cast("dict[str, Any]", payload) if isinstance(payload, dict) else {}
-    if status == 409:
-        raw = body.get("detail", body)
-        detail = cast("dict[str, Any]", raw) if isinstance(raw, dict) else {}
-        message = str(detail.get("message", "rejected"))
-        error = detail.get("error")
-        if error == ERROR_SCHEMA_SKEW:
-            raise SchemaSkewError(message)
-        if error == ERROR_DANGLING_REF:  # faithful, not folded into ConflictError
-            raise DanglingRefError(message)
-        # carry the LOCKED conflict envelope into the typed error so a caller can
-        # read exc.actual_base/expected_base to drive its re-read (the fields the
-        # coordinator sent — ConflictError's documented contract).
-        raise ConflictError(
-            message,
-            key=detail.get("key"),
-            expected_base=detail.get("expected_base"),
-            actual_base=detail.get("actual_base"),
-        )
-    if status != 200:
+    if status == HTTPStatus.CONFLICT:
+        _raise_rejection(body)
+    if status != HTTPStatus.OK:
         raise RuntimeError(f"/v1/submit returned {status}: {payload!r}")
     # applied_tid is null when the coordinator committed nothing (an idempotent
     # re-send / value-equal no-op); pass that through as None, never int(None).
@@ -336,7 +396,7 @@ def open_follower(
     *,
     api_key: str | None = None,
     path: str | Path | None = None,
-    client: Any | None = None,
+    client: HttpClient | None = None,
 ) -> Store:
     """Open a local replica synced from a coordinator's federation endpoint.
 

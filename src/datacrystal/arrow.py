@@ -36,12 +36,12 @@ from datacrystal._records import (
     decimal_ext,
     decode_payload,
 )
-from datacrystal._snapshot import Ref
+from datacrystal._snapshot import Ref, Snapshot
 from datacrystal.contract.applier import (
     CONTRACT_VERSION,
-    FORMAT_MARKER,
     DeltaFormatError,
     DeltaGapError,
+    check_delta_header,
 )
 
 try:
@@ -91,39 +91,51 @@ class MirrorConfigError(DataCrystalError):
 # cannot distinguish an int64 OID reference from an int64 quantity). They are
 # stamped into each segment's schema metadata and unified in the manifest.
 
+_MIN_SEGMENTS = 2
 _NUMERIC_RANK = {"bool": 0, "int": 1, "float": 2}
 _INT64_MIN, _INT64_MAX = -(2**63), 2**63 - 1
 
 
-def _tag_of(value: Any) -> str:
+_SCALAR_TAGS: tuple[tuple[type | tuple[type, ...], str], ...] = (
+    (float, "float"),
+    (str, "str"),
+    ((bytes, bytearray, memoryview), "bytes"),
+    ((RefToken, Ref), "ref"),
+)
+
+
+def _temporal_tag(value: _dt.datetime | _dt.date | _dt.time) -> str:
+    if isinstance(value, _dt.datetime):  # before date: a datetime IS a date
+        return "ts" if value.tzinfo is None else "ts_utc"
+    if isinstance(value, _dt.date):
+        return "date"
+    # ISO offset times survive the codec but have no arrow type — fallback
+    return "time" if value.tzinfo is None else "fallback"
+
+
+def _list_tag(items: Iterable[object]) -> str:
+    inner = "null"
+    for item in items:
+        inner = _unify_tags(inner, _tag_of(item))
+    return "fallback" if inner == "fallback" else f"list<{inner}>"
+
+
+def _tag_of(value: object) -> str:
     if value is None:
         return "null"
     if isinstance(value, bool):
         return "bool"
     if isinstance(value, int):
         return "int" if _INT64_MIN <= value <= _INT64_MAX else "fallback"
-    if isinstance(value, float):
-        return "float"
-    if isinstance(value, str):
-        return "str"
-    if isinstance(value, (bytes, bytearray, memoryview)):
-        return "bytes"
-    if isinstance(value, (RefToken, Ref)):
-        return "ref"
-    if isinstance(value, _dt.datetime):  # before date: a datetime IS a date
-        return "ts" if value.tzinfo is None else "ts_utc"
-    if isinstance(value, _dt.date):
-        return "date"
-    if isinstance(value, _dt.time):
-        # ISO offset times survive the codec but have no arrow type — fallback
-        return "time" if value.tzinfo is None else "fallback"
+    for kind, tag in _SCALAR_TAGS:
+        if isinstance(value, kind):
+            return tag
+    if isinstance(value, (_dt.datetime, _dt.date, _dt.time)):
+        return _temporal_tag(value)
     if isinstance(value, _decimal.Decimal):
         return _decimal_tag(value)
     if isinstance(value, (list, tuple)):
-        inner = "null"
-        for item in cast("tuple[object, ...] | list[object]", value):
-            inner = _unify_tags(inner, _tag_of(item))
-        return "fallback" if inner == "fallback" else f"list<{inner}>"
+        return _list_tag(cast("tuple[object, ...] | list[object]", value))
     return "fallback"  # dicts/mappings and anything exotic
 
 
@@ -200,15 +212,17 @@ def _arrow_type(tag: str) -> pa.DataType:
     }[tag]
 
 
-def _storable(value: Any, tag: str) -> Any:
+def _storable(value: object, tag: str) -> object:
     """One decoded value → what pyarrow stores under ``tag``."""
     if value is None:
         return None
     if tag == "ref":
+        assert isinstance(value, (RefToken, Ref))  # the tag was derived from the value
         return value.oid
     if tag == "fallback":
         return _encode_fallback(value)
     if tag.startswith("list<"):
+        assert isinstance(value, (list, tuple))
         inner = tag[5:-1]
         return [_storable(item, inner) for item in value]
     if tag == "float" and isinstance(value, int):
@@ -216,19 +230,23 @@ def _storable(value: Any, tag: str) -> Any:
     if tag == "int" and isinstance(value, bool):
         return int(value)
     if tag == "bytes":
+        assert isinstance(value, (bytes, bytearray, memoryview))
         return bytes(value)
     return value
 
 
-def _semantic(value: Any, tag: str) -> Any:
+def _semantic(value: object, tag: str) -> object:
     """Return the decoded value for an arrow-read ``value``; the inverse of :func:`_storable`."""
     if value is None:
         return None
     if tag == "ref":
+        assert isinstance(value, int)  # parquet stores a ref as int64
         return RefToken(value)
     if tag == "fallback":
+        assert isinstance(value, bytes)
         return decode_fallback(value)
     if tag.startswith("list<"):
+        assert isinstance(value, list)
         inner = tag[5:-1]
         return [_semantic(item, inner) for item in value]
     return value
@@ -252,7 +270,7 @@ _FALLBACK_ENCODER = msgspec.msgpack.Encoder()
 _FALLBACK_DECODER = msgspec.msgpack.Decoder(ext_hook=_ext_hook)
 
 
-def _reswizzle(value: Any) -> Any:
+def _reswizzle(value: object) -> object:
     if isinstance(value, (RefToken, Ref)):
         return msgspec.msgpack.Ext(REF_EXT_CODE, _OID_STRUCT.pack(value.oid))
     if isinstance(value, _dt.datetime):
@@ -277,11 +295,11 @@ def _reswizzle(value: Any) -> Any:
     return value
 
 
-def _encode_fallback(value: Any) -> bytes:
+def _encode_fallback(value: object) -> bytes:
     return _FALLBACK_ENCODER.encode(_reswizzle(value))
 
 
-def decode_fallback(buf: bytes) -> Any:
+def decode_fallback(buf: bytes) -> Any:  # noqa: ANN401 - public return, the cell's value is dynamic
     """Decode one msgpack-fallback cell back to its value (refs come back
     as ``RefToken``s, temporals as their datetime types).
     """
@@ -337,8 +355,8 @@ class ArrowMirror:
         """
         if flush_every < 1:
             raise MirrorConfigError("flush_every must be >= 1")
-        if max_segments < 2:
-            raise MirrorConfigError("max_segments must be >= 2")
+        if max_segments < _MIN_SEGMENTS:
+            raise MirrorConfigError(f"max_segments must be >= {_MIN_SEGMENTS}")
         self._only = (
             None if only is None
             else tuple(sorted(
@@ -379,19 +397,12 @@ class ArrowMirror:
         Raises DeltaFormatError for a foreign marker or a non-current version, DeltaGapError on a
         TID gap.
         """
-        if delta.get("f") != FORMAT_MARKER:
-            raise DeltaFormatError(f"not a datacrystal delta: f={delta.get('f')!r}")
-        version = delta.get("v")
-        if version != CONTRACT_VERSION:
-            if isinstance(version, int) and version > CONTRACT_VERSION:
-                raise DeltaFormatError(
-                    f"delta version {version} is newer than this mirror "
-                    f"supports ({CONTRACT_VERSION}); upgrade datacrystal[arrow]"
-                )
-            raise DeltaFormatError(
-                f"delta version {version!r} predates v{CONTRACT_VERSION} — "
-                "incompatible (COMMIT-DELTA-v2 §7, no-compat): rebuild the mirror"
-            )
+        check_delta_header(
+            delta,
+            consumer="mirror",
+            upgrade="upgrade datacrystal[arrow]",
+            remedy="rebuild the mirror",
+        )
         tid = delta["tid"]
         if tid <= self._watermark:
             return False  # §4.2: apply-twice ≡ apply-once
@@ -407,8 +418,22 @@ class ArrowMirror:
         lineage = self._types | new_types
         # Decode and validate EVERY op before mutating anything: a refused
         # delta (unknown op, unseen cid) must leave no trace (§4.4 shape).
+        batch = self._decode_ops(delta["ops"], lineage)
+        self._types = lineage
+        for typename, oid, row in batch:
+            self._pending.setdefault(typename, {})[oid] = row
+        self._watermark = tid
+        self._applies_since_flush += 1
+        if self._applies_since_flush >= self._flush_every:
+            self.flush()
+        return True
+
+    def _decode_ops(
+        self, ops: list[dict[str, Any]], lineage: dict[int, tuple[str, list[str]]]
+    ) -> list[tuple[str, int, Any]]:
+        """Decode the mirrored ops into ``(typename, oid, row)``, raising on a malformed one."""
         batch: list[tuple[str, int, Any]] = []
-        for op in delta["ops"]:
+        for op in ops:
             kind, oid = op["op"], op["oid"]
             if kind not in ("upsert", "delete"):
                 raise DeltaFormatError(f"unknown op {kind!r} — refusing to guess")
@@ -431,19 +456,12 @@ class ArrowMirror:
                     (typename, oid, self._row_values(typename, persisted,
                                                      op["payload"]))
                 )
-        self._types = lineage
-        for typename, oid, row in batch:
-            self._pending.setdefault(typename, {})[oid] = row
-        self._watermark = tid
-        self._applies_since_flush += 1
-        if self._applies_since_flush >= self._flush_every:
-            self.flush()
-        return True
+        return batch
 
     # -- bootstrap (the §5 mid-life attach recipe) --------------------------------
 
     @classmethod
-    def bootstrap(cls, path: str | Path, snapshot: Any, *,
+    def bootstrap(cls, path: str | Path, snapshot: Snapshot, *,
                   only: Iterable[type | str] | None = None,
                   flush_every: int = 1, max_segments: int = 16,
                   batch: int = 50_000) -> ArrowMirror:
@@ -479,7 +497,7 @@ class ArrowMirror:
 
     @staticmethod
     def _require_root_for_protected(
-        snapshot: Any, only: Iterable[type | str] | None
+        snapshot: Snapshot, only: Iterable[type | str] | None
     ) -> None:
         """Fail closed before anything is wiped if a protected type would be mirrored without root.
 

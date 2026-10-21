@@ -19,6 +19,7 @@ from typing import Any, Self
 
 from datacrystal._actors import Principal
 from datacrystal._conditions import Condition
+from datacrystal._lazy import LazyReferenceManager
 from datacrystal._pipeline import DeltaConsumer
 from datacrystal._snapshot import Snapshot
 from datacrystal._store import Store
@@ -67,7 +68,7 @@ class AsyncStore:
     def _wake(self) -> None:
         self._loop.call_soon_threadsafe(self._store._pump)  # ADR-001: async facade binds to the sync engine
 
-    async def _sweep_forever(self, manager: Any) -> None:
+    async def _sweep_forever(self, manager: LazyReferenceManager) -> None:
         while True:
             await asyncio.sleep(manager.sweep_interval)
             manager.sweep()
@@ -77,37 +78,37 @@ class AsyncStore:
     # the explicit Lazy[T] cut points make that a visible choice) ----------
 
     @property
-    def root(self) -> Any:
+    def root(self) -> Any:  # noqa: ANN401 - public return mirrors Store.root, whose value is dynamic
         return self._store.root
 
     @root.setter
-    def root(self, value: Any) -> None:
+    def root(self, value: object) -> None:
         self._store.root = value
 
     @property
     def last_tid(self) -> int:
         return self._store.last_tid
 
-    def store(self, obj: Any) -> int:
+    def store(self, obj: object) -> int:
         return self._store.store(obj)
 
-    def mark_dirty(self, obj: Any) -> None:
+    def mark_dirty(self, obj: object) -> None:
         self._store.mark_dirty(obj)
 
-    def delete(self, obj_or_cls: Any, /, **unique_key: Any) -> bool:
+    def delete(self, obj_or_cls: object, /, **unique_key: object) -> bool:
         """Buffer a deletion (ADR-003) — like ``store()``, this only touches
         in-memory buffers; ``await commit()`` makes it durable.
         """
         return self._store.delete(obj_or_cls, **unique_key)
 
-    def upsert(self, obj: Any, /, key: str | None = None) -> Any:
+    def upsert(self, obj: object, /, key: str | None = None) -> Any:  # noqa: ANN401 - public return mirrors Store.upsert
         """Insert-or-merge by natural key — see :meth:`Store.upsert`."""
         return self._store.upsert(obj, key=key)
 
-    def get(self, cls: type, **unique_key: Any) -> Any | None:
+    def get(self, cls: type, **unique_key: object) -> Any | None:  # noqa: ANN401 - public return mirrors Store.get
         return self._store.get(cls, **unique_key)
 
-    def get_many(self, refs: Iterable[Any] | type, /, **unique_key: Any) -> list[Any]:
+    def get_many(self, refs: Iterable[Any] | type, /, **unique_key: object) -> list[Any]:
         return self._store.get_many(refs, **unique_key)
 
     def query(self, cond: Condition) -> list[Any]:
