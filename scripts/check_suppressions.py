@@ -6,8 +6,10 @@
 """Checks the suppression comments in src/ against standard typed-python.
 
 Usage: uv run scripts/check_suppressions.py [<dir-or-file>...]   (default: src)
+Ruff and pyrefly read the keywords in any letter case, so the check does too.
 A `# noqa` names its codes, only BLE001, TRY004, UP007 or ANN401, and ends in ` - <reason>`.
-A `# pyrefly: ignore[<code>]` ends in ` - <reason>`; `type: ignore` and file-wide ones are refused.
+A `# pyrefly: ignore[<code>]` ends in ` - <reason>`.
+`type: ignore` and the file-wide `ruff: noqa`, `flake8: noqa`, `pyrefly: ignore-errors` are refused.
 Prints file:line and the problem per finding; exit 1 on any.
 """
 
@@ -21,20 +23,26 @@ from pathlib import Path
 
 ALLOWED_NOQA_CODES = {"BLE001", "TRY004", "UP007", "ANN401"}
 COMMENT_BOUNDARY = re.compile(r"\s+#\s*")
-NOQA = re.compile(r"noqa\b(?::\s*(?P<codes>[A-Z]+\d+(?:\s*,\s*[A-Z]+\d+)*))?(?P<rest>.*)$")
-PYREFLY_IGNORE = re.compile(r"pyrefly:\s*ignore\b(?P<codes>\[[^\]]+\])?(?P<rest>.*)$")
+NOQA = re.compile(
+    r"noqa\b(?::\s*(?P<codes>[A-Z]+\d+(?:\s*,\s*[A-Z]+\d+)*))?(?P<rest>.*)$", re.IGNORECASE
+)
+PYREFLY_IGNORE = re.compile(
+    r"pyrefly:\s*ignore\b(?P<codes>\[[^\]]+\])?(?P<rest>.*)$", re.IGNORECASE
+)
+FILE_WIDE = re.compile(r"(ruff|flake8):\s*noqa\b|pyrefly:\s*ignore-errors\b")
 REASON = re.compile(r"^ - \S")
 
 
 def segment_problems(segment: str) -> list[str]:
     """Problems of one `# ...` fragment of a comment; empty when it is fine or no suppression."""
-    if segment.startswith("type:") and "ignore" in segment:
+    keyword = segment.lower()
+    if keyword.startswith("type:") and "ignore" in keyword:
         return ["`type: ignore` is refused, fix the type or use a reasoned `pyrefly: ignore[...]`"]
-    if segment.startswith(("ruff: noqa", "pyrefly: ignore-errors")):
+    if FILE_WIDE.match(keyword):
         return ["a file-wide suppression is refused"]
-    if segment.startswith("noqa"):
+    if keyword.startswith("noqa"):
         return noqa_problems(segment)
-    if segment.startswith("pyrefly:"):
+    if keyword.startswith("pyrefly:"):
         return pyrefly_problems(segment)
     return []
 
@@ -45,7 +53,7 @@ def noqa_problems(segment: str) -> list[str]:
     if match is None or match["codes"] is None:
         return ["a blanket `noqa` names no code"]
     problems = []
-    codes = {code.strip() for code in match["codes"].split(",")}
+    codes = {code.strip().upper() for code in match["codes"].split(",")}
     refused = sorted(codes - ALLOWED_NOQA_CODES)
     if refused:
         problems.append(f"`noqa` for {', '.join(refused)} is not allowed in src/, fix the code")

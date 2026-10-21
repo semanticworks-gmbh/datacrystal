@@ -64,7 +64,7 @@ from datacrystal._errors import (
     WriteDeniedError,
     WrongThreadError,
 )
-from datacrystal._follower import open_follower
+from datacrystal._follower import HttpClient, open_follower
 from datacrystal._indexes import QueryPlan
 from datacrystal._lazy import BlobHandle, BlobSource, Lazy, blob_from_path
 from datacrystal._permissions import Permissions, protect, share, unshare
@@ -117,6 +117,7 @@ __all__ = [
     "FrozenEntityError",
     "FullText",
     "Glue",
+    "HttpClient",
     "Index",
     "Lazy",
     "LeaseLostError",

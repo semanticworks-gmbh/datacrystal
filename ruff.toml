@@ -43,10 +43,6 @@ extend-ignore = ["D205"]
 # readable-tests wants the expected value as a literal in the assert (DAMP over DRY), as in tetrahedron's ruff.toml.
 "{tests/**,scripts/test_*.py,benchmarks/test_*.py,**/conftest.py}" = ["PLR2004"]
 
-[lint.flake8-bugbear]
-# FastAPI dependency markers in a route signature are immutable by design.
-extend-immutable-calls = ["fastapi.Depends", "fastapi.Body"]
-
 [lint.pydocstyle]
 convention = "google"
 

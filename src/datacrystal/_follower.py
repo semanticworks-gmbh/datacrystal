@@ -40,6 +40,8 @@ if TYPE_CHECKING:
 _FRAME = struct.Struct(">Q")
 _FRAME_HEADER_SIZE = _FRAME.size
 
+__all__ = ["HttpClient", "open_follower"]
+
 
 class _PostResponse(Protocol):
     """The slice of ``httpx.Response`` that a ``/v1/submit`` reply is read through."""

@@ -27,6 +27,9 @@ if TYPE_CHECKING:
         SNAPSHOT_CONTEXT_KEY as SNAPSHOT_CONTEXT_KEY,
     )
     from datacrystal.web._app import (
+        StoreOpenOptions as StoreOpenOptions,
+    )
+    from datacrystal.web._app import (
         create_app as create_app,
     )
     from datacrystal.web._app import (
@@ -74,6 +77,7 @@ _LAZY: dict[str, str] = {
     "snapshot_context": "_strawberry",
     # _app: FastAPI app wiring (#92) — needs fastapi
     "SNAPSHOT_CONTEXT_KEY": "_app",
+    "StoreOpenOptions": "_app",
     "create_app": "_app",
     "get_principal": "_app",
     "get_store": "_app",
@@ -111,6 +115,7 @@ __all__ = [
     "SNAPSHOT_CONTEXT_KEY",
     "FieldDescriptor",
     "SnapshotLoader",
+    "StoreOpenOptions",
     "StrawberryReflector",
     "create_app",
     "entity_model",

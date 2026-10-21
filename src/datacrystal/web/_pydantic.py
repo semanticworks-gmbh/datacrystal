@@ -124,9 +124,9 @@ def to_pydantic(
     return model.model_validate(data)
 
 
-def from_pydantic(
-    model_instance: pydantic.BaseModel, cls: type, *, store: Store | None = None
-) -> Any:  # noqa: ANN401 - a public return typed per cls would break every caller's checking
+def from_pydantic[T](
+    model_instance: pydantic.BaseModel, cls: type[T], *, store: Store | None = None
+) -> T:
     """Rebuild a live ``@entity`` of ``cls`` from a boundary DTO via its public constructor (#98).
 
     The result is a fresh ``STATE_NEW`` instance; the engine slots are never written, and a

@@ -26,6 +26,7 @@ from datacrystal.web._strawberry import snapshot_context
 
 __all__ = [
     "SNAPSHOT_CONTEXT_KEY",
+    "StoreOpenOptions",
     "create_app",
     "get_principal",
     "get_store",

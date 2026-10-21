@@ -22,7 +22,7 @@ from contextvars import ContextVar
 from functools import partial
 from pathlib import Path
 from types import TracebackType
-from typing import TYPE_CHECKING, Any, BinaryIO, NoReturn, Protocol, Self, cast
+from typing import TYPE_CHECKING, Any, BinaryIO, NoReturn, Self, cast
 
 from pyroaring import BitMap64
 
@@ -94,6 +94,7 @@ from datacrystal._permissions import (
     PERM_FIELDS,
     PERM_LEGACY_FILLS,
     VIEWER,
+    LabelColumns,
     authority_towards,
     can_read_row,
     is_root,
@@ -157,15 +158,6 @@ _THREAD_RECIPE = (
     "runs it at its next store call or store.run_pending() — and return plain "
     "data, never live entities; for cross-thread reads take a store.snapshot()"
 )
-
-
-class _Labelled(Protocol):
-    """A protected entity's four ``_dc_`` label columns (ADR-008)."""
-
-    _dc_owner: int
-    _dc_groups: list[int]
-    _dc_read_floor: int
-    _dc_write_floor: int
 
 
 @entity
@@ -1316,7 +1308,7 @@ class Store:
             _gate_delete(p, oid, ti, labels[oid])
         return records
 
-    def _gate_new_record(self, p: Principal, oid: int, obj: _Labelled, ti: TypeInfo) -> _Labels:
+    def _gate_new_record(self, p: Principal, oid: int, obj: LabelColumns, ti: TypeInfo) -> _Labels:
         """Gate a NEW protected record and return its baseline: the birth/inherited labels.
 
         There is no floor to clear. The anonymous case is normally refused at the stamp site
@@ -2339,7 +2331,7 @@ class Store:
                                  child_container,
                                  eager_position=not spec.lazy_refs)
 
-    def _stamp_perm_labels(self, obj: _Labelled, container: _Labelled | None) -> None:
+    def _stamp_perm_labels(self, obj: LabelColumns, container: LabelColumns | None) -> None:
         """Stamp birth labels on a fresh protected record, once, from :meth:`_register_graph`.
 
         ``_dc_owner`` is the acting principal's uid, never inherited (R6 provenance). Groups and
@@ -2744,7 +2736,7 @@ class Store:
         if oid in self._new:
             p = self.principal
             # the caller (Lazy.get) checked type_info(obj).protected, so the label columns exist
-            labelled = cast("_Labelled", obj)
+            labelled = cast("LabelColumns", obj)
             if is_root(p) or can_read_row(
                     p, labelled._dc_owner, list(labelled._dc_groups), labelled._dc_read_floor):
                 return obj
@@ -3239,7 +3231,7 @@ def _deny_write(p: Principal, message: str) -> NoReturn:
                            "(ADR-008)")
 
 
-def _gate_persisted_record(p: Principal, oid: int, obj: _Labelled, ti: TypeInfo,
+def _gate_persisted_record(p: Principal, oid: int, obj: LabelColumns, ti: TypeInfo,
                            prior: _Labels) -> _Labels:
     """Gate a write to a persisted protected record and return its prior labels as the baseline."""
     held = authority_towards(p, prior[0], prior[1])
@@ -3261,7 +3253,7 @@ def _gate_persisted_record(p: Principal, oid: int, obj: _Labelled, ti: TypeInfo,
     return prior
 
 
-def _gate_label_changes(p: Principal, oid: int, obj: _Labelled, ti: TypeInfo,
+def _gate_label_changes(p: Principal, oid: int, obj: LabelColumns, ti: TypeInfo,
                         base: _Labels) -> None:
     """Gate the staged groups and floors against the baseline and the principal's authority (R8)."""
     staged_groups = list(obj._dc_groups)

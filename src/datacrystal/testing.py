@@ -151,7 +151,7 @@ def _check_gap_refusal(factory: _Factory, content: _Content | None) -> None:
         gap_refused = True
     _require("§4.4 gap refusal", gap_refused,
              "a delta skipping past the watermark MUST raise — history is missing")
-    _require("§4.4 gap refusal", consumer.watermark == 1,
+    _require("§4.4 gap refusal", consumer.watermark == _CREATE_TID,
              "the refused gap delta moved the watermark")
     if content is not None:
         _require("§4.4 gap refusal", content(consumer) == before,
@@ -220,7 +220,7 @@ def _check_unknown_op(factory: _Factory, content: _Content | None) -> None:
     except Exception:  # noqa: BLE001 - the contract only demands a raise, not a type
         op_refused = True
     _require("§3 unknown op", op_refused, "an unknown op MUST raise, not be guessed")
-    _require("§3 unknown op", consumer.watermark == 1,
+    _require("§3 unknown op", consumer.watermark == _CREATE_TID,
              "the refused unknown-op delta moved the watermark")
     if content is not None:
         _require("§3 unknown op", content(consumer) == before,
@@ -251,7 +251,7 @@ def _check_delete_totality(factory: _Factory, content: _Content) -> None:
     for delta in _stream_create_update_delete():
         deleted.apply(delta)
     empty = factory()
-    for delta in _stream_types_only(length=_DELETE_TID):
+    for delta in _stream_types_only(length=len(_stream_create_update_delete())):
         empty.apply(delta)
     _require("§3.1 delete totality", content(deleted) == content(empty),
              "after a delete tombstone, derived state must hold nothing for the "

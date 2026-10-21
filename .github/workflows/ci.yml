@@ -85,7 +85,7 @@ jobs:
         run: uv run scripts/test_testrules.py
 
       - name: Changed test modules
-        run: git diff --name-only --diff-filter=d "origin/${{ github.base_ref }}...HEAD" -- ':(glob)tests/**/test_*.py' ':(glob)benchmarks/test_*.py' > changed.txt
+        run: git diff --name-only --diff-filter=d "origin/${{ github.base_ref }}...HEAD" -- ':(glob)tests/**/test_*.py' ':(glob)benchmarks/test_*.py' scripts/test_check_suppressions.py > changed.txt
 
       - name: Gate
         run: |
