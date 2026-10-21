@@ -1,66 +1,10 @@
 """``datacrystal[web]`` GraphQL boundary — reflect ``@entity`` into Strawberry (#23 / #49 S6).
 
-The GraphQL half of the web tier: the shared reflection in :mod:`._reflect` is
-turned into a Strawberry type here, resolving fields over a pinned
-``store.snapshot()`` — never the live engine object. The reflection rules
-(which fields, what core type) come straight from the engine's
-:class:`~datacrystal._entity.TypeInfo`, so the REST (:mod:`._pydantic`) and
-GraphQL surfaces can never disagree on what an entity exposes.
+The shared reflection in :mod:`._reflect` becomes Strawberry types resolving over a pinned snapshot.
+Scalar fields use the default ``getattr`` on the frozen ``EntityView`` (#99).
+Reference fields batch through a per-request :class:`SnapshotLoader` (#100, ``web-deployment.md``).
+``strawberry`` is imported only here, never from core or :mod:`._reflect`.
 
-What this story (#99) builds, and where it stops:
-
-* **Scalar fields** (``str``/``int``/``float``/``bool``, and ``list``-of-scalar
-  via :func:`datacrystal._entity._is_list_of_scalar`) become GraphQL scalar
-  fields with **no resolver** — Strawberry's *default* resolver
-  (``StrawberryField.get_result`` → ``default_resolver(source, python_name)``,
-  ``types/field.py:234``) does a plain ``getattr`` against the source, which is
-  a frozen :class:`~datacrystal._snapshot.EntityView`
-  (``EntityView.__getattr__``, ``_snapshot.py:114``). No Pydantic, no copy, no
-  live entity crosses the request edge.
-* **Entity-reference fields** (``FieldSpec.entity_ref`` / ``lazy_refs``) become
-  GraphQL *object* fields whose declared type is the referenced ``@entity``'s
-  reflected Strawberry type. Since #100 (S6b) they carry an **async relation
-  resolver** (:func:`_relation_resolver`): it reads the raw
-  :class:`~datacrystal._snapshot.Ref` token the default resolver would have
-  returned and hands the OID to a **per-request DataLoader**, so a query
-  following N sibling refs in one resolver tick batches into **one**
-  ``Snapshot.get_many`` instead of N+1-ing the store.
-
-The DataLoader (the N+1 killer)
--------------------------------
-
-The relation resolver pulls a :class:`SnapshotLoader` off ``info.context`` (the
-key :data:`LOADER_CONTEXT_KEY`) and awaits ``loader.load(oid)``. The loader
-is **built per request, not defaulted** (:func:`snapshot_context` /
-:meth:`SnapshotLoader.__init__`):
-
-* its ``load_fn`` is :meth:`Snapshot.get_many` over the **one** snapshot pinned
-  for that request/operation — the same watermark every field on the request
-  reads from (ADR-002 read views);
-* it is constructed with ``cache=False``. Strawberry's vendored DataLoader
-  defaults to ``cache=True`` (``dataloader.py:139``), a **lifetime** cache that
-  would leak resolved entities across requests *and* across snapshot watermarks
-  (a stale read after a commit). Request scoping is a property we *build* by
-  turning that off and constructing the loader fresh per request — never a
-  default we inherit (:func:`test_loader_is_request_scoped_not_lifetime_cached`);
-* a tick's ``.load()`` calls coalesce into one batch by Strawberry's
-  ``call_soon`` scheduling (``dataloader.py:248``), so the load_fn receives the
-  whole sibling-set of OIDs at once;
-* a deleted/dangling ``Ref`` rides ``get_many``'s None-on-miss (ADR-003,
-  unchecked deletes) — the loader returns ``None`` in that slot and the field
-  resolves to GraphQL ``null``, never a 500.
-
-Mutually- and self-referential entities (``Mineral`` ↔ ``Locality``) are built
-with the type registry in :class:`StrawberryReflector`: each entity gets one
-Strawberry type, cached by typename; a reference field's annotation is patched
-in **after** both endpoint types exist (Strawberry resolves field types lazily
-at schema-conversion, so the post-build patch is honoured). No hand-written
-per-entity schema class — :func:`strawberry.tools.create_type` builds each type
-from the reflected field list at runtime.
-
-``strawberry`` is imported **only at this submodule's top** — never from core and
-never from :mod:`._reflect` — so plain ``import datacrystal`` stays inside the
-``{msgspec, pyroaring}`` budget (fitness gate ``test_import_isolation_*``).
 """
 
 from __future__ import annotations
@@ -97,36 +41,18 @@ __all__ = [
     "snapshot_context",
 ]
 
-#: The key under which a per-request :class:`SnapshotLoader` lives on the
-#: GraphQL ``info.context``. The relation resolver looks it up here; the request
-#: wiring (#92) and :func:`snapshot_context` put it there. A module-level
-#: constant (not a bare string at the call sites) so the resolver and the
-#: context builder can never disagree on the name.
+#: The ``info.context`` key under which a per-request :class:`SnapshotLoader` lives.
 LOADER_CONTEXT_KEY = "dc_snapshot_loader"
 
 
 class SnapshotLoader:
     """A per-request DataLoader over one pinned snapshot — the N+1 killer (#100).
 
-    Holds a :class:`strawberry.dataloader.DataLoader` whose ``load_fn`` is this
-    snapshot's :meth:`~datacrystal._snapshot.Snapshot.get_many` (#94): a batch of
-    OIDs collected in one resolver tick resolves in a single
-    :meth:`~datacrystal._snapshot.Snapshot.get_many` round-trip, aligned 1:1 and
-    ``None``-tolerant on a dangling reference (ADR-003 unchecked deletes).
-
-    **Request-scoped by construction, not by default.** Strawberry's vendored
-    DataLoader defaults to ``cache=True`` (``dataloader.py:139``) — a *lifetime*
-    cache keyed by OID that would survive across requests and across snapshot
-    watermarks, serving a pre-commit entity after a later commit changed it. We
-    build the loader with ``cache=False`` and construct one fresh per request
-    (:func:`snapshot_context`), so the only thing scoping a batch is the request
-    itself. The tick-coalescing that turns N sibling ``.load()`` calls into one
-    ``get_many`` is Strawberry's ``call_soon`` batch dispatch (``dataloader.py:248``),
-    which ``cache=False`` does not disturb.
-
-    One loader binds one snapshot: every field on the request reads from the same
-    committed watermark (ADR-002 read views), so a graph traversal is internally
-    consistent even while the owner thread keeps committing.
+    The OIDs collected in one resolver tick resolve in a single ``Snapshot.get_many``, ``None``
+    where a reference dangles (ADR-003).
+    Built with ``cache=False`` and fresh per request, because Strawberry's default lifetime cache
+    would serve pre-commit entities across requests and watermarks.
+    One loader binds one snapshot, so a traversal reads one watermark (ADR-002).
     """
 
     __slots__ = ("loader", "snapshot")
@@ -135,21 +61,13 @@ class SnapshotLoader:
         self.snapshot = snapshot
 
         async def load_fn(oids: list[int]) -> list[EntityView | None]:
-            # get_many is sync (a snapshot read view); the DataLoader contract is
-            # an async load_fn returning a list aligned 1:1 with the keys —
-            # exactly get_many's shape (#94), None where an OID is gone.
-            #
-            # Read fence (ADR-008 W4-4): a denied protected row comes back from
-            # get_many as a redacted twin (isinstance(_, Redacted); any data-field
-            # access RAISES). Map it to None HERE — BEFORE Strawberry resolves the
-            # reference's subfields — so a denied ``about`` ref resolves to GraphQL
-            # null exactly like a dangling/deleted ref (denied ≡ dangling ≡ null;
-            # no existence leak), never a 500 from getattr on the twin.
+            # Read fence (ADR-008 W4-4): a denied row comes back as a redacted twin whose
+            # field access raises. Map it to None before Strawberry resolves subfields, so
+            # denied, dangling and deleted all resolve to null (no existence leak, no 500).
             views = snapshot.get_many(oids)
             return [None if isinstance(v, Redacted) else v for v in views]
 
-        # cache=False is the load-bearing argument (see the class docstring): the
-        # default cache=True is a lifetime cache that leaks across watermarks.
+        # cache=False is load-bearing (see the class docstring).
         self.loader: DataLoader[int, EntityView | None] = DataLoader(
             load_fn=load_fn, cache=False
         )
@@ -160,17 +78,11 @@ class SnapshotLoader:
 
 
 def snapshot_context(snapshot: Snapshot) -> dict[str, Any]:
-    """Build a fresh GraphQL ``context`` carrying a per-request
-    :class:`SnapshotLoader` over ``snapshot`` (#100).
+    """Build a GraphQL ``context`` carrying a per-request :class:`SnapshotLoader` (#100).
 
-    Call this **once per request/operation** with the snapshot pinned for that
-    request, then pass the result as ``context_value`` to ``schema.execute`` /
-    ``execute_sync`` (or return it from the FastAPI GraphQL ``context_getter``,
-    #92). Building it per request — rather than sharing one loader on the schema —
-    is what scopes batching and caching to the request and pins every field to
-    one watermark (ADR-002). The dict is the caller's to extend with other
-    per-request values; the relation resolver only reads
-    :data:`LOADER_CONTEXT_KEY`.
+    Call it once per request and pass the result as ``context_value`` (or return it from the
+    ``context_getter``, #92).
+    The dict is the caller's to extend; the resolver reads only :data:`LOADER_CONTEXT_KEY`.
     """
     return {LOADER_CONTEXT_KEY: SnapshotLoader(snapshot)}
 
@@ -178,30 +90,10 @@ def snapshot_context(snapshot: Snapshot) -> dict[str, Any]:
 def _make_relation_resolver(name: str, *, list_edge: bool) -> Any:
     """Build the async relation resolver for the reference field ``name`` (#100).
 
-    Returned as a closure (the field name captured, never a GraphQL argument) so
-    Strawberry sees a resolver of exactly ``(root, info)`` — ``root`` untyped is
-    the source :class:`~datacrystal._snapshot.EntityView`, ``info`` annotated
-    :class:`strawberry.types.Info` is the context injection. The field's GraphQL
-    type comes from the patched ``type_annotation`` (``_resolve_pending``), not
-    from this resolver, so the resolver carries no return annotation — which also
-    lets a cycle's target type be unbuilt when the closure is made.
-
-    The default resolver would return the view's raw
-    :class:`~datacrystal._snapshot.Ref` token (#99); this one takes that token's
-    OID to the per-request DataLoader, so a tick's sibling references batch into
-    one :meth:`~datacrystal._snapshot.Snapshot.get_many` (the N+1 killer). An
-    absent edge (``None``) short-circuits without touching the loader; a
-    dangling/deleted reference rides ``get_many``'s None-on-miss (ADR-003) and
-    resolves to GraphQL ``null`` — never a 500.
-
-    ``list_edge`` switches on the #30 multi-valued adjacency shape (story #103):
-    the view holds a **tuple** of :class:`~datacrystal._snapshot.Ref` tokens, so
-    every element's OID is dispatched to the loader and the per-element awaits are
-    gathered in the SAME tick — Strawberry's ``call_soon`` coalescing then folds
-    them (and every sibling list/scalar edge in the tick) into ONE
-    :meth:`~datacrystal._snapshot.Snapshot.get_many`, never one batch per list.
-    An empty list resolves to ``[]`` (no loader round-trip); a dangling element
-    becomes ``null`` in its slot, the list itself non-null.
+    The closure takes exactly ``(root, info)`` and has no return annotation: the field type is
+    patched later by ``_resolve_pending``, since the target may not exist yet on a cycle.
+    It sends the view's ``Ref`` OID through the per-request loader; a dangling edge is ``null``.
+    With ``list_edge`` (#103) the loads are gathered in one tick, coalescing into one ``get_many``.
     """
     if list_edge:
 
@@ -210,9 +102,7 @@ def _make_relation_resolver(name: str, *, list_edge: bool) -> Any:
             if edges is None:
                 return []
             loader = _loader_from(info)
-            # The view freezes a list edge to a tuple of Ref tokens; tolerate a
-            # bare OID defensively. Gather in one tick so the loads coalesce into
-            # a single get_many — across this list AND every sibling edge.
+            # Gather in one tick so the loads coalesce into one get_many; a bare OID is tolerated.
             return await asyncio.gather(
                 *(
                     loader.load(edge.oid if isinstance(edge, Ref) else edge)
@@ -229,7 +119,7 @@ def _make_relation_resolver(name: str, *, list_edge: bool) -> Any:
         if ref is None:
             return None
         loader = _loader_from(info)
-        # The view stores edges as Ref tokens; tolerate a bare OID defensively.
+        # A bare OID is tolerated next to a Ref token.
         oid = ref.oid if isinstance(ref, Ref) else ref
         return await loader.load(oid)
 
@@ -239,13 +129,10 @@ def _make_relation_resolver(name: str, *, list_edge: bool) -> Any:
 
 
 def _relation_field(name: str, *, list_edge: bool) -> StrawberryField:
-    """A reference field named ``name`` carrying the async relation resolver.
+    """Build a reference field named ``name`` carrying the async relation resolver.
 
-    The ``type_annotation`` is a placeholder (``object``) here; it is patched to
-    the (nullable, or ``list[...]``) target Strawberry type in
-    :meth:`StrawberryReflector._resolve_pending` once every endpoint type is
-    cached (the cycle break). ``list_edge`` selects the multi-valued resolver +
-    the ``list[Target | None]`` annotation (story #103).
+    Its ``type_annotation`` is a placeholder that :meth:`StrawberryReflector._resolve_pending`
+    patches (the cycle break).
     """
     return StrawberryField(
         python_name=name,
@@ -257,9 +144,7 @@ def _relation_field(name: str, *, list_edge: bool) -> StrawberryField:
 
 
 def _loader_from(info: Info[Any, Any]) -> SnapshotLoader:
-    """Pull the per-request :class:`SnapshotLoader` off the GraphQL context, or
-    fail loudly if the request was not wired with :func:`snapshot_context`.
-    """
+    """Return the per-request :class:`SnapshotLoader`, raising if it was not set up."""
     context: object = info.context
     if isinstance(context, Mapping):
         mapping = cast("Mapping[object, object]", context)
@@ -276,13 +161,9 @@ def _loader_from(info: Info[Any, Any]) -> SnapshotLoader:
 
 
 def _is_scalar_field(desc: FieldDescriptor) -> bool:
-    """A field GraphQL can serve directly off the frozen view: a scalar, an
-    optional scalar, or a ``list`` of scalars (`#13`-style multi-valued field).
+    """Report whether a field is a scalar, optional scalar or list of scalars served off the view.
 
-    Mirrors the engine's own indexable/list-of-scalar split
-    (:func:`datacrystal._entity._is_indexable` / ``_is_list_of_scalar``) so the
-    GraphQL scalar set is exactly the leaf set the engine treats as plain data —
-    no second definition of "scalar" to drift.
+    It reuses the engine's leaf-set predicates so "scalar" has one definition.
     """
     from datacrystal._entity import (
         _is_indexable,  # engine leaf-set predicate, no second "scalar" definition
@@ -294,19 +175,13 @@ def _is_scalar_field(desc: FieldDescriptor) -> bool:
 class StrawberryReflector:
     """Builds one Strawberry type per ``@entity`` class, cached by typename.
 
-    The registry exists so a graph of mutually-referential entities reflects
-    into a graph of mutually-referential Strawberry types without re-creating a
-    type (Strawberry rejects two distinct types sharing a GraphQL name) and
-    without infinite recursion on a cycle. #100 reuses the same cache to attach
-    the relation resolver to the reference fields this story leaves resolver-less.
+    Strawberry rejects two types with one GraphQL name, and the cache also stops recursion on a
+    cycle.
     """
 
     def __init__(self) -> None:
         self._types: dict[str, type] = {}
-        # Reference fields whose target type is patched in once both ends exist
-        # (the cycle break): (field, referenced typename, is_list_edge) deferred
-        # until resolve(). The list flag (#103) selects ``list[Target | None]``
-        # over a plain nullable ``Target`` for a multi-valued adjacency field.
+        # (field, referenced typename, is_list_edge), patched once both ends exist.
         self._pending_refs: list[tuple[StrawberryField, str, bool]] = []
 
     def reflect(self, cls: type) -> type:
@@ -324,10 +199,7 @@ class StrawberryReflector:
         return gql_type
 
     def _build(self, info: TypeInfo, descriptors: tuple[FieldDescriptor, ...]) -> type:
-        # The engine's persisted typename is ``module:QualName`` (lineage-stable);
-        # the GraphQL name is the bare class name — the identifier a schema reader
-        # sees. (A future story may add a name-override hook for cross-module
-        # name collisions; v1 takes the class name.)
+        # The GraphQL name is the bare class name; the persisted typename is ``module:QualName``.
         gql_name = info.cls.__name__
         fields: list[StrawberryField] = []
         referents: list[type] = []  # entity classes to reflect AFTER this is cached
@@ -341,11 +213,7 @@ class StrawberryReflector:
                 "— a GraphQL type needs at least one scalar or reference field"
             )
         gql_type = create_type(gql_name, fields)
-        # Cache this type BEFORE recursing into the referents so a cycle back to
-        # it (referent → … → this type) terminates on the cache hit instead of
-        # rebuilding — the cycle break. The reference fields' target annotations
-        # are still placeholders here; they are patched once every referent is
-        # built (``_resolve_pending``, called by the outer ``reflect``).
+        # Cache before recursing so a cycle back to this type ends on the cache hit.
         self._types[info.typename] = gql_type
         for target in referents:
             self.reflect(target)
@@ -354,29 +222,17 @@ class StrawberryReflector:
     def _field_for(
         self, desc: FieldDescriptor, referents: list[type]
     ) -> StrawberryField | None:
-        """One reflected field → a Strawberry field, or ``None`` to skip it.
+        """Return a Strawberry field for one reflected field, or ``None`` to skip it.
 
-        A reference field's target class is appended to ``referents`` to be
-        reflected *after* the current type is cached (never recursed into here —
-        that would loop on a cycle before the cache entry exists).
-
-        Scalar fields are resolver-less: the default ``getattr`` resolver reads
-        them straight off the :class:`~datacrystal._snapshot.EntityView`. A
-        reference field instead carries the **async relation resolver** (#100),
-        which takes the view's :class:`~datacrystal._snapshot.Ref` token through
-        the per-request DataLoader (the N+1 killer) rather than returning it raw.
-        A **list-valued** reference (the #30 multi-valued edge) reflects as a
-        ``list[Target | None]`` of edges resolved through the same loader (#103) —
-        detected via the container origin (``list_ref_target``), since
-        ``referenced_entities`` flattens a list edge and a scalar ref to the same
-        referent tuple.
+        A reference target is appended to ``referents``, reflected after the current type is cached
+        (a cycle would loop otherwise).
+        A list edge reflects as ``list[Target | None]`` (#103); ``list_ref_target`` detects it
+        because ``referenced_entities`` flattens it like a scalar ref.
         """
         if _is_scalar_field(desc):
             return _plain_field(desc.name, desc.core_type)
         list_target = list_ref_target(desc.core_type)
         if list_target is not None:
-            # A list-of-ref adjacency edge (#103): reflect ``list[Target | None]``
-            # and resolve every element OID through the per-request DataLoader.
             target_info, _ = reflect(list_target)
             field = _relation_field(desc.name, list_edge=True)
             self._pending_refs.append((field, target_info.typename, True))
@@ -384,36 +240,24 @@ class StrawberryReflector:
             return field
         targets = referenced_entities(desc.core_type)
         if not targets:
-            # Neither a scalar nor an entity reference (bare ``list``, ``dict``,
-            # a ``dc.Blob`` bytes field, …) — GraphQL has no native shape for it,
-            # so it is not part of the reflected type. A later story may map blobs
-            # to a URL field; nothing here pretends to expose them.
+            # No GraphQL shape (bare ``list``, ``dict``, a ``dc.Blob`` field): not reflected.
             return None
-        # An entity reference: a single-target edge keeps the referent's GraphQL
-        # type; a multi-target (heterogeneous container/union of entities) is
-        # out of scope for v1's single-type reflection.
+        # A union of several entities is out of scope for v1's single-type reflection.
         if len(targets) != 1:
             return None
         target = targets[0]
         target_info, _ = reflect(target)
-        # The type annotation is a placeholder here (the target's Strawberry type
-        # may not exist yet on a cycle) — patched in ``_resolve_pending`` once
-        # every endpoint is cached. The relation resolver (#100) is bound now.
         field = _relation_field(desc.name, list_edge=False)
         self._pending_refs.append((field, target_info.typename, False))
         referents.append(target)
         return field
 
     def _resolve_pending(self) -> None:
-        """Patch each deferred reference field's annotation to its target
-        Strawberry type, now that every endpoint type is in the cache.
+        """Patch each deferred reference field's annotation to its target type once all are cached.
 
-        Strawberry resolves a field's type lazily at schema-conversion, so the
-        annotation set here — after ``create_type`` — is the one the schema
-        sees. A scalar edge becomes ``Target | None`` (nullable, so an absent
-        reference validates without a non-null violation); a list edge (#103)
-        becomes ``list[Target | None]`` — a non-null list (empty → ``[]``) of
-        nullable elements (a dangling element resolves to ``null``, ADR-003).
+        Strawberry resolves types lazily, so a patch after ``create_type`` is honoured.
+        A scalar edge is ``Target | None``; a list edge (#103) is a non-null ``list[Target |
+        None]``.
         """
         still_pending: list[tuple[StrawberryField, str, bool]] = []
         for field, typename, is_list in self._pending_refs:
@@ -429,20 +273,16 @@ class StrawberryReflector:
 def reflect_strawberry_type(cls: type) -> type:
     """Reflect an ``@entity`` class into a Strawberry GraphQL type (#99).
 
-    Convenience over a fresh :class:`StrawberryReflector` for the common case of
-    one reflected root; callers that reflect several entities into one schema
-    should share a single reflector so referents map to one GraphQL type each.
+    Callers reflecting several entities into one schema should share a :class:`StrawberryReflector`,
+    so each referent maps to one GraphQL type.
     """
     return StrawberryReflector().reflect(cls)
 
 
 def _plain_field(name: str, core_type: Any) -> StrawberryField:
-    """A resolver-less Strawberry field of ``core_type`` named ``name``.
+    """Build a resolver-less Strawberry field of ``core_type`` named ``name``.
 
-    With no ``base_resolver``, Strawberry uses the default resolver
-    (``types/field.py:234``) — a ``getattr(source, name)`` against whatever the
-    parent field returns, which on this surface is a frozen
-    :class:`~datacrystal._snapshot.EntityView` (``_snapshot.py:114``).
+    Strawberry's default resolver does ``getattr`` on the parent, a frozen ``EntityView`` here.
     """
     return StrawberryField(
         python_name=name,
