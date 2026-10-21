@@ -17,7 +17,7 @@ Gates that switch on in a later wave say so by issue: ANN401, C901, PLR2004 in `
 ### typed-python
 - **Rule:** Every function and method is fully annotated (ruff `ANN`) and the project passes Pyrefly at zero errors; CI blocks on both. A suppression is a line-level `# pyrefly: ignore[<code>]` with its reason, never file-wide in `src/`. A ruff `# noqa: <code> - <reason>` in `src/` is line-level too and allowed only where the rule contradicts a documented contract (BLE001, TRY004, UP007 today).
 - **Applies to:** `src/`, `examples/`, `benchmarks/`; `tests/`.
-- **Enforced by:** ci — `uv run pyrefly check` at 0 on `src`, `examples`, `benchmarks`, `tests`; `uvx ruff@0.17.1 check .` selects ANN001–ANN003 and ANN2xx for `src`, `examples` and `scripts`, ANN401 (`Any`) from #192 and ANN for `tests`, `benchmarks` and `evals`; cannot see: an `Any` that hides a real type, a suppression without a reason.
+- **Enforced by:** ci — `uv run pyrefly check` at 0 on `src`, `examples`, `benchmarks`, `tests`; `uvx ruff check .` selects ANN001–ANN003 and ANN2xx for `src`, `examples` and `scripts`, ANN401 (`Any`) from #192 and ANN for `tests`, `benchmarks` and `evals`; cannot see: an `Any` that hides a real type, a suppression without a reason.
 - **Example:** `src/datacrystal/web/_pydantic.py` (the one `bad-return` suppression, with its reason)
 - **Source:** tetrahedron decision 552, copied 2026-10-20 (#186); pyright leaves `src/` CI here.
 

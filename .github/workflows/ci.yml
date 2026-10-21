@@ -26,7 +26,7 @@ jobs:
         run: uv sync --all-extras
 
       - name: Lint (ruff)
-        run: uvx ruff@0.17.1 check .
+        run: uvx ruff check .
 
       - name: Type check (Pyrefly — src, examples, benchmarks, tests)
         run: uv run pyrefly check

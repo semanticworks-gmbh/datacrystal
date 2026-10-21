@@ -1,6 +1,6 @@
 # Adopted from tetrahedron's ruff.toml (#186). A rule group is selected once it is at 0 on the paths
 # it covers; a group not yet clean is left out here, and the issue named beside it switches it on.
-# Run pinned: `uvx ruff@0.17.1 check .` (CI, AGENTS.md and CONTRIBUTING.md use the same pin; a bump is its own change).
+# Run unpinned: `uvx ruff check .` (a new release's findings show at once).
 line-length = 100
 src = ["src", "tests"]
 
@@ -20,7 +20,7 @@ extend-select = [
     "PT", "FBT001", # readable-tests, tests only (ignored elsewhere below)
     "T20", # structured-logging: no print() outside CLI output
 ]
-# extend-select keeps ruff's own default set on and names E4, E7, E9, F explicitly; ruff is pinned in CI, bump it on purpose.
+# extend-select keeps ruff's own default set on and names E4, E7, E9, F explicitly, so a narrower default cannot narrow the gate.
 # ANN is at 0 on every path except ANN401 (Any); T20 is at 0 outside the CLI paths ignored below.
 # The docstring form (D102, D105, D107, D401, D403, D415) gates in src/ and scripts/ since #191;
 # the five-body-line limit has no ruff rule and is checked in review.

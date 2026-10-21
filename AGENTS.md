@@ -16,7 +16,7 @@ bump) — **never bump versions by hand** (a fitness gate enforces every mirror 
 ```
 uv sync --all-extras                 # env (Python 3.14 via .python-version; extras for their tests)
 uv run pytest -q                     # full suite incl. fitness gates + SIGKILL crash test
-uvx ruff@0.17.1 check .                     # lint, config in ruff.toml (line length 100)
+uvx ruff check .                     # lint, config in ruff.toml (line length 100)
 uv run pyrefly check                 # types on src, examples, benchmarks, tests — 0 errors, CI-gated
 uv run scripts/test_testrules.py     # the testrules self-tests
 uv run scripts/testrules.py <test_*.py>  # readable-tests check; CI runs it on the test modules a PR changes

@@ -25,7 +25,7 @@ datacrystal targets **Python 3.14** (pinned via `.python-version`) and uses
 ```bash
 uv sync --all-extras          # environment, incl. the [fts]/[arrow]/[web] extras for their tests
 uv run pytest -q              # full suite, incl. the fitness gates + the SIGKILL crash test
-uvx ruff@0.17.1 check .              # lint, config in ruff.toml (line length 100)
+uvx ruff check .              # lint, config in ruff.toml (line length 100)
 uv run pyrefly check          # types on src, examples, benchmarks, tests — 0 errors
 ```
 
