@@ -8,8 +8,6 @@ import cycle between them.
 
 from __future__ import annotations
 
-from typing import Any
-
 # Entity lifecycle states (kept as small ints in the __dc_state__ slot).
 STATE_NEW = 0      # constructed in this process, not yet committed
 STATE_CLEAN = 1    # in sync with the store; write hook armed
@@ -17,7 +15,7 @@ STATE_DIRTY = 2    # changed since the last commit; buffered for the next one
 STATE_DELETED = 3  # store.delete()d (ADR-003); reads work, writes raise
 
 
-def touch(obj: Any) -> None:
+def touch(obj: object) -> None:
     """Flip a CLEAN entity to DIRTY via its store, BEFORE the mutation lands.
 
     The store call enforces the ADR-001 owner-thread check (raising leaves the entity unmodified).

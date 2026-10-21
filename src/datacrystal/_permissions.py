@@ -11,10 +11,12 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
+
+    from datacrystal._actors import Principal
 
 WORLD = 0
 """The world group id: every principal implicitly holds ``{WORLD: VIEWER}``."""
@@ -66,13 +68,22 @@ class Permissions:
     write_floor: int
 
 
+class LabelColumns(Protocol):
+    """The four lib-managed label columns, as a ``protected=True`` entity carries them."""
+
+    _dc_owner: int
+    _dc_groups: list[int]
+    _dc_read_floor: int
+    _dc_write_floor: int
+
+
 # --- the label verbs (W2-4) ---------------------------------------------------
 
 
-def _staged(rec: Any) -> Any:
-    """Validate that ``rec`` is a live, mutable, protected entity, the shared preamble of the label
-    verbs.
+def _staged(rec: object) -> LabelColumns:
+    """Validate that ``rec`` is a live, mutable, protected entity and return its label columns.
 
+    This is the shared preamble of the label verbs.
     Raises before any mutation, so a refused verb stages nothing.
     The verbs perform no authority check: the commit gate checks the committing principal
     (maker-checker flow).
@@ -102,10 +113,11 @@ def _staged(rec: Any) -> Any:
             "labels were fixed at registration (container inheritance or "
             "birth defaults) and can never be relabeled"
         )
-    return info
+    # no static type says "an @entity(protected=True) class": decoration injects the columns
+    return cast("LabelColumns", rec)
 
 
-def _check_level(name: str, level: Any) -> None:
+def _check_level(name: str, level: object) -> None:
     """Raise if ``level`` is not a grantable ladder level."""
     if type(level) is not int:
         raise TypeError(f"{name} must be an int ladder level, got {level!r}")
@@ -116,13 +128,13 @@ def _check_level(name: str, level: Any) -> None:
         )
 
 
-def _check_group(group: Any) -> None:
+def _check_group(group: object) -> None:
     """Raise if ``group`` is not an int group id."""
     if type(group) is not int:
         raise TypeError(f"group must be an int group id, got {group!r}")
 
 
-def share(rec: Any, group: int, *, read: int, write: int) -> None:
+def share(rec: object, group: int, *, read: int, write: int) -> None:
     """Share ``rec`` into ``group`` and set the record-wide floors; both levels are required (R6).
 
     Staging only: the commit gate decides whether you may set these floors (ADR-008 R8).
@@ -132,34 +144,34 @@ def share(rec: Any, group: int, *, read: int, write: int) -> None:
         ValueError: a level below ``VIEWER``.
         FrozenEntityError: ``rec`` is ``frozen=True`` (``DeletedEntityError`` if deleted).
     """
-    _staged(rec)
+    labelled = _staged(rec)
     _check_group(group)
     _check_level("read", read)
     _check_level("write", write)
-    rec._dc_read_floor = read
-    rec._dc_write_floor = write
-    groups = rec._dc_groups
+    labelled._dc_read_floor = read
+    labelled._dc_write_floor = write
+    groups = labelled._dc_groups
     if group not in groups:
         groups.append(group)  # in place: the owner-bound list dirty-marks rec
 
 
-def unshare(rec: Any, group: int) -> None:
+def unshare(rec: object, group: int) -> None:
     """Remove ``group`` from ``rec``'s groups; an absent group is a no-op that buffers no write.
 
     Floors are untouched; use :func:`protect`.
     """
-    _staged(rec)
+    labelled = _staged(rec)
     _check_group(group)
-    groups = rec._dc_groups
+    groups = labelled._dc_groups
     if group in groups:
         groups.remove(group)
 
 
-def protect(rec: Any, *, read: int | None = None, write: int | None = None) -> None:
+def protect(rec: object, *, read: int | None = None, write: int | None = None) -> None:
     """Set ``rec``'s read and/or write floor, never its groups; at least one keyword is required
     (R6).
     """
-    _staged(rec)
+    labelled = _staged(rec)
     if read is None and write is None:
         raise TypeError(
             "protect() needs read= and/or write= — a bare protect() would "
@@ -170,29 +182,29 @@ def protect(rec: Any, *, read: int | None = None, write: int | None = None) -> N
     if write is not None:
         _check_level("write", write)
     if read is not None:
-        rec._dc_read_floor = read
+        labelled._dc_read_floor = read
     if write is not None:
-        rec._dc_write_floor = write
+        labelled._dc_write_floor = write
 
 
 # --- the normative predicates (ADR-008 Context, transcribed verbatim) -----------
 
 
-def level(p: Any, g: int) -> int:
+def level(p: Principal, g: int) -> int:
     """Return the level ``p`` holds in group ``g``; every principal holds at least ``VIEWER`` in
     ``WORLD`` (ADR-008).
     """
     return p.memberships.get(g, VIEWER if g == WORLD else NO_STANDING)
 
 
-def is_owner(p: Any, owner: int) -> bool:
+def is_owner(p: Principal, owner: int) -> bool:
     """Return whether ``p`` owns a record with ``owner``; uid 0 is anonymous, so ``_dc_owner == 0``
     means nobody (R7a).
     """
     return p.uid != 0 and owner == p.uid
 
 
-def authority_towards(p: Any, owner: int, groups: Iterable[int]) -> int:
+def authority_towards(p: Principal, owner: int, groups: Iterable[int]) -> int:
     """Return the highest level ``p`` holds in any group the record is shared with.
 
     The owner of an unshared record acts at their personal-best level (ADR-008, F3 amendment
@@ -207,7 +219,7 @@ def authority_towards(p: Any, owner: int, groups: Iterable[int]) -> int:
     return max(levels, default=NO_STANDING)
 
 
-def is_root(p: Any) -> bool:
+def is_root(p: Principal) -> bool:
     """Return whether ``p`` is the store root: EXECUTIVE held in WORLD, the audited break-glass
     (R9).
 
@@ -216,7 +228,7 @@ def is_root(p: Any) -> bool:
     return p.uid != 0 and p.memberships.get(WORLD, VIEWER) >= EXECUTIVE
 
 
-def can_read_row(p: Any, owner: int, groups: Iterable[int], read_floor: int) -> bool:
+def can_read_row(p: Principal, owner: int, groups: Iterable[int], read_floor: int) -> bool:
     """Return the ADR-008 ``can_read`` predicate over decoded label values (W3-1).
 
     Pure, builds no entity and touches no registry; root (R9) is the one bypass.

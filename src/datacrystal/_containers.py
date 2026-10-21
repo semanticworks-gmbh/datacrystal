@@ -9,14 +9,17 @@ Wrapping COPIES: after ``e.tags = data``, mutate through ``e.tags``, not ``data`
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
-from typing import Any, Self, SupportsIndex, cast
+from collections.abc import Callable, Iterable, Mapping
+from typing import TYPE_CHECKING, Any, Self, SupportsIndex, cast
 
 from datacrystal._errors import FrozenEntityError
 from datacrystal._state import touch
 
+if TYPE_CHECKING:
+    from _typeshed import SupportsKeysAndGetItem, SupportsRichComparison
 
-def wrap_value(value: Any, owner: Any) -> Any:
+
+def wrap_value(value: object, owner: object) -> object:
     """Wrap lists and dicts (recursively) as persistent containers bound to ``owner``.
 
     Containers already bound to the same owner pass through; everything else is copied.
@@ -34,12 +37,14 @@ def wrap_value(value: Any, owner: Any) -> Any:
     return value
 
 
-def _is_frozen_owner(owner: Any) -> bool:
+def _is_frozen_owner(owner: object) -> bool:
     if owner is None:
         return False
-    # owner.__class__ (Any) instead of type(owner) (type[Any]) keeps the
-    # attribute access typed Any — no cast() on this hot (per-wrap) path.
-    return owner.__class__.__dc_typeinfo__.frozen
+    # type.__getattribute__ returns Any, so no cast() on this hot (per-wrap) path.
+    return type.__getattribute__(type(owner), "__dc_typeinfo__").frozen
+
+
+type _UpdateSource = SupportsKeysAndGetItem[Any, Any] | Iterable[tuple[Any, Any]]
 
 
 class PersistentList(list[Any]):
@@ -47,7 +52,7 @@ class PersistentList(list[Any]):
 
     __slots__ = ("_dc_frozen", "_dc_owner")
 
-    def __init__(self, iterable: Iterable[Any] = (), *, owner: Any = None) -> None:
+    def __init__(self, iterable: Iterable[object] = (), *, owner: object = None) -> None:
         self._dc_owner = owner
         self._dc_frozen = _is_frozen_owner(owner)
         super().__init__(wrap_value(item, owner) for item in iterable)
@@ -64,23 +69,23 @@ class PersistentList(list[Any]):
 
     # -- mutators: touch first (may raise), then mutate, wrapping new items --
 
-    def append(self, item: Any) -> None:
+    def append(self, item: object) -> None:
         self._touch()
         super().append(wrap_value(item, self._dc_owner))
 
-    def extend(self, iterable: Iterable[Any]) -> None:
+    def extend(self, iterable: Iterable[object]) -> None:
         self._touch()
         super().extend(wrap_value(item, self._dc_owner) for item in iterable)
 
-    def insert(self, index: SupportsIndex, item: Any) -> None:
+    def insert(self, index: SupportsIndex, item: object) -> None:
         self._touch()
         super().insert(index, wrap_value(item, self._dc_owner))
 
-    def remove(self, item: Any) -> None:
+    def remove(self, item: object) -> None:
         self._touch()
         super().remove(item)
 
-    def pop(self, index: SupportsIndex = -1) -> Any:
+    def pop(self, index: SupportsIndex = -1) -> Any:  # noqa: ANN401 - public element type is dynamic, as in list[Any]
         self._touch()
         return super().pop(index)
 
@@ -88,7 +93,9 @@ class PersistentList(list[Any]):
         self._touch()
         super().clear()
 
-    def sort(self, *, key: Any = None, reverse: bool = False) -> None:
+    def sort(
+        self, *, key: Callable[[Any], SupportsRichComparison] | None = None, reverse: bool = False
+    ) -> None:
         self._touch()
         super().sort(key=key, reverse=reverse)
 
@@ -96,21 +103,21 @@ class PersistentList(list[Any]):
         self._touch()
         super().reverse()
 
-    def __setitem__(self, index: Any, value: Any) -> None:
+    def __setitem__(self, index: SupportsIndex | slice, value: object) -> None:
         self._touch()
         if isinstance(index, slice):
             super().__setitem__(
-                cast("slice[Any, Any, Any]", index),
-                [wrap_value(item, self._dc_owner) for item in value],
+                index,
+                [wrap_value(item, self._dc_owner) for item in cast("Iterable[object]", value)],
             )
         else:
             super().__setitem__(index, wrap_value(value, self._dc_owner))
 
-    def __delitem__(self, index: Any) -> None:
+    def __delitem__(self, index: SupportsIndex | slice) -> None:
         self._touch()
         super().__delitem__(index)
 
-    def __iadd__(self, other: Iterable[Any]) -> Self:
+    def __iadd__(self, other: Iterable[object]) -> Self:
         self.extend(other)
         return self
 
@@ -126,7 +133,7 @@ class PersistentDict(dict[Any, Any]):
     __slots__ = ("_dc_frozen", "_dc_owner")
 
     def __init__(self, mapping: Mapping[Any, Any] | Iterable[Any] = (),
-                 *, owner: Any = None) -> None:
+                 *, owner: object = None) -> None:
         self._dc_owner = owner
         self._dc_frozen = _is_frozen_owner(owner)
         super().__init__()
@@ -150,15 +157,15 @@ class PersistentDict(dict[Any, Any]):
 
     # -- mutators ------------------------------------------------------------
 
-    def __setitem__(self, key: Any, value: Any) -> None:
+    def __setitem__(self, key: object, value: object) -> None:
         self._touch()
         super().__setitem__(key, wrap_value(value, self._dc_owner))
 
-    def __delitem__(self, key: Any) -> None:
+    def __delitem__(self, key: object) -> None:
         self._touch()
         super().__delitem__(key)
 
-    def pop(self, key: Any, *default: Any) -> Any:
+    def pop(self, key: object, *default: object) -> Any:  # noqa: ANN401 - public value type is dynamic, as in dict[Any, Any]
         self._touch()
         return super().pop(key, *default)
 
@@ -170,12 +177,12 @@ class PersistentDict(dict[Any, Any]):
         self._touch()
         super().clear()
 
-    def update(self, *args: Any, **kwargs: Any) -> None:
+    def update(self, *args: _UpdateSource, **kwargs: object) -> None:
         self._touch()
         for key, value in dict(*args, **kwargs).items():
             super().__setitem__(key, wrap_value(value, self._dc_owner))
 
-    def setdefault(self, key: Any, default: Any = None) -> Any:
+    def setdefault(self, key: object, default: object = None) -> Any:  # noqa: ANN401 - public value type is dynamic, as in dict[Any, Any]
         if key in self:
             return self[key]
         self._touch()
@@ -183,6 +190,6 @@ class PersistentDict(dict[Any, Any]):
         super().__setitem__(key, wrapped)
         return wrapped
 
-    def __ior__(self, other: Any) -> Self:
+    def __ior__(self, other: _UpdateSource) -> Self:
         self.update(other)
         return self

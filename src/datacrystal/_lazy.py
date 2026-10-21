@@ -14,9 +14,12 @@ import time
 import weakref
 from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from datacrystal._errors import StoreClosedError
+
+if TYPE_CHECKING:
+    from datacrystal._store import Store
 
 
 class Lazy[T]:
@@ -56,7 +59,7 @@ class Lazy[T]:
         return self
 
     @classmethod
-    def _loaded(cls, obj: T, oid: int, store: Any) -> Lazy[T]:
+    def _loaded(cls, obj: T, oid: int, store: Store) -> Lazy[T]:
         """Engine path: a hydrated handle whose target is already live
         (registry hit) — demotable, unlike a user-made ``Lazy.of``.
         """
@@ -66,7 +69,7 @@ class Lazy[T]:
         return self
 
     @classmethod
-    def _unloaded(cls, oid: int, store: Any) -> Lazy[Any]:
+    def _unloaded(cls, oid: int, store: Store) -> Lazy[Any]:
         self = object.__new__(cls)
         self._obj = None
         self._oid = oid
@@ -209,7 +212,7 @@ class BlobHandle:
         raise TypeError("dc.Blob handles are created by the engine on hydration")
 
     @classmethod
-    def _bind(cls, blob_oid: int, size: int, hash: bytes, store: Any,
+    def _bind(cls, blob_oid: int, size: int, hash: bytes, store: Store,
               owner_oid: int | None = None) -> BlobHandle:
         """Engine path: a handle for a decoded :class:`BlobToken`, bound to its
         store but with the bytes still on disk (fetched on first ``.bytes()``).
@@ -348,7 +351,7 @@ class LazyReferenceManager:
             raise ValueError(f"lazy_timeout must be positive, got {timeout!r}")
         self._timeout = timeout
         self._clock = clock
-        self._handles: weakref.WeakSet[Any] = weakref.WeakSet()
+        self._handles: weakref.WeakSet[Lazy[Any] | BlobHandle] = weakref.WeakSet()
         self._last_sweep = clock()
         # Conformance hooks (fitness #4, daemon principle): which thread
         # demoted last, and how many handles ever.
@@ -360,7 +363,7 @@ class LazyReferenceManager:
         """Seconds between piggybacked sweeps, a quarter of the timeout."""
         return max(self._timeout / 4.0, 0.01)
 
-    def track(self, handle: Any) -> None:
+    def track(self, handle: Lazy[Any] | BlobHandle) -> None:
         """Register a (re)loaded handle and stamp its access time."""
         handle._clock = self._clock
         handle._atime = self._clock()

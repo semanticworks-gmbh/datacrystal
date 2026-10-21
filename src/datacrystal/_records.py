@@ -103,14 +103,8 @@ def decimal_ext(value: decimal.Decimal) -> msgspec.msgpack.Ext:
     return msgspec.msgpack.Ext(DECIMAL_EXT_CODE, str(value).encode())
 
 
-def swizzle(value: Any, oid_for: Callable[[Any], int]) -> Any:
-    """Replace entities/Lazy handles in a value tree with OID extensions.
-
-    ``oid_for`` must return the OID of a live entity — the storer guarantees
-    every reachable new entity is registered before encoding begins (P1).
-    """
-    if isinstance(value, _SCALARS):
-        return value
+def _refuse_blob_values(value: object) -> None:
+    """Raise for a blob handle or streamed-write source that reached a non-blob position."""
     if isinstance(value, BlobHandle):
         # A BlobHandle reaching swizzle means a field holding blob data is NOT a
         # blob position any more — i.e. `dc.Blob` was removed from a field that
@@ -131,16 +125,31 @@ def swizzle(value: Any, oid_for: Callable[[Any], int]) -> Any:
             "(Annotated[bytes, dc.Blob]) — it is a streamed-write token, not a "
             "general value"
         )
+
+
+def _lazy_ref_ext(lazy: Lazy[Any], oid_for: Callable[[object], int]) -> msgspec.msgpack.Ext:
+    """Swizzle a ``Lazy`` handle to the OID of its loaded target, or of its own unloaded OID."""
+    target = lazy._peek_unchecked()  # OID only
+    if target is not None:
+        return _ref_ext(oid_for(target))
+    if lazy.oid is None:
+        raise TypeError("unloaded Lazy reference without an OID cannot be stored")
+    return _ref_ext(lazy.oid)
+
+
+def swizzle(value: object, oid_for: Callable[[object], int]) -> object:
+    """Replace entities/Lazy handles in a value tree with OID extensions.
+
+    ``oid_for`` must return the OID of a live entity — the storer guarantees
+    every reachable new entity is registered before encoding begins (P1).
+    """
+    if isinstance(value, _SCALARS):
+        return value
+    _refuse_blob_values(value)
     if is_entity(value):
         return _ref_ext(oid_for(value))
     if isinstance(value, Lazy):
-        lazy = cast("Lazy[Any]", value)
-        target = lazy._peek_unchecked()  # OID only
-        if target is not None:
-            return _ref_ext(oid_for(target))
-        if lazy.oid is None:
-            raise TypeError("unloaded Lazy reference without an OID cannot be stored")
-        return _ref_ext(lazy.oid)
+        return _lazy_ref_ext(cast("Lazy[Any]", value), oid_for)
     if isinstance(value, (list, tuple)):
         return [swizzle(item, oid_for) for item in cast("list[object] | tuple[object, ...]", value)]
     if isinstance(value, dict):
@@ -148,6 +157,11 @@ def swizzle(value: Any, oid_for: Callable[[Any], int]) -> Any:
             key: swizzle(item, oid_for)
             for key, item in cast("dict[Any, object]", value).items()
         }
+    return _swizzle_leaf(value)
+
+
+def _swizzle_leaf(value: object) -> object:
+    """Swizzle a value that holds no entity: temporal and decimal ext codes, or a refusal."""
     if isinstance(value, _dt.datetime):  # before date: datetime IS a date
         if value.tzinfo is None:
             return msgspec.msgpack.Ext(
@@ -220,7 +234,7 @@ def fingerprint_payload(values: list[Any], oid_for: Callable[[Any], int]) -> byt
     return _ENCODER.encode(out)
 
 
-def _ext_hook(code: int, data: memoryview) -> Any:
+def _ext_hook(code: int, data: memoryview) -> object:
     if code == REF_EXT_CODE:
         return RefToken(_OID_STRUCT.unpack(data)[0])
     if code == NAIVE_DATETIME_EXT_CODE:
@@ -245,11 +259,11 @@ def decode_payload(payload: bytes) -> list[Any]:
     return _DECODER.decode(payload)
 
 
-def _no_oid(_value: Any) -> int:  # pragma: no cover - never reached on a ref-free tree
+def _no_oid(_value: object) -> int:  # pragma: no cover - never reached on a ref-free tree
     raise TypeError("an entity reference cannot appear in an index-cache blob")
 
 
-def encode_scalar_tree(tree: Any) -> bytes:
+def encode_scalar_tree(tree: object) -> bytes:
     """Encode a ref-free value tree with the record codec's temporal ext codes (#106).
 
     msgspec's default would round-trip a naive datetime as a bare ``str`` and break the
@@ -258,7 +272,7 @@ def encode_scalar_tree(tree: Any) -> bytes:
     return _ENCODER.encode(swizzle(tree, _no_oid))
 
 
-def decode_scalar_tree(payload: bytes) -> Any:
+def decode_scalar_tree(payload: bytes) -> Any:  # noqa: ANN401 - a decoded tree of any shape; callers index it
     """Decode what :func:`encode_scalar_tree` wrote, restoring datetime, date and time (#106)."""
     return _DECODER.decode(payload)
 
