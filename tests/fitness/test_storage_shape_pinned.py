@@ -18,7 +18,6 @@ import dataclasses
 import hashlib
 import pathlib
 import re
-from typing import Any
 
 from datacrystal._storage.protocol import (
     CommitBatch,
@@ -35,8 +34,10 @@ _FOLLOWER_SRC = (_SRC / "_follower.py").read_text()
 
 
 def _defines_delta_consumer(src: str) -> bool:
-    """True if the module names ``DeltaConsumer`` or defines a class shaped like one
-    (an ``apply`` method plus a ``watermark`` member) — the v1 §5 "no second consumer".
+    """Say whether the module names ``DeltaConsumer`` or defines a class shaped like one.
+
+    Shaped like one means an ``apply`` method plus a ``watermark`` member (v1 §5 "no second
+    consumer").
     """
     if "DeltaConsumer" in src:
         return True
@@ -53,7 +54,7 @@ def _defines_delta_consumer(src: str) -> bool:
     return False
 
 
-def _field_names(dc: Any) -> tuple[str, ...]:
+def _field_names(dc: type) -> tuple[str, ...]:
     return tuple(f.name for f in dataclasses.fields(dc))
 
 
@@ -62,14 +63,23 @@ def _protocol_methods(proto: type) -> set[str]:
 
 
 def test_stored_record_shape_pinned() -> None:
-    # A new field here would be a new per-record persisted column (e.g. an OCC
-    # version or an idempotency key) — exactly what the v1 facade must NOT add.
+    """Given the StoredRecord dataclass
+    When its field names are listed
+    Then they are exactly oid, cid, tid and payload
+
+    A new field would be a new per-record persisted column (e.g. an OCC version or an
+    idempotency key), exactly what the v1 facade must NOT add.
+    """
     assert _field_names(StoredRecord) == ("oid", "cid", "tid", "payload")
 
 
 def test_commit_batch_channels_pinned() -> None:
-    # The set of things one commit persists. A new channel (e.g. a dedup
-    # key-ledger) would add a field here.
+    """Given the CommitBatch dataclass
+    When its field names are listed
+    Then they are exactly the channels one commit persists
+
+    A new channel (e.g. a dedup key-ledger) would add a field here.
+    """
     assert _field_names(CommitBatch) == (
         "tid",
         "records",
@@ -81,9 +91,14 @@ def test_commit_batch_channels_pinned() -> None:
     )
 
 
-def test_storage_protocol_methods_pinned() -> None:
-    # Storage-protocol growth needs an ADR (ADR-002 precedent). Federation is a
-    # facade above this seam and adds nothing here.
+def test_storage_backend_methods_pinned() -> None:
+    """Given the StorageBackend protocol
+    When its methods are listed
+    Then they are exactly the seven the engine writes through
+
+    Storage-protocol growth needs an ADR (ADR-002 precedent). Federation is a facade above
+    this seam and adds nothing here.
+    """
     assert _protocol_methods(StorageBackend) == {
         "boot",
         "load_many",
@@ -93,6 +108,13 @@ def test_storage_protocol_methods_pinned() -> None:
         "read_view",
         "close",
     }
+
+
+def test_storage_read_view_methods_pinned() -> None:
+    """Given the StorageReadView protocol
+    When its methods are listed
+    Then they are exactly the six a snapshot reads through
+    """
     assert _protocol_methods(StorageReadView) == {
         "boot",
         "load_many",
@@ -103,17 +125,32 @@ def test_storage_protocol_methods_pinned() -> None:
     }
 
 
-def test_federation_registers_no_delta_consumer() -> None:
-    # FEDERATION-WIRE-v1 §"Idempotency" (#157): exactly-once rides the natural-key
-    # upsert + OCC — NO second DeltaConsumer / dedup ledger ships in v1. The
-    # federation facade must not define or register one (the operator still attaches
-    # the DeltaLog; the engine never retains, §5).
-    assert not _defines_delta_consumer(_FED_SRC), "web/_federation.py adds a DeltaConsumer (§5 cut)"
-    assert not _defines_delta_consumer(_FOLLOWER_SRC), "_follower.py adds a DeltaConsumer (§5 cut)"
+def test_federation_module_defines_no_delta_consumer() -> None:
+    """Given the federation facade web/_federation.py
+    When it is searched for a DeltaConsumer or a class shaped like one
+    Then there is none
+
+    FEDERATION-WIRE-v1 "Idempotency" (#157): exactly-once rides the natural-key upsert + OCC,
+    so no second DeltaConsumer or dedup ledger ships in v1 (§5 cut).
+    """
+    assert not _defines_delta_consumer(_FED_SRC), "web/_federation.py adds a DeltaConsumer"
+
+
+def test_follower_module_defines_no_delta_consumer() -> None:
+    """Given the follower client _follower.py
+    When it is searched for a DeltaConsumer or a class shaped like one
+    Then there is none
+    """
+    assert not _defines_delta_consumer(_FOLLOWER_SRC), "_follower.py adds a DeltaConsumer"
 
 
 def test_sqlite_table_set_pinned() -> None:
+    """Given the SQLite backend's source
+    When its CREATE TABLE statements are collected
+    Then the tables are exactly meta, types, objects and blobs
+    """
     tables = set(re.findall(r"CREATE TABLE IF NOT EXISTS (\w+)", _SQLITE_SRC))
+
     assert tables == {"meta", "types", "objects", "blobs"}, (
         f"SQLite table set changed: {tables}. A new durable table (e.g. a "
         "federation idempotency-key ledger) is a §5-cut — it needs an ADR; v1 "
@@ -122,15 +159,20 @@ def test_sqlite_table_set_pinned() -> None:
 
 
 def test_sqlite_schema_ddl_pinned() -> None:
-    # Catches column-level changes a new-table check would miss (e.g. sneaking an
-    # idem_key column onto `objects`). Whitespace-normalized so reflow alone
-    # doesn't trip it.
-    match = re.search(r'_SCHEMA = """(.*?)"""', _SQLITE_SRC, re.S)
+    """Given the SQLite backend's schema text, whitespace-normalized
+    When its SHA-256 digest is taken
+    Then it equals the pinned digest
+
+    This catches column-level changes a new-table check would miss (e.g. an idem_key column
+    on `objects`); normalizing whitespace keeps a reflow from tripping it.
+    """
+    match = re.search(r'_SCHEMA = """(.*?)"""', _SQLITE_SRC, re.DOTALL)
     assert match is not None, "could not locate _SCHEMA in sqlite.py"
     normalized = " ".join(match.group(1).split())
+
     digest = hashlib.sha256(normalized.encode()).hexdigest()
-    pinned = "7ecf6749251f5b40818dfc278995fec1b799a2ff29ff92cf3ce24a83a9641c9d"
-    assert digest == pinned, (
+
+    assert digest == "7ecf6749251f5b40818dfc278995fec1b799a2ff29ff92cf3ce24a83a9641c9d", (
         f"SQLite DDL changed (now {digest}). If this is a real schema change, "
         "update the pin and add/cite the ADR in the same PR."
     )

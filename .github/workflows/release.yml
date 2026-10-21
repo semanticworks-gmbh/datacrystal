@@ -1,7 +1,7 @@
 # Manual release routine (KICKOFF §7 "Runs" — the release lane).
 #
 # Hit "Run workflow", pick patch/minor/major. The job: re-runs the full gate
-# (lint → Pyrefly + pyright on tests → tests → demo/journal rerun → build +
+# (lint → Pyrefly → tests → demo/journal rerun → build +
 # wheel purity), then bumps pyproject, commits `release: datacrystal vX.Y.Z`
 # to main, pushes an annotated tag, and cuts a GitHub Release with
 # auto-generated notes. Nothing is committed/pushed unless the gate is green.
@@ -74,11 +74,8 @@ jobs:
       - name: Gate — lint (ruff)
         run: uvx ruff check .
 
-      - name: Gate — types (Pyrefly — src, examples, benchmarks)
+      - name: Gate — types (Pyrefly — src, examples, benchmarks, tests)
         run: uv run pyrefly check
-
-      - name: Gate — types (pyright standard — tests only, until #190)
-        run: uvx pyright tests
 
       - name: Gate — tests (unit, property, integration, extras, fitness gates + crash test)
         run: uv run pytest -q

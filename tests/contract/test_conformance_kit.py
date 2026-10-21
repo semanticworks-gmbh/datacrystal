@@ -33,22 +33,49 @@ ALL_SECTIONS = [
 
 # -- honest consumers must pass ------------------------------------------------
 
-def test_counting_consumer_is_conformant():
-    ran = check_delta_consumer(CountingConsumer, content=lambda c: c.content())
+def applier_content(applier: ReferenceApplier) -> object:
+    """Return the derived state of a reference applier for the kit's content checks."""
+    return (dict(applier.objects), dict(applier.types))
+
+
+def test_counting_consumer_passes_every_section() -> None:
+    """Given the shipped CountingConsumer and its content reader
+    When the conformance kit certifies it
+    Then every section ran
+    """
+    ran = check_delta_consumer(CountingConsumer, content=content_of)
+
     assert ran == ALL_SECTIONS
 
 
-def test_reference_applier_is_conformant():
-    ran = check_delta_consumer(
-        ReferenceApplier,
-        content=lambda a: (dict(a.objects), dict(a.types)),
-    )
+def test_reference_applier_passes_every_section() -> None:
+    """Given the ReferenceApplier and a reader of its objects and types
+    When the conformance kit certifies it
+    Then every section ran
+    """
+    ran = check_delta_consumer(ReferenceApplier, content=applier_content)
+
     assert ran == ALL_SECTIONS
 
 
-def test_without_content_the_value_sections_are_skipped():
+def test_without_content_the_prior_section_is_skipped() -> None:
+    """Given the shipped CountingConsumer and no content reader
+    When the conformance kit certifies it
+    Then the prior un-index section did not run
+    """
     ran = check_delta_consumer(CountingConsumer)
-    assert "§3 prior un-index" not in ran and "§3.1 delete totality" not in ran
+
+    assert "§3 prior un-index" not in ran
+
+
+def test_without_content_the_delete_totality_section_is_skipped() -> None:
+    """Given the shipped CountingConsumer and no content reader
+    When the conformance kit certifies it
+    Then the delete totality section did not run
+    """
+    ran = check_delta_consumer(CountingConsumer)
+
+    assert "§3.1 delete totality" not in ran
 
 
 # -- a value-derived consumer (mini inverted index) -----------------------------
@@ -57,7 +84,8 @@ class _TermIndex:
     """A tiny in-memory inverted index: (oid, word) pairs over str fields.
 
     The smallest consumer whose derived state depends on record VALUES —
-    the shape that genuinely needs ``prior`` payloads to un-index."""
+    the shape that genuinely needs ``prior`` payloads to un-index.
+    """
 
     def __init__(self) -> None:
         self.watermark = 0
@@ -102,12 +130,22 @@ class _TermIndex:
         self.watermark = tid
         return True
 
-    def content(self) -> Any:
+    def content(self) -> tuple[list[tuple[int, str]], dict[int, str]]:
         return (sorted(self.terms), dict(sorted(self.types.items())))
 
 
-def test_term_index_is_conformant():
-    ran = check_delta_consumer(_TermIndex, content=lambda c: c.content())
+def content_of(consumer: CountingConsumer | _TermIndex) -> object:
+    """Return the consumer's derived state for the kit's content checks."""
+    return consumer.content()
+
+
+def test_term_index_passes_every_section() -> None:
+    """Given a value-derived inverted-index consumer and its content reader
+    When the conformance kit certifies it
+    Then every section ran
+    """
+    ran = check_delta_consumer(_TermIndex, content=content_of)
+
     assert ran == ALL_SECTIONS
 
 
@@ -143,10 +181,12 @@ class _VersionBlind(CountingConsumer):
 
 
 class _PartialApplierOnVersion(CountingConsumer):
-    """§4.5 violation, the OTHER half of the sentence ("never partially
-    applied"): folds types+ops into derived state FIRST and validates the
+    """§4.5 violation, the OTHER half of the sentence ("never partially applied").
+
+    Folds types+ops into derived state FIRST and validates the
     version LAST — raises loudly, watermark untouched, residue retained.
-    The natural late-validation bug; the W1 review's PoC, pinned closed."""
+    The natural late-validation bug; the W1 review's PoC, pinned closed.
+    """
 
     def apply(self, delta: dict[str, Any]) -> bool:
         if delta["v"] != CONTRACT_VERSION:
@@ -176,7 +216,8 @@ class _OpGuesser(CountingConsumer):
 class _StalePrior(_TermIndex):
     """§3 violation (THE missing-prior-value twin): an update indexes the
     new payload but never un-indexes the old one — stale terms survive.
-    Deletes still work, so exactly the prior section catches fire."""
+    Deletes still work, so exactly the prior section catches fire.
+    """
 
     def _forget_on_update(self, oid: int, prior: bytes) -> None:
         pass
@@ -190,40 +231,110 @@ class _DeleteIgnorer(_TermIndex):
         return super().apply({**delta, "ops": ops})
 
 
-@pytest.mark.parametrize(
-    ("twin", "section"),
-    [
-        (_GapBlind, "§4.4"),
-        (_Reapplier, "§4.2"),
-        (_VersionBlind, "§4.5"),
-        (_PartialApplierOnVersion, "§4.5"),
-        (_OpGuesser, "§3 unknown op"),
-        (_DeleteIgnorer, "§3.1"),
-    ],
-)
-def test_evil_twins_fail_their_section(twin, section):
+def test_gap_blind_twin_fails_the_gap_section() -> None:
+    """Given an evil twin that pretends it saw the missing history
+    When the conformance kit certifies it
+    Then the kit fails naming the gap refusal section
+    """
     with pytest.raises(AssertionError) as failure:
-        check_delta_consumer(twin, content=lambda c: c.content())
-    assert section in str(failure.value)
+        check_delta_consumer(_GapBlind, content=content_of)
+
+    assert "§4.4" in str(failure.value)
 
 
-def test_missing_prior_value_twin_fails_the_prior_section():
-    """The KICKOFF-named twin: ignoring `prior` on update leaves stale
-    derived state, and only the prior section may catch fire for it."""
+def test_reapplier_twin_fails_the_idempotency_section() -> None:
+    """Given an evil twin that applies an already-applied delta again
+    When the conformance kit certifies it
+    Then the kit fails naming the idempotency section
+    """
     with pytest.raises(AssertionError) as failure:
-        check_delta_consumer(_StalePrior, content=lambda c: c.content())
+        check_delta_consumer(_Reapplier, content=content_of)
+
+    assert "§4.2" in str(failure.value)
+
+
+def test_version_blind_twin_fails_the_version_section() -> None:
+    """Given an evil twin that quietly downgrades a newer contract version
+    When the conformance kit certifies it
+    Then the kit fails naming the version refusal section
+    """
+    with pytest.raises(AssertionError) as failure:
+        check_delta_consumer(_VersionBlind, content=content_of)
+
+    assert "§4.5" in str(failure.value)
+
+
+def test_partial_applier_twin_fails_the_version_section() -> None:
+    """Given an evil twin that folds the delta into its state before it refuses the version
+    When the conformance kit certifies it
+    Then the kit fails naming the version refusal section
+    """
+    with pytest.raises(AssertionError) as failure:
+        check_delta_consumer(_PartialApplierOnVersion, content=content_of)
+
+    assert "§4.5" in str(failure.value)
+
+
+def test_op_guesser_twin_fails_the_unknown_op_section() -> None:
+    """Given an evil twin that guesses an unknown op is an upsert
+    When the conformance kit certifies it
+    Then the kit fails naming the unknown op section
+    """
+    with pytest.raises(AssertionError) as failure:
+        check_delta_consumer(_OpGuesser, content=content_of)
+
+    assert "§3 unknown op" in str(failure.value)
+
+
+def test_delete_ignorer_twin_fails_the_delete_totality_section() -> None:
+    """Given an evil twin that silently drops delete tombstones
+    When the conformance kit certifies it
+    Then the kit fails naming the delete totality section
+    """
+    with pytest.raises(AssertionError) as failure:
+        check_delta_consumer(_DeleteIgnorer, content=content_of)
+
+    assert "§3.1" in str(failure.value)
+
+
+def test_missing_prior_value_twin_fails_the_prior_section() -> None:
+    """Given the KICKOFF-named twin that ignores `prior` on update and keeps stale derived state
+    When the conformance kit certifies it
+    Then the kit fails naming the prior un-index section
+    """
+    with pytest.raises(AssertionError) as failure:
+        check_delta_consumer(_StalePrior, content=content_of)
+
     assert "§3 prior un-index" in str(failure.value)
 
 
-def test_garbage_or_missing_version_is_a_format_error_not_a_crash():
-    """Review finding: a delta with a missing or non-int `v` must refuse with
-    the typed DeltaFormatError — never a raw KeyError/TypeError from the
-    comparison (the hand-rolled checks mirror the applier's defensive shape)."""
-    base = {
-        "f": "datacrystal-delta", "v": CONTRACT_VERSION, "tid": 1,
-        "actor": 0, "at": 0, "ops": [], "types": [], "root": None,
-    }
-    for evil in ({k: v for k, v in base.items() if k != "v"},
-                 {**base, "v": "2"}, {**base, "v": 2.0 + 1e-9}, {**base, "v": None}):
-        with pytest.raises(DeltaFormatError):
-            CountingConsumer().apply(evil)
+DELTA_WITHOUT_ANY_VERSION = {
+    "f": "datacrystal-delta",
+    "tid": 1,
+    "actor": 0,
+    "at": 0,
+    "ops": [],
+    "types": [],
+    "root": None,
+}
+
+
+def test_missing_version_is_a_format_error_not_a_crash() -> None:
+    """Given a delta with no `v` key at all
+    When a consumer applies it
+    Then it refuses with the typed DeltaFormatError, not a raw KeyError
+    """
+    with pytest.raises(DeltaFormatError):
+        CountingConsumer().apply(DELTA_WITHOUT_ANY_VERSION)
+
+
+@pytest.mark.parametrize("garbage_version", ["2", 2.000000001, None])
+def test_garbage_version_is_a_format_error_not_a_crash(garbage_version: object) -> None:
+    """Given a delta whose `v` is a string, a near-integer float or None
+    When a consumer applies it
+    Then it refuses with the typed DeltaFormatError, not a raw TypeError
+    """
+    delta = {**DELTA_WITHOUT_ANY_VERSION, "v": garbage_version}
+
+    with pytest.raises(DeltaFormatError):
+        CountingConsumer().apply(delta)

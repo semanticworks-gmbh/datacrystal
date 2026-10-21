@@ -10,8 +10,11 @@ never wall-clock, per invariant 12.
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import field
 from typing import Annotated
+
+import pytest
 
 import datacrystal as dc
 from datacrystal._entity import type_info
@@ -19,13 +22,15 @@ from datacrystal._entity import type_info
 
 @dc.entity
 class Specimen:
-    """A flat cabinet row: scalars, a string foreign key, a list of scalars —
-    nothing that can hold an entity reference."""
+    """A flat cabinet row: scalars, a string foreign key, a list of scalars.
+
+    Nothing in it can hold an entity reference.
+    """
 
     code: Annotated[str, dc.Unique]
     name: str
     mohs: float = 0.0
-    locality_code: str | None = None          # foreign key kept as a plain str
+    locality_code: str | None = None  # foreign key kept as a plain str
     tags: list[str] = field(default_factory=list)
 
 
@@ -46,61 +51,183 @@ class Drawer:
     contents: list[Specimen] = field(default_factory=list)
 
 
-def test_has_entity_refs_flag_matches_field_shapes():
-    assert type_info(Specimen).has_entity_refs is False   # all ref-free leaves
-    assert type_info(Shelf).has_entity_refs is True        # direct entity field
-    assert type_info(Drawer).has_entity_refs is True        # Lazy + container
-
-
-def _count_walks(store, monkeypatch) -> dict[str, int]:
+@pytest.fixture
+def walk_calls(store: dc.Store, monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
+    """Count the store's `_walk_value` calls; `calls["n"]` stays 0 while discovery is skipped."""
     calls = {"n": 0}
     real = type(store)._walk_value
 
-    def counting(self, value, queue, container=None, **kwargs):
+    def counting(
+        self: dc.Store,
+        value: object,
+        queue: deque[tuple[object, object]],
+        container: object = None,
+        *,
+        eager_position: bool = False,
+    ) -> None:
         calls["n"] += 1
-        return real(self, value, queue, container, **kwargs)
+        real(self, value, queue, container, eager_position=eager_position)
 
     monkeypatch.setattr(type(store), "_walk_value", counting)
     return calls
 
 
-def test_flat_type_walks_no_fields(store, monkeypatch):
-    calls = _count_walks(store, monkeypatch)
-    for i in range(25):
-        store.store(Specimen(code=f"s{i}", name=f"n{i}", mohs=float(i),
-                             locality_code="DE-1", tags=["igneous", "quartz"]))
+def _store_all(store: dc.Store, entities: list[Specimen]) -> None:
+    for entity in entities:
+        store.store(entity)
+
+
+def _flat_specimens(count: int) -> list[Specimen]:
+    return [
+        Specimen(
+            code=f"s{i}", name=f"n{i}", mohs=float(i), locality_code="DE-1", tags=["igneous", "quartz"]
+        )
+        for i in range(count)
+    ]
+
+
+def test_specimen_has_no_entity_refs() -> None:
+    """Given the flat Specimen type, all fields ref-free leaves
+    When its type info is read
+    Then has_entity_refs is False
+    """
+    flat_has_refs = type_info(Specimen).has_entity_refs
+
+    assert flat_has_refs is False
+
+
+def test_shelf_with_a_direct_entity_field_has_entity_refs() -> None:
+    """Given the Shelf type with a direct Specimen field
+    When its type info is read
+    Then has_entity_refs is True
+    """
+    shelf_has_refs = type_info(Shelf).has_entity_refs
+
+    assert shelf_has_refs is True
+
+
+def test_drawer_with_a_lazy_handle_and_entity_container_has_entity_refs() -> None:
+    """Given the Drawer type with a Lazy handle and a list of Specimen
+    When its type info is read
+    Then has_entity_refs is True
+    """
+    drawer_has_refs = type_info(Drawer).has_entity_refs
+
+    assert drawer_has_refs is True
+
+
+def test_flat_type_walks_no_fields(store: dc.Store, walk_calls: dict[str, int]) -> None:
+    """Given 25 flat Specimens stored in a store counting field walks
+    When the store commits
+    Then no field was walked, neither on store() nor on commit
+    """
+    _store_all(store, _flat_specimens(25))
+
     store.commit()
-    assert calls["n"] == 0     # flat type → discovery skipped on store() AND commit
+
+    assert walk_calls["n"] == 0
 
 
-def test_ref_bearing_type_still_walks(store, monkeypatch):
-    calls = _count_walks(store, monkeypatch)
+def test_ref_bearing_type_still_walks(store: dc.Store, walk_calls: dict[str, int]) -> None:
+    """Given a Shelf holding a Specimen stored in a store counting field walks
+    When the store commits
+    Then fields were walked to discover the graph
+    """
     store.store(Shelf(label="sh", holds=Specimen(code="x", name="X")))
+
     store.commit()
-    assert calls["n"] > 0      # ref-bearing type must still discover its graph
+
+    assert walk_calls["n"] > 0
 
 
-def test_flat_entity_round_trips_with_str_fk(store):
-    store.store(Specimen(code="q", name="Quartz", mohs=7.0,
-                        locality_code="DE-7", tags=["a", "b"]))
+def test_flat_entity_keeps_its_string_foreign_key(store: dc.Store) -> None:
+    """Given a committed flat Specimen with locality_code "DE-7"
+    When it is fetched by its unique code
+    Then its locality_code is still "DE-7"
+    """
+    store.store(Specimen(code="q", name="Quartz", mohs=7.0, locality_code="DE-7", tags=["a", "b"]))
     store.commit()
+
     got = store.get(Specimen, code="q")
+
+    assert got is not None
+    assert got.locality_code == "DE-7"
+
+
+def test_flat_entity_keeps_its_name_and_tags(store: dc.Store) -> None:
+    """Given a committed flat Specimen named Quartz tagged "a" and "b"
+    When it is fetched by its unique code
+    Then its name is "Quartz"
+    And its tags are "a" and "b"
+    """
+    store.store(Specimen(code="q", name="Quartz", mohs=7.0, locality_code="DE-7", tags=["a", "b"]))
+    store.commit()
+
+    got = store.get(Specimen, code="q")
+
     assert got is not None
     assert got.name == "Quartz"
-    assert got.locality_code == "DE-7"          # the string FK survived the skip
     assert list(got.tags) == ["a", "b"]
 
 
-def test_skip_never_drops_a_real_ref(store):
-    # The fast-path must not break discovery of entities referenced only through
-    # a ref-bearing parent (direct field, Lazy handle, and container alike).
-    a = Specimen(code="a", name="A")
-    b = Specimen(code="b", name="B")
-    inner = Specimen(code="inner", name="In")
-    store.store(Shelf(label="sh", holds=inner))
-    store.store(Drawer(name="d", primary=dc.Lazy.of(a), contents=[b]))
+@pytest.fixture
+def referenced_specimens(store: dc.Store) -> None:
+    """Commit specimens reachable only through a Shelf field, a Lazy handle and a container."""
+    store.store(Shelf(label="sh", holds=Specimen(code="inner", name="In")))
+    store.store(
+        Drawer(
+            name="d",
+            primary=dc.Lazy.of(Specimen(code="a", name="A")),
+            contents=[Specimen(code="b", name="B")],
+        )
+    )
     store.commit()
-    assert store.get(Specimen, code="inner").name == "In"   # via direct field
-    assert store.get(Specimen, code="a").name == "A"        # via Lazy handle
-    assert store.get(Specimen, code="b").name == "B"        # via container
-    assert store.get(Shelf, label="sh").holds.name == "In"  # ref resolves back
+
+
+@pytest.mark.usefixtures("referenced_specimens")
+def test_specimen_reached_through_a_direct_field_is_stored(store: dc.Store) -> None:
+    """Given a Shelf holding Specimen "inner" committed
+    When Specimen "inner" is fetched
+    Then it is named "In"
+    """
+    inner = store.get(Specimen, code="inner")
+
+    assert inner is not None
+    assert inner.name == "In"
+
+
+@pytest.mark.usefixtures("referenced_specimens")
+def test_specimen_reached_through_a_lazy_handle_is_stored(store: dc.Store) -> None:
+    """Given a Drawer whose primary is a Lazy of Specimen "a" committed
+    When Specimen "a" is fetched
+    Then it is named "A"
+    """
+    primary = store.get(Specimen, code="a")
+
+    assert primary is not None
+    assert primary.name == "A"
+
+
+@pytest.mark.usefixtures("referenced_specimens")
+def test_specimen_reached_through_a_container_is_stored(store: dc.Store) -> None:
+    """Given a Drawer whose contents list holds Specimen "b" committed
+    When Specimen "b" is fetched
+    Then it is named "B"
+    """
+    content = store.get(Specimen, code="b")
+
+    assert content is not None
+    assert content.name == "B"
+
+
+@pytest.mark.usefixtures("referenced_specimens")
+def test_shelf_ref_resolves_back_to_its_specimen(store: dc.Store) -> None:
+    """Given a Shelf holding Specimen "inner" committed
+    When the Shelf is fetched and its holds field read
+    Then the held specimen is named "In"
+    """
+    shelf = store.get(Shelf, label="sh")
+
+    assert shelf is not None
+    assert shelf.holds is not None
+    assert shelf.holds.name == "In"

@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS sidecar_types (
 
 
 def fts5_available() -> bool:
+    """Report whether this sqlite3 build can create FTS5 tables."""
     try:
         conn = sqlite3.connect(":memory:")
         try:
@@ -75,6 +76,7 @@ class FtsSidecar:
     """
 
     def __init__(self, path: str, fulltext: dict[str, list[str]]) -> None:
+        """Open (or create) the sidecar file and resume from its persisted watermark and types."""
         self._fulltext = {name: list(fields) for name, fields in fulltext.items()}
         self._conn = sqlite3.connect(path, isolation_level=None)
         self._conn.executescript(_SCHEMA)
@@ -94,9 +96,11 @@ class FtsSidecar:
 
     @property
     def watermark(self) -> int:
+        """The tid of the last applied delta, 0 for a fresh sidecar."""
         return self._watermark
 
     def apply(self, delta: dict[str, Any]) -> bool:
+        """Apply one delta atomically with the watermark bump; False when already applied."""
         if delta.get("f") != FORMAT_MARKER:
             raise DeltaFormatError(f"not a datacrystal delta: f={delta.get('f')!r}")
         if delta["v"] != CONTRACT_VERSION:  # §4.5 exactness, both directions
@@ -139,7 +143,7 @@ class FtsSidecar:
     # -- queries --------------------------------------------------------------
 
     def search(self, query: str) -> set[int]:
-        """OIDs whose indexed prose matches the FTS5 ``query``."""
+        """Return the OIDs whose indexed prose matches the FTS5 ``query``."""
         return {
             oid for (oid,) in self._conn.execute(
                 "SELECT rowid FROM docs WHERE docs MATCH ?", (query,)
@@ -147,8 +151,11 @@ class FtsSidecar:
         }
 
     def terms(self) -> set[tuple[int, str]]:
-        """Every (oid, term) instance in the index — the conformance kit's
-        ``content`` probe, via fts5vocab (works on contentless tables)."""
+        """Return every (oid, term) instance in the index.
+
+        This is the conformance kit's ``content`` probe, via fts5vocab (works on contentless
+        tables).
+        """
         return {
             (doc, term) for term, doc, _col, _off in self._conn.execute(
                 "SELECT term, doc, col, offset FROM docs_vocab"
@@ -156,6 +163,7 @@ class FtsSidecar:
         }
 
     def close(self) -> None:
+        """Close the sidecar's SQLite connection."""
         self._conn.close()
 
     # -- internals --------------------------------------------------------------
@@ -165,9 +173,10 @@ class FtsSidecar:
         self._conn.execute(sql, params)
 
     def _prose(self, cid: int, payload: bytes) -> str | None:
-        """Concatenated FullText field values of one record, or None if the
-        type has no indexed prose. Decodes the payload bytes only — the
-        whole point: never a store read."""
+        """Return the concatenated FullText field values of one record, or None without prose.
+
+        Decodes the payload bytes only — the whole point: never a store read.
+        """
         known = self._types.get(cid)
         if known is None:
             raise DeltaFormatError(f"op references cid {cid} before its types row")
@@ -198,9 +207,11 @@ class FtsSidecar:
             raise DeltaFormatError(f"unknown op {kind!r} — refusing to guess")
 
     def _unindex(self, cid: int, oid: int, prior: bytes) -> None:
-        """Remove a record's old tokens — by REPLAYING the prior payload
-        into FTS5's 'delete' command. Contentless tables refuse deletion
-        without the old column values: prior-value sufficiency, proven."""
+        """Remove a record's old tokens by replaying the prior payload into FTS5's 'delete'.
+
+        Contentless tables refuse deletion without the old column values:
+        prior-value sufficiency, proven.
+        """
         text = self._prose(cid, prior)
         if text is not None:
             self._exec(

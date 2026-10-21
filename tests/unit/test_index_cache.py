@@ -1,17 +1,22 @@
-"""Index cache serialization (ADR-005 / #12): a built ClassIndexes round-trips
-through dump()/msgpack/load() with identical query answers, reconstructs its
-incremental memory so further commits still un-index, and refuses a cache whose
-index markers no longer match the live class (never authoritative)."""
+"""Index cache serialization (ADR-005 / #12).
+
+A built ClassIndexes round-trips through dump()/msgpack/load() with identical query answers,
+reconstructs its incremental memory so further commits still un-index, and refuses a cache
+whose index markers no longer match the live class (never authoritative).
+"""
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from collections.abc import Callable, Iterable
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Annotated
 
 import msgspec.msgpack
 import pytest
 
 import datacrystal as dc
+import datacrystal._indexes as _idx
 from datacrystal._entity import oid_of, type_info
 from datacrystal._indexes import ClassIndexes, plan
 from datacrystal._records import decode_scalar_tree, encode_scalar_tree
@@ -19,182 +24,400 @@ from datacrystal._records import decode_scalar_tree, encode_scalar_tree
 
 @dc.entity
 class Rock:
+    """A cabinet rock with a hardness, a colour and tags."""
+
     name: Annotated[str, dc.Unique]
     hardness: Annotated[float, dc.SortedIndex] = 0.0
     color: Annotated[str | None, dc.Index] = None
     tags: Annotated[list[str], dc.Index] = ()  # type: ignore[assignment]
 
 
+@dc.entity
+class Find:
+    """A numbered field find with the moment it was made."""
+
+    seq: Annotated[int, dc.Unique]
+    at: Annotated[datetime | None, dc.SortedIndex] = None
+
+
 F = dc.fields(Rock)
+DF = dc.fields(Find)
+TIMEZONES = {"naive": None, "aware": UTC}
+KINDS = pytest.mark.parametrize("kind", ["naive", "aware"])
 
 
-def _built_index(store) -> ClassIndexes:
-    rocks = [
-        Rock(name=f"r{i}", hardness=float(i),
-             color="red" if i % 2 else "blue", tags=["igneous", f"g{i % 3}"])
-        for i in range(6)
-    ]
-    for r in rocks:
-        store.store(r)
-    store.commit()
-    return store._index.ensure(type_info(Rock))  # pyright: ignore[reportPrivateUsage]
+def _names(rocks: Iterable[Rock]) -> list[str]:
+    return sorted(rock.name for rock in rocks)
 
 
-def _oids(cond, ci: ClassIndexes) -> set[int]:
-    bm, _ = plan(cond, ci)
-    assert bm is not None
-    return set(bm)
+def _seqs(finds: Iterable[Find]) -> list[int]:
+    return [find.seq for find in finds]
 
 
 def _reload(ci: ClassIndexes) -> ClassIndexes | None:
-    # exactly what the cache does: dump → msgpack bytes → decode → load
     blob = msgspec.msgpack.decode(msgspec.msgpack.encode(ci.dump()))
     return ClassIndexes.load(blob, type_info(Rock))
 
 
-def test_roundtrip_preserves_every_query(store):
-    ci = _built_index(store)
-    loaded = _reload(ci)
-    assert loaded is not None
-    assert set(loaded.extent) == set(ci.extent)
-    for cond in [F.color == "red", F.hardness >= 3.0, F.hardness < 2.0,
-                 F.name == "r4", F.tags.contains("igneous"), F.tags.contains("g1")]:
-        orig, _ = plan(cond, ci)
-        back, _ = plan(cond, loaded)
-        assert orig is not None and back is not None
-        assert set(orig) == set(back), cond
+def _counting_build_class_indexes(calls: list[int]) -> Callable[..., object]:
+    real: Callable[..., object] = _idx.build_class_indexes
+
+    def counting(*args: object, **kwargs: object) -> object:
+        calls.append(1)
+        return real(*args, **kwargs)
+
+    return counting
 
 
-def test_loaded_index_still_un_indexes_on_update(store):
-    ci = _built_index(store)
-    loaded = _reload(ci)
-    assert loaded is not None
-    oid = next(iter(_oids(F.color == "red", loaded)))  # an oid with color="red"
-    # re-index it (an update) — the reconstructed _last_values must drop the old key
-    loaded.insert(oid, {"name": "rX", "hardness": 99.0, "color": "green", "tags": ["meta"]})
-    assert oid not in _oids(F.color == "red", loaded)     # old key un-indexed
-    assert oid in _oids(F.color == "green", loaded)       # new key indexed
-    assert oid in _oids(F.hardness >= 99.0, loaded)       # sorted run updated
-    assert oid in _oids(F.tags.contains("meta"), loaded)  # list re-indexed
+@pytest.fixture
+def built(store: dc.Store) -> ClassIndexes:
+    """Return the class indexes of six committed rocks r0..r5 (odd ones red, the rest blue)."""
+    for i in range(6):
+        color = "red" if i % 2 else "blue"
+        store.store(Rock(name=f"r{i}", hardness=float(i), color=color, tags=["igneous", f"g{i % 3}"]))
+    store.commit()
+    return store._index.ensure(type_info(Rock))
 
 
-def test_cache_refused_when_markers_changed(store):
-    ci = _built_index(store)
-    blob = msgspec.msgpack.decode(msgspec.msgpack.encode(ci.dump()))
-
-    # a same-named class whose index surface differs (color no longer indexed)
-    @dc.entity
-    class Rock2:
-        name: Annotated[str, dc.Unique]
-        hardness: Annotated[float, dc.SortedIndex] = 0.0
-        color: str | None = None  # plain — no dc.Index
-        tags: Annotated[list[str], dc.Index] = ()  # type: ignore[assignment]
-
-    assert ClassIndexes.load(blob, type_info(Rock2)) is None  # config mismatch → rebuild
+@pytest.fixture
+def loaded(built: ClassIndexes) -> ClassIndexes:
+    """Return the same indexes after a cache dump and reload."""
+    reloaded = _reload(built)
+    if reloaded is None:
+        pytest.fail("the dumped cache did not load back")
+    return reloaded
 
 
-def test_reopen_loads_from_cache_without_rebuilding(tmp_path, monkeypatch):
-    import datacrystal._indexes as _idx
-
+@pytest.fixture
+def cabinet_of_five_rocks(tmp_path: Path) -> Path:
+    """Return a closed on-disk cabinet of rocks r0..r4 whose hardness index was cached."""
     path = tmp_path / "cabinet"
     s = dc.Store.open(path, cache_index=True)
     for i in range(5):
         s.store(Rock(name=f"r{i}", hardness=float(i), color="red" if i % 2 else "blue"))
     s.commit()
-    assert s.count(F.hardness >= 2.0) == 3   # builds the index this session
+    s.count(F.hardness >= 2.0)
     s.close()
-    assert (path / "index.cache").exists()   # written on close, stamped at the watermark
-
-    built: list[int] = []
-    real = _idx.build_class_indexes
-    monkeypatch.setattr(_idx, "build_class_indexes",
-                        lambda *a, **k: built.append(1) or real(*a, **k))
-    s2 = dc.Store.open(path, cache_index=True)
-    assert s2.count(F.hardness >= 2.0) == 3   # same answer
-    assert sorted(r.name for r in s2.query(F.color == "red")) == ["r1", "r3"]
-    assert built == []                         # served from the cache — NO O(corpus) rebuild
-    s2.close()
+    return path
 
 
-def test_commit_before_build_invalidates_stale_cache_blob(tmp_path):
-    """#71: a delete (or insert) committed BEFORE a class's index is built in a
-    session must invalidate the boot-loaded cache blob, so ensure() rebuilds from
-    the now-current records instead of loading a pre-commit blob — which would
-    otherwise resurrect a deleted OID (and raise DanglingRefError on hydration)."""
+@pytest.fixture
+def cabinet_of_rocks_a_and_b(tmp_path: Path) -> tuple[Path, int]:
+    """Return a closed on-disk cabinet of rocks a and b with its index cached, and a's oid."""
     path = tmp_path / "cabinet"
     s = dc.Store.open(path, cache_index=True)
-    a, b = Rock(name="a"), Rock(name="b")
+    a = Rock(name="a")
     s.store(a)
-    s.store(b)
+    s.store(Rock(name="b"))
     s.commit()
     oid_a = oid_of(a)
-    assert s.count(Rock) == 2     # builds the index this session
-    s.close()                     # writes index.cache (has a, b) at this watermark
+    s.count(Rock)
+    s.close()
+    if oid_a is None:
+        pytest.fail("the committed rock has no oid")
+    return path, oid_a
 
-    # reopen: the cache blob is loaded at boot; delete `a` by raw OID WITHOUT a
-    # query, so the index is never built and apply_deletes can't fold the delete.
+
+@pytest.fixture
+def cabinet_of_dated_finds(tmp_path: Path, kind: str) -> Path:
+    """Return a closed on-disk cabinet of five dated finds and one undated, index cached."""
+    path = tmp_path / "cabinet"
+    base = datetime(2021, 1, 1, 9, 0, tzinfo=TIMEZONES[kind])
     s = dc.Store.open(path, cache_index=True)
-    a2 = s.get_many([oid_a])[0]   # hydrate by OID — does not build the secondary index
-    s.delete(a2)
+    for i in range(5):
+        s.store(Find(seq=i, at=base + timedelta(days=i)))
+    s.store(Find(seq=99, at=None))
     s.commit()
-    assert s.count(Rock) == 1                                  # NOT served the stale blob
-    assert sorted(r.name for r in s.query(Rock)) == ["b"]      # 'a' gone, no DanglingRefError
+    s.count(DF.at >= base + timedelta(days=2))
+    s.close()
+    return path
+
+
+def test_reload_keeps_the_extent(built: ClassIndexes, loaded: ClassIndexes) -> None:
+    """Given six committed rocks and their indexes reloaded from a dumped cache
+    When the extents are compared
+    Then the reloaded extent equals the original
+    """
+    assert set(loaded.extent) == set(built.extent)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "method", "argument"),
+    [
+        ("color", "__eq__", "red"),
+        ("hardness", "__ge__", 3.0),
+        ("hardness", "__lt__", 2.0),
+        ("name", "__eq__", "r4"),
+        ("tags", "contains", "igneous"),
+        ("tags", "contains", "g1"),
+    ],
+    ids=["color-eq", "hardness-ge", "hardness-lt", "name-eq", "tags-igneous", "tags-g1"],
+)
+def test_reload_answers_each_query_like_the_original(
+    built: ClassIndexes, loaded: ClassIndexes, field_name: str, method: str, argument: object
+) -> None:
+    """Given six committed rocks and their indexes reloaded from a dumped cache
+    When the same condition is planned on both
+    Then the reloaded indexes match the same rocks as the original
+    """
+    condition = getattr(getattr(F, field_name), method)(argument)
+
+    original, _ = plan(condition, built)
+    reloaded, _ = plan(condition, loaded)
+
+    assert original is not None
+    assert reloaded is not None
+    assert set(reloaded) == set(original)
+
+
+def test_updating_a_loaded_index_un_indexes_the_old_color(loaded: ClassIndexes) -> None:
+    """Given a reloaded index where rock r1 is red
+    When r1 is re-indexed as green
+    Then r1 is no longer among the red rocks
+    """
+    oid = loaded.unique["name"]["r1"]
+
+    loaded.insert(oid, {"name": "rX", "hardness": 99.0, "color": "green", "tags": ["meta"]})
+
+    red, _ = plan(F.color == "red", loaded)
+    assert red is not None
+    assert oid not in set(red)
+
+
+def test_updating_a_loaded_index_indexes_the_new_color(loaded: ClassIndexes) -> None:
+    """Given a reloaded index where rock r1 is red
+    When r1 is re-indexed as green
+    Then r1 is among the green rocks
+    """
+    oid = loaded.unique["name"]["r1"]
+
+    loaded.insert(oid, {"name": "rX", "hardness": 99.0, "color": "green", "tags": ["meta"]})
+
+    green, _ = plan(F.color == "green", loaded)
+    assert green is not None
+    assert oid in set(green)
+
+
+def test_updating_a_loaded_index_updates_the_sorted_run(loaded: ClassIndexes) -> None:
+    """Given a reloaded index where rock r1 has hardness 1.0
+    When r1 is re-indexed with hardness 99.0
+    Then r1 is among the rocks of hardness at least 99.0
+    """
+    oid = loaded.unique["name"]["r1"]
+
+    loaded.insert(oid, {"name": "rX", "hardness": 99.0, "color": "green", "tags": ["meta"]})
+
+    hardest, _ = plan(F.hardness >= 99.0, loaded)
+    assert hardest is not None
+    assert oid in set(hardest)
+
+
+def test_updating_a_loaded_index_re_indexes_the_tags(loaded: ClassIndexes) -> None:
+    """Given a reloaded index where rock r1 is tagged igneous and g1
+    When r1 is re-indexed with the tags ["meta"]
+    Then r1 is among the rocks tagged meta
+    """
+    oid = loaded.unique["name"]["r1"]
+
+    loaded.insert(oid, {"name": "rX", "hardness": 99.0, "color": "green", "tags": ["meta"]})
+
+    meta, _ = plan(F.tags.contains("meta"), loaded)
+    assert meta is not None
+    assert oid in set(meta)
+
+
+def test_cache_is_refused_when_the_index_markers_changed(built: ClassIndexes) -> None:
+    """Given a dumped cache of Rock, and a same-shaped class whose color is no longer indexed
+    When the cache is loaded for that class
+    Then the load is refused, so the index is rebuilt
+    """
+    blob = msgspec.msgpack.decode(msgspec.msgpack.encode(built.dump()))
+
+    @dc.entity
+    class Rock2:
+        name: Annotated[str, dc.Unique]
+        hardness: Annotated[float, dc.SortedIndex] = 0.0
+        color: str | None = None  # plain, no dc.Index
+        tags: Annotated[list[str], dc.Index] = ()  # type: ignore[assignment]
+
+    refused = ClassIndexes.load(blob, type_info(Rock2))
+
+    assert refused is None
+
+
+def test_closing_a_store_writes_the_index_cache(cabinet_of_five_rocks: Path) -> None:
+    """Given a cabinet whose hardness index was built in a session
+    When the store was closed
+    Then an index.cache file is on disk
+    """
+    assert (cabinet_of_five_rocks / "index.cache").exists()
+
+
+def test_reopen_serves_a_range_count_from_the_cache(cabinet_of_five_rocks: Path) -> None:
+    """Given a cabinet of rocks r0..r4 whose index was cached on close
+    When it is reopened and rocks of hardness at least 2.0 are counted
+    Then the count is 3
+    """
+    reopened = dc.Store.open(cabinet_of_five_rocks, cache_index=True)
+
+    counted = reopened.count(F.hardness >= 2.0)
+
+    assert counted == 3
+    reopened.close()
+
+
+def test_reopen_serves_a_color_query_from_the_cache(cabinet_of_five_rocks: Path) -> None:
+    """Given a cabinet of rocks r0..r4 whose index was cached on close
+    When it is reopened and the red rocks are queried
+    Then they are r1 and r3
+    """
+    reopened = dc.Store.open(cabinet_of_five_rocks, cache_index=True)
+
+    red = reopened.query(F.color == "red")
+
+    assert _names(red) == ["r1", "r3"]
+    reopened.close()
+
+
+def test_reopen_does_not_rebuild_the_indexes(
+    cabinet_of_five_rocks: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Given a cabinet of rocks r0..r4 whose index was cached on close
+    When it is reopened and rocks of hardness at least 2.0 are counted
+    Then no class index is built again
+    """
+    built: list[int] = []
+    monkeypatch.setattr(_idx, "build_class_indexes", _counting_build_class_indexes(built))
+    reopened = dc.Store.open(cabinet_of_five_rocks, cache_index=True)
+
+    reopened.count(F.hardness >= 2.0)
+
+    assert built == []
+    reopened.close()
+
+
+def test_a_delete_before_the_index_is_built_does_not_resurrect_the_rock_in_count(
+    cabinet_of_rocks_a_and_b: tuple[Path, int],
+) -> None:
+    """Given a cached cabinet of rocks a and b, reopened, with a deleted by oid before any query
+    When the rocks are counted
+    Then the count is 1, not served from the stale cache blob (#71)
+    """
+    path, oid_a = cabinet_of_rocks_a_and_b
+    s = dc.Store.open(path, cache_index=True)
+    s.delete(s.get_many([oid_a])[0])
+    s.commit()
+
+    counted = s.count(Rock)
+
+    assert counted == 1
     s.close()
 
-    s3 = dc.Store.open(path, cache_index=True)                 # next session also correct
-    assert s3.count(Rock) == 1
-    assert sorted(r.name for r in s3.query(Rock)) == ["b"]
-    s3.close()
+
+def test_a_delete_before_the_index_is_built_does_not_resurrect_the_rock_in_a_query(
+    cabinet_of_rocks_a_and_b: tuple[Path, int],
+) -> None:
+    """Given a cached cabinet of rocks a and b, reopened, with a deleted by oid before any query
+    When the rocks are queried
+    Then only b is returned, without a DanglingRefError (#71)
+    """
+    path, oid_a = cabinet_of_rocks_a_and_b
+    s = dc.Store.open(path, cache_index=True)
+    s.delete(s.get_many([oid_a])[0])
+    s.commit()
+
+    rocks = s.query(Rock)
+
+    assert _names(rocks) == ["b"]
+    s.close()
+
+
+def test_a_delete_before_the_index_is_built_holds_in_the_next_session(
+    cabinet_of_rocks_a_and_b: tuple[Path, int],
+) -> None:
+    """Given a cached cabinet of rocks a and b, a deleted by oid before any query, then closed
+    When the store is reopened and the rocks are queried
+    Then only b is returned, and the count is 1
+    """
+    path, oid_a = cabinet_of_rocks_a_and_b
+    s = dc.Store.open(path, cache_index=True)
+    s.delete(s.get_many([oid_a])[0])
+    s.commit()
+    s.close()
+    next_session = dc.Store.open(path, cache_index=True)
+
+    rocks = next_session.query(Rock)
+
+    assert _names(rocks) == ["b"]
+    assert next_session.count(Rock) == 1
+    next_session.close()
 
 
 # --- datetime SortedIndex keys survive the cache codec (#106) -----------------
 
 
-@dc.entity
-class Dated:
-    seq: Annotated[int, dc.Unique]
-    at: Annotated[datetime | None, dc.SortedIndex] = None
+@KINDS
+def test_datetime_keys_survive_the_cache_codec_roundtrip(kind: str) -> None:
+    """Given three consecutive datetimes, naive or aware, as sorted-run keys
+    When they pass through the cache's scalar-tree codec
+    Then the keys equal the originals
+    And each key is a datetime, not a str (#106)
+    """
+    base = datetime(2021, 1, 1, 9, 0, tzinfo=TIMEZONES[kind])
+    days = [base, base + timedelta(days=1), base + timedelta(days=2)]
+
+    back = decode_scalar_tree(encode_scalar_tree({"classes": {"x": days}}))
+
+    assert back["classes"]["x"] == days
+    assert all(isinstance(k, datetime) for k in back["classes"]["x"])
 
 
-DF = dc.fields(Dated)
+@KINDS
+def test_datetime_range_survives_reopen_via_cache(
+    cabinet_of_dated_finds: Path, kind: str
+) -> None:
+    """Given a cabinet of five dated finds whose datetime index was cached on close
+    When it is reopened and finds at or after day 2 are queried
+    Then they are the finds 2, 3 and 4
+    """
+    reopened = dc.Store.open(cabinet_of_dated_finds, cache_index=True)
+    cut = datetime(2021, 1, 3, 9, 0, tzinfo=TIMEZONES[kind])
+
+    finds = reopened.query(DF.at >= cut)
+
+    assert sorted(_seqs(finds)) == [2, 3, 4]
+    reopened.close()
 
 
-@pytest.mark.parametrize("tz", [None, timezone.utc], ids=["naive", "aware"])
-def test_datetime_keys_survive_cache_codec_roundtrip(tz):
-    # The cache codec must route datetime keys through the record ext codes
-    # (encode_scalar_tree/decode_scalar_tree, #106): msgspec's DEFAULT msgpack
-    # encoding silently turns a *naive* datetime into a bare ISO str, which would
-    # corrupt the sorted run (a later range bisect of a datetime vs str crashes).
-    base = datetime(2021, 1, 1, 9, 0, tzinfo=tz)
-    blob = {"classes": {"x": [base + timedelta(days=i) for i in range(3)]}}
-    back = decode_scalar_tree(encode_scalar_tree(blob))
-    keys = back["classes"]["x"]
-    assert keys == [base + timedelta(days=i) for i in range(3)]
-    assert all(isinstance(k, datetime) for k in keys)  # NOT decoded back as str
+@KINDS
+def test_datetime_order_survives_reopen_via_cache(
+    cabinet_of_dated_finds: Path, kind: str
+) -> None:
+    """Given a cabinet of five dated finds and one undated, datetime index cached on close
+    When it is reopened and the finds are queried ordered by time descending
+    Then they come as 4, 3, 2, 1, 0 and the undated 99 last
+    """
+    reopened = dc.Store.open(cabinet_of_dated_finds, cache_index=True)
+
+    finds = reopened.query(Find, order_by=(DF.at, "desc"))
+
+    assert _seqs(finds) == [4, 3, 2, 1, 0, 99]
+    reopened.close()
 
 
-@pytest.mark.parametrize("tz", [None, timezone.utc], ids=["naive", "aware"])
-def test_datetime_sorted_index_range_survives_reopen_via_cache(tmp_path, monkeypatch, tz):
-    import datacrystal._indexes as _idx
-
-    path = tmp_path / "cabinet"
-    base = datetime(2021, 1, 1, 9, 0, tzinfo=tz)
-    s = dc.Store.open(path, cache_index=True)
-    for i in range(5):
-        s.store(Dated(seq=i, at=base + timedelta(days=i)))
-    s.store(Dated(seq=99, at=None))
-    s.commit()
-    assert s.count(DF.at >= base + timedelta(days=2)) == 3  # builds + caches the index
-    s.close()
-
+@KINDS
+def test_datetime_index_is_reconstructed_from_the_cache_not_rebuilt(
+    cabinet_of_dated_finds: Path, kind: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Given a cabinet of five dated finds whose datetime index was cached on close
+    When it is reopened and finds at or after day 2 are queried
+    Then no class index is built again
+    """
     built: list[int] = []
-    real = _idx.build_class_indexes
-    monkeypatch.setattr(_idx, "build_class_indexes",
-                        lambda *a, **k: built.append(1) or real(*a, **k))
-    s2 = dc.Store.open(path, cache_index=True)
-    cut = base + timedelta(days=2)
-    assert sorted(e.seq for e in s2.query(DF.at >= cut)) == [2, 3, 4]  # range intact
-    assert [e.seq for e in s2.query(Dated, order_by=(DF.at, "desc"))] == \
-        [4, 3, 2, 1, 0, 99]                                            # order intact
-    assert built == []  # served from the cache — the datetime run reconstructed, not rebuilt
-    s2.close()
+    monkeypatch.setattr(_idx, "build_class_indexes", _counting_build_class_indexes(built))
+    reopened = dc.Store.open(cabinet_of_dated_finds, cache_index=True)
+
+    reopened.query(DF.at >= datetime(2021, 1, 3, 9, 0, tzinfo=TIMEZONES[kind]))
+
+    assert built == []
+    reopened.close()

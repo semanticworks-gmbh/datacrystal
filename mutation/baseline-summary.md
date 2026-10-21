@@ -1,7 +1,8 @@
 # Mutation baseline (#189)
 
 Mutants of `src/datacrystal/` at v0.10.0 (86d6b21) against the v0.10.0 tests, mutmut 3.8.0, 8 CPUs.
-The killed names (`mutation/baseline-killed.txt`) and their check (`scripts/mutation_check.py`) live on the branch `mutation/baseline-v0.10.0`, never merged: #190 checks its rewritten tests against them, and the branch is deleted once #190 merges.
+The killed names (`mutation/baseline-killed.txt`) and their check (`scripts/mutation_check.py`) live on the branch `mutation/baseline-v0.10.0`, never merged, deleted once #190 merges.
+#190's rewritten tests kill all 9,224 baseline-killed mutants that ran to an end; the other 40 (`count`, `get_many`, `pluck`) time out under a full run and die when run alone.
 This summary stays as the record; #193's run on the cleaned code replaces it.
 
 ## Run

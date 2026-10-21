@@ -17,7 +17,7 @@ of the level count, an N+1 regression slipped the loader and this fails the PR
 that introduced it.
 
 It reuses the KICKOFF counting-storage harness pattern from
-:mod:`tests.fitness.test_scale_shape` (``CountingBackend.load_calls``), counting
+:mod:`tests.fitness.test_scale_shape` (``ReadViewCountingBackend.load_calls``), counting
 at the storage seam the snapshot actually reads through
 (:meth:`~datacrystal._snapshot.Snapshot.get_many` →
 ``_load_missing`` → ``read_view.load_many``) — so the count is the true number
@@ -30,8 +30,10 @@ being installed (``strawberry``).
 from __future__ import annotations
 
 import asyncio
-from dataclasses import field
-from typing import Annotated, Any, Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import ExitStack
+from dataclasses import dataclass, field
+from typing import Annotated, BinaryIO, cast
 
 import pytest
 
@@ -39,12 +41,20 @@ pytest.importorskip("strawberry", reason="datacrystal[web] extra not installed")
 
 import strawberry
 from strawberry.tools import create_type
+from strawberry.types.field import StrawberryField
 
 import datacrystal as dc
+from datacrystal._entity import oid_of
+from datacrystal._snapshot import Snapshot
 from datacrystal._storage.memory import MemoryBackend
-from datacrystal._storage.protocol import BootInfo, CommitBatch, StoredBlob, StoredRecord
+from datacrystal._storage.protocol import (
+    BootInfo,
+    CommitBatch,
+    StorageReadView,
+    StoredBlob,
+    StoredRecord,
+)
 from datacrystal.web import StrawberryReflector, snapshot_context
-
 
 # --- a self-referential slice of the mineral cabinet --------------------------
 #
@@ -57,25 +67,28 @@ from datacrystal.web import StrawberryReflector, snapshot_context
 
 @dc.entity
 class Mineral:
+    """A mineral that weathers to one other mineral and alters to many."""
+
     qid: Annotated[str, dc.Unique]
     name: str
-    weathers_to: dc.Lazy["Mineral"] | None = None
+    weathers_to: dc.Lazy[Mineral] | None = None
     # The #103 list edge: a node alters to MANY products (a fan-out tree). The
     # list-edge gate below proves that following a level's lists costs ONE
     # get_many — O(depth), never O(nodes) — exactly like the scalar edge.
-    alters_to: list[dc.Lazy["Mineral"]] = field(default_factory=list)
+    alters_to: list[dc.Lazy[Mineral]] = field(default_factory=list)
 
 
 # --- the counting storage harness (KICKOFF pattern, test_scale_shape.py) ------
 
 
 class _CountingReadView:
-    """Wraps a backend read view, counting the ``load_many`` round-trips the
-    snapshot issues — the seam ``Snapshot.get_many`` reads through. Index
-    builds go via ``scan_type`` and are deliberately not counted (the documented
-    one-time cost), exactly like the live-store counting wrapper."""
+    """Wrap a backend read view and count the ``load_many`` round-trips the snapshot issues.
 
-    def __init__(self, inner: Any, counter: "CountingBackend") -> None:
+    That is the seam ``Snapshot.get_many`` reads through. Index builds go via ``scan_type`` and
+    are deliberately not counted (the documented one-time cost), like the live-store wrapper.
+    """
+
+    def __init__(self, inner: StorageReadView, counter: ReadViewCountingBackend) -> None:
         self._inner = inner
         self._counter = counter
 
@@ -94,50 +107,59 @@ class _CountingReadView:
     def load_blob(self, oid: int) -> StoredBlob | None:
         return self._inner.load_blob(oid)
 
-    def open_blob_stream(
-        self, oid: int, on_close: Callable[[], None] | None = None
-    ) -> Any:
+    def open_blob_stream(self, oid: int, on_close: Callable[[], None] | None = None) -> BinaryIO:
         return self._inner.open_blob_stream(oid, on_close)
 
     def close(self) -> None:
         self._inner.close()
 
 
-class CountingBackend:
-    """Storage wrapper counting batch reads on its read views — the KICKOFF
-    'counting storage wrapper' pattern (``test_scale_shape.py``), pointed at the
-    snapshot read path the GraphQL DataLoader drives. ``load_calls`` is the
-    number of ``load_many`` round-trips; the N+1 gate asserts it scales with
-    relation LEVELS, never node count."""
+class ReadViewCountingBackend:
+    """Count the batch reads on a backend's read views.
+
+    The KICKOFF 'counting storage wrapper' pattern (``test_scale_shape.py``), pointed at the
+    snapshot read path the GraphQL DataLoader drives. ``load_calls`` is the number of
+    ``load_many`` round-trips; the N+1 gate asserts it scales with relation LEVELS, never node
+    count.
+    """
 
     def __init__(self, inner: MemoryBackend) -> None:
+        """Wrap the inner backend with zeroed counters."""
         self._inner = inner
         self.load_calls = 0
         self.records_loaded = 0
 
     def reset(self) -> None:
+        """Zero both counters."""
         self.load_calls = 0
         self.records_loaded = 0
 
     def boot(self) -> BootInfo:
+        """Delegate to the inner backend."""
         return self._inner.boot()
 
     def load_many(self, oids: list[int]) -> dict[int, StoredRecord]:
+        """Delegate to the inner backend."""
         return self._inner.load_many(oids)
 
     def scan_type(self, cid: int) -> Iterator[StoredRecord]:
+        """Delegate to the inner backend."""
         return self._inner.scan_type(cid)
 
     def load_blob(self, oid: int) -> StoredBlob | None:
+        """Delegate to the inner backend."""
         return self._inner.load_blob(oid)
 
     def apply(self, batch: CommitBatch) -> None:
+        """Delegate to the inner backend."""
         return self._inner.apply(batch)
 
     def read_view(self) -> _CountingReadView:
+        """Delegate to the inner backend."""
         return _CountingReadView(self._inner.read_view(), self)
 
     def close(self) -> None:
+        """Delegate to the inner backend."""
         self._inner.close()
 
 
@@ -145,12 +167,12 @@ class CountingBackend:
 
 
 def _build_chain_tree(store: dc.Store, depth: int, fanout: int) -> list[int]:
-    """Store ``fanout`` independent ``weathers_to`` chains, each ``depth`` edges
-    long, and return the OIDs of the ``fanout`` chain heads (the query's roots).
+    """Store ``fanout`` ``weathers_to`` chains of ``depth`` edges and return the chain heads' OIDs.
 
-    Every chain head sits at level 0; following ``weathers_to`` ``depth`` times
-    walks ``depth`` relation levels. With ``fanout`` heads queried as siblings,
-    each level holds ``fanout`` nodes whose edges resolve in one tick."""
+    Every chain head sits at level 0; following ``weathers_to`` ``depth`` times walks ``depth``
+    relation levels. With ``fanout`` heads queried as siblings, each level holds ``fanout``
+    nodes whose edges resolve in one tick.
+    """
     heads: list[int] = []
     for chain in range(fanout):
         # Build the chain tail-first so each node can reference the next; the
@@ -170,110 +192,145 @@ def _build_chain_tree(store: dc.Store, depth: int, fanout: int) -> list[int]:
     return heads
 
 
-def _schema_exposing_list(gql_type: Any, values: list[Any]) -> strawberry.Schema:
-    """A one-field ``Query`` whose ``root`` returns ``values`` behind
-    ``list[gql_type]`` — the #99/#100 consumer pattern."""
+def _schema_exposing_list(gql_type: type, values: Sequence[object]) -> strawberry.Schema:
+    """Return a one-field ``Query`` whose ``root`` returns ``values`` behind ``list[gql_type]``.
+
+    That is the #99/#100 consumer pattern.
+    """
 
     def root() -> object:
         return values
 
-    root_field: Any = strawberry.field(
-        resolver=root, graphql_type=list[gql_type], name="root"
+    root_field = cast(
+        StrawberryField, strawberry.field(resolver=root, graphql_type=list[gql_type], name="root")
     )
     return strawberry.Schema(query=create_type("Query", [root_field]))
 
 
 def _nested_selection(depth: int) -> str:
-    """A GraphQL selection following ``weathers_to`` ``depth`` levels deep."""
+    """Return a GraphQL selection following ``weathers_to`` ``depth`` levels deep."""
     inner = "qid name"
     for _ in range(depth):
         inner = f"qid name weathersTo {{ {inner} }}"
     return f"{{ root {{ {inner} }} }}"
 
 
+@dataclass
+class Tree:
+    """A snapshot over a counting backend and the level-0 nodes a query starts from."""
+
+    backend: ReadViewCountingBackend
+    snapshot: Snapshot
+    roots: Sequence[object]
+
+
+@pytest.fixture
+def open_chain_tree() -> Iterator[Callable[[int, int], Tree]]:
+    """Yield a function that opens a ``fanout``-sibling, ``depth``-edge chain tree.
+
+    The roots are loaded and any index build is paid before the counters reset, so a count
+    isolates exactly the reference-following reads. Stores and snapshots close at teardown.
+    """
+    with ExitStack() as cleanup:
+
+        def open_tree(depth: int, fanout: int) -> Tree:
+            backend = ReadViewCountingBackend(MemoryBackend())
+            store = dc.Store._from_backend(backend)
+            cleanup.callback(store.close)
+            heads = _build_chain_tree(store, depth=depth, fanout=fanout)
+            snapshot = cleanup.enter_context(store.snapshot())
+            roots = [snapshot.get(oid) for oid in heads]
+            backend.reset()
+            return Tree(backend, snapshot, roots)
+
+        yield open_tree
+
+
 # --- the gate -----------------------------------------------------------------
 
 
-def test_nested_graphql_does_o_depth_reads_not_o_nodes() -> None:
-    """The non-negotiable N+1 gate: a depth-``D`` query over a tree with ``N``
-    siblings per level issues exactly ``D`` batch reads — ``load_many`` scales
-    with relation LEVELS, not the ``N``-node breadth. Without the per-request
-    DataLoader each of the ``N*D`` followed edges would be its own store read."""
-    depth, fanout = 4, 6  # 6 chains, each 4 edges deep → 24 followed edges
-    backend = CountingBackend(MemoryBackend())
-    store = dc.Store._from_backend(backend)
-    try:
-        heads = _build_chain_tree(store, depth=depth, fanout=fanout)
+def test_nested_graphql_issues_one_batch_read_per_level(
+    open_chain_tree: Callable[[int, int], Tree],
+) -> None:
+    """Given 6 sibling chains of 4 weathers_to edges, 24 followed edges in all
+    When a depth-4 nested GraphQL query resolves them
+    Then the storage backend sees exactly 4 load_many calls, one per relation level
 
-        gql = StrawberryReflector().reflect(Mineral)
-        with store.snapshot() as snap:
-            roots = [snap.get(oid) for oid in heads]  # materialize level 0
+    The non-negotiable N+1 gate. Without the per-request DataLoader each of the 24 followed
+    edges would be its own store read.
+    """
+    tree = open_chain_tree(4, 6)
+    schema = _schema_exposing_list(StrawberryReflector().reflect(Mineral), tree.roots)
 
-            # Reset AFTER the roots are loaded and any index build is paid, so
-            # the count isolates exactly the reference-following reads.
-            backend.reset()
+    result = asyncio.run(
+        schema.execute(_nested_selection(4), context_value=snapshot_context(tree.snapshot))
+    )
 
-            schema = _schema_exposing_list(gql, roots)
-            result = asyncio.run(
-                schema.execute(
-                    _nested_selection(depth),
-                    context_value=snapshot_context(snap),
-                )
-            )
-
-        assert result.errors is None, result.errors
-
-        followed_edges = fanout * depth  # every edge actually resolved
-        assert backend.load_calls == depth, (
-            f"N+1 REGRESSION: a depth-{depth} GraphQL query following "
-            f"{followed_edges} reference edges across {fanout} siblings per "
-            f"level issued {backend.load_calls} get_many batches — expected "
-            f"exactly {depth} (one per relation LEVEL). The per-request "
-            "DataLoader is no longer coalescing sibling resolves into one "
-            "Snapshot.get_many; reads scale with NODE COUNT, not depth."
-        )
-        # The whole point of O(depth): the batch count is far below the node
-        # count it would be if each edge were its own read.
-        assert backend.load_calls < followed_edges, (
-            f"load_many calls ({backend.load_calls}) must stay below the "
-            f"{followed_edges} edges followed — O(depth), never O(nodes)"
-        )
-        # Every followed edge was served by those D batches.
-        assert backend.records_loaded == followed_edges
-    finally:
-        store.close()
+    assert result.errors is None, result.errors
+    assert tree.backend.load_calls == 4, (
+        f"N+1 REGRESSION: {tree.backend.load_calls} get_many batches for a depth-4 query, "
+        "expected 4 (one per relation LEVEL). The per-request DataLoader is no longer "
+        "coalescing sibling resolves into one Snapshot.get_many; reads scale with NODE COUNT."
+    )
 
 
-def test_n_plus_1_batching_holds_as_fanout_grows() -> None:
-    """The batch count is invariant to breadth: 4× the siblings per level still
-    costs ``D`` batches. This is the same-extent twin of the scale-shape gate —
-    only the haystack (fanout) grows; the read count must not."""
-    depth = 3
-    counts: list[int] = []
-    for fanout in (4, 16):  # 4× apart, like test_scale_shape's two extents
-        backend = CountingBackend(MemoryBackend())
-        store = dc.Store._from_backend(backend)
-        try:
-            heads = _build_chain_tree(store, depth=depth, fanout=fanout)
-            gql = StrawberryReflector().reflect(Mineral)
-            with store.snapshot() as snap:
-                roots = [snap.get(oid) for oid in heads]
-                backend.reset()
-                schema = _schema_exposing_list(gql, roots)
-                result = asyncio.run(
-                    schema.execute(
-                        _nested_selection(depth),
-                        context_value=snapshot_context(snap),
-                    )
-                )
-            assert result.errors is None, result.errors
-            counts.append(backend.load_calls)
-        finally:
-            store.close()
+def test_nested_graphql_batches_stay_below_the_followed_edges(
+    open_chain_tree: Callable[[int, int], Tree],
+) -> None:
+    """Given 6 sibling chains of 4 weathers_to edges, 24 followed edges in all
+    When a depth-4 nested GraphQL query resolves them
+    Then fewer load_many calls than 24 were issued, O(depth) and never O(nodes)
+    """
+    tree = open_chain_tree(4, 6)
+    schema = _schema_exposing_list(StrawberryReflector().reflect(Mineral), tree.roots)
 
-    assert counts == [depth, depth], (
-        f"batch count must stay {depth} (one per level) as fanout grows 4×, "
-        f"got {counts} — the DataLoader batched per node, not per level (N+1)"
+    result = asyncio.run(
+        schema.execute(_nested_selection(4), context_value=snapshot_context(tree.snapshot))
+    )
+
+    assert result.errors is None, result.errors
+    assert tree.backend.load_calls < 24
+
+
+def test_nested_graphql_serves_every_followed_edge_from_the_batches(
+    open_chain_tree: Callable[[int, int], Tree],
+) -> None:
+    """Given 6 sibling chains of 4 weathers_to edges, 24 followed edges in all
+    When a depth-4 nested GraphQL query resolves them
+    Then the batches loaded 24 records, one per followed edge
+    """
+    tree = open_chain_tree(4, 6)
+    schema = _schema_exposing_list(StrawberryReflector().reflect(Mineral), tree.roots)
+
+    result = asyncio.run(
+        schema.execute(_nested_selection(4), context_value=snapshot_context(tree.snapshot))
+    )
+
+    assert result.errors is None, result.errors
+    assert tree.backend.records_loaded == 24
+
+
+@pytest.mark.parametrize("fanout", [4, 16])
+def test_batch_count_does_not_grow_with_the_fanout(
+    open_chain_tree: Callable[[int, int], Tree], fanout: int
+) -> None:
+    """Given sibling chains of 3 edges at a fanout of 4 or 16, 4x apart
+    When a depth-3 nested GraphQL query resolves them
+    Then the backend sees exactly 3 load_many calls at either fanout
+
+    Only the haystack (fanout) grows; the read count must not.
+    """
+    tree = open_chain_tree(3, fanout)
+    schema = _schema_exposing_list(StrawberryReflector().reflect(Mineral), tree.roots)
+
+    result = asyncio.run(
+        schema.execute(_nested_selection(3), context_value=snapshot_context(tree.snapshot))
+    )
+
+    assert result.errors is None, result.errors
+    assert tree.backend.load_calls == 3, (
+        f"batch count must stay 3 (one per level) at fanout {fanout}; "
+        "the DataLoader batched per node, not per level (N+1)"
     )
 
 
@@ -291,11 +348,11 @@ def test_n_plus_1_batching_holds_as_fanout_grows() -> None:
 
 
 def _build_alteration_tree(store: dc.Store, depth: int, fanout: int) -> int:
-    """Store a fan-out ``alters_to`` tree ``depth`` levels deep where every node
-    has ``fanout`` children, and return the root OID. Built leaves-first so each
-    parent can reference its already-stored children as ``Lazy`` adjacency."""
-    from datacrystal._entity import oid_of
+    """Store a fan-out ``alters_to`` tree ``depth`` levels deep and return the root OID.
 
+    Every node has ``fanout`` children. It is built leaves-first so each parent can reference
+    its already-stored children as ``Lazy`` adjacency.
+    """
     counter = [0]
 
     def build(level: int) -> Mineral:
@@ -310,58 +367,83 @@ def _build_alteration_tree(store: dc.Store, depth: int, fanout: int) -> int:
 
     root = build(0)
     store.commit()
-    root_oid = oid_of(root)
-    assert root_oid is not None
-    return root_oid
+    return cast(int, oid_of(root))
 
 
 def _list_nested_selection(depth: int) -> str:
-    """A GraphQL selection following the ``alters_to`` LIST edge ``depth`` deep."""
+    """Return a GraphQL selection following the ``alters_to`` LIST edge ``depth`` deep."""
     inner = "qid name"
     for _ in range(depth):
         inner = f"qid name altersTo {{ {inner} }}"
     return f"{{ root {{ {inner} }} }}"
 
 
-def test_list_edge_nesting_is_o_depth_not_o_nodes() -> None:
-    """The #103 list-edge N+1 gate: a depth-``D`` query following a LIST-valued
-    ``alters_to`` edge over a fan-out tree issues exactly ``D`` batch reads — one
-    ``get_many`` per relation LEVEL — while ``fanout**1 + … + fanout**D`` edges
-    are followed. The per-request DataLoader coalesces every list at a level into
-    one batch; per-list batching would scale reads with NODE COUNT (N+1)."""
-    depth, fanout = 3, 3  # 3 + 9 + 27 = 39 followed edges across 3 levels
-    backend = CountingBackend(MemoryBackend())
+@pytest.fixture
+def alteration_tree() -> Iterator[Tree]:
+    """Yield a snapshot over a depth-3, fanout-3 ``alters_to`` tree with only the root loaded.
+
+    The tree has 3 + 9 + 27 = 39 followed edges across 3 levels.
+    """
+    backend = ReadViewCountingBackend(MemoryBackend())
     store = dc.Store._from_backend(backend)
-    try:
-        root_oid = _build_alteration_tree(store, depth=depth, fanout=fanout)
+    root_oid = _build_alteration_tree(store, depth=3, fanout=3)
+    with store.snapshot() as snapshot:
+        root_view = snapshot.get(root_oid)
+        backend.reset()
+        yield Tree(backend, snapshot, [root_view])
+    store.close()
 
-        gql = StrawberryReflector().reflect(Mineral)
-        with store.snapshot() as snap:
-            root_view = snap.get(root_oid)  # materialize level 0
-            backend.reset()  # isolate the reference-following reads
 
-            schema = _schema_exposing_list(gql, [root_view])
-            result = asyncio.run(
-                schema.execute(
-                    _list_nested_selection(depth),
-                    context_value=snapshot_context(snap),
-                )
-            )
+def test_list_edge_nesting_issues_one_batch_read_per_level(alteration_tree: Tree) -> None:
+    """Given a fan-out-3 tree of alters_to lists, 39 followed edges across 3 levels
+    When a depth-3 nested GraphQL query follows the list edge
+    Then the backend sees exactly 3 load_many calls, one per relation level
 
-        assert result.errors is None, result.errors
+    The #103 list-edge N+1 gate: the per-request DataLoader coalesces every list at a level
+    into one batch; per-list batching would scale reads with NODE COUNT.
+    """
+    schema = _schema_exposing_list(StrawberryReflector().reflect(Mineral), alteration_tree.roots)
 
-        followed_edges = sum(fanout**level for level in range(1, depth + 1))  # 39
-        assert backend.load_calls == depth, (
-            f"LIST-EDGE N+1 REGRESSION: a depth-{depth} query following a "
-            f"list-valued edge over a fan-out-{fanout} tree ({followed_edges} "
-            f"edges) issued {backend.load_calls} get_many batches — expected "
-            f"exactly {depth} (one per relation LEVEL). The per-request "
-            "DataLoader is no longer coalescing a level's lists into one "
-            "Snapshot.get_many; reads scale with NODE COUNT, not depth."
+    result = asyncio.run(
+        schema.execute(
+            _list_nested_selection(3), context_value=snapshot_context(alteration_tree.snapshot)
         )
-        # O(depth): the batch count is far below the followed-edge count.
-        assert backend.load_calls < followed_edges
-        # Every followed edge was served by those D batches.
-        assert backend.records_loaded == followed_edges
-    finally:
-        store.close()
+    )
+
+    assert result.errors is None, result.errors
+    assert alteration_tree.backend.load_calls == 3, (
+        f"LIST-EDGE N+1 REGRESSION: {alteration_tree.backend.load_calls} get_many batches for a "
+        "depth-3 query over a fan-out-3 tree, expected 3 (one per relation LEVEL)."
+    )
+
+
+def test_list_edge_batches_stay_below_the_followed_edges(alteration_tree: Tree) -> None:
+    """Given a fan-out-3 tree of alters_to lists, 39 followed edges across 3 levels
+    When a depth-3 nested GraphQL query follows the list edge
+    Then fewer load_many calls than 39 were issued, O(depth) and never O(nodes)
+    """
+    schema = _schema_exposing_list(StrawberryReflector().reflect(Mineral), alteration_tree.roots)
+
+    asyncio.run(
+        schema.execute(
+            _list_nested_selection(3), context_value=snapshot_context(alteration_tree.snapshot)
+        )
+    )
+
+    assert alteration_tree.backend.load_calls < 39
+
+
+def test_list_edge_serves_every_followed_edge_from_the_batches(alteration_tree: Tree) -> None:
+    """Given a fan-out-3 tree of alters_to lists, 39 followed edges across 3 levels
+    When a depth-3 nested GraphQL query follows the list edge
+    Then the batches loaded 39 records, one per followed edge
+    """
+    schema = _schema_exposing_list(StrawberryReflector().reflect(Mineral), alteration_tree.roots)
+
+    asyncio.run(
+        schema.execute(
+            _list_nested_selection(3), context_value=snapshot_context(alteration_tree.snapshot)
+        )
+    )
+
+    assert alteration_tree.backend.records_loaded == 39

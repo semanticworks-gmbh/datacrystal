@@ -1,18 +1,15 @@
-"""W4-6: the CAPSTONE read-fence sieve — one protected record, EVERY public
-read surface across EVERY tier, in one module (ADR-008, epic #168, issue #174).
+"""W4-6: the CAPSTONE read-fence sieve — one protected record, EVERY public read surface.
 
-The per-tier sieves already prove each tier in isolation: the live store
-(``tests/unit/test_read_fence_sieve.py``, W3), the snapshot
-(``tests/unit/test_read_fence_snapshot.py``, W4-1/2/3), the ``[web]``
-per-request principal (``tests/web/test_read_principal.py``, W4-4), and the
-``[fts]`` post-filter (``tests/extras/test_fts.py``, W4-5). This module is the
-campaign's *completeness* proof: it takes ONE protected ``Specimen`` — owned by
-principal ``A``, shared to nobody — and drives the SAME record through the whole
-public read matrix at once, asserting it is invisible-or-denied to a reader
-``B`` who has no standing, and fully readable to ``A`` and to ``ROOT``. Each
-assertion is labeled so a reviewer can read the matrix off the failures; a
-future surface that forgets the fence fails HERE, naming itself, rather than
-leaking silently three PRs later.
+ADR-008, epic #168, issue #174. The per-tier sieves already prove each tier in isolation: the live
+store (``tests/unit/test_read_fence_sieve.py``, W3), the snapshot
+(``tests/unit/test_read_fence_snapshot.py``, W4-1/2/3), the ``[web]`` per-request principal
+(``tests/web/test_read_principal.py``, W4-4), and the ``[fts]`` post-filter
+(``tests/extras/test_fts.py``, W4-5). This module is the campaign's *completeness* proof: it takes
+ONE protected ``Specimen`` — owned by principal ``A``, shared to nobody — and drives the SAME
+record through the whole public read matrix at once, asserting it is invisible-or-denied to a
+reader ``B`` who has no standing, and fully readable to ``A`` and to ``ROOT``. Each surface is its
+own test, so a reviewer reads the matrix off the failures; a future surface that forgets the fence
+fails HERE, naming itself, rather than leaking silently three PRs later.
 
 The matrix (surface -> expected for B / expected for A+ROOT):
 
@@ -42,461 +39,1056 @@ BLOBS
   store.open_blob / snapshot.open_blob       -> ReadDeniedError    / bytes
   BlobHandle.bytes()                         -> ReadDeniedError    / bytes
 
-The live/snapshot/blob tiers ride both backends via the ``store``/
-``store_factory`` fixtures (``tests/conftest.py``); the ``[web]`` and ``[fts]``
-tiers skip cleanly when their extra is absent (per-function ``importorskip``),
-so the extra-free tiers of the matrix always run.
+The live/snapshot/blob tiers ride both backends via the ``store``/``store_factory`` fixtures
+(``tests/conftest.py``); the ``[web]`` and ``[fts]`` tiers skip cleanly when their extra is absent
+(a fixture ``importorskip``), so the extra-free tiers of the matrix always run.
 """
-# pyright: reportAttributeAccessIssue=false, reportCallIssue=false, reportOptionalMemberAccess=false
-# pyright: reportArgumentType=false, reportFunctionMemberAccess=false
-# pyright: reportPrivateUsage=false, reportUnknownMemberType=false
-# pyright: reportUnknownVariableType=false, reportUnknownArgumentType=false
-# pyright: reportUnknownParameterType=false, reportMissingParameterType=false
 
 from __future__ import annotations
 
-from typing import Annotated, Any, cast
+from collections.abc import Callable, Iterator
+from pathlib import Path
+from types import ModuleType
+from typing import TYPE_CHECKING, NamedTuple
 
 import pytest
 
 import datacrystal as dc
 from datacrystal._entity import TYPES_BY_NAME, oid_of, type_info
+from tests.extras.fence_world import (
+    CAPSTONE_FULLTEXT,
+    LABEL,
+    PRINCIPALS,
+    ROOT,
+    SECRET_BYTES,
+    SPECIMEN_TYPENAME,
+    TERM,
+    A,
+    B,
+    Cabinet,
+    Specimen,
+    seed,
+)
 
-TEAM = 5
-OTHER = 6
+if TYPE_CHECKING:
+    from fastapi.testclient import TestClient
 
-# A owns the record; B has no standing on it; ROOT is the audited break-glass.
-A = dc.Principal(uid=2, memberships={TEAM: dc.CURATOR})     # owner
-B = dc.Principal(uid=4, memberships={OTHER: dc.CURATOR})    # denied reader
-ROOT = dc.root_principal(99)
+    from datacrystal.fts import FullTextIndex
 
-LABEL = "hidden"      # the one protected record under test
-ANCHOR = "anchor"     # a WORLD-readable Specimen it links to (the incoming seam)
-TERM = "crystal"      # a word only the hidden record's fulltext note carries
-
-
-@dc.entity(protected=True)
-class Specimen:
-    """The single protected record every surface below is asked about — one
-    class carrying a fulltext field (the FTS tier), a blob field (the blob
-    tier), and a self-referential Lazy edge (so it can be an ``incoming()``
-    referrer of the WORLD anchor, and a deref target)."""
-
-    label: Annotated[str, dc.Unique]
-    note: Annotated[str | None, dc.FullText(language="en")] = None
-    scan: Annotated[bytes | None, dc.Blob] = None
-    linked: dc.Lazy["Specimen"] | None = None
+READERS = pytest.mark.parametrize("who", ["A", "ROOT"])
 
 
-@dc.entity
-class Cabinet:
-    """An UNPROTECTED referrer holding a direct Lazy handle onto the record —
-    the deref seam (``Lazy.get()`` / ``get_many([oid])``): a reader who holds a
-    reference gets a masked twin, never the data."""
+class Seeded(NamedTuple):
+    """The seeded world: the hidden record, its WORLD-readable anchor and the holding cabinet."""
 
-    tag: Annotated[str, dc.Unique]
-    holds: dc.Lazy[Specimen] | None = None
+    hidden: Specimen
+    anchor: Specimen
+    cabinet: Cabinet
 
 
-SPECIMEN_TYPENAME = "tests.extras.test_read_fence_capstone:Specimen"
-CAPSTONE_FULLTEXT = {SPECIMEN_TYPENAME: {"note": "en"}}
+def oid_int(entity: object) -> int:
+    """Return the oid of a committed entity."""
+    oid = oid_of(entity)
+    if oid is None:
+        raise LookupError("entity was not committed")
+    return oid
 
 
-def _seed(store) -> tuple[Specimen, Specimen, Cabinet]:
-    """A WORLD-readable ``anchor`` + the owner-only ``hidden`` record that links
-    to it, plus an unprotected ``Cabinet`` holding a Lazy handle onto ``hidden``.
-    ``hidden`` is shared to nobody, so only ``A`` and ``ROOT`` may read it."""
-    with store.acting_as(A):
-        anchor = Specimen(label=ANCHOR)
-        store.store(anchor)
-        dc.share(anchor, dc.WORLD, read=dc.VIEWER, write=dc.VIEWER)
+@pytest.fixture
+def seeded(store: dc.Store) -> Seeded:
+    """Seed the protected world into the store."""
+    return Seeded(*seed(store))
 
-        hidden = Specimen(
-            label=LABEL, note="the crystal lattice diagram",
-            scan=b"top-secret-bytes", linked=dc.Lazy.of(anchor),
-        )
-        store.store(hidden)  # owner-only — the record under test
 
-        cabinet = Cabinet(tag="drawer-1", holds=dc.Lazy.of(hidden))
-        store.store(cabinet)
-        store.commit()
-    return hidden, anchor, cabinet
+@pytest.fixture
+def principal(who: str) -> dc.Principal:
+    """Return the principal a parametrized ``who`` names."""
+    return PRINCIPALS[who]
 
 
 # === LIVE STORE ==============================================================
 
-
-def _live_discovery(store, anchor: Specimen) -> dict[str, bool]:
-    """One entry per live-store discovery surface — True iff the ambient
-    principal sees ``hidden`` through it. One dict, one loop below."""
-    F = dc.fields(Specimen)
-    return {
-        "get(cls, key)": store.get(Specimen, label=LABEL) is not None,
-        "get_many(cls, key=[...])": store.get_many(Specimen, label=[LABEL])[0] is not None,
-        "query(cls)": LABEL in {o.label for o in store.query(Specimen)},
-        "query(cond)": LABEL in {o.label for o in store.query(F.label == LABEL)},
-        "query_iter(cls)": LABEL in {o.label for o in store.query_iter(Specimen)},
-        "count(cond)": store.count(F.label == LABEL) == 1,
-        "pluck(cls, field)": LABEL in store.pluck(Specimen, "label"),
-        "explain(cls).extent": store.explain(Specimen).extent == 2,
-        "explain(cond).candidates": store.explain(F.label == LABEL).candidates == 1,
-        "incoming(anchor)": any(
-            getattr(r, "label", None) == LABEL for r in store.incoming(anchor)
-        ),
-    }
-
-
-def test_capstone_live_store(store):
-    hidden, anchor, cabinet = _seed(store)
-    hidden_oid = oid_of(hidden)
-
-    # --- discovery (R12: denied is ABSENT, never an error) -------------------
+def test_get_hides_the_record_from_a_denied_reader(store: dc.Store, seeded: Seeded) -> None:
+    """Given a protected record owned by A and shared to nobody
+    When B asks the live store for the record by its unique key with get
+    Then B gets nothing
+    """
     with store.acting_as(B):
-        leaked = [s for s, visible in _live_discovery(store, anchor).items() if visible]
-    assert not leaked, f"live store leaked the hidden record to B via: {leaked}"
+        found = store.get(Specimen, label=LABEL)
 
-    for who, principal in (("A", A), ("ROOT", ROOT)):
-        with store.acting_as(principal):
-            hidden_from = [s for s, v in _live_discovery(store, anchor).items() if not v]
-        assert not hidden_from, f"live store hid the record from {who} via: {hidden_from}"
+    assert found is None
 
-    # --- deref (R14: denied is a masked TWIN, never the data) ----------------
+
+@READERS
+def test_get_shows_the_record_to_owner_and_root(
+    store: dc.Store, seeded: Seeded, principal: dc.Principal
+) -> None:
+    """Given a protected record owned by A and shared to nobody
+    When the owner or root asks the live store for the record by its unique key with get
+    Then the record is found
+    """
+    with store.acting_as(principal):
+        found = store.get(Specimen, label=LABEL)
+
+    assert found is not None
+
+
+def test_get_many_by_key_hides_the_record_from_a_denied_reader(store: dc.Store, seeded: Seeded) -> None:
+    """Given a protected record owned by A and shared to nobody
+    When B asks the live store for the record by its unique key with get_many
+    Then B gets nothing
+    """
     with store.acting_as(B):
-        [via_get_many] = store.get_many([hidden_oid])
-        via_lazy = cabinet.holds.get()
-    for surface, obj in (("get_many([oid])", via_get_many), ("Lazy.get()", via_lazy)):
-        assert isinstance(obj, dc.Redacted), f"B via {surface} must get a masked twin"
-        assert isinstance(obj, Specimen)  # traversal graceful
-        with pytest.raises(dc.ReadDeniedError):
-            _ = obj.note  # using the data is loud
+        [found] = store.get_many(Specimen, label=[LABEL])
 
-    for who, principal in (("A", A), ("ROOT", ROOT)):
-        with store.acting_as(principal):
-            [via_get_many] = store.get_many([hidden_oid])
-            via_lazy = cabinet.holds.get()
-        for surface, obj in (("get_many([oid])", via_get_many), ("Lazy.get()", via_lazy)):
-            assert not isinstance(obj, dc.Redacted), f"{who} via {surface} got a twin"
-            assert obj.label == LABEL
+    assert found is None
 
 
-def test_capstone_upsert(store):
-    """``upsert()`` is a read-modify-write, so a committed survivor the actor
-    cannot read is DENIED (ADR-008 W4-6, closing the W3-3 return exposure) —
-    never handed back — while its owner and root upsert it normally. The
-    natural-key LOOKUP stays unfenced, so dedup is unaffected; only the RETURN
-    is fenced. This is the last per-record read exposure the campaign closes."""
-    _seed(store)
+@READERS
+def test_get_many_by_key_shows_the_record_to_owner_and_root(
+    store: dc.Store, seeded: Seeded, principal: dc.Principal
+) -> None:
+    """Given a protected record owned by A and shared to nobody
+    When the owner or root asks the live store for the record by its unique key with get_many
+    Then the record is found
+    """
+    with store.acting_as(principal):
+        [found] = store.get_many(Specimen, label=[LABEL])
 
-    # B knows the unique key but has no standing: the survivor is fenced.
+    assert found is not None
+
+
+def test_query_by_class_hides_the_record_from_a_denied_reader(store: dc.Store, seeded: Seeded) -> None:
+    """Given a protected record owned by A and shared to nobody
+    When B asks the live store for every Specimen with query
+    Then the record is not among them
+    """
     with store.acting_as(B):
-        with pytest.raises(dc.ReadDeniedError):
-            store.upsert(Specimen(label=LABEL))
+        found = store.query(Specimen)
 
-    # A and ROOT get the real survivor back and can read it (the probe's merge
-    # is staged only, never committed, so the record is untouched on disk).
-    for who, principal in (("A", A), ("ROOT", ROOT)):
-        with store.acting_as(principal):
-            survivor = store.upsert(Specimen(label=LABEL))
-            assert not isinstance(survivor, dc.Redacted), f"{who} upsert got a twin"
-            assert survivor.label == LABEL, f"{who} upsert was denied the survivor"
+    assert LABEL not in {specimen.label for specimen in found}
+
+
+@READERS
+def test_query_by_class_shows_the_record_to_owner_and_root(
+    store: dc.Store, seeded: Seeded, principal: dc.Principal
+) -> None:
+    """Given a protected record owned by A and shared to nobody
+    When the owner or root asks the live store for every Specimen with query
+    Then the record is among them
+    """
+    with store.acting_as(principal):
+        found = store.query(Specimen)
+
+    assert LABEL in {specimen.label for specimen in found}
+
+
+def test_query_by_condition_hides_the_record_from_a_denied_reader(store: dc.Store, seeded: Seeded) -> None:
+    """Given a protected record owned by A and shared to nobody
+    When B asks the live store for the record by a condition with query
+    Then the record is not among them
+    """
+    with store.acting_as(B):
+        found = store.query(dc.fields(Specimen).label == LABEL)
+
+    assert LABEL not in {specimen.label for specimen in found}
+
+
+@READERS
+def test_query_by_condition_shows_the_record_to_owner_and_root(
+    store: dc.Store, seeded: Seeded, principal: dc.Principal
+) -> None:
+    """Given a protected record owned by A and shared to nobody
+    When the owner or root asks the live store for the record by a condition with query
+    Then the record is among them
+    """
+    with store.acting_as(principal):
+        found = store.query(dc.fields(Specimen).label == LABEL)
+
+    assert LABEL in {specimen.label for specimen in found}
+
+
+def test_query_iter_hides_the_record_from_a_denied_reader(store: dc.Store, seeded: Seeded) -> None:
+    """Given a protected record owned by A and shared to nobody
+    When B asks the live store for every Specimen with query_iter
+    Then the record is not among them
+    """
+    with store.acting_as(B):
+        found = list(store.query_iter(Specimen))
+
+    assert LABEL not in {specimen.label for specimen in found}
+
+
+@READERS
+def test_query_iter_shows_the_record_to_owner_and_root(
+    store: dc.Store, seeded: Seeded, principal: dc.Principal
+) -> None:
+    """Given a protected record owned by A and shared to nobody
+    When the owner or root asks the live store for every Specimen with query_iter
+    Then the record is among them
+    """
+    with store.acting_as(principal):
+        found = list(store.query_iter(Specimen))
+
+    assert LABEL in {specimen.label for specimen in found}
+
+
+def test_count_hides_the_record_from_a_denied_reader(store: dc.Store, seeded: Seeded) -> None:
+    """Given a protected record owned by A and shared to nobody
+    When B asks the live store to count the record by a condition
+    Then the count is 0
+    """
+    with store.acting_as(B):
+        found = store.count(dc.fields(Specimen).label == LABEL)
+
+    assert found == 0
+
+
+@READERS
+def test_count_shows_the_record_to_owner_and_root(
+    store: dc.Store, seeded: Seeded, principal: dc.Principal
+) -> None:
+    """Given a protected record owned by A and shared to nobody
+    When the owner or root asks the live store to count the record by a condition
+    Then the count is 1
+    """
+    with store.acting_as(principal):
+        found = store.count(dc.fields(Specimen).label == LABEL)
+
+    assert found == 1
+
+
+def test_pluck_hides_the_record_from_a_denied_reader(store: dc.Store, seeded: Seeded) -> None:
+    """Given a protected record owned by A and shared to nobody
+    When B asks the live store to pluck every Specimen label
+    Then the record's label is not among them
+    """
+    with store.acting_as(B):
+        found = store.pluck(Specimen, "label")
+
+    assert LABEL not in found
+
+
+@READERS
+def test_pluck_shows_the_record_to_owner_and_root(
+    store: dc.Store, seeded: Seeded, principal: dc.Principal
+) -> None:
+    """Given a protected record owned by A and shared to nobody
+    When the owner or root asks the live store to pluck every Specimen label
+    Then the record's label is among them
+    """
+    with store.acting_as(principal):
+        found = store.pluck(Specimen, "label")
+
+    assert LABEL in found
+
+
+def test_explain_extent_hides_the_record_from_a_denied_reader(store: dc.Store, seeded: Seeded) -> None:
+    """Given a protected record owned by A and shared to nobody
+    When B asks the live store to explain the Specimen extent
+    Then the extent is 1, the anchor alone
+    """
+    with store.acting_as(B):
+        plan = store.explain(Specimen)
+
+    assert plan.extent == 1
+
+
+@READERS
+def test_explain_extent_shows_the_record_to_owner_and_root(
+    store: dc.Store, seeded: Seeded, principal: dc.Principal
+) -> None:
+    """Given a protected record owned by A and shared to nobody
+    When the owner or root asks the live store to explain the Specimen extent
+    Then the extent is 2
+    """
+    with store.acting_as(principal):
+        plan = store.explain(Specimen)
+
+    assert plan.extent == 2
+
+
+def test_explain_candidates_hides_the_record_from_a_denied_reader(store: dc.Store, seeded: Seeded) -> None:
+    """Given a protected record owned by A and shared to nobody
+    When B asks the live store to explain the record's condition
+    Then there are 0 candidates
+    """
+    with store.acting_as(B):
+        plan = store.explain(dc.fields(Specimen).label == LABEL)
+
+    assert plan.candidates == 0
+
+
+@READERS
+def test_explain_candidates_shows_the_record_to_owner_and_root(
+    store: dc.Store, seeded: Seeded, principal: dc.Principal
+) -> None:
+    """Given a protected record owned by A and shared to nobody
+    When the owner or root asks the live store to explain the record's condition
+    Then there is 1 candidate
+    """
+    with store.acting_as(principal):
+        plan = store.explain(dc.fields(Specimen).label == LABEL)
+
+    assert plan.candidates == 1
+
+
+def test_incoming_hides_the_record_from_a_denied_reader(store: dc.Store, seeded: Seeded) -> None:
+    """Given a protected record owned by A and shared to nobody
+    When B asks the live store for the referrers of the WORLD anchor with incoming
+    Then the record is not among the referrers
+    """
+    with store.acting_as(B):
+        found = store.incoming(seeded.anchor)
+
+    assert LABEL not in {getattr(referrer, "label", None) for referrer in found}
+
+
+@READERS
+def test_incoming_shows_the_record_to_owner_and_root(
+    store: dc.Store, seeded: Seeded, principal: dc.Principal
+) -> None:
+    """Given a protected record owned by A and shared to nobody
+    When the owner or root asks the live store for the referrers of the WORLD anchor with incoming
+    Then the record is among the referrers
+    """
+    with store.acting_as(principal):
+        found = store.incoming(seeded.anchor)
+
+    assert LABEL in {getattr(referrer, "label", None) for referrer in found}
+
+
+def test_get_many_by_oid_hands_a_denied_reader_a_masked_twin(
+    store: dc.Store, seeded: Seeded
+) -> None:
+    """Given a protected record owned by A and shared to nobody
+    When B fetches its oid with get_many
+    Then B gets a redacted twin
+    And the twin is still a Specimen for traversal
+    And reading the twin's note is denied
+    """
+    with store.acting_as(B):
+        [twin] = store.get_many([oid_int(seeded.hidden)])
+
+    assert isinstance(twin, dc.Redacted)
+    assert isinstance(twin, Specimen)
+    with pytest.raises(dc.ReadDeniedError):
+        _ = twin.note
+
+
+def test_lazy_get_hands_a_denied_reader_a_masked_twin(store: dc.Store, seeded: Seeded) -> None:
+    """Given a cabinet that holds a Lazy handle onto a protected record
+    When B dereferences the handle
+    Then B gets a redacted twin
+    And the twin is still a Specimen for traversal
+    And reading the twin's note is denied
+    """
+    with store.acting_as(B):
+        twin = seeded.cabinet.holds.get()  # pyrefly: ignore[missing-attribute]
+
+    assert isinstance(twin, dc.Redacted)
+    assert isinstance(twin, Specimen)
+    with pytest.raises(dc.ReadDeniedError):
+        _ = twin.note
+
+
+@READERS
+def test_get_many_by_oid_hands_owner_and_root_the_real_record(
+    store: dc.Store, seeded: Seeded, principal: dc.Principal
+) -> None:
+    """Given a protected record owned by A and shared to nobody
+    When the owner or root fetches its oid with get_many
+    Then the record is real, not a twin
+    And it carries its label
+    """
+    with store.acting_as(principal):
+        [record] = store.get_many([oid_int(seeded.hidden)])
+
+    assert not isinstance(record, dc.Redacted)
+    assert record.label == LABEL
+
+
+@READERS
+def test_lazy_get_hands_owner_and_root_the_real_record(
+    store: dc.Store, seeded: Seeded, principal: dc.Principal
+) -> None:
+    """Given a cabinet that holds a Lazy handle onto a protected record
+    When the owner or root dereferences the handle
+    Then the record is real, not a twin
+    And it carries its label
+    """
+    with store.acting_as(principal):
+        record = seeded.cabinet.holds.get()  # pyrefly: ignore[missing-attribute]
+
+    assert not isinstance(record, dc.Redacted)
+    assert record.label == LABEL
+
+
+def test_upsert_of_the_key_is_denied_to_a_reader_without_standing(
+    store: dc.Store, seeded: Seeded
+) -> None:
+    """Given a protected record B knows only by its unique key
+    When B upserts a probe with that key
+    Then the committed survivor is fenced with ReadDeniedError, never handed back
+    """
+    with store.acting_as(B), pytest.raises(dc.ReadDeniedError):
+        store.upsert(Specimen(label=LABEL))
+
+
+@READERS
+def test_upsert_of_the_key_hands_owner_and_root_the_real_survivor(
+    store: dc.Store, seeded: Seeded, principal: dc.Principal
+) -> None:
+    """Given a protected record committed under a unique key
+    When the owner or root upserts a probe with that key
+    Then the survivor is real, not a twin
+    And it carries its label
+    """
+    with store.acting_as(principal):
+        survivor = store.upsert(Specimen(label=LABEL))
+
+    assert not isinstance(survivor, dc.Redacted)
+    assert survivor.label == LABEL
 
 
 # === SNAPSHOT ================================================================
 
 
-def test_capstone_snapshot(store):
-    hidden, anchor, _cab = _seed(store)
-    hidden_oid = cast("int", oid_of(hidden))
-    anchor_oid = cast("int", oid_of(anchor))
-    F = dc.fields(Specimen)
-
-    # --- B: denied on every snapshot surface ---------------------------------
-    with store.snapshot(principal=B) as s:
-        with pytest.raises(dc.ReadDeniedError):
-            s.get(hidden_oid)                                    # strict deref reveals
-        [twin] = s.get_many([hidden_oid])
-        assert isinstance(twin, dc.Redacted), "get_many must hand back a twin slot"
-        assert twin.oid == hidden_oid                           # identity readable
-        with pytest.raises(dc.ReadDeniedError):
-            _ = twin.note
-        assert LABEL not in {v.label for v in s.all(Specimen)}, "all(cls) leaked"
-        assert LABEL not in {v.label for v in s.all(SPECIMEN_TYPENAME)}, "all(str) leaked"
-        assert LABEL not in {v.label for v in s.query(Specimen)}, "query leaked"
-        assert s.count(F.label == LABEL) == 0, "count included the denied row"
-        assert s.explain(F.label == LABEL).candidates == 0, "explain leaked candidates"
-        assert not any(
-            getattr(r, "label", None) == LABEL for r in s.incoming(anchor_oid)
-        ), "incoming leaked the denied referrer"
-        with pytest.raises(dc.ReadDeniedError):
-            s.open_blob(hidden_oid, "scan")
-        with pytest.raises(dc.ReadDeniedError):
-            s.index_bitmaps(Specimen)                           # protected: refuses
-        with pytest.raises(dc.ReadDeniedError):
-            list(s._stream(SPECIMEN_TYPENAME))                  # mirror guard, non-root
-
-    # --- A and ROOT: readable on every discovery + deref surface -------------
-    for who, principal in (("A", A), ("ROOT", ROOT)):
-        with store.snapshot(principal=principal) as s:
-            assert s.get(hidden_oid).label == LABEL, f"{who} get() denied"
-            [v] = s.get_many([hidden_oid])
-            assert not isinstance(v, dc.Redacted) and v.label == LABEL, f"{who} get_many twin"
-            assert LABEL in {x.label for x in s.all(Specimen)}, f"{who} all(cls) hid it"
-            assert LABEL in {x.label for x in s.all(SPECIMEN_TYPENAME)}, f"{who} all(str) hid it"
-            assert s.count(F.label == LABEL) == 1, f"{who} count excluded it"
-            assert s.explain(F.label == LABEL).candidates == 1, f"{who} explain hid it"
-            assert any(
-                getattr(r, "label", None) == LABEL for r in s.incoming(anchor_oid)
-            ), f"{who} incoming dropped the readable referrer"
-            with s.open_blob(hidden_oid, "scan") as fh:
-                assert fh.read() == b"top-secret-bytes", f"{who} open_blob denied"
-            # index_bitmaps refuses on a protected class for EVERYONE, incl. root
-            with pytest.raises(dc.ReadDeniedError):
-                s.index_bitmaps(Specimen)
-        # root streams the protected mirror; A (non-root) may not
-        with store.snapshot(principal=ROOT) as rs:
-            assert len(list(rs._stream(SPECIMEN_TYPENAME))) == 2
+def test_snapshot_get_denies_a_reader_without_standing(store: dc.Store, seeded: Seeded) -> None:
+    """Given a protected record owned by A and shared to nobody
+    When B's snapshot gets it by oid
+    Then the strict deref is denied
+    """
+    with store.snapshot(principal=B) as snapshot, pytest.raises(dc.ReadDeniedError):
+        snapshot.get(oid_int(seeded.hidden))
 
 
-def test_capstone_snapshot_no_live_class_fails_closed(store, monkeypatch):
-    """``all(str)`` over a persisted ``_dc_*`` lineage whose live class was
-    removed fails CLOSED for a non-root principal (can't compile a readable
-    bitmap without the class), and root still dumps it (R9)."""
-    _seed(store)
+def test_snapshot_get_many_hands_a_denied_reader_a_twin_slot(
+    store: dc.Store, seeded: Seeded
+) -> None:
+    """Given a protected record owned by A and shared to nobody
+    When B's snapshot fetches its oid with get_many
+    Then the slot is a redacted twin
+    And the twin's identity is readable
+    And reading the twin's note is denied
+    """
+    with store.snapshot(principal=B) as snapshot:
+        [twin] = snapshot.get_many([oid_int(seeded.hidden)])
+
+    assert isinstance(twin, dc.Redacted)
+    assert twin.oid == oid_int(seeded.hidden)
+    with pytest.raises(dc.ReadDeniedError):
+        _ = twin.note
+
+
+def test_snapshot_all_by_class_excludes_the_record_for_a_denied_reader(
+    store: dc.Store, seeded: Seeded
+) -> None:
+    """Given a protected record owned by A and shared to nobody
+    When B's snapshot lists all Specimens by class
+    Then the record is not among them
+    """
+    with store.snapshot(principal=B) as snapshot:
+        listed = snapshot.all(Specimen)
+
+    assert LABEL not in {specimen.label for specimen in listed}
+
+
+def test_snapshot_all_by_typename_excludes_the_record_for_a_denied_reader(
+    store: dc.Store, seeded: Seeded
+) -> None:
+    """Given a protected record owned by A and shared to nobody
+    When B's snapshot lists all Specimens by typename
+    Then the record is not among them
+    """
+    with store.snapshot(principal=B) as snapshot:
+        listed = snapshot.all(SPECIMEN_TYPENAME)
+
+    assert LABEL not in {specimen.label for specimen in listed}
+
+
+def test_snapshot_query_excludes_the_record_for_a_denied_reader(
+    store: dc.Store, seeded: Seeded
+) -> None:
+    """Given a protected record owned by A and shared to nobody
+    When B's snapshot queries every Specimen
+    Then the record is not among them
+    """
+    with store.snapshot(principal=B) as snapshot:
+        found = snapshot.query(Specimen)
+
+    assert LABEL not in {specimen.label for specimen in found}
+
+
+def test_snapshot_count_excludes_the_record_for_a_denied_reader(
+    store: dc.Store, seeded: Seeded
+) -> None:
+    """Given a protected record owned by A and shared to nobody
+    When B's snapshot counts the record by a condition
+    Then the count is 0
+    """
+    with store.snapshot(principal=B) as snapshot:
+        counted = snapshot.count(dc.fields(Specimen).label == LABEL)  # pyrefly: ignore[bad-argument-type]
+
+    assert counted == 0
+
+
+def test_snapshot_explain_finds_no_candidates_for_a_denied_reader(
+    store: dc.Store, seeded: Seeded
+) -> None:
+    """Given a protected record owned by A and shared to nobody
+    When B's snapshot explains the record's condition
+    Then there are 0 candidates
+    """
+    with store.snapshot(principal=B) as snapshot:
+        plan = snapshot.explain(dc.fields(Specimen).label == LABEL)  # pyrefly: ignore[bad-argument-type]
+
+    assert plan.candidates == 0
+
+
+def test_snapshot_incoming_drops_the_denied_referrer(store: dc.Store, seeded: Seeded) -> None:
+    """Given a protected record that links to a WORLD-readable anchor
+    When B's snapshot lists the anchor's referrers
+    Then the record is not among them
+    """
+    with store.snapshot(principal=B) as snapshot:
+        referrers = snapshot.incoming(oid_int(seeded.anchor))
+
+    assert LABEL not in {getattr(referrer, "label", None) for referrer in referrers}
+
+
+def test_snapshot_open_blob_denies_a_reader_without_standing(
+    store: dc.Store, seeded: Seeded
+) -> None:
+    """Given a protected record with a scan blob
+    When B's snapshot opens the blob
+    Then the open is denied
+    """
+    with store.snapshot(principal=B) as snapshot, pytest.raises(dc.ReadDeniedError):
+        snapshot.open_blob(oid_int(seeded.hidden), "scan")
+
+
+def test_snapshot_index_bitmaps_refuses_a_denied_reader(store: dc.Store, seeded: Seeded) -> None:
+    """Given a protected class
+    When B's snapshot asks for its index bitmaps
+    Then the request is refused
+    """
+    with store.snapshot(principal=B) as snapshot, pytest.raises(dc.ReadDeniedError):
+        snapshot.index_bitmaps(Specimen)
+
+
+def test_snapshot_stream_refuses_a_non_root_reader(store: dc.Store, seeded: Seeded) -> None:
+    """Given a protected class mirrored to a stream
+    When B's snapshot streams it, the non-root mirror guard
+    Then the stream is refused
+    """
+    with store.snapshot(principal=B) as snapshot, pytest.raises(dc.ReadDeniedError):
+        list(snapshot._stream(SPECIMEN_TYPENAME))
+
+
+@READERS
+def test_snapshot_get_shows_owner_and_root_the_record(
+    store: dc.Store, seeded: Seeded, principal: dc.Principal
+) -> None:
+    """Given a protected record owned by A and shared to nobody
+    When the owner's or root's snapshot gets it by oid
+    Then the view carries its label
+    """
+    with store.snapshot(principal=principal) as snapshot:
+        view = snapshot.get(oid_int(seeded.hidden))
+
+    assert view.label == LABEL  # pyrefly: ignore[missing-attribute]
+
+
+@READERS
+def test_snapshot_get_many_shows_owner_and_root_the_real_record(
+    store: dc.Store, seeded: Seeded, principal: dc.Principal
+) -> None:
+    """Given a protected record owned by A and shared to nobody
+    When the owner's or root's snapshot fetches its oid with get_many
+    Then the record is real, not a twin
+    And it carries its label
+    """
+    with store.snapshot(principal=principal) as snapshot:
+        [record] = snapshot.get_many([oid_int(seeded.hidden)])
+
+    assert not isinstance(record, dc.Redacted)
+    assert record.label == LABEL  # pyrefly: ignore[missing-attribute]
+
+
+@READERS
+def test_snapshot_all_by_class_lists_the_record_for_owner_and_root(
+    store: dc.Store, seeded: Seeded, principal: dc.Principal
+) -> None:
+    """Given a protected record owned by A and shared to nobody
+    When the owner's or root's snapshot lists all Specimens by class
+    Then the record is among them
+    """
+    with store.snapshot(principal=principal) as snapshot:
+        listed = snapshot.all(Specimen)
+
+    assert LABEL in {specimen.label for specimen in listed}
+
+
+@READERS
+def test_snapshot_all_by_typename_lists_the_record_for_owner_and_root(
+    store: dc.Store, seeded: Seeded, principal: dc.Principal
+) -> None:
+    """Given a protected record owned by A and shared to nobody
+    When the owner's or root's snapshot lists all Specimens by typename
+    Then the record is among them
+    """
+    with store.snapshot(principal=principal) as snapshot:
+        listed = snapshot.all(SPECIMEN_TYPENAME)
+
+    assert LABEL in {specimen.label for specimen in listed}
+
+
+@READERS
+def test_snapshot_count_includes_the_record_for_owner_and_root(
+    store: dc.Store, seeded: Seeded, principal: dc.Principal
+) -> None:
+    """Given a protected record owned by A and shared to nobody
+    When the owner's or root's snapshot counts the record by a condition
+    Then the count is 1
+    """
+    with store.snapshot(principal=principal) as snapshot:
+        counted = snapshot.count(dc.fields(Specimen).label == LABEL)  # pyrefly: ignore[bad-argument-type]
+
+    assert counted == 1
+
+
+@READERS
+def test_snapshot_explain_finds_the_candidate_for_owner_and_root(
+    store: dc.Store, seeded: Seeded, principal: dc.Principal
+) -> None:
+    """Given a protected record owned by A and shared to nobody
+    When the owner's or root's snapshot explains the record's condition
+    Then there is 1 candidate
+    """
+    with store.snapshot(principal=principal) as snapshot:
+        plan = snapshot.explain(dc.fields(Specimen).label == LABEL)  # pyrefly: ignore[bad-argument-type]
+
+    assert plan.candidates == 1
+
+
+@READERS
+def test_snapshot_incoming_keeps_the_readable_referrer_for_owner_and_root(
+    store: dc.Store, seeded: Seeded, principal: dc.Principal
+) -> None:
+    """Given a protected record that links to a WORLD-readable anchor
+    When the owner's or root's snapshot lists the anchor's referrers
+    Then the record is among them
+    """
+    with store.snapshot(principal=principal) as snapshot:
+        referrers = snapshot.incoming(oid_int(seeded.anchor))
+
+    assert LABEL in {getattr(referrer, "label", None) for referrer in referrers}
+
+
+@READERS
+def test_snapshot_open_blob_reads_the_scan_for_owner_and_root(
+    store: dc.Store, seeded: Seeded, principal: dc.Principal
+) -> None:
+    """Given a protected record with a scan blob
+    When the owner's or root's snapshot opens the blob
+    Then its bytes are the scan
+    """
+    with store.snapshot(principal=principal) as snapshot, snapshot.open_blob(
+        oid_int(seeded.hidden), "scan"
+    ) as blob:
+        content = blob.read()
+
+    assert content == SECRET_BYTES
+
+
+@READERS
+def test_snapshot_index_bitmaps_refuses_even_owner_and_root(
+    store: dc.Store, seeded: Seeded, principal: dc.Principal
+) -> None:
+    """Given a protected class
+    When the owner's or root's snapshot asks for its index bitmaps
+    Then the request is refused for everyone
+    """
+    with store.snapshot(principal=principal) as snapshot, pytest.raises(dc.ReadDeniedError):
+        snapshot.index_bitmaps(Specimen)
+
+
+def test_snapshot_stream_gives_root_the_protected_mirror(store: dc.Store, seeded: Seeded) -> None:
+    """Given a protected class holding the anchor and the hidden record
+    When root's snapshot streams it
+    Then two records stream
+    """
+    with store.snapshot(principal=ROOT) as snapshot:
+        streamed = list(snapshot._stream(SPECIMEN_TYPENAME))
+
+    assert len(streamed) == 2
+
+
+@pytest.fixture
+def without_live_specimen_class(seeded: Seeded, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Remove the live Specimen class from the type registry, leaving its persisted lineage."""
     monkeypatch.delitem(TYPES_BY_NAME, type_info(Specimen).typename)
 
-    with store.snapshot(principal=B) as s:
-        with pytest.raises(dc.ReadDeniedError):
-            s.all(SPECIMEN_TYPENAME)
-    with store.snapshot(principal=ROOT) as s:
-        assert len(s.all(SPECIMEN_TYPENAME)) == 2  # root ops-dump over the lineage
+
+@pytest.mark.usefixtures("without_live_specimen_class")
+def test_snapshot_all_by_typename_fails_closed_without_the_live_class(store: dc.Store) -> None:
+    """Given a persisted _dc_* lineage whose live class was removed
+    When a non-root snapshot lists it by typename
+    Then it fails closed, as no readable bitmap compiles without the class
+    """
+    with store.snapshot(principal=B) as snapshot, pytest.raises(dc.ReadDeniedError):
+        snapshot.all(SPECIMEN_TYPENAME)
+
+
+@pytest.mark.usefixtures("without_live_specimen_class")
+def test_snapshot_all_by_typename_dumps_the_lineage_for_root(store: dc.Store) -> None:
+    """Given a persisted _dc_* lineage whose live class was removed
+    When root's snapshot lists it by typename
+    Then both records are dumped (R9)
+    """
+    with store.snapshot(principal=ROOT) as snapshot:
+        dumped = snapshot.all(SPECIMEN_TYPENAME)
+
+    assert len(dumped) == 2
 
 
 # === WEB (datacrystal[web]) ==================================================
 
 
-def test_capstone_web_rest_and_graphql():
+@pytest.fixture
+def fence_web() -> ModuleType:
+    """Import the web helper, skipping when a datacrystal[web] dependency is missing."""
     pytest.importorskip("pydantic", reason="datacrystal[web] extra not installed")
     pytest.importorskip("fastapi", reason="datacrystal[web] extra not installed")
     pytest.importorskip("strawberry", reason="datacrystal[web] extra not installed")
     pytest.importorskip("httpx", reason="pip install httpx (ASGITransport)")
+    from tests.extras import fence_web as web_helpers
 
-    import asyncio
+    return web_helpers
 
-    import httpx
-    import strawberry
-    from fastapi import Depends, FastAPI
-    from strawberry.fastapi import GraphQLRouter
-    from strawberry.tools import create_type
-    from strawberry.types import Info
 
-    # ``from __future__ import annotations`` stringizes the resolver's ``info:
-    # Info[...]`` annotation; strawberry resolves it against module globals, so
-    # the function-local import must be surfaced there for the schema to build.
-    globals()["Info"] = Info
+@pytest.fixture
+def web_store(fence_web: ModuleType) -> Iterator[dc.Store]:
+    """Open the web tier's in-memory store holding the hidden record, and close it afterwards."""
+    store = fence_web.seed_web_store()
+    yield store
+    store.close()
 
-    from datacrystal._snapshot import Snapshot
-    from datacrystal._storage.memory import MemoryBackend
-    from datacrystal.web import SNAPSHOT_CONTEXT_KEY as SNAP_KEY
-    from datacrystal.web import (
-        StrawberryReflector,
-        get_principal,
-        graphql_context_getter,
-        read_snapshot,
-        to_pydantic,
-    )
 
-    OPERATOR = dc.Principal(uid=1, memberships={dc.WORLD: dc.ADMIN})
+@pytest.fixture
+def rest_client_as(
+    fence_web: ModuleType, web_store: dc.Store
+) -> Callable[[dc.Principal], TestClient]:
+    """Return a factory for a REST test client whose requests read as the given principal."""
+    from fastapi.testclient import TestClient
 
-    def _no_dc_keys(obj: Any, where: str) -> None:
-        """Recursively assert no lib-managed ``_dc_*`` column reached the wire."""
-        if isinstance(obj, dict):
-            for k, v in obj.items():
-                assert not str(k).startswith("_dc"), f"{where}: _dc_* column {k!r} on the wire"
-                _no_dc_keys(v, where)
-        elif isinstance(obj, list):
-            for v in obj:
-                _no_dc_keys(v, where)
+    app = fence_web.rest_app(web_store)
 
-    def _seed_web() -> dc.Store:
-        store = dc.Store._from_backend(MemoryBackend(), principal=OPERATOR)
-        with store.acting_as(A):
-            # No blob value here: the web tier exercises the discovery + deref
-            # fence (the blob tier owns blobs). A populated dc.Blob field
-            # projects to its OID, an orthogonal to_pydantic/Blob modeling gap.
-            secret = Specimen(label=LABEL, note="the crystal lattice diagram")
-            store.store(secret)          # owner-only — B never reads it
-            from datacrystal._entity import oid_of as _oid
-            doc_ref = dc.Lazy.of(secret)
-            cabinet = Cabinet(tag="d1", holds=doc_ref)
-            store.store(cabinet)
-            store.commit()
-            assert _oid(secret) is not None
-        return store
+    def client_as(reader: dc.Principal) -> TestClient:
+        return TestClient(fence_web.read_as(app, reader))
 
-    def _client(app: FastAPI) -> httpx.AsyncClient:
-        return httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
-                                 base_url="http://web")
+    return client_as
 
-    def _rest_app(store: dc.Store) -> FastAPI:
-        app = FastAPI()
-        app.state.dc_store = store
 
-        @app.get("/specimens")
-        async def specimens(snap: Snapshot = Depends(read_snapshot)):  # noqa: ANN202
-            return {"labels": [v.label for v in snap.query(Specimen)]}
+@pytest.fixture
+def graphql_client_as(
+    fence_web: ModuleType, web_store: dc.Store
+) -> Callable[[dc.Principal], TestClient]:
+    """Return a factory for a GraphQL test client whose requests read as the given principal."""
+    from fastapi.testclient import TestClient
 
-        @app.get("/cabinet/{tag}")
-        async def cabinet(tag: str, snap: Snapshot = Depends(read_snapshot)):  # noqa: ANN202
-            matches = snap.query(Cabinet.tag == tag)
-            if not matches:
-                return {"found": False}
-            c = matches[0]
-            holds: Any = None
-            if c.holds is not None:
-                (sec,) = snap.get_many([c.holds])
-                dto = to_pydantic(sec, face="public") if sec is not None else None
-                holds = dto.model_dump() if dto is not None else None
-            return {"found": True, "holds": holds}
+    app = fence_web.graphql_app(web_store)
 
-        return app
+    def client_as(reader: dc.Principal) -> TestClient:
+        return TestClient(fence_web.read_as(app, reader))
 
-    def _graphql_app(store: dc.Store) -> FastAPI:
-        reflector = StrawberryReflector()
-        cab_gql = reflector.reflect(Cabinet)
+    return client_as
 
-        def cab_resolver(tag: str, info: Info[Any, Any]) -> Any:
-            snap: Snapshot = info.context[SNAP_KEY]
-            matches = snap.query(Cabinet.tag == tag)
-            return matches[0] if matches else None
 
-        cab_field: Any = strawberry.field(
-            resolver=cab_resolver, graphql_type=cab_gql | None, name="cabinet"
-        )
-        schema = strawberry.Schema(query=create_type("Query", [cab_field]))
-        app = FastAPI()
-        app.state.dc_store = store
-        app.include_router(
-            GraphQLRouter(schema, context_getter=graphql_context_getter), prefix="/graphql"
-        )
-        return app
+GRAPHQL_CABINET = '{ cabinet(tag: "d1") { tag holds { label } } }'
 
-    async def run() -> None:
-        # --- REST discovery + deref ------------------------------------------
-        store = _seed_web()
-        app = _rest_app(store)
 
-        app.dependency_overrides[get_principal] = lambda: B
-        async with _client(app) as c:
-            assert (await c.get("/specimens")).json() == {"labels": []}   # discovery excluded
-            body = (await c.get("/cabinet/d1")).json()
-        assert body == {"found": True, "holds": None}                     # ref -> wire-null
+def test_rest_discovery_excludes_the_record_for_a_denied_reader(rest_client_as: Callable[[dc.Principal], TestClient]) -> None:
+    """Given a REST app over a protected record
+    When B lists the specimens
+    Then no label is listed
+    """
+    response = rest_client_as(B).get("/specimens")
 
-        for who, principal in (("A", A), ("ROOT", ROOT)):
-            app.dependency_overrides[get_principal] = lambda p=principal: p
-            async with _client(app) as c:
-                assert (await c.get("/specimens")).json() == {"labels": [LABEL]}, who
-                body = (await c.get("/cabinet/d1")).json()
-            assert body["found"] and body["holds"]["label"] == LABEL, who
-            _no_dc_keys(body, f"REST/{who}")
-        store.close()
+    assert response.json() == {"labels": []}
 
-        # --- GraphQL discovery + deref ---------------------------------------
-        store = _seed_web()
-        app = _graphql_app(store)
-        query = '{ cabinet(tag: "d1") { tag holds { label } } }'
 
-        app.dependency_overrides[get_principal] = lambda: B
-        async with _client(app) as c:
-            resp = await c.post("/graphql", json={"query": query})
-        assert resp.status_code == 200
-        gbody = resp.json()
-        assert gbody.get("errors") is None
-        assert gbody["data"] == {"cabinet": {"tag": "d1", "holds": None}}  # ref -> null
+def test_rest_ref_is_wire_null_for_a_denied_reader(rest_client_as: Callable[[dc.Principal], TestClient]) -> None:
+    """Given a REST app whose cabinet refers to a protected record
+    When B fetches the cabinet
+    Then the cabinet is found
+    And its reference to the record is null on the wire
+    """
+    response = rest_client_as(B).get("/cabinet/d1")
 
-        for who, principal in (("A", A), ("ROOT", ROOT)):
-            app.dependency_overrides[get_principal] = lambda p=principal: p
-            async with _client(app) as c:
-                resp = await c.post("/graphql", json={"query": query})
-            gbody = resp.json()
-            assert gbody.get("errors") is None, who
-            assert gbody["data"] == {"cabinet": {"tag": "d1", "holds": {"label": LABEL}}}, who
-            _no_dc_keys(gbody, f"GraphQL/{who}")
-        store.close()
+    assert response.json() == {"found": True, "holds": None}
 
-    asyncio.run(run())
+
+@READERS
+def test_rest_discovery_lists_the_record_for_owner_and_root(
+    rest_client_as: Callable[[dc.Principal], TestClient], principal: dc.Principal
+) -> None:
+    """Given a REST app over a protected record
+    When the owner or root lists the specimens
+    Then the record's label is listed
+    """
+    response = rest_client_as(principal).get("/specimens")
+
+    assert response.json() == {"labels": [LABEL]}
+
+
+@READERS
+def test_rest_ref_is_rendered_for_owner_and_root(
+    rest_client_as: Callable[[dc.Principal], TestClient], principal: dc.Principal
+) -> None:
+    """Given a REST app whose cabinet refers to a protected record
+    When the owner or root fetches the cabinet
+    Then the cabinet is found
+    And the reference renders the record's label
+    """
+    body = rest_client_as(principal).get("/cabinet/d1").json()
+
+    assert body["found"] is True
+    assert body["holds"]["label"] == LABEL
+
+
+@READERS
+def test_rest_wire_carries_no_lib_managed_column(
+    fence_web: ModuleType, rest_client_as: Callable[[dc.Principal], TestClient], principal: dc.Principal
+) -> None:
+    """Given a REST app whose cabinet refers to a protected record
+    When the owner or root fetches the cabinet
+    Then no _dc_* column is on the wire
+    """
+    body = rest_client_as(principal).get("/cabinet/d1").json()
+
+    assert fence_web.dc_keys_on_wire(body) == []
+
+
+def test_graphql_request_for_a_denied_reader_succeeds(graphql_client_as: Callable[[dc.Principal], TestClient]) -> None:
+    """Given a GraphQL app whose cabinet refers to a protected record
+    When B queries the cabinet
+    Then the response status is 200
+    """
+    response = graphql_client_as(B).post("/graphql", json={"query": GRAPHQL_CABINET})
+
+    assert response.status_code == 200
+
+
+def test_graphql_ref_is_null_for_a_denied_reader(graphql_client_as: Callable[[dc.Principal], TestClient]) -> None:
+    """Given a GraphQL app whose cabinet refers to a protected record
+    When B queries the cabinet
+    Then there are no errors
+    And the cabinet's reference to the record is null
+    """
+    body = graphql_client_as(B).post("/graphql", json={"query": GRAPHQL_CABINET}).json()
+
+    assert body.get("errors") is None
+    assert body["data"] == {"cabinet": {"tag": "d1", "holds": None}}
+
+
+@READERS
+def test_graphql_ref_is_rendered_for_owner_and_root(
+    graphql_client_as: Callable[[dc.Principal], TestClient], principal: dc.Principal
+) -> None:
+    """Given a GraphQL app whose cabinet refers to a protected record
+    When the owner or root queries the cabinet
+    Then there are no errors
+    And the reference renders the record's label
+    """
+    body = graphql_client_as(principal).post("/graphql", json={"query": GRAPHQL_CABINET}).json()
+
+    assert body.get("errors") is None
+    assert body["data"] == {"cabinet": {"tag": "d1", "holds": {"label": LABEL}}}
+
+
+@READERS
+def test_graphql_wire_carries_no_lib_managed_column(
+    fence_web: ModuleType, graphql_client_as: Callable[[dc.Principal], TestClient], principal: dc.Principal
+) -> None:
+    """Given a GraphQL app whose cabinet refers to a protected record
+    When the owner or root queries the cabinet
+    Then no _dc_* column is on the wire
+    """
+    body = graphql_client_as(principal).post("/graphql", json={"query": GRAPHQL_CABINET}).json()
+
+    assert fence_web.dc_keys_on_wire(body) == []
 
 
 # === FTS (datacrystal[fts]) ==================================================
 
 
-def test_capstone_fts(store_factory, tmp_path):
+@pytest.fixture
+def fts_seeded(store: dc.Store, tmp_path: Path) -> Iterator[tuple[FullTextIndex, Seeded]]:
+    """Attach a full-text index first, then seed so the index rides the commit."""
     pytest.importorskip("snowballstemmer", reason="datacrystal[fts] extra not installed")
     from datacrystal.fts import FullTextIndex
 
-    store = store_factory()
-    idx = FullTextIndex(tmp_path / "capstone.fts", fulltext=CAPSTONE_FULLTEXT)
-    store.attach(idx)                       # attach first, then seed so it rides the commit
-    hidden, _anchor, _cab = _seed(store)
-    hidden_oid = oid_of(hidden)
+    index = FullTextIndex(tmp_path / "capstone.fts", fulltext=CAPSTONE_FULLTEXT)
+    store.attach(index)
+    yield index, Seeded(*seed(store))
+    index.close()
 
-    # No snapshot over an index covering a protected class: fail-closed (R12).
+
+def test_fts_search_without_a_snapshot_fails_closed(fts_seeded: tuple[FullTextIndex, Seeded]) -> None:
+    """Given an index covering a protected class
+    When it is searched with no snapshot
+    Then the search is denied (R12)
+    """
+    index, _ = fts_seeded
+
     with pytest.raises(dc.ReadDeniedError):
-        idx.search(TERM)
+        index.search(TERM)
 
-    # B: the denied hit is dropped from the ranked results.
-    with store.snapshot(principal=B) as snap:
-        assert idx.search(TERM, snapshot=snap) == [], "FTS leaked the denied hit to B"
 
-    # A and ROOT: the hit is returned.
-    for who, principal in (("A", A), ("ROOT", ROOT)):
-        with store.snapshot(principal=principal) as snap:
-            hits = idx.search(TERM, snapshot=snap)
-            assert {h.oid for h in hits} == {hidden_oid}, f"FTS hid the record from {who}"
-    store.close()
-    idx.close()
+def test_fts_search_drops_the_denied_hit_for_a_denied_reader(
+    store: dc.Store, fts_seeded: tuple[FullTextIndex, Seeded]
+) -> None:
+    """Given an index covering a protected record
+    When it is searched through B's snapshot
+    Then the denied hit is dropped from the ranked results
+    """
+    index, _ = fts_seeded
+
+    with store.snapshot(principal=B) as snapshot:
+        hits = index.search(TERM, snapshot=snapshot)
+
+    assert hits == []
+
+
+@READERS
+def test_fts_search_returns_the_hit_for_owner_and_root(
+    store: dc.Store, fts_seeded: tuple[FullTextIndex, Seeded], principal: dc.Principal
+) -> None:
+    """Given an index covering a protected record
+    When it is searched through the owner's or root's snapshot
+    Then the hit is the record
+    """
+    index, seeded = fts_seeded
+
+    with store.snapshot(principal=principal) as snapshot:
+        hits = index.search(TERM, snapshot=snapshot)
+
+    assert {hit.oid for hit in hits} == {oid_int(seeded.hidden)}
 
 
 # === BLOBS ===================================================================
 
 
-def test_capstone_blobs(store_factory):
-    # Seed, then reopen so the blob field reads back as a BlobHandle (a live
-    # same-process assignment stays raw bytes until a fresh hydration).
-    s0 = store_factory()
-    hidden, _anchor, _cab = _seed(s0)
-    hidden_oid = cast("int", oid_of(hidden))
-    s0.close()
+@pytest.fixture
+def reopened_with_blob(store_factory: Callable[[], dc.Store]) -> Iterator[tuple[dc.Store, int]]:
+    """Seed, close and reopen so the blob field reads back as a BlobHandle.
 
-    s = store_factory()
-    try:
-        # --- store.open_blob + BlobHandle.bytes(), re-gated across principals -
-        with s.acting_as(A):
-            v = s.get_many([hidden_oid])[0]          # owner: real entity + handle
-            handle = v.scan
-            assert handle.bytes() == b"top-secret-bytes"
-            with s.open_blob(v, "scan") as fh:
-                assert fh.read() == b"top-secret-bytes"
-        with s.acting_as(B):
-            with pytest.raises(dc.ReadDeniedError):
-                handle.bytes()                       # SAME handle, re-gated to B
-            with pytest.raises(dc.ReadDeniedError):
-                s.open_blob(v, "scan")               # entity in hand, still denied
-        with s.acting_as(ROOT):
-            assert handle.bytes() == b"top-secret-bytes"
-            with s.open_blob(v, "scan") as fh:
-                assert fh.read() == b"top-secret-bytes"
-    finally:
-        s.close()
+    A live same-process assignment stays raw bytes until a fresh hydration.
+    """
+    first = store_factory()
+    hidden, _anchor, _cabinet = seed(first)
+    hidden_oid = oid_int(hidden)
+    first.close()
+    reopened = store_factory()
+    yield reopened, hidden_oid
+    reopened.close()
 
-    # --- snapshot.open_blob ---------------------------------------------------
-    s = store_factory()
-    try:
-        with s.snapshot(principal=B) as snap:
-            with pytest.raises(dc.ReadDeniedError):
-                snap.open_blob(hidden_oid, "scan")
-        for principal in (A, ROOT):
-            with s.snapshot(principal=principal) as snap:
-                with snap.open_blob(hidden_oid, "scan") as fh:
-                    assert fh.read() == b"top-secret-bytes"
-    finally:
-        s.close()
+
+@pytest.fixture
+def owner_view(reopened_with_blob: tuple[dc.Store, int]) -> Specimen:
+    """Fetch the hidden record as its owner, holding the real entity and its blob handle."""
+    reopened, hidden_oid = reopened_with_blob
+    with reopened.acting_as(A):
+        [view] = reopened.get_many([hidden_oid])
+    return view
+
+
+def test_blob_handle_bytes_are_denied_to_a_reader_without_standing(
+    reopened_with_blob: tuple[dc.Store, int], owner_view: Specimen
+) -> None:
+    """Given a blob handle the owner fetched
+    When B reads the SAME handle's bytes
+    Then the read is re-gated and denied
+    """
+    reopened, _ = reopened_with_blob
+
+    with reopened.acting_as(B), pytest.raises(dc.ReadDeniedError):
+        owner_view.scan.bytes()  # pyrefly: ignore[missing-attribute]
+
+
+def test_store_open_blob_is_denied_to_a_reader_holding_the_entity(
+    reopened_with_blob: tuple[dc.Store, int], owner_view: Specimen
+) -> None:
+    """Given the real entity in B's hand, fetched by the owner
+    When B opens its scan blob through the store
+    Then the open is still denied
+    """
+    reopened, _ = reopened_with_blob
+
+    with reopened.acting_as(B), pytest.raises(dc.ReadDeniedError):
+        reopened.open_blob(owner_view, "scan")
+
+
+@READERS
+def test_blob_handle_bytes_are_readable_to_owner_and_root(
+    reopened_with_blob: tuple[dc.Store, int], owner_view: Specimen, principal: dc.Principal
+) -> None:
+    """Given a blob handle the owner fetched
+    When the owner or root reads the handle's bytes
+    Then they are the scan
+    """
+    reopened, _ = reopened_with_blob
+
+    with reopened.acting_as(principal):
+        content = owner_view.scan.bytes()  # pyrefly: ignore[missing-attribute]
+
+    assert content == SECRET_BYTES
+
+
+@READERS
+def test_store_open_blob_is_readable_to_owner_and_root(
+    reopened_with_blob: tuple[dc.Store, int], owner_view: Specimen, principal: dc.Principal
+) -> None:
+    """Given the real entity fetched by the owner
+    When the owner or root opens its scan blob through the store
+    Then its bytes are the scan
+    """
+    reopened, _ = reopened_with_blob
+
+    with reopened.acting_as(principal), reopened.open_blob(owner_view, "scan") as blob:
+        content = blob.read()
+
+    assert content == SECRET_BYTES
+
+
+def test_reopened_snapshot_open_blob_is_denied_to_a_reader_without_standing(
+    reopened_with_blob: tuple[dc.Store, int],
+) -> None:
+    """Given a protected record with a scan blob, in a reopened store
+    When B's snapshot opens the blob
+    Then the open is denied
+    """
+    reopened, hidden_oid = reopened_with_blob
+
+    with reopened.snapshot(principal=B) as snapshot, pytest.raises(dc.ReadDeniedError):
+        snapshot.open_blob(hidden_oid, "scan")
+
+
+@READERS
+def test_reopened_snapshot_open_blob_reads_the_scan_for_owner_and_root(
+    reopened_with_blob: tuple[dc.Store, int], principal: dc.Principal
+) -> None:
+    """Given a protected record with a scan blob, in a reopened store
+    When the owner's or root's snapshot opens the blob
+    Then its bytes are the scan
+    """
+    reopened, hidden_oid = reopened_with_blob
+
+    with reopened.snapshot(principal=principal) as snapshot, snapshot.open_blob(
+        hidden_oid, "scan"
+    ) as blob:
+        content = blob.read()
+
+    assert content == SECRET_BYTES

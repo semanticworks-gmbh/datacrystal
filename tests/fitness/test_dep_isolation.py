@@ -23,35 +23,51 @@ BANNED_AT_IMPORT = {
 }
 
 
-def test_runtime_dependency_budget():
+def test_runtime_dependency_budget_is_msgspec_and_pyroaring() -> None:
+    """Given the project's pyproject.toml
+    When its runtime dependencies are read
+    Then they are exactly msgspec and pyroaring
+    """
     pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text())
-    deps = {d.split(">=")[0].split("==")[0].strip() for d in pyproject["project"]["dependencies"]}
-    assert deps == {"msgspec", "pyroaring"}, f"core dependency budget violated: {deps}"
+
+    dependencies = pyproject["project"]["dependencies"]
+
+    assert {d.split(">=")[0].split("==")[0].strip() for d in dependencies} == {
+        "msgspec",
+        "pyroaring",
+    }
 
 
-def test_import_isolation_and_lazy_sqlite():
+def test_import_loads_no_extra_dependency_and_no_sqlite() -> None:
+    """Given a fresh interpreter
+    When it imports datacrystal
+    Then none of the extras' heavyweight modules, nor sqlite3, is loaded
+    """
     probe = (
         "import sys; import datacrystal; "
         f"loaded = {BANNED_AT_IMPORT!r} & set(sys.modules); "
         "assert not loaded, f'banned modules at import time: {loaded}'; "
         "print('ISOLATION-OK')"
     )
+
     result = subprocess.run(
-        [sys.executable, "-c", probe], capture_output=True, text=True, timeout=60
+        [sys.executable, "-c", probe], capture_output=True, text=True, timeout=60, check=False
     )
+
     assert result.returncode == 0, result.stderr
     assert "ISOLATION-OK" in result.stdout
 
 
-def test_follower_profile_reaches_contribute_serializer():
-    """The ``datacrystal[follower]`` install (pydantic + httpx, NO fastapi /
-    strawberry) must be able to import the contribute serializer.
+def test_follower_profile_reaches_contribute_serializer() -> None:
+    """Given an interpreter that blocks fastapi and strawberry at import
+    When it imports the contribute serializer to_pydantic
+    Then the import succeeds and neither blocked module is loaded
 
-    A follower's ``commit()`` reaches ``datacrystal.web._pydantic.to_pydantic``,
-    which first runs the ``datacrystal.web`` package init — that barrel lazily
-    imports its fastapi-/strawberry-backed submodules (PEP 562), so a follower-only
-    install does not crash on the first contribute (#153 peer-review fix). Simulate
-    the profile by blocking ``fastapi``/``strawberry`` at import via ``meta_path``.
+    The ``datacrystal[follower]`` install (pydantic + httpx, NO fastapi / strawberry) must be
+    able to import the contribute serializer. A follower's ``commit()`` reaches
+    ``datacrystal.web._pydantic.to_pydantic``, which first runs the ``datacrystal.web`` package
+    init; that barrel lazily imports its fastapi-/strawberry-backed submodules (PEP 562), so a
+    follower-only install does not crash on the first contribute (#153 peer-review fix).
     """
     probe = (
         "import sys, importlib.abc\n"
@@ -68,8 +84,10 @@ def test_follower_profile_reaches_contribute_serializer():
         "assert callable(to_pydantic)\n"
         "print('FOLLOWER-PROFILE-OK')\n"
     )
+
     result = subprocess.run(
-        [sys.executable, "-c", probe], capture_output=True, text=True, timeout=60
+        [sys.executable, "-c", probe], capture_output=True, text=True, timeout=60, check=False
     )
+
     assert result.returncode == 0, result.stderr
     assert "FOLLOWER-PROFILE-OK" in result.stdout

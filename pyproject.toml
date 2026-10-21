@@ -59,7 +59,7 @@ packages = ["src/datacrystal"]
 testpaths = ["tests"]
 
 [tool.pyrefly]
-project-includes = ["src", "examples", "benchmarks"]
+project-includes = ["src", "examples", "benchmarks", "tests"]
 search-path = ["typings", "src", "."]  # typings first (stubs), then src so datacrystal is not src.datacrystal, then "." for `from benchmarks import _gen`
 
 [tool.mutmut]
@@ -70,8 +70,3 @@ pytest_add_cli_args_test_selection = ["tests/"]
 also_copy = ["mutation", "tests", "docs", "scripts", "examples", "benchmarks", "evals", "assets", "typings", "README.md", "CHANGELOG.md", "CONTRIBUTING.md", "AGENTS.md", "CLAUDE.md", "llms.txt", "LICENSE", ".python-version"]
 # trampolines add `import mutmut...` to src/, which the engine-free gate rightly rejects
 pytest_add_cli_args = ["-p", "no:cacheprovider", "-p", "mutation.mutmut_order", "--deselect", "tests/fitness/test_contract_engine_free.py::test_contract_package_imports_no_engine"]
-
-[tool.pyright]
-# tests/ only, standard mode, until #190 moves them to Pyrefly
-venvPath = "."
-venv = ".venv"

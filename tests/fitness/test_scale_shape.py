@@ -17,199 +17,255 @@ worse, and with zero entity constructions (the decode-level read path).
 from __future__ import annotations
 
 import gc
+from collections import deque
+from collections.abc import Iterator
+from dataclasses import dataclass
+from itertools import islice
 from typing import Annotated
+
+import pytest
 
 import datacrystal as dc
 from datacrystal._storage.memory import MemoryBackend
+from datacrystal._store import _RAW_CHUNK
+from tests.fitness._counting_backend import CountingBackend
 
 
 @dc.entity
 class GateSpecimen:
+    """A specimen with a unique key, an indexed crystal system and an unindexed hardness."""
+
     qid: Annotated[str, dc.Unique]
     crystal_system: Annotated[str | None, dc.Index] = None
     mohs: float | None = None
 
 
-class CountingBackend:
-    """Storage wrapper counting load_many traffic (the KICKOFF 'counting
-    storage wrapper' pattern; index builds go through scan_type and are
-    deliberately not counted — they are the documented one-time cost)."""
-
-    def __init__(self, inner: MemoryBackend) -> None:
-        self._inner = inner
-        self.load_calls = 0
-        self.records_loaded = 0
-
-    def reset(self) -> None:
-        self.load_calls = 0
-        self.records_loaded = 0
-
-    def boot(self):
-        return self._inner.boot()
-
-    def load_many(self, oids):
-        out = self._inner.load_many(oids)
-        self.load_calls += 1
-        self.records_loaded += len(out)
-        return out
-
-    def scan_type(self, cid):
-        return self._inner.scan_type(cid)
-
-    def load_blob(self, oid):
-        return self._inner.load_blob(oid)
-
-    def apply(self, batch):
-        return self._inner.apply(batch)
-
-    def read_view(self):
-        return self._inner.read_view()
-
-    def close(self):
-        self._inner.close()
+HITS = 500  # fixed across both extents: only the haystack grows
+SMALL = 25_000  # the other extent, 100_000, is 4x larger
 
 
-HITS = 500          # fixed across both extents: only the haystack grows
-SMALL, LARGE = 25_000, 100_000  # 4× apart
+@dataclass
+class Cabinet:
+    """A committed store of ``extent`` specimens, 500 of them cubic, over a counting backend."""
+
+    store: dc.Store
+    backend: CountingBackend
+    extent: int
+    mohs_nine_and_up: int
+    live_baseline: int
 
 
-def _grow(store: dc.Store, start: int, upto: int) -> None:
-    for i in range(start, upto):
+def _grow(store: dc.Store, upto: int) -> None:
+    for i in range(upto):
         system = "cubic" if i < HITS else f"sys-{i % 7}"
-        store.store(GateSpecimen(qid=f"Q{i}", crystal_system=system,
-                                 mohs=float(i % 10)))
+        store.store(GateSpecimen(qid=f"Q{i}", crystal_system=system, mohs=float(i % 10)))
     store.commit()
 
 
-def test_indexed_reads_scale_with_hits_not_extent():
+def _open_cabinet(extent: int, mohs_nine_and_up: int) -> Cabinet:
     backend = CountingBackend(MemoryBackend())
     store = dc.Store._from_backend(backend)
-    S = dc.fields(GateSpecimen)
-
-    grown = 0
-    for extent in (SMALL, LARGE):
-        _grow(store, grown, extent)
-        grown = extent
-        store.count(GateSpecimen)  # force the one-time index build (scan_type)
-        gc.collect()
-        live_baseline = len(store._registry)
-
-        # count(): cardinality answers — ZERO record loads, both extents.
-        backend.reset()
-        assert store.count(GateSpecimen) == extent
-        assert store.count(S.crystal_system == "cubic") == HITS
-        assert backend.records_loaded == 0, (
-            f"count() loaded {backend.records_loaded} records at extent "
-            f"{extent} — cardinality must come from the index alone"
-        )
-
-        # query() on an indexed predicate: loads exactly |hits|, never extent.
-        backend.reset()
-        hits = store.query(S.crystal_system == "cubic")
-        assert len(hits) == HITS
-        assert backend.records_loaded == HITS, (
-            f"indexed query loaded {backend.records_loaded} records for "
-            f"{HITS} hits at extent {extent} — extent-shaped scan detected"
-        )
-        del hits
-        gc.collect()
-
-        # pluck(): loads |hits|, constructs ZERO entities.
-        backend.reset()
-        names = store.pluck(S.crystal_system == "cubic", "qid")
-        assert len(names) == HITS
-        assert backend.records_loaded == HITS
-        gc.collect()
-        assert len(store._registry) == live_baseline, (
-            "pluck() constructed live entities — it must stay decode-level"
-        )
-
-        # bulk unique-key get_many(): one round trip, loads == keys.
-        backend.reset()
-        got = store.get_many(GateSpecimen, qid=[f"Q{i}" for i in range(100)])
-        assert all(entity is not None for entity in got)
-        assert backend.load_calls == 1, "bulk key lookup must batch (no N+1)"
-        assert backend.records_loaded == 100
-        del got
-        gc.collect()
-
-        # contains/startswith on an indexed field iterate DISTINCT index
-        # keys (8 here), never records: count() stays at zero loads and
-        # query() at exactly |hits| — at both extents.
-        backend.reset()
-        assert store.count(S.crystal_system.startswith("cub")) == HITS
-        assert backend.records_loaded == 0, (
-            f"indexed startswith count loaded {backend.records_loaded} "
-            f"records at extent {extent} — it must OR index-key postings"
-        )
-        hits = store.query(S.crystal_system.contains("ubi"))
-        assert len(hits) == HITS
-        assert backend.records_loaded == HITS
-        del hits
-        gc.collect()
-
-        # The residual cliff, pinned at its documented cost: a non-indexed
-        # predicate scans the extent (never MORE than the extent, and with
-        # zero entity constructions).
-        backend.reset()
-        assert store.count(S.mohs >= 9.0) == extent // 10
-        assert backend.records_loaded == extent
-        gc.collect()
-        assert len(store._registry) == live_baseline
-
-    store.close()
-
-
-def test_limit_stops_early_on_indexed_read():
-    # #14: a windowed no-residual read slices OIDs before hydration, so it loads
-    # at most `limit` records — never the full hit set, never the extent.
-    backend = CountingBackend(MemoryBackend())
-    store = dc.Store._from_backend(backend)
-    _grow(store, 0, SMALL)
-    store.count(GateSpecimen)  # one-time index build
-    gc.collect()  # evict the non-root-reachable specimens from the weak registry
-    S = dc.fields(GateSpecimen)
-
+    _grow(store, extent)
+    store.count(GateSpecimen)  # force the one-time index build (scan_type)
+    gc.collect()
     backend.reset()
-    hits = store.query(S.crystal_system == "cubic", limit=10)
+    return Cabinet(store, backend, extent, mohs_nine_and_up, len(store._registry))
+
+
+def _qids(count: int) -> list[str]:
+    return [f"Q{i}" for i in range(count)]
+
+
+@pytest.fixture(params=[(25_000, 2_500), (100_000, 10_000)], ids=["25k", "100k"])
+def cabinet(request: pytest.FixtureRequest) -> Iterator[Cabinet]:
+    """Yield a cabinet at each of the two extents 4x apart."""
+    extent, mohs_nine_and_up = request.param
+    opened = _open_cabinet(extent, mohs_nine_and_up)
+    yield opened
+    opened.store.close()
+
+
+@pytest.fixture
+def small_cabinet() -> Iterator[Cabinet]:
+    """Yield a cabinet of 25_000 specimens, more than three raw chunks of 8192."""
+    opened = _open_cabinet(SMALL, 2_500)
+    yield opened
+    opened.store.close()
+
+
+# What kills you at millions of rows is accidental O(extent), not constants: every indexed
+# operation costs the same number of record loads at both extents.
+
+
+def test_count_of_the_extent_loads_no_record(cabinet: Cabinet) -> None:
+    """Given a cabinet of specimens at either extent
+    When the specimens are counted
+    Then the count is the extent
+    And no record was loaded
+    """
+    total = cabinet.store.count(GateSpecimen)
+
+    assert total == cabinet.extent
+    assert cabinet.backend.records_loaded == 0
+
+
+def test_count_of_indexed_hits_loads_no_record(cabinet: Cabinet) -> None:
+    """Given a cabinet of specimens at either extent
+    When the cubic specimens are counted
+    Then the count is 500
+    And no record was loaded, as cardinality comes from the index alone
+    """
+    cubic = cabinet.store.count(dc.fields(GateSpecimen).crystal_system == "cubic")
+
+    assert cubic == 500
+    assert cabinet.backend.records_loaded == 0
+
+
+def test_indexed_query_loads_exactly_the_hits(cabinet: Cabinet) -> None:
+    """Given a cabinet of specimens at either extent
+    When the cubic specimens are queried
+    Then 500 hits are returned
+    And exactly 500 records were loaded, never the extent
+    """
+    hits = cabinet.store.query(dc.fields(GateSpecimen).crystal_system == "cubic")
+
+    assert len(hits) == 500
+    assert cabinet.backend.records_loaded == 500
+
+
+def test_pluck_loads_the_hits_only(cabinet: Cabinet) -> None:
+    """Given a cabinet of specimens at either extent
+    When the qids of the cubic specimens are plucked
+    Then 500 qids are returned
+    And exactly 500 records were loaded
+    """
+    qids = cabinet.store.pluck(dc.fields(GateSpecimen).crystal_system == "cubic", "qid")
+
+    assert len(qids) == 500
+    assert cabinet.backend.records_loaded == 500
+
+
+def test_pluck_constructs_no_live_entity(cabinet: Cabinet) -> None:
+    """Given a cabinet of specimens at either extent
+    When the qids of the cubic specimens are plucked and the collector runs
+    Then the registry holds as many live entities as before, as pluck stays decode-level
+    """
+    cabinet.store.pluck(dc.fields(GateSpecimen).crystal_system == "cubic", "qid")
+    gc.collect()
+
+    assert len(cabinet.store._registry) == cabinet.live_baseline
+
+
+def test_bulk_unique_get_many_is_one_round_trip(cabinet: Cabinet) -> None:
+    """Given a cabinet of specimens at either extent
+    When 100 specimens are fetched by unique key in one get_many
+    Then all 100 are found
+    And one load_many call served them, so there is no N+1
+    And exactly 100 records were loaded
+    """
+    found = cabinet.store.get_many(GateSpecimen, qid=_qids(100))
+
+    assert all(specimen is not None for specimen in found)
+    assert cabinet.backend.load_calls == 1
+    assert cabinet.backend.records_loaded == 100
+
+
+def test_startswith_count_on_an_indexed_field_loads_no_record(cabinet: Cabinet) -> None:
+    """Given a cabinet of specimens at either extent
+    When the specimens whose crystal system starts with "cub" are counted
+    Then the count is 500
+    And no record was loaded, as the index keys' postings are ORed
+    """
+    cubic = cabinet.store.count(dc.fields(GateSpecimen).crystal_system.startswith("cub"))
+
+    assert cubic == 500
+    assert cabinet.backend.records_loaded == 0
+
+
+def test_contains_query_on_an_indexed_field_loads_exactly_the_hits(cabinet: Cabinet) -> None:
+    """Given a cabinet of specimens at either extent
+    When the specimens whose crystal system contains "ubi" are queried
+    Then 500 hits are returned
+    And exactly 500 records were loaded, as only the distinct index keys are scanned
+    """
+    hits = cabinet.store.query(dc.fields(GateSpecimen).crystal_system.contains("ubi"))
+
+    assert len(hits) == 500
+    assert cabinet.backend.records_loaded == 500
+
+
+# The residual cliff, pinned at its documented cost: a non-indexed predicate scans the extent
+# (never more than the extent, and with zero entity constructions).
+
+
+def test_unindexed_count_scans_exactly_the_extent(cabinet: Cabinet) -> None:
+    """Given a cabinet of specimens at either extent
+    When the specimens with mohs 9 or more are counted
+    Then a tenth of the extent matches
+    And every record of the extent was loaded once
+    """
+    hard = cabinet.store.count(dc.fields(GateSpecimen).mohs >= 9.0)
+
+    assert hard == cabinet.mohs_nine_and_up
+    assert cabinet.backend.records_loaded == cabinet.extent
+
+
+def test_unindexed_count_constructs_no_live_entity(cabinet: Cabinet) -> None:
+    """Given a cabinet of specimens at either extent
+    When the specimens with mohs 9 or more are counted and the collector runs
+    Then the registry holds as many live entities as before
+    """
+    cabinet.store.count(dc.fields(GateSpecimen).mohs >= 9.0)
+    gc.collect()
+
+    assert len(cabinet.store._registry) == cabinet.live_baseline
+
+
+def test_limit_stops_a_query_early(small_cabinet: Cabinet) -> None:
+    """Given 25_000 specimens of which 500 are cubic
+    When the cubic specimens are queried with limit 10
+    Then 10 hits are returned
+    And exactly 10 records were loaded, as the limit slices OIDs before hydration (#14)
+    """
+    hits = small_cabinet.store.query(dc.fields(GateSpecimen).crystal_system == "cubic", limit=10)
+
     assert len(hits) == 10
-    assert backend.records_loaded == 10, (
-        f"windowed query loaded {backend.records_loaded}, expected 10 — limit "
-        "must slice OIDs before get_many"
+    assert small_cabinet.backend.records_loaded == 10
+
+
+def test_limit_stops_a_pluck_early(small_cabinet: Cabinet) -> None:
+    """Given 25_000 specimens of which 500 are cubic
+    When the qids of the cubic specimens are plucked with limit 10
+    Then 10 qids are returned
+    And exactly 10 records were decoded
+    """
+    qids = small_cabinet.store.pluck(
+        dc.fields(GateSpecimen).crystal_system == "cubic", "qid", limit=10
     )
-    del hits
+
+    assert len(qids) == 10
+    assert small_cabinet.backend.records_loaded == 10
+
+
+def test_query_iter_yields_every_specimen(small_cabinet: Cabinet) -> None:
+    """Given 25_000 specimens
+    When the whole extent is streamed through query_iter
+    Then 25_000 specimens are yielded
+    """
+    streamed = list(small_cabinet.store.query_iter(GateSpecimen))
+
+    assert len(streamed) == 25_000
+
+
+@pytest.mark.parametrize("consumed", [5_000, 10_000, 15_000, 20_000, 25_000])
+def test_query_iter_keeps_a_bounded_live_set(small_cabinet: Cabinet, consumed: int) -> None:
+    """Given 25_000 specimens streamed through query_iter and dropped as they come
+    When a number of them have been consumed and the collector runs
+    Then at most two raw chunks of entities are live, never the extent (#15)
+    """
+    stream = small_cabinet.store.query_iter(GateSpecimen)
+
+    deque(islice(stream, consumed), maxlen=0)
     gc.collect()
 
-    backend.reset()
-    names = store.pluck(S.crystal_system == "cubic", "qid", limit=10)
-    assert len(names) == 10
-    assert backend.records_loaded == 10, (
-        f"windowed pluck decoded {backend.records_loaded}, expected 10"
-    )
-    store.close()
-
-
-def test_query_iter_streams_with_bounded_live_set():
-    # #15: streaming a full-extent query keeps O(chunk) entities live, never
-    # O(extent) — the registry must not accumulate the whole result set.
-    from datacrystal._store import _RAW_CHUNK
-
-    backend = CountingBackend(MemoryBackend())
-    store = dc.Store._from_backend(backend)
-    _grow(store, 0, SMALL)  # 25_000 > 3 chunks of 8192
-    gc.collect()
-
-    peak = 0
-    seen = 0
-    for obj in store.query_iter(GateSpecimen):
-        seen += 1
-        if seen % 1000 == 0:
-            gc.collect()
-            peak = max(peak, len(store._registry))
-        del obj
-    assert seen == SMALL
-    assert peak <= 2 * _RAW_CHUNK, (
-        f"iter() held {peak} live entities at extent {SMALL} (chunk "
-        f"{_RAW_CHUNK}) — a streaming read must stay O(chunk), not O(extent)"
-    )
-    store.close()
+    assert len(small_cabinet.store._registry) <= 2 * _RAW_CHUNK

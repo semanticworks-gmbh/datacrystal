@@ -104,3 +104,15 @@ def small_store(tmp_path_factory) -> Iterator[dc.Store]:
     print(f"[corpus] small: {counts}")
     yield store
     store.close()
+
+
+@pytest.fixture
+def big_cabinet(big_store: dc.Store) -> dc.Store:
+    """Hand the session's big cabinet to one test."""
+    return big_store
+
+
+@pytest.fixture
+def small_cabinet(small_store: dc.Store) -> dc.Store:
+    """Hand the session's small cabinet to one test."""
+    return small_store

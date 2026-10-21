@@ -29,19 +29,10 @@ transport) is a dev dependency. All four importorskip so the bare suite stays
 green without them (the ``tests/web/`` and ``tests/extras/`` precedent).
 """
 
-# The reflected GraphQL types are dynamically built (pyright can't see their
-# fields), the magic-query ``Mineral.qid == qid`` returns an untypeable Condition,
-# and FastAPI/Strawberry resolver signatures lean on framework markers pyright
-# reads as Unknown. File-scoped pragmas, exactly like the REST e2e + magic-query
-# tests (tests/web/test_rest_e2e.py, tests/unit/test_query.py).
-# pyright: reportAttributeAccessIssue=false, reportUnknownMemberType=false
-# pyright: reportUnknownVariableType=false, reportUnknownArgumentType=false
-# pyright: reportUnknownParameterType=false, reportMissingParameterType=false
-# pyright: reportArgumentType=false
-
 from __future__ import annotations
 
 import threading
+from pathlib import Path
 from typing import Annotated, Any
 
 import pytest
@@ -60,7 +51,7 @@ from strawberry.types import Info
 
 import datacrystal as dc
 from datacrystal import WrongThreadError
-from datacrystal._snapshot import Snapshot
+from datacrystal._snapshot import EntityView, Snapshot
 from datacrystal._store import Store
 from datacrystal.web import (
     SNAPSHOT_CONTEXT_KEY as SNAP_KEY,
@@ -74,14 +65,15 @@ from datacrystal.web import (
     store_lifespan,
     submit_write,
 )
-from datacrystal.web._app import STORE_STATE_KEY, _StoreLifespan
-
+from datacrystal.web._app import STORE_STATE_KEY, _OwnerWriter, _StoreLifespan
 
 # --- a self-contained slice of the mineral cabinet (reference) ----------------
 
 
 @dc.entity
 class Locality:
+    """Where a mineral was first found."""
+
     qid: Annotated[str, dc.Unique]
     name: str
     country: Annotated[str | None, dc.Index] = None
@@ -89,49 +81,55 @@ class Locality:
 
 @dc.entity
 class Mineral:
+    """A mineral species, optionally pointing at its type locality."""
+
     qid: Annotated[str, dc.Unique]
     name: str
     mohs: float | None = None
     type_locality: dc.Lazy[Locality] | None = None
 
 
-def _seed(path: str) -> None:
-    """Seed one Mineral pointing at one Locality, then close the store so the
-    app's lifespan can re-open it (single-writer: the seeding store must be
-    closed first)."""
+@pytest.fixture
+def seeded_path(tmp_path: Path) -> str:
+    """Return the path of a closed store holding one Mineral pointing at one Locality.
+
+    The seeding store is closed so the app's lifespan can re-open it (single writer).
+    """
+    path = str(tmp_path / "cab.store")
     store = dc.Store.open(path)
     gotthard = Locality(qid="L1", name="St Gotthard", country="CH")
     quartz = Mineral(qid="Q1", name="Quartz", mohs=7.0, type_locality=dc.Lazy.of(gotthard))
     store.store(quartz)
     store.commit()
     store.close()
+    return path
 
 
-# --- the REST app: lifespan + read + write dependencies -----------------------
+# --- the apps under test --------------------------------------------------------
 
 
 def _make_rest_app(path: str) -> FastAPI:
-    """A real FastAPI app over the #92 wiring: a snapshot GET and a submit POST.
+    """Build a FastAPI app over the #92 wiring: a snapshot GET and a submit POST.
 
-    The write route is **async** (it runs on the owner loop thread, so the
-    closure shipped to ``submit()`` runs inline and commits); the read route is
-    **sync** (a threadpool worker, off the owner — correct because a snapshot is
-    any-thread, ADR-002)."""
+    The write route is async (it runs on the owner loop thread); the read route is
+    sync (a threadpool worker, off the owner, correct because a snapshot is any-thread).
+    """
     app = create_app(path)
 
     @app.get("/minerals/{qid}")
-    def read_mineral(qid: str, snap: Snapshot = Depends(read_snapshot)):  # noqa: ANN202
-        matches = snap.query(Mineral.qid == qid)
+    def read_mineral(qid: str, snap: Annotated[Snapshot, Depends(read_snapshot)]) -> dict[str, object]:
+        matches = snap.query(Mineral.qid == qid)  # pyrefly: ignore[bad-argument-type]
         if not matches:
             return {"found": False}
         view = matches[0]
         return {"found": True, "qid": view.qid, "name": view.name, "mohs": view.mohs}
 
     @app.post("/minerals/{qid}")
-    async def add_mineral(qid: str, name: str, writer=Depends(submit_write)):  # noqa: ANN202
+    async def add_mineral(
+        qid: str, name: str, writer: Annotated[_OwnerWriter, Depends(submit_write)]
+    ) -> dict[str, object]:
         def do_write(store: Store) -> int:
-            # Mutate + commit on the OWNER thread (submit ran us there). Return
-            # plain data (the new TID) — a live entity would EntityEscapeError.
+            # Plain data (the new TID) crosses back: a live entity would EntityEscapeError.
             store.store(Mineral(qid=qid, name=name))
             return store.commit() or store.last_tid
 
@@ -139,9 +137,9 @@ def _make_rest_app(path: str) -> FastAPI:
         return {"committed_tid": tid}
 
     @app.post("/minerals/{qid}/direct")
-    def add_mineral_direct(qid: str, store: Store = Depends(get_store)):  # noqa: ANN202
-        # A SYNC route → threadpool worker → foreign thread. A DIRECT live write
-        # must raise WrongThreadError (ADR-001), proving submit() is mandatory.
+    def add_mineral_direct(qid: str, store: Annotated[Store, Depends(get_store)]) -> dict[str, bool]:
+        # A SYNC route runs on a threadpool worker, a foreign thread: a DIRECT live
+        # write must raise WrongThreadError (ADR-001), proving submit() is mandatory.
         try:
             store.store(Mineral(qid=qid, name="should-not-land"))
             store.commit()
@@ -152,78 +150,26 @@ def _make_rest_app(path: str) -> FastAPI:
     return app
 
 
-def test_lifespan_opens_one_store_and_closes_it(tmp_path) -> None:
-    """The lifespan opens the store on startup (reachable via get_store) and
-    closes it on shutdown — the store is gone from app.state afterwards."""
-    path = str(tmp_path / "cab.store")
-    _seed(path)
-    app = create_app(path)
-    # Before the lifespan runs, there is no store on app.state.
-    assert getattr(app.state, STORE_STATE_KEY, None) is None
-    with TestClient(app):  # entering the client runs the lifespan startup
-        store = getattr(app.state, STORE_STATE_KEY, None)
-        assert isinstance(store, Store)
-    # On shutdown the store was closed (a closed store refuses snapshots).
-    assert store._closed  # pyright: ignore[reportPrivateUsage]  # asserting the lifespan closed it
+def _add_peek_route(app: FastAPI, seen: list[Snapshot]) -> None:
+    """Add GET /peek, which records the snapshot each request was handed."""
 
-
-def test_snapshot_get_reads_committed_state(tmp_path) -> None:
-    """A snapshot-backed GET returns committed data from a threadpool worker —
-    off the owner thread, correct because a snapshot is any-thread (ADR-002)."""
-    path = str(tmp_path / "cab.store")
-    _seed(path)
-    with TestClient(_make_rest_app(path)) as client:
-        resp = client.get("/minerals/Q1")
-        assert resp.status_code == 200
-        assert resp.json() == {"found": True, "qid": "Q1", "name": "Quartz", "mohs": 7.0}
-
-
-def test_submit_post_writes_through_the_owner_and_get_round_trips(tmp_path) -> None:
-    """A POST ships a mutation to the owner via submit_write, which commits and
-    returns the TID; a subsequent snapshot GET sees the new entity — the
-    write-then-read round-trip through the #92 wiring."""
-    path = str(tmp_path / "cab.store")
-    _seed(path)
-    with TestClient(_make_rest_app(path)) as client:
-        resp = client.post("/minerals/Q2", params={"name": "Calcite"})
-        assert resp.status_code == 200
-        assert resp.json()["committed_tid"] > 0
-
-        got = client.get("/minerals/Q2")
-        assert got.status_code == 200
-        assert got.json() == {"found": True, "qid": "Q2", "name": "Calcite", "mohs": None}
-
-
-def test_foreign_thread_direct_write_still_raises_wrong_thread(tmp_path) -> None:
-    """A sync route (threadpool worker) writing the live store DIRECTLY raises
-    WrongThreadError — owner confinement is unchanged (ADR-001), which is exactly
-    why a write must go through submit_write."""
-    path = str(tmp_path / "cab.store")
-    _seed(path)
-    with TestClient(_make_rest_app(path)) as client:
-        resp = client.post("/minerals/Q3/direct")
-        assert resp.status_code == 200
-        assert resp.json() == {"raised": True}
-
-        # The bad write was rejected before landing: Q3 is absent.
-        assert client.get("/minerals/Q3").json() == {"found": False}
-
-
-# --- the GraphQL app: per-request snapshot context + DataLoader ---------------
+    @app.get("/peek")
+    def peek(snap: Annotated[Snapshot, Depends(read_snapshot)]) -> dict[str, int]:
+        seen.append(snap)
+        return {"tid": snap.tid}
 
 
 def _make_graphql_app(path: str) -> FastAPI:
-    """A real FastAPI + Strawberry app: a ``mineral(qid)`` query whose root reads
-    the per-request snapshot off the context, then resolves the reference edge
-    through the per-request DataLoader (graphql_context_getter / #100)."""
-    reflector = StrawberryReflector()
-    mineral_gql = reflector.reflect(Mineral)
+    """Build a FastAPI + Strawberry app with a ``mineral(qid)`` query.
 
-    def mineral_resolver(qid: str, info: Info[Any, Any]) -> Any:
-        # The per-request snapshot rides on the context the getter built; the
-        # reference field is hydrated lazily by the DataLoader, not here.
+    The root reads the per-request snapshot off the context; the reference edge is
+    resolved through the per-request DataLoader (graphql_context_getter, #100).
+    """
+    mineral_gql = StrawberryReflector().reflect(Mineral)
+
+    def mineral_resolver(qid: str, info: Info[Any, Any]) -> EntityView | None:
         snap: Snapshot = info.context[SNAP_KEY]
-        matches = snap.query(Mineral.qid == qid)
+        matches = snap.query(Mineral.qid == qid)  # pyrefly: ignore[bad-argument-type]
         return matches[0] if matches else None
 
     mineral_field: Any = strawberry.field(
@@ -238,128 +184,12 @@ def _make_graphql_app(path: str) -> FastAPI:
     return app
 
 
-def test_graphql_resolves_two_level_nested_graph_through_the_loader(tmp_path) -> None:
-    """A Strawberry query resolves a 2-level nested graph (Mineral →
-    type_locality → Locality) through the per-request DataLoader on a per-request
-    snapshot — the headline GraphQL acceptance criterion (#92 + #100)."""
-    path = str(tmp_path / "cab.store")
-    _seed(path)
-    query = (
-        '{ mineral(qid: "Q1") { qid name mohs '
-        "typeLocality { qid name country } } }"
-    )
-    with TestClient(_make_graphql_app(path)) as client:
-        resp = client.post("/graphql", json={"query": query})
-        assert resp.status_code == 200
-        body = resp.json()
-        assert body.get("errors") is None
-        assert body["data"] == {
-            "mineral": {
-                "qid": "Q1",
-                "name": "Quartz",
-                "mohs": 7.0,
-                "typeLocality": {"qid": "L1", "name": "St Gotthard", "country": "CH"},
-            }
-        }
-
-
-# --- the dependencies in isolation (the contracts the routes above rely on) ----
-
-
-def test_get_store_without_lifespan_fails_loudly(tmp_path) -> None:
-    """A route reaching for the store on an app that was NOT wired with the
-    lifespan gets a clear error pointing at the fix, not an AttributeError."""
-    app = FastAPI()  # no store_lifespan
-
-    @app.get("/x")
-    def x(store: Store = Depends(get_store)):  # noqa: ANN202
-        return {"ok": store is not None}
-
-    # raise_server_exceptions=False so the RuntimeError surfaces as a 500
-    # response (the default re-raises it into the test for debugging).
-    with TestClient(app, raise_server_exceptions=False) as client:
-        resp = client.get("/x")
-        assert resp.status_code == 500
-
-
-def test_read_snapshot_is_pooled_per_watermark(tmp_path) -> None:
-    """#104: reads at one watermark share ONE pooled snapshot (index built once,
-    not per request) and it is closed on SHUTDOWN — not per request. The identity
-    check is the same-run proof that only one snapshot is built across many reads
-    at a watermark: O(n)/commit, not O(n)/request (proving ground #93)."""
-    path = str(tmp_path / "cab.store")
-    _seed(path)
-    seen: list[Snapshot] = []
-
-    app = create_app(path)
-
-    @app.get("/peek")
-    def peek(snap: Snapshot = Depends(read_snapshot)):  # noqa: ANN202
-        seen.append(snap)
-        return {"tid": snap.tid}
-
-    with TestClient(app) as client:
-        assert client.get("/peek").status_code == 200
-        assert client.get("/peek").status_code == 200
-        # Same watermark → the SAME pooled snapshot, NOT rebuilt or closed between
-        # requests (the one O(n) index build is amortised across every read).
-        assert len(seen) == 2
-        assert seen[0] is seen[1]
-        assert not seen[0]._core.closed  # pyright: ignore[reportPrivateUsage]
-    # Shutdown closed the pooled snapshot (its WAL read txn released).
-    assert seen[0]._core.closed  # pyright: ignore[reportPrivateUsage]
-
-
-def test_snapshot_pool_refreshes_when_a_commit_advances_the_watermark(tmp_path) -> None:
-    """#104: when a commit advances ``store.last_tid`` the next read builds a
-    FRESH pooled snapshot at the new watermark, and the superseded one is closed
-    once its last reader drained — reads never go stale, the old WAL txn is freed."""
-    path = str(tmp_path / "cab.store")
-    _seed(path)
-    seen: list[Snapshot] = []
-
-    app = _make_rest_app(path)
-
-    @app.get("/peek")
-    def peek(snap: Snapshot = Depends(read_snapshot)):  # noqa: ANN202
-        seen.append(snap)
-        return {"tid": snap.tid}
-
-    with TestClient(app) as client:
-        assert client.get("/peek").status_code == 200                 # snapshot A @ tid T
-        assert client.post("/minerals/NEW", params={"name": "Beryl"}).status_code == 200  # → T+1
-        assert client.get("/peek").status_code == 200                 # snapshot B @ tid T+1
-    assert len(seen) == 2
-    assert seen[0] is not seen[1]
-    assert seen[0].tid < seen[1].tid
-    # The superseded snapshot A was retired + closed (no reader still holds it).
-    assert seen[0]._core.closed  # pyright: ignore[reportPrivateUsage]
-
-
-def test_store_lifespan_factory_builds_the_lifespan_cm(tmp_path) -> None:
-    """store_lifespan returns a callable that, given the app, is the async
-    context manager that opens/closes the store (the FastAPI lifespan shape)."""
-    path = str(tmp_path / "cab.store")
-    _seed(path)
-    factory = store_lifespan(path)
-    app = FastAPI()
-    cm = factory(app)
-    assert isinstance(cm, _StoreLifespan)
-
-
-def test_submit_write_runs_on_the_owner_not_the_caller_thread(tmp_path) -> None:
-    """The closure submit_write ships executes on the store's OWNER thread (the
-    lifespan/loop thread), never the threadpool worker the route may run on —
-    the whole point of fanning the write in (ADR-001)."""
-    path = str(tmp_path / "cab.store")
-    _seed(path)
-    recorded: dict[str, int] = {}
-
+def _make_probe_app(path: str, recorded: dict[str, int]) -> FastAPI:
+    """Build an app whose POST /probe records the route's and the closure's thread ids."""
     app = create_app(path)
 
     @app.post("/probe")
-    async def probe(writer=Depends(submit_write)):  # noqa: ANN202
-        # The route coroutine runs on the loop (owner) thread.
+    async def probe(writer: Annotated[_OwnerWriter, Depends(submit_write)]) -> dict[str, bool]:
         route_thread = threading.get_ident()
 
         def on_owner(store: Store) -> int:
@@ -370,9 +200,241 @@ def test_submit_write_runs_on_the_owner_not_the_caller_thread(tmp_path) -> None:
         recorded["owner"] = owner_thread
         return {"same": route_thread == owner_thread}
 
+    return app
+
+
+# --- the REST app: lifespan + read + write dependencies -----------------------
+
+
+def test_app_state_holds_no_store_before_the_lifespan_runs(seeded_path: str) -> None:
+    """Given an app created over a seeded store path
+    When nothing has entered the lifespan yet
+    Then app.state holds no store
+    """
+    app = create_app(seeded_path)
+
+    store_before_startup = getattr(app.state, STORE_STATE_KEY, None)
+
+    assert store_before_startup is None
+
+
+def test_lifespan_opens_the_store_on_startup(seeded_path: str) -> None:
+    """Given an app created over a seeded store path
+    When a client enters the app's lifespan
+    Then app.state holds an open Store
+    """
+    app = create_app(seeded_path)
+
+    with TestClient(app):
+        store = getattr(app.state, STORE_STATE_KEY, None)
+
+        assert isinstance(store, Store)
+
+
+def test_lifespan_closes_the_store_on_shutdown(seeded_path: str) -> None:
+    """Given an app whose lifespan opened the store
+    When the client leaves the lifespan
+    Then the store is closed
+    """
+    app = create_app(seeded_path)
+    with TestClient(app):
+        store = getattr(app.state, STORE_STATE_KEY)
+
+    assert store._closed
+
+
+def test_snapshot_get_reads_committed_state(seeded_path: str) -> None:
+    """Given a committed quartz and a snapshot-backed GET route
+    When a client GETs the quartz
+    Then the response is 200
+    And the body holds the quartz as committed
+    """
+    with TestClient(_make_rest_app(seeded_path)) as client:
+        resp = client.get("/minerals/Q1")
+
+    assert resp.status_code == 200
+    assert resp.json() == {"found": True, "qid": "Q1", "name": "Quartz", "mohs": 7.0}
+
+
+def test_submit_post_commits_and_returns_the_tid(seeded_path: str) -> None:
+    """Given a POST route that ships its write through submit_write
+    When a client POSTs a new calcite
+    Then the response is 200
+    And the committed TID is positive
+    """
+    with TestClient(_make_rest_app(seeded_path)) as client:
+        resp = client.post("/minerals/Q2", params={"name": "Calcite"})
+
+    assert resp.status_code == 200
+    assert resp.json()["committed_tid"] > 0
+
+
+def test_posted_mineral_is_read_back_by_a_snapshot_get(seeded_path: str) -> None:
+    """Given a calcite POSTed through submit_write
+    When a client GETs the calcite
+    Then the response is 200
+    And the body holds the calcite
+    """
+    with TestClient(_make_rest_app(seeded_path)) as client:
+        client.post("/minerals/Q2", params={"name": "Calcite"})
+
+        got = client.get("/minerals/Q2")
+
+    assert got.status_code == 200
+    assert got.json() == {"found": True, "qid": "Q2", "name": "Calcite", "mohs": None}
+
+
+def test_foreign_thread_direct_write_still_raises_wrong_thread(seeded_path: str) -> None:
+    """Given a sync route that writes the live store directly
+    When a client POSTs to it
+    Then the route reports WrongThreadError was raised
+    """
+    with TestClient(_make_rest_app(seeded_path)) as client:
+        resp = client.post("/minerals/Q3/direct")
+
+    assert resp.status_code == 200
+    assert resp.json() == {"raised": True}
+
+
+def test_rejected_direct_write_does_not_land(seeded_path: str) -> None:
+    """Given a direct write from a foreign thread that raised WrongThreadError
+    When a client GETs the mineral it tried to write
+    Then the mineral is absent
+    """
+    with TestClient(_make_rest_app(seeded_path)) as client:
+        client.post("/minerals/Q3/direct")
+
+        got = client.get("/minerals/Q3")
+
+    assert got.json() == {"found": False}
+
+
+# --- the GraphQL app: per-request snapshot context + DataLoader ---------------
+
+
+def test_graphql_resolves_two_level_nested_graph_through_the_loader(seeded_path: str) -> None:
+    """Given a committed quartz pointing at St Gotthard and a GraphQL app
+    When a client queries the quartz with its type locality
+    Then the response is 200
+    And the body holds no errors
+    And the data holds the quartz with its type locality
+    """
+    query = '{ mineral(qid: "Q1") { qid name mohs typeLocality { qid name country } } }'
+
+    with TestClient(_make_graphql_app(seeded_path)) as client:
+        resp = client.post("/graphql", json={"query": query})
+
+    body = resp.json()
+    assert resp.status_code == 200
+    assert body.get("errors") is None
+    assert body["data"] == {
+        "mineral": {
+            "qid": "Q1",
+            "name": "Quartz",
+            "mohs": 7.0,
+            "typeLocality": {"qid": "L1", "name": "St Gotthard", "country": "CH"},
+        }
+    }
+
+
+# --- the dependencies in isolation (the contracts the routes above rely on) ----
+
+
+def test_get_store_without_lifespan_fails_loudly() -> None:
+    """Given an app wired without store_lifespan and a route depending on get_store
+    When a client GETs the route
+    Then the response is a 500
+    """
+    app = FastAPI()
+
+    @app.get("/x")
+    def x(store: Annotated[Store, Depends(get_store)]) -> dict[str, bool]:
+        return {"ok": store is not None}
+
+    # raise_server_exceptions=False: the RuntimeError surfaces as a 500 response
+    with TestClient(app, raise_server_exceptions=False) as client:
+        resp = client.get("/x")
+
+    assert resp.status_code == 500
+
+
+def test_read_snapshot_is_pooled_per_watermark(seeded_path: str) -> None:
+    """Given an app whose /peek route records its snapshot
+    When a client GETs /peek twice at one watermark
+    Then both requests were handed the same snapshot
+    And that snapshot is still open
+    """
+    seen: list[Snapshot] = []
+    app = create_app(seeded_path)
+    _add_peek_route(app, seen)
+
     with TestClient(app) as client:
+        client.get("/peek")
+        client.get("/peek")
+
+        assert len(seen) == 2
+        assert seen[0] is seen[1]
+        assert not seen[0]._core.closed
+
+
+def test_pooled_snapshot_is_closed_on_shutdown(seeded_path: str) -> None:
+    """Given a pooled snapshot handed to a /peek request
+    When the client leaves the lifespan
+    Then the snapshot is closed
+    """
+    seen: list[Snapshot] = []
+    app = create_app(seeded_path)
+    _add_peek_route(app, seen)
+    with TestClient(app) as client:
+        client.get("/peek")
+
+    assert seen[0]._core.closed
+
+
+def test_snapshot_pool_refreshes_when_a_commit_advances_the_watermark(seeded_path: str) -> None:
+    """Given a /peek read at watermark T and a POST that commits T+1
+    When a client GETs /peek again
+    Then the second request got a different snapshot
+    And the second snapshot's tid is later than the first's
+    And the superseded snapshot is closed
+    """
+    seen: list[Snapshot] = []
+    app = _make_rest_app(seeded_path)
+    _add_peek_route(app, seen)
+
+    with TestClient(app) as client:
+        client.get("/peek")
+        client.post("/minerals/NEW", params={"name": "Beryl"})
+
+        client.get("/peek")
+
+    assert len(seen) == 2
+    assert seen[0] is not seen[1]
+    assert seen[0].tid < seen[1].tid
+    assert seen[0]._core.closed
+
+
+def test_store_lifespan_factory_builds_the_lifespan_cm(seeded_path: str) -> None:
+    """Given the factory store_lifespan returns for a store path
+    When it is called with an app
+    Then it returns the store-lifespan context manager
+    """
+    factory = store_lifespan(seeded_path)
+
+    cm = factory(FastAPI())
+
+    assert isinstance(cm, _StoreLifespan)
+
+
+def test_submit_write_runs_on_the_owner_not_the_caller_thread(seeded_path: str) -> None:
+    """Given an async route that submits a closure returning its thread id
+    When a client POSTs to the route
+    Then the closure ran on the route coroutine's own thread, the owner thread
+    """
+    recorded: dict[str, int] = {}
+
+    with TestClient(_make_probe_app(seeded_path, recorded)) as client:
         resp = client.post("/probe")
-        assert resp.status_code == 200
-        # Async route on the loop == the store's owner thread, so submit ran the
-        # closure inline on that very thread.
-        assert recorded["route"] == recorded["owner"]
+
+    assert resp.status_code == 200
+    assert recorded["route"] == recorded["owner"]

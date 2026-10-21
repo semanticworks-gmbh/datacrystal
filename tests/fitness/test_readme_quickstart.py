@@ -24,41 +24,45 @@ from pathlib import Path
 README = Path(__file__).resolve().parents[2] / "README.md"
 
 
-def _first_python_block(readme: str) -> str:
-    m = re.search(r"```python\n(.*?)```", readme, re.DOTALL)
-    assert m, "README.md must contain a ```python fenced quickstart block"
-    return m.group(1)
+def _first_python_block(readme: str) -> str | None:
+    match = re.search(r"```python\n(.*?)```", readme, re.DOTALL)
+    return match.group(1) if match else None
 
 
-def _final_int(stdout: str) -> int:
-    """The last non-blank stdout line is the run counter (store.root['runs'])."""
-    lines = [ln.strip() for ln in stdout.splitlines() if ln.strip()]
-    assert lines, f"quickstart produced no stdout to prove persistence: {stdout!r}"
-    last = lines[-1]
-    assert last.isdigit(), f"expected the final quickstart line to be the run count, got {last!r}"
-    return int(last)
+def _last_line(stdout: str) -> str:
+    """Return the last non-blank stdout line, the run counter (store.root['runs'])."""
+    lines = [line.strip() for line in stdout.splitlines() if line.strip()]
+    return lines[-1] if lines else ""
 
 
-def test_readme_quickstart_runs_twice_and_persists(tmp_path: Path):
+def test_readme_quickstart_runs_twice_and_persists(tmp_path: Path) -> None:
+    """Given the README's first python block saved as a script in a clean directory
+    When the script runs twice in that directory
+    Then the second run reopens the first run's store, so the run counter reads 2
+    """
     block = _first_python_block(README.read_text())
+    assert block is not None, "README.md must contain a ```python fenced quickstart block"
     script = tmp_path / "quickstart.py"
     script.write_text(block)
 
-    counts: list[int] = []
-    for run in (1, 2):
-        result = subprocess.run(
-            [sys.executable, str(script)],
-            cwd=str(tmp_path),
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-        assert result.returncode == 0, (
-            f"README quickstart failed on run {run} (rc={result.returncode}):\n{result.stderr}"
-        )
-        counts.append(_final_int(result.stdout))
-
-    # Persistence: the second run reopened the first run's store, so the counter advanced.
-    assert counts[1] > counts[0], (
-        f"README quickstart did not persist across runs — run-count did not increment: {counts}"
+    first_run = subprocess.run(
+        [sys.executable, str(script)],
+        cwd=str(tmp_path),
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
     )
+    second_run = subprocess.run(
+        [sys.executable, str(script)],
+        cwd=str(tmp_path),
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+
+    assert first_run.returncode == 0, f"first run failed:\n{first_run.stderr}"
+    assert second_run.returncode == 0, f"second run failed:\n{second_run.stderr}"
+    assert _last_line(first_run.stdout) == "1"
+    assert _last_line(second_run.stdout) == "2", "the run counter did not persist across runs"

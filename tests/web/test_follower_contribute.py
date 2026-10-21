@@ -8,6 +8,8 @@ capstone, which stands up a real-threaded server):
   computes the OCC base, and hands them to the contribute hook (here a stub);
 * the serializer — ``_contribute`` projects entities to the wire ops and
   translates a coordinator 409 into the typed local exception.
+
+Both layers run over both ``store_factory`` backends (the ``store`` fixture).
 """
 
 from __future__ import annotations
@@ -37,128 +39,188 @@ class Specimen:
     scan: Annotated[bytes, dc.Blob] = b""
 
 
-def test_commit_contributes_new_entity(store_factory) -> None:
-    store = store_factory()
-    sent: list[tuple[Any, str | None]] = []
+class _ContributeStub:
+    """Stand in for a follower's contribute hook: record the items, answer a fixed TID."""
 
-    def stub(items: list[tuple[Any, str | None]]) -> int:
-        sent.extend(items)
-        return 7
+    def __init__(self, tid: int) -> None:
+        self.tid = tid
+        self.sent: list[tuple[Any, str | None]] = []
 
-    try:
-        store._contribute_fn = stub  # a follower's commit() fans in via this hook
-        store.upsert(Mineral(qid="QN", name="New"))
-        tid = store.commit()
-        assert tid == 7
-        assert len(sent) == 1
-        obj, base = sent[0]
-        assert obj.qid == "QN" and base is None  # NEW → base None
-        assert not store._new  # buffers cleared on success
-    finally:
-        store.close()
-
-
-def test_commit_contributes_dirty_entity_with_read_base(store_factory) -> None:
-    store = store_factory()
-    sent: list[tuple[Any, str | None]] = []
-
-    def stub(items: list[tuple[Any, str | None]]) -> int:
-        sent.extend(items)
-        return 9
-
-    try:
-        store.upsert(Mineral(qid="QD", name="Old", mohs=5.0))
-        store.commit()  # a normal local commit (no contribute hook yet)
-        base_expected = store._payload_digest(type_info(Mineral), "qid", "QD")
-        store._contribute_fn = stub
-        m = store.get(Mineral, qid="QD")
-        assert m is not None
-        m.mohs = 6.0  # an edit → DIRTY
-        assert store.commit() == 9
-        obj, base = sent[0]
-        assert obj.qid == "QD" and base == base_expected  # DIRTY → the read hash
-    finally:
-        store.close()
+    def __call__(self, items: list[tuple[Any, str | None]]) -> int:
+        self.sent.extend(items)
+        return self.tid
 
 
 class _FakeResp:
-    def __init__(self, status: int, data: Any) -> None:
+    def __init__(self, status: int, data: object) -> None:
         self.status_code = status
         self.content = b"{}"
         self._data = data
 
-    def json(self) -> Any:
+    def json(self) -> object:
         return self._data
 
 
 class _FakeClient:
     def __init__(self, resp: _FakeResp) -> None:
         self.resp = resp
-        self.posted: tuple[str, Any] | None = None
+        self.posted: tuple[str, dict[str, Any]] | None = None
 
-    def post(self, path: str, json: Any) -> _FakeResp:
+    def post(self, path: str, json: dict[str, Any]) -> _FakeResp:
         self.posted = (path, json)
         return self.resp
 
 
-def test_contribute_serializes_ops_and_returns_tid(store) -> None:
-    store.upsert(Mineral(qid="QS", name="Quartz", mohs=7.0))
+def _committed_mineral(store: dc.Store, **fields: object) -> Mineral:
+    """Commit a Mineral built from ``fields`` and return it as read back."""
+    store.upsert(Mineral(**fields))  # type: ignore[arg-type]
     store.commit()
-    m = store.get(Mineral, qid="QS")
+    qid = fields["qid"]
+    mineral = store.get(Mineral, qid=qid)
+    if mineral is None:
+        raise LookupError(f"mineral {qid} was not committed")
+    return mineral
+
+
+def test_commit_contributes_new_entity_with_no_base(store: dc.Store) -> None:
+    """Given a follower store whose contribute hook answers TID 7
+    When a new mineral is upserted and committed
+    Then the commit returns TID 7
+    And exactly one item was sent
+    And the item is the new mineral with base None
+    And the new-entity buffer is cleared
+    """
+    stub = _ContributeStub(tid=7)
+    store._contribute_fn = stub
+    store.upsert(Mineral(qid="QN", name="New"))
+
+    tid = store.commit()
+
+    assert tid == 7
+    assert len(stub.sent) == 1
+    obj, base = stub.sent[0]
+    assert obj.qid == "QN"
+    assert base is None
+    assert not store._new
+
+
+def test_commit_contributes_dirty_entity_with_the_read_base(store: dc.Store) -> None:
+    """Given a committed mineral read back and edited after the contribute hook is set
+    When the follower commits the edit
+    Then the commit returns the hook's TID 9
+    And the item is the edited mineral
+    And its base is the digest of the payload that was read
+    """
+    store.upsert(Mineral(qid="QD", name="Old", mohs=5.0))
+    store.commit()
+    base_expected = store._payload_digest(type_info(Mineral), "qid", "QD")
+    stub = _ContributeStub(tid=9)
+    store._contribute_fn = stub
+    mineral = store.get(Mineral, qid="QD")
+    assert mineral is not None
+    mineral.mohs = 6.0
+
+    tid = store.commit()
+
+    obj, base = stub.sent[0]
+    assert tid == 9
+    assert obj.qid == "QD"
+    assert base == base_expected
+
+
+def test_contribute_returns_the_applied_tid(store: dc.Store) -> None:
+    """Given a coordinator answering 200 with applied_tid 5
+    When a quartz is contributed with base abc
+    Then _contribute returns TID 5
+    """
+    quartz = _committed_mineral(store, qid="QS", name="Quartz", mohs=7.0)
     fake = _FakeClient(_FakeResp(200, {"applied_tid": 5, "keys": {"QS": 1}}))
-    tid = _contribute([(m, "abc")], url="http://x", api_key=None, client=fake)
+
+    tid = _contribute([(quartz, "abc")], url="http://x", api_key=None, client=fake)
+
     assert tid == 5
+
+
+def test_contribute_posts_one_serialized_op_to_submit(store: dc.Store) -> None:
+    """Given a coordinator answering 200
+    When a quartz is contributed with base abc
+    Then exactly the /v1/submit path is posted
+    And the op names the Mineral type and the qid key
+    And the op carries the base abc
+    And the op fields hold the quartz's qid and hardness
+    """
+    quartz = _committed_mineral(store, qid="QS", name="Quartz", mohs=7.0)
+    fake = _FakeClient(_FakeResp(200, {"applied_tid": 5, "keys": {"QS": 1}}))
+
+    _contribute([(quartz, "abc")], url="http://x", api_key=None, client=fake)
+
     assert fake.posted is not None
     path, body = fake.posted
-    assert path == "/v1/submit"
     op = body["ops"][0]
-    assert op["type"].endswith(":Mineral") and op["key"] == "qid" and op["base"] == "abc"
-    assert op["fields"]["qid"] == "QS" and op["fields"]["mohs"] == 7.0
+    assert path == "/v1/submit"
+    assert op["type"].endswith(":Mineral")
+    assert op["key"] == "qid"
+    assert op["base"] == "abc"
+    assert op["fields"]["qid"] == "QS"
+    assert op["fields"]["mohs"] == 7.0
 
 
-def test_contribute_translates_409_to_typed_exceptions(store) -> None:
-    store.upsert(Mineral(qid="QC", name="Calcite"))
-    store.commit()
-    m = store.get(Mineral, qid="QC")
+def test_contribute_translates_409_conflict_to_conflict_error(store: dc.Store) -> None:
+    """Given a coordinator answering 409 conflict with the message moved
+    When a calcite is contributed with a stale base
+    Then _contribute raises ConflictError
+    And the error message carries moved
+    """
+    calcite = _committed_mineral(store, qid="QC", name="Calcite")
     conflict = _FakeClient(_FakeResp(409, {"detail": {"error": "conflict", "message": "moved"}}))
+
     with pytest.raises(ConflictError) as conflict_exc:
-        _contribute([(m, "stale")], url="http://x", api_key=None, client=conflict)
-    assert "moved" in str(conflict_exc.value)  # the 409 body's message rides through
+        _contribute([(calcite, "stale")], url="http://x", api_key=None, client=conflict)
+
+    assert "moved" in str(conflict_exc.value)
+
+
+def test_contribute_translates_409_schema_skew_to_schema_skew_error(store: dc.Store) -> None:
+    """Given a coordinator answering 409 schema-skew with the message field
+    When a calcite is contributed
+    Then _contribute raises SchemaSkewError
+    And the error message carries field
+    """
+    calcite = _committed_mineral(store, qid="QC", name="Calcite")
     skew = _FakeClient(_FakeResp(409, {"detail": {"error": "schema-skew", "message": "field"}}))
+
     with pytest.raises(SchemaSkewError) as skew_exc:
-        _contribute([(m, None)], url="http://x", api_key=None, client=skew)
+        _contribute([(calcite, None)], url="http://x", api_key=None, client=skew)
+
     assert "field" in str(skew_exc.value)
 
 
-def test_commit_refuses_to_contribute_a_delete(store_factory) -> None:
-    store = store_factory()
-    sent: list[tuple[Any, str | None]] = []
-
-    def stub(items: list[tuple[Any, str | None]]) -> int:
-        sent.extend(items)
-        return 1
-
-    try:
-        store.upsert(Mineral(qid="QX", name="X"))
-        store.commit()  # local commit (no contribute hook yet)
-        store._contribute_fn = stub
-        store.delete(Mineral, qid="QX")  # a buffered delete
-        with pytest.raises(NotImplementedError):
-            store.commit()
-        assert not sent  # fail loud: the delete was NOT silently fanned in (or dropped)
-    finally:
-        store.close()
-
-
-def test_contribute_conflict_carries_envelope_fields(store) -> None:
-    """The follower-side ``ConflictError`` carries the LOCKED conflict envelope
-    (key/expected_base/actual_base) the coordinator sent, so a programmatic caller
-    can read ``exc.actual_base`` to drive its re-read (#155 re-verification fix —
-    the decode previously dropped the fields, keeping only the message).
+def test_commit_refuses_to_contribute_a_delete(store: dc.Store) -> None:
+    """Given a committed mineral and a contribute hook on the follower store
+    When the mineral is deleted and the delete is committed
+    Then the commit raises NotImplementedError
+    And nothing was fanned in
     """
-    store.upsert(Mineral(qid="QE", name="Quartz"))
+    store.upsert(Mineral(qid="QX", name="X"))
     store.commit()
-    m = store.get(Mineral, qid="QE")
+    stub = _ContributeStub(tid=1)
+    store._contribute_fn = stub
+    store.delete(Mineral, qid="QX")
+
+    with pytest.raises(NotImplementedError):
+        store.commit()
+
+    assert not stub.sent
+
+
+def test_contribute_conflict_carries_envelope_fields(store: dc.Store) -> None:
+    """Given a coordinator answering 409 with the full conflict envelope
+    When a quartz is contributed with base a-times-64
+    Then ConflictError carries the key QE
+    And it carries the expected base
+    And it carries the actual base
+    """
+    quartz = _committed_mineral(store, qid="QE", name="Quartz")
     envelope = {
         "error": "conflict",
         "key": "QE",
@@ -167,72 +229,89 @@ def test_contribute_conflict_carries_envelope_fields(store) -> None:
         "message": "moved",
     }
     fake = _FakeClient(_FakeResp(409, {"detail": envelope}))
+
     with pytest.raises(ConflictError) as exc:
-        _contribute([(m, "a" * 64)], url="http://x", api_key=None, client=fake)
+        _contribute([(quartz, "a" * 64)], url="http://x", api_key=None, client=fake)
+
     assert exc.value.key == "QE"
     assert exc.value.expected_base == "a" * 64
     assert exc.value.actual_base == "b" * 64
 
 
-def test_contribute_refuses_entity_in_unsupported_container(store) -> None:
-    """An @entity nested in a bare ``list`` field would land as a bare int on the
-    coordinator (the OID-int boundary cannot rebind it) — fail loud before the
-    wire, never silently corrupt (#153 peer-review fix, FEDERATION-WIRE-v1 §5).
+def test_contribute_refuses_entity_in_unsupported_container(store: dc.Store) -> None:
+    """Given a mineral holding a committed locality inside its bare list field tags
+    When it is contributed
+    Then _contribute raises NotImplementedError
+    And nothing was posted
     """
     store.store(Locality(qid="LB", name="Tsumeb"))
     store.commit()
     loc = store.get(Locality, qid="LB")
-    # a committed Locality placed inside Mineral.tags (a bare ``list`` field)
     mineral = Mineral(qid="QB", name="X", tags=[loc])
     fake = _FakeClient(_FakeResp(200, {"applied_tid": 1, "keys": {}}))
+
     with pytest.raises(NotImplementedError):
         _contribute([(mineral, None)], url="http://x", api_key=None, client=fake)
-    assert fake.posted is None  # the unfederatable container ref never crossed
 
-
-def test_contribute_refuses_blob_field(store) -> None:
-    """A ``dc.Blob`` field has no create-face wire shape — a follower must refuse
-    to contribute a blob-bearing entity, loudly, never silently inline its bytes
-    (#153 peer-review fix, FEDERATION-WIRE-v1 §5).
-    """
-    spec = Specimen(qid="SP", scan=b"\x89PNG not-utf8 bytes")
-    fake = _FakeClient(_FakeResp(200, {"applied_tid": 1, "keys": {}}))
-    with pytest.raises(NotImplementedError):
-        _contribute([(spec, None)], url="http://x", api_key=None, client=fake)
     assert fake.posted is None
 
 
-def test_contribute_noop_returns_none_not_typeerror(store) -> None:
-    """A coordinator ``applied_tid: null`` (the documented no-op / idempotent
-    re-send response) returns ``None`` cleanly, never ``int(None)`` → TypeError
-    (#155 peer-review fix).
+def test_contribute_refuses_blob_field(store: dc.Store) -> None:
+    """Given a specimen with a dc.Blob scan
+    When it is contributed
+    Then _contribute raises NotImplementedError
+    And nothing was posted
     """
-    store.upsert(Mineral(qid="QZ", name="Z"))
-    store.commit()
-    m = store.get(Mineral, qid="QZ")
+    spec = Specimen(qid="SP", scan=b"\x89PNG not-utf8 bytes")
+    fake = _FakeClient(_FakeResp(200, {"applied_tid": 1, "keys": {}}))
+
+    with pytest.raises(NotImplementedError):
+        _contribute([(spec, None)], url="http://x", api_key=None, client=fake)
+
+    assert fake.posted is None
+
+
+def test_contribute_noop_returns_none_not_typeerror(store: dc.Store) -> None:
+    """Given a coordinator answering 200 with applied_tid null, the idempotent re-send
+    When a mineral is contributed
+    Then _contribute returns None
+    """
+    mineral = _committed_mineral(store, qid="QZ", name="Z")
     fake = _FakeClient(_FakeResp(200, {"applied_tid": None, "keys": {"QZ": 1}}))
-    assert _contribute([(m, "base")], url="http://x", api_key=None, client=fake) is None
+
+    tid = _contribute([(mineral, "base")], url="http://x", api_key=None, client=fake)
+
+    assert tid is None
 
 
-def test_contribute_translates_dangling_ref_faithfully(store) -> None:
-    """A 409 ``dangling-ref`` maps to ``DanglingRefError``, not folded into
-    ``ConflictError`` ("re-read and retry" is wrong for a dangle) (#153/#155 fix).
+def test_contribute_translates_dangling_ref_faithfully(store: dc.Store) -> None:
+    """Given a coordinator answering 409 dangling-ref with the message gone
+    When a calcite is contributed
+    Then _contribute raises DanglingRefError
+    And the error message carries gone
     """
-    store.upsert(Mineral(qid="QC", name="Calcite"))
-    store.commit()
-    m = store.get(Mineral, qid="QC")
+    calcite = _committed_mineral(store, qid="QC", name="Calcite")
     fake = _FakeClient(_FakeResp(409, {"detail": {"error": "dangling-ref", "message": "gone"}}))
+
     with pytest.raises(DanglingRefError) as exc:
-        _contribute([(m, "x")], url="http://x", api_key=None, client=fake)
+        _contribute([(calcite, "x")], url="http://x", api_key=None, client=fake)
+
     assert "gone" in str(exc.value)
 
 
-def test_contribute_refuses_new_to_new_reference(store) -> None:
+def test_contribute_refuses_new_to_new_reference(store: dc.Store) -> None:
+    """Given a new mineral referencing a new, not yet committed locality
+    When both are contributed
+    Then _contribute raises NotImplementedError
+    And nothing crossed the wire
+    """
     loc = Locality(qid="LZ", name="Zomba")
     mineral = Mineral(qid="QM", name="X", type_locality=dc.Lazy.of(loc))
     store.store(loc)
-    store.store(mineral)  # both NEW; mineral references the not-yet-committed loc
+    store.store(mineral)
     fake = _FakeClient(_FakeResp(200, {"applied_tid": 1, "keys": {}}))
+
     with pytest.raises(NotImplementedError):
         _contribute([(mineral, None), (loc, None)], url="http://x", api_key=None, client=fake)
-    assert fake.posted is None  # the unsafe follower-local OID never crossed the wire
+
+    assert fake.posted is None
