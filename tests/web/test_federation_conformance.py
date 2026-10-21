@@ -27,8 +27,8 @@ from __future__ import annotations
 
 import socket
 import threading
-import time
-from typing import Any, Iterator
+from collections.abc import Callable, Iterator
+from pathlib import Path
 
 import pytest
 
@@ -42,6 +42,7 @@ from fastapi import FastAPI
 
 import datacrystal as dc
 from datacrystal import ConflictError
+from datacrystal._follower import _apply_catchup, _contribute, _iter_frames
 from datacrystal._storage.memory import MemoryBackend
 from datacrystal.contract.applier import DeltaGapError
 from datacrystal.deltalog import DeltaLog
@@ -52,12 +53,29 @@ from tests.conftest import Locality, Mineral
 _MINERAL = f"{Mineral.__module__}:{Mineral.__qualname__}"
 
 
+def _apply_all(consumer: CountingConsumer, deltas: list[dict]) -> None:
+    for delta in deltas:
+        consumer.apply(delta)
+
+
 def _free_port() -> int:
     """Bind ``:0`` to claim a free TCP port, then release it for uvicorn."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind(("127.0.0.1", 0))
         return sock.getsockname()[1]
+
+
+class _ReadyServer(uvicorn.Server):
+    """A uvicorn server that sets an event once it accepts connections."""
+
+    def __init__(self, config: uvicorn.Config, ready: threading.Event) -> None:
+        super().__init__(config)
+        self._ready = ready
+
+    async def startup(self, sockets: list[socket.socket] | None = None) -> None:
+        await super().startup(sockets)
+        self._ready.set()
 
 
 class _CoordinatorServer:
@@ -69,13 +87,14 @@ class _CoordinatorServer:
     ``check_delta_consumer`` scenario, which reads the served change-feed.
     """
 
-    def __init__(self, open_store: Any, log_dir: str) -> None:
+    def __init__(self, open_store: Callable[[], dc.Store], log_dir: str) -> None:
         self._open_store = open_store
         self._log_dir = log_dir
         self.port = _free_port()
         self.store: dc.Store | None = None
         self.log: DeltaLog | None = None
         self._server: uvicorn.Server | None = None
+        self._ready = threading.Event()
         self._error: BaseException | None = None
         self._thread = threading.Thread(target=self._run, name="coordinator", daemon=True)
 
@@ -85,15 +104,10 @@ class _CoordinatorServer:
 
     def start(self) -> None:
         self._thread.start()
-        deadline = time.monotonic() + 10.0
-        while time.monotonic() < deadline:
-            if self._error is not None:
-                raise RuntimeError("coordinator server failed to start") from self._error
-            server = self._server
-            if server is not None and server.started:
-                return
-            time.sleep(0.02)
-        raise TimeoutError("coordinator server did not become ready within 10s")
+        if not self._ready.wait(timeout=10.0):
+            raise TimeoutError("coordinator server did not become ready within 10s")
+        if self._error is not None:
+            raise RuntimeError("coordinator server failed to start") from self._error
 
     def stop(self) -> None:
         server = self._server
@@ -124,106 +138,244 @@ class _CoordinatorServer:
                 log_level="warning",
                 lifespan="off",
             )
-            server = uvicorn.Server(config)
+            server = _ReadyServer(config, self._ready)
             self._server = server
             try:
                 server.run()  # owns the event loop on THIS thread until should_exit
             finally:
                 store.close()  # close on the owner thread (ADR-001)
-        except BaseException as exc:  # noqa: BLE001 - surface the startup failure
+        except BaseException as exc:  # noqa: BLE001 - surface the startup failure to start()
             self._error = exc
+            self._ready.set()
 
 
-@pytest.fixture(params=["memory", "sqlite"])
-def coordinator(request: pytest.FixtureRequest, tmp_path: Any) -> Iterator[_CoordinatorServer]:
-    """A live coordinator over BOTH backends, opened on the server thread.
-
-    memory  → ``Store._from_backend(MemoryBackend())`` (the conftest store_factory
-              memory mode); sqlite → ``Store.open(tmp_path/'coord')``.
-    """
-    if request.param == "memory":
+def _started_server(
+    backend_kind: str, tmp_path: Path, principal: dc.Principal | None = None
+) -> _CoordinatorServer:
+    """Start a coordinator over the memory or the sqlite backend, opened on the server thread."""
+    if backend_kind == "memory":
         backend = MemoryBackend()
 
         def open_store() -> dc.Store:
-            return dc.Store._from_backend(backend)  # pyright: ignore[reportPrivateUsage]
+            return dc.Store._from_backend(backend, principal=principal)
+
     else:
 
         def open_store() -> dc.Store:
-            return dc.Store.open(tmp_path / "coord")
+            return dc.Store.open(tmp_path / "coord", principal=principal)
 
     server = _CoordinatorServer(open_store, log_dir=str(tmp_path / "coordlog"))
     server.start()
-    try:
-        yield server
-    finally:
-        server.stop()
+    return server
 
 
-def _head_tid(base_url: str) -> int:
-    with httpx.Client(base_url=base_url) as client:
-        return int(client.get("/v1/head").json()["tid"])
+@pytest.fixture(params=["memory", "sqlite"])
+def coordinator(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[_CoordinatorServer]:
+    """Start a live coordinator over BOTH backends, opened on the server thread."""
+    server = _started_server(request.param, tmp_path)
+    yield server
+    server.stop()
+
+
+@pytest.fixture(params=["memory", "sqlite"])
+def operator_coordinator(
+    request: pytest.FixtureRequest, tmp_path: Path
+) -> Iterator[_CoordinatorServer]:
+    """Start a live coordinator over BOTH backends whose ambient principal has uid 42."""
+    server = _started_server(request.param, tmp_path, principal=dc.Principal(uid=42))
+    yield server
+    server.stop()
+
+
+@pytest.fixture
+def connect_follower() -> Iterator[Callable[[_CoordinatorServer], dc.Store]]:
+    """Provide a factory opening in-memory followers of a coordinator, all closed at teardown."""
+    opened: list[dc.Store] = []
+
+    def connect(server: _CoordinatorServer) -> dc.Store:
+        follower = dc.open_follower(server.base_url, path=None)
+        opened.append(follower)
+        return follower
+
+    yield connect
+    for follower in opened:
+        follower.close()
+
+
+@pytest.fixture
+def connect_http() -> Iterator[Callable[[_CoordinatorServer], httpx.Client]]:
+    """Provide a factory opening raw HTTP clients of a coordinator, all closed at teardown."""
+    opened: list[httpx.Client] = []
+
+    def connect(server: _CoordinatorServer) -> httpx.Client:
+        client = httpx.Client(base_url=server.base_url)
+        opened.append(client)
+        return client
+
+    yield connect
+    for client in opened:
+        client.close()
+
+
+@pytest.fixture
+def lagging_follower(
+    coordinator: _CoordinatorServer,
+    connect_follower: Callable[[_CoordinatorServer], dc.Store],
+) -> dc.Store:
+    """Open a follower, then let another follower commit two minerals ahead of it."""
+    follower = connect_follower(coordinator)
+    contributor = connect_follower(coordinator)
+    contributor.upsert(Mineral(qid="QG1", name="Gapstone1"))
+    contributor.commit()
+    contributor.upsert(Mineral(qid="QG2", name="Gapstone2"))
+    contributor.commit()
+    return follower
 
 
 # --- §3.a bootstrap-read -----------------------------------------------------
 
 
-def test_bootstrap_reads_seeded_data_locally(coordinator: _CoordinatorServer) -> None:
-    """A follower bootstraps replay-from-0 and reads the coordinator's seed locally."""
-    follower = dc.open_follower(coordinator.base_url, path=None)
-    try:
-        quartz = follower.get(Mineral, qid="Q1")
-        zomba = follower.get(Locality, qid="LZ")
-        assert quartz is not None and quartz.name == "Quartz" and quartz.mohs == 7.0
-        assert zomba is not None and zomba.name == "Zomba" and zomba.country == "MW"
-        assert {m.qid for m in follower.query(Mineral)} == {"Q1", "Q2"}
-        assert {loc.qid for loc in follower.query(Locality)} == {"LZ", "LT"}
-        assert follower.last_tid == _head_tid(coordinator.base_url)
-    finally:
-        follower.close()
+def test_bootstrap_reads_seeded_entities_by_key_locally(
+    coordinator: _CoordinatorServer,
+    connect_follower: Callable[[_CoordinatorServer], dc.Store],
+) -> None:
+    """Given a coordinator seeded with Quartz and the locality Zomba
+    When a follower bootstraps by replaying from 0
+    Then the follower reads Quartz by key with its name and hardness
+    And the follower reads Zomba by key with its name and country
+    """
+    follower = connect_follower(coordinator)
+
+    quartz = follower.get(Mineral, qid="Q1")
+    zomba = follower.get(Locality, qid="LZ")
+
+    assert quartz is not None
+    assert quartz.name == "Quartz"
+    assert quartz.mohs == 7.0
+    assert zomba is not None
+    assert zomba.name == "Zomba"
+    assert zomba.country == "MW"
+
+
+def test_bootstrap_queries_every_seeded_entity_locally(
+    coordinator: _CoordinatorServer,
+    connect_follower: Callable[[_CoordinatorServer], dc.Store],
+) -> None:
+    """Given a coordinator seeded with two minerals and two localities
+    When a follower bootstraps by replaying from 0
+    Then a local query finds both minerals
+    And a local query finds both localities
+    """
+    follower = connect_follower(coordinator)
+
+    assert {m.qid for m in follower.query(Mineral)} == {"Q1", "Q2"}
+    assert {loc.qid for loc in follower.query(Locality)} == {"LZ", "LT"}
+
+
+def test_bootstrap_lands_the_follower_on_the_coordinator_head(
+    coordinator: _CoordinatorServer,
+    connect_follower: Callable[[_CoordinatorServer], dc.Store],
+    connect_http: Callable[[_CoordinatorServer], httpx.Client],
+) -> None:
+    """Given a coordinator seeded by one commit
+    When a follower bootstraps by replaying from 0
+    Then the follower's watermark equals the coordinator's head
+    """
+    follower = connect_follower(coordinator)
+    http = connect_http(coordinator)
+
+    head = int(http.get("/v1/head").json()["tid"])
+
+    assert follower.last_tid == head
 
 
 # --- §3.b contribute-new -----------------------------------------------------
 
 
-def test_follower_contributes_new_entity_lands_on_coordinator(
+def test_follower_contribution_advances_the_coordinator_head(
     coordinator: _CoordinatorServer,
+    connect_follower: Callable[[_CoordinatorServer], dc.Store],
+    connect_http: Callable[[_CoordinatorServer], httpx.Client],
 ) -> None:
-    """A follower upsert+commit fans into the coordinator; the head advances."""
-    follower = dc.open_follower(coordinator.base_url, path=None)
-    try:
-        before = _head_tid(coordinator.base_url)
-        follower.upsert(Mineral(qid="Q3", name="Topaz", crystal_system="orthorhombic", mohs=8.0))
-        applied = follower.commit()
-        after = _head_tid(coordinator.base_url)
-        assert applied == after and after > before
-        # read-your-writes: the contribution synced back into the follower
-        topaz = follower.get(Mineral, qid="Q3")
-        assert topaz is not None and topaz.name == "Topaz" and topaz.mohs == 8.0
-    finally:
-        follower.close()
+    """Given a follower and the coordinator's head before any contribution
+    When the follower upserts a new topaz and commits
+    Then the commit returns the coordinator's new head
+    And the head is later than before
+    """
+    follower = connect_follower(coordinator)
+    http = connect_http(coordinator)
+    before = int(http.get("/v1/head").json()["tid"])
+
+    follower.upsert(Mineral(qid="Q3", name="Topaz", crystal_system="orthorhombic", mohs=8.0))
+    applied = follower.commit()
+
+    after = int(http.get("/v1/head").json()["tid"])
+    assert applied == after
+    assert after > before
+
+
+def test_follower_reads_its_own_contribution_back(
+    coordinator: _CoordinatorServer,
+    connect_follower: Callable[[_CoordinatorServer], dc.Store],
+) -> None:
+    """Given a follower that contributed a new topaz
+    When the follower reads the topaz by key
+    Then it finds the topaz with its name and hardness
+    """
+    follower = connect_follower(coordinator)
+    follower.upsert(Mineral(qid="Q3", name="Topaz", crystal_system="orthorhombic", mohs=8.0))
+    follower.commit()
+
+    topaz = follower.get(Mineral, qid="Q3")
+
+    assert topaz is not None
+    assert topaz.name == "Topaz"
+    assert topaz.mohs == 8.0
 
 
 # --- §3.c round-trip-to-2nd-follower -----------------------------------------
 
 
-def test_contribution_round_trips_to_a_second_follower(
+def test_second_follower_does_not_see_a_contribution_before_it_syncs(
     coordinator: _CoordinatorServer,
+    connect_follower: Callable[[_CoordinatorServer], dc.Store],
 ) -> None:
-    """f1 contributes; f2 (opened first) sees it only after sync()."""
-    f1 = dc.open_follower(coordinator.base_url, path=None)
-    f2 = dc.open_follower(coordinator.base_url, path=None)
-    try:
-        assert f2.get(Mineral, qid="Q4") is None  # not there yet
-        f1.upsert(Mineral(qid="Q4", name="Beryl", crystal_system="hexagonal", mohs=7.5))
-        f1.commit()
-        wm_before = f2.last_tid
-        wm_after = f2.sync()
-        assert wm_after > wm_before
-        beryl = f2.get(Mineral, qid="Q4")
-        assert beryl is not None and beryl.name == "Beryl" and beryl.mohs == 7.5
-    finally:
-        f1.close()
-        f2.close()
+    """Given two followers opened before the first contributes a beryl
+    When the first follower commits the beryl
+    Then the second follower does not hold the beryl yet
+    """
+    f1 = connect_follower(coordinator)
+    f2 = connect_follower(coordinator)
+
+    f1.upsert(Mineral(qid="Q4", name="Beryl", crystal_system="hexagonal", mohs=7.5))
+    f1.commit()
+
+    beryl_before_sync = f2.get(Mineral, qid="Q4")
+    assert beryl_before_sync is None
+
+
+def test_second_follower_sees_a_contribution_after_sync(
+    coordinator: _CoordinatorServer,
+    connect_follower: Callable[[_CoordinatorServer], dc.Store],
+) -> None:
+    """Given two followers opened before the first contributes a beryl
+    When the second follower syncs
+    Then its watermark advances
+    And it holds the beryl with its name and hardness
+    """
+    f1 = connect_follower(coordinator)
+    f2 = connect_follower(coordinator)
+    f1.upsert(Mineral(qid="Q4", name="Beryl", crystal_system="hexagonal", mohs=7.5))
+    f1.commit()
+    wm_before = f2.last_tid
+
+    wm_after = f2.sync()
+
+    beryl = f2.get(Mineral, qid="Q4")
+    assert wm_after > wm_before
+    assert beryl is not None
+    assert beryl.name == "Beryl"
+    assert beryl.mohs == 7.5
 
 
 # --- §3.d CROSS-ENTITY-REF (highest value) -----------------------------------
@@ -231,247 +383,298 @@ def test_contribution_round_trips_to_a_second_follower(
 
 def test_cross_entity_reference_resolves_to_the_right_locality(
     coordinator: _CoordinatorServer,
+    connect_follower: Callable[[_CoordinatorServer], dc.Store],
 ) -> None:
-    """A contributed Mineral referencing an ALREADY-COMMITTED coordinator Locality
-    round-trips so a 2nd follower resolves the ref to the RIGHT Locality (by qid).
+    """Given a mineral contributed with a reference to the coordinator's committed Tsumeb
+    When a second follower syncs and follows the mineral's type locality
+    Then it resolves Tsumeb by qid and name, not the other seeded locality
     """
-    f1 = dc.open_follower(coordinator.base_url, path=None)
-    f2 = dc.open_follower(coordinator.base_url, path=None)
-    try:
-        # The Locality already lives on the coordinator (seeded); its OID is the
-        # coordinator's OID (one in-process registry), so the ref is valid on the
-        # wire — the cross-ref bug this scenario surfaces.
-        tsumeb = f1.get(Locality, qid="LT")
-        assert tsumeb is not None
-        f1.upsert(
-            Mineral(qid="Q5", name="Smithsonite", mohs=4.5, type_locality=dc.Lazy.of(tsumeb))
-        )
+    f1 = connect_follower(coordinator)
+    f2 = connect_follower(coordinator)
+    # Tsumeb's OID is the coordinator's own (one in-process registry): the ref is valid on the wire
+    tsumeb = f1.get(Locality, qid="LT")
+    assert tsumeb is not None
+    f1.upsert(Mineral(qid="Q5", name="Smithsonite", mohs=4.5, type_locality=dc.Lazy.of(tsumeb)))
+    f1.commit()
+
+    f2.sync()
+
+    smithsonite = f2.get(Mineral, qid="Q5")
+    assert smithsonite is not None
+    assert smithsonite.name == "Smithsonite"
+    handle = smithsonite.type_locality
+    assert handle is not None
+    resolved = handle.get()
+    assert resolved is not None
+    assert resolved.qid == "LT"
+    assert resolved.name == "Tsumeb"
+
+
+def test_reference_to_an_uncommitted_locality_is_refused_and_never_lands(
+    coordinator: _CoordinatorServer,
+    connect_follower: Callable[[_CoordinatorServer], dc.Store],
+    connect_http: Callable[[_CoordinatorServer], httpx.Client],
+) -> None:
+    """Given a batch holding a new locality and a new mineral referencing it
+    When the follower commits the batch
+    Then the commit raises NotImplementedError
+    And the coordinator's head is unchanged
+    And a fresh follower finds neither the mineral nor the locality
+    """
+    f1 = connect_follower(coordinator)
+    http = connect_http(coordinator)
+    head_before = int(http.get("/v1/head").json()["tid"])
+    new_loc = Locality(qid="LX", name="Phantom", country="ZZ")
+    f1.store(new_loc)
+    f1.store(Mineral(qid="Q6", name="Ghostite", type_locality=dc.Lazy.of(new_loc)))
+
+    with pytest.raises(NotImplementedError):
         f1.commit()
 
-        f2.sync()
-        smithsonite = f2.get(Mineral, qid="Q5")
-        assert smithsonite is not None and smithsonite.name == "Smithsonite"
-        handle = smithsonite.type_locality
-        assert handle is not None
-        resolved = handle.get()
-        # the RIGHT Locality by qid — not merely non-None (LT, not the other LZ)
-        assert resolved is not None and resolved.qid == "LT" and resolved.name == "Tsumeb"
-
-        # the new→new guard: referencing a NOT-yet-committed Locality in the same
-        # batch must raise NotImplementedError (its follower-local OID is invalid
-        # on the coordinator) — and nothing crosses the wire.
-        head_before = _head_tid(coordinator.base_url)
-        new_loc = Locality(qid="LX", name="Phantom", country="ZZ")
-        f1.store(new_loc)
-        f1.store(Mineral(qid="Q6", name="Ghostite", type_locality=dc.Lazy.of(new_loc)))
-        with pytest.raises(NotImplementedError):
-            f1.commit()
-        # post-state: the unsafe contribution never landed on the coordinator
-        assert _head_tid(coordinator.base_url) == head_before
-        # the reject left f1's buffers intact (re-read-and-retry contract); a
-        # fresh follower proves nothing escaped to the coordinator.
-        f3 = dc.open_follower(coordinator.base_url, path=None)
-        try:
-            assert f3.get(Mineral, qid="Q6") is None and f3.get(Locality, qid="LX") is None
-        finally:
-            f3.close()
-    finally:
-        f1.close()
-        f2.close()
+    head_after = int(http.get("/v1/head").json()["tid"])
+    fresh = connect_follower(coordinator)
+    assert head_after == head_before
+    assert fresh.get(Mineral, qid="Q6") is None
+    assert fresh.get(Locality, qid="LX") is None
 
 
 # --- §3.e OCC conflict -------------------------------------------------------
 
 
-def test_occ_stale_base_commit_raises_conflict(coordinator: _CoordinatorServer) -> None:
-    """f1 reads X, f2 updates X first (legit current base), f1's stale commit conflicts."""
-    f1 = dc.open_follower(coordinator.base_url, path=None)
-    f2 = dc.open_follower(coordinator.base_url, path=None)
-    try:
-        m1 = f1.get(Mineral, qid="Q1")
-        assert m1 is not None and m1.mohs == 7.0
-        # f2 legitimately moves Q1 first (carries the CURRENT base)
-        m2 = f2.get(Mineral, qid="Q1")
-        assert m2 is not None
-        m2.mohs = 7.2
-        f2.commit()
-        # f1 now edits its stale Q1 and commits → base mismatch
-        m1.mohs = 9.9
-        with pytest.raises(ConflictError):
-            f1.commit()
-        # post-state: the coordinator holds f2's value, never f1's stale 9.9.
-        # (the reject leaves f1's buffer dirty per the re-read-and-retry contract,
-        # so verify the authoritative state through f2 and a fresh follower.)
-        winner = f2.get(Mineral, qid="Q1")
-        assert winner is not None and winner.mohs == 7.2
-        f3 = dc.open_follower(coordinator.base_url, path=None)
-        try:
-            authoritative = f3.get(Mineral, qid="Q1")
-            assert authoritative is not None and authoritative.mohs == 7.2
-        finally:
-            f3.close()
-    finally:
-        f1.close()
-        f2.close()
-
-
-def test_occ_conflict_recovery_loop_converges(coordinator: _CoordinatorServer) -> None:
-    """The documented OCC recovery loop runs end-to-end: after a ConflictError,
-    ``discard()`` → ``sync()`` → re-read → re-apply → ``commit()`` succeeds and the
-    graph converges (#153 peer-review fix — recovery was previously wedged because
-    ``sync()`` refused the dirty buffer and no ``discard()`` existed).
+def test_occ_stale_base_commit_raises_conflict_and_the_winner_stays(
+    coordinator: _CoordinatorServer,
+    connect_follower: Callable[[_CoordinatorServer], dc.Store],
+) -> None:
+    """Given f1 holds Quartz at hardness 7.0 and f2 has since committed 7.2
+    When f1 commits its stale edit to 9.9
+    Then the commit raises ConflictError
+    And f2 still reads 7.2
+    And a fresh follower reads 7.2
     """
-    f1 = dc.open_follower(coordinator.base_url, path=None)
-    f2 = dc.open_follower(coordinator.base_url, path=None)
-    try:
-        m1 = f1.get(Mineral, qid="Q2")
-        assert m1 is not None and m1.mohs == 3.0
-        # f2 moves Q2 first (carries the current base) → f1's edit goes stale
-        m2 = f2.get(Mineral, qid="Q2")
-        assert m2 is not None
-        m2.mohs = 3.5
-        f2.commit()
-        m1.mohs = 9.9
-        with pytest.raises(ConflictError):
-            f1.commit()
-        # recovery: drop the rejected edit, pull the winner, re-read, re-apply
-        f1.discard()
-        f1.sync()  # MUST NOT raise now (discard cleared the buffer)
-        m1b = f1.get(Mineral, qid="Q2")
-        assert m1b is not None and m1b.mohs == 3.5  # sees f2's committed value
-        m1b.mohs = 4.0
-        f1.commit()  # succeeds this time (base now matches)
-        # converged: f2 and a fresh follower both see 4.0, never f1's stale 9.9
-        f2.sync()
-        winner = f2.get(Mineral, qid="Q2")
-        assert winner is not None and winner.mohs == 4.0
-        f3 = dc.open_follower(coordinator.base_url, path=None)
-        try:
-            authoritative = f3.get(Mineral, qid="Q2")
-            assert authoritative is not None and authoritative.mohs == 4.0
-        finally:
-            f3.close()
-    finally:
-        f1.close()
-        f2.close()
+    f1 = connect_follower(coordinator)
+    f2 = connect_follower(coordinator)
+    m1 = f1.get(Mineral, qid="Q1")
+    assert m1 is not None
+    assert m1.mohs == 7.0
+    m2 = f2.get(Mineral, qid="Q1")
+    assert m2 is not None
+    m2.mohs = 7.2
+    f2.commit()
+    m1.mohs = 9.9
+
+    with pytest.raises(ConflictError):
+        f1.commit()
+
+    winner = f2.get(Mineral, qid="Q1")
+    authoritative = connect_follower(coordinator).get(Mineral, qid="Q1")
+    assert winner is not None
+    assert winner.mohs == 7.2
+    assert authoritative is not None
+    assert authoritative.mohs == 7.2
+
+
+def test_discard_then_sync_after_a_conflict_pulls_the_winning_value(
+    coordinator: _CoordinatorServer,
+    connect_follower: Callable[[_CoordinatorServer], dc.Store],
+) -> None:
+    """Given f1's stale edit of Calcite was rejected after f2 committed 3.5
+    When f1 discards its buffer and syncs
+    Then f1 re-reads Calcite at 3.5
+    """
+    f1 = connect_follower(coordinator)
+    f2 = connect_follower(coordinator)
+    m1 = f1.get(Mineral, qid="Q2")
+    assert m1 is not None
+    assert m1.mohs == 3.0
+    m2 = f2.get(Mineral, qid="Q2")
+    assert m2 is not None
+    m2.mohs = 3.5
+    f2.commit()
+    m1.mohs = 9.9
+    with pytest.raises(ConflictError):
+        f1.commit()
+
+    f1.discard()
+    f1.sync()
+
+    reread = f1.get(Mineral, qid="Q2")
+    assert reread is not None
+    assert reread.mohs == 3.5
+
+
+def test_recommit_after_conflict_recovery_converges_on_the_new_value(
+    coordinator: _CoordinatorServer,
+    connect_follower: Callable[[_CoordinatorServer], dc.Store],
+) -> None:
+    """Given f1 discarded and synced after a rejected stale edit of Calcite
+    When f1 re-applies hardness 4.0 and commits
+    Then f2 reads 4.0 after a sync
+    And a fresh follower reads 4.0, never the stale 9.9
+    """
+    f1 = connect_follower(coordinator)
+    f2 = connect_follower(coordinator)
+    m1 = f1.get(Mineral, qid="Q2")
+    assert m1 is not None
+    m2 = f2.get(Mineral, qid="Q2")
+    assert m2 is not None
+    m2.mohs = 3.5
+    f2.commit()
+    m1.mohs = 9.9
+    with pytest.raises(ConflictError):
+        f1.commit()
+    f1.discard()
+    f1.sync()
+    reread = f1.get(Mineral, qid="Q2")
+    assert reread is not None
+    reread.mohs = 4.0
+
+    f1.commit()
+
+    f2.sync()
+    winner = f2.get(Mineral, qid="Q2")
+    authoritative = connect_follower(coordinator).get(Mineral, qid="Q2")
+    assert winner is not None
+    assert winner.mohs == 4.0
+    assert authoritative is not None
+    assert authoritative.mohs == 4.0
 
 
 def test_committing_recovers_a_conflict_without_a_manual_loop(
     coordinator: _CoordinatorServer,
+    connect_follower: Callable[[_CoordinatorServer], dc.Store],
 ) -> None:
-    """``store.committing()`` re-runs the block against fresh state on a conflict
-    and converges — the recommended DX, no hand-written discard/sync loop, and the
-    increment is re-applied to the WINNING value (never last-writer-wins) (#153).
+    """Given f2 moved Calcite from 3.0 to 5.0 so f1's replica is stale
+    When f1 increments Calcite by 1.0 through two committing() attempts
+    Then Calcite converges on 6.0, the winning 5.0 plus 1.0
     """
-    f1 = dc.open_follower(coordinator.base_url, path=None)
-    f2 = dc.open_follower(coordinator.base_url, path=None)
-    try:
-        # f2 moves Q2 (3.0 → 5.0) first; f1's replica is now stale.
-        m2 = f2.get(Mineral, qid="Q2")
-        assert m2 is not None
-        m2.mohs = 5.0
-        f2.commit()
-        # f1 increments Q2 via committing(): attempt 1 conflicts on the stale base,
-        # committing() discards+syncs+re-reads f2's 5.0, attempt 2 applies +1.0.
-        for txn in f1.committing(retries=5):
-            with txn:
-                m1 = f1.get(Mineral, qid="Q2")
-                assert m1 is not None
-                m1.mohs = (m1.mohs or 0) + 1.0
-        # converged on 6.0 = f2's winning 5.0 + 1.0 — proves the retry re-read fresh
-        # state (a lost-update bug would leave 4.0 = stale 3.0 + 1.0).
-        f2.sync()
-        winner = f2.get(Mineral, qid="Q2")
-        assert winner is not None and winner.mohs == 6.0
-    finally:
-        f1.close()
-        f2.close()
+    f1 = connect_follower(coordinator)
+    f2 = connect_follower(coordinator)
+    m2 = f2.get(Mineral, qid="Q2")
+    assert m2 is not None
+    m2.mohs = 5.0
+    f2.commit()
+
+    attempts = f1.committing(retries=5)
+    first_attempt = next(attempts)
+    with first_attempt:  # conflicts on the stale base, discards and syncs
+        m1 = f1.get(Mineral, qid="Q2")
+        assert m1 is not None
+        m1.mohs = (m1.mohs or 0) + 1.0
+    second_attempt = next(attempts)
+    with second_attempt:  # re-reads f2's 5.0 and applies +1.0 again
+        m1 = f1.get(Mineral, qid="Q2")
+        assert m1 is not None
+        m1.mohs = (m1.mohs or 0) + 1.0
+
+    f2.sync()
+    winner = f2.get(Mineral, qid="Q2")
+    assert winner is not None
+    assert winner.mohs == 6.0
 
 
-def test_committing_exhausts_retries_and_raises(coordinator: _CoordinatorServer) -> None:
-    """``retries=0`` is a single strict attempt: a stale write surfaces
-    ``ConflictError`` (committing() never silently swallows an unresolved conflict).
+def test_committing_with_no_retries_raises_the_unresolved_conflict(
+    coordinator: _CoordinatorServer,
+    connect_follower: Callable[[_CoordinatorServer], dc.Store],
+) -> None:
+    """Given f2 moved Calcite to 5.0 so f1's next commit is stale
+    When f1 makes its single committing(retries=0) attempt
+    Then the next step raises ConflictError
+    And a fresh follower still reads 5.0, never f1's 9.9
     """
-    f1 = dc.open_follower(coordinator.base_url, path=None)
-    f2 = dc.open_follower(coordinator.base_url, path=None)
-    try:
-        m2 = f2.get(Mineral, qid="Q2")
-        assert m2 is not None
-        m2.mohs = 5.0
-        f2.commit()  # move Q2 so f1's next commit is stale
-        with pytest.raises(ConflictError):
-            for txn in f1.committing(retries=0):  # one strict attempt, no retry
-                with txn:
-                    m1 = f1.get(Mineral, qid="Q2")
-                    assert m1 is not None
-                    m1.mohs = 9.9
-    finally:
-        f1.close()
-        f2.close()
+    f1 = connect_follower(coordinator)
+    f2 = connect_follower(coordinator)
+    m2 = f2.get(Mineral, qid="Q2")
+    assert m2 is not None
+    m2.mohs = 5.0
+    f2.commit()
+    attempts = f1.committing(retries=0)
+    only_attempt = next(attempts)
+    with only_attempt:
+        m1 = f1.get(Mineral, qid="Q2")
+        assert m1 is not None
+        m1.mohs = 9.9
+
+    with pytest.raises(ConflictError):
+        next(attempts)
+
+    authoritative = connect_follower(coordinator).get(Mineral, qid="Q2")
+    assert authoritative is not None
+    assert authoritative.mohs == 5.0
 
 
 def test_lost_ack_reinsert_with_base_none_raises_conflict(
     coordinator: _CoordinatorServer,
+    connect_follower: Callable[[_CoordinatorServer], dc.Store],
+    connect_http: Callable[[_CoordinatorServer], httpx.Client],
 ) -> None:
-    """A fresh entity (base=None) on an already-present key — the wire shape of a
-    lost-ack re-insert — is refused through the follower contribute path.
+    """Given an untracked Quartz with base None, the wire shape of a lost-ack re-insert
+    When it is contributed although Q1 is already present
+    Then the contribution raises ConflictError
+    And the coordinator's head is unchanged
+    And exactly one Quartz remains, with the original hardness
     """
-    from datacrystal._follower import _contribute
+    http = connect_http(coordinator)
+    follower = connect_follower(coordinator)
+    head_before = int(http.get("/v1/head").json()["tid"])
+    fresh = Mineral(qid="Q1", name="Quartz", mohs=7.0)
 
-    client = httpx.Client(base_url=coordinator.base_url)
-    follower = dc.open_follower(coordinator.base_url, path=None)
-    try:
-        head_before = _head_tid(coordinator.base_url)
-        # an untracked Q1 contributed with base=None (its local insert never
-        # reconciled with the coordinator) must 409, never duplicate / clobber.
-        fresh = Mineral(qid="Q1", name="Quartz", mohs=7.0)
-        with pytest.raises(ConflictError):
-            _contribute([(fresh, None)], url=coordinator.base_url, api_key=None, client=client)
-        # post-state: no new commit, still exactly one Q1 with the original value
-        assert _head_tid(coordinator.base_url) == head_before
-        follower.sync()
-        rows = [m for m in follower.query(Mineral) if m.qid == "Q1"]
-        assert len(rows) == 1 and rows[0].mohs == 7.0
-    finally:
-        follower.close()
-        client.close()
+    with pytest.raises(ConflictError):
+        _contribute([(fresh, None)], url=coordinator.base_url, api_key=None, client=http)
+
+    head_after = int(http.get("/v1/head").json()["tid"])
+    follower.sync()
+    assert head_after == head_before
+    assert [m.mohs for m in follower.query(Mineral) if m.qid == "Q1"] == [7.0]
 
 
 # --- §3.f schema-skew --------------------------------------------------------
 
 
-def test_raw_submit_with_unknown_field_is_schema_skew(
+def test_raw_submit_with_unknown_field_is_refused_as_schema_skew(
     coordinator: _CoordinatorServer,
+    connect_http: Callable[[_CoordinatorServer], httpx.Client],
 ) -> None:
-    """A raw POST carrying a field the coordinator's Mineral lacks → 409 schema-skew;
-    the coordinator writes nothing.
+    """Given a raw submit carrying a field the coordinator's Mineral lacks
+    When it is POSTed to /v1/submit
+    Then the response is 409
+    And the error detail is schema-skew
     """
-    follower = dc.open_follower(coordinator.base_url, path=None)
-    client = httpx.Client(base_url=coordinator.base_url)
-    try:
-        head_before = _head_tid(coordinator.base_url)
-        resp = client.post(
-            "/v1/submit",
-            json={
-                "ops": [
-                    {
-                        "type": _MINERAL,
-                        "key": "qid",
-                        "fields": {"qid": "QSK", "name": "Skewstone", "bogus_field": 1},
-                        "base": None,
-                    }
-                ]
-            },
-        )
-        assert resp.status_code == 409, resp.text
-        assert resp.json()["detail"]["error"] == "schema-skew"
-        # post-state: fail closed — nothing landed, head unchanged, no QSK
-        assert _head_tid(coordinator.base_url) == head_before
-        follower.sync()
-        assert follower.get(Mineral, qid="QSK") is None
-    finally:
-        follower.close()
-        client.close()
+    http = connect_http(coordinator)
+    fields = {"qid": "QSK", "name": "Skewstone", "bogus_field": 1}
+
+    resp = http.post(
+        "/v1/submit",
+        json={"ops": [{"type": _MINERAL, "key": "qid", "fields": fields, "base": None}]},
+    )
+
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"]["error"] == "schema-skew"
+
+
+def test_schema_skew_submit_writes_nothing(
+    coordinator: _CoordinatorServer,
+    connect_follower: Callable[[_CoordinatorServer], dc.Store],
+    connect_http: Callable[[_CoordinatorServer], httpx.Client],
+) -> None:
+    """Given a raw submit carrying a field the coordinator's Mineral lacks
+    When it is POSTed to /v1/submit and refused
+    Then the coordinator's head is unchanged
+    And a synced follower does not hold the skewed mineral
+    """
+    follower = connect_follower(coordinator)
+    http = connect_http(coordinator)
+    head_before = int(http.get("/v1/head").json()["tid"])
+    fields = {"qid": "QSK", "name": "Skewstone", "bogus_field": 1}
+
+    http.post(
+        "/v1/submit",
+        json={"ops": [{"type": _MINERAL, "key": "qid", "fields": fields, "base": None}]},
+    )
+
+    head_after = int(http.get("/v1/head").json()["tid"])
+    follower.sync()
+    assert head_after == head_before
+    assert follower.get(Mineral, qid="QSK") is None
 
 
 # --- §3.g delta-gap on catch-up (over the wire) ------------------------------
@@ -479,128 +682,118 @@ def test_raw_submit_with_unknown_field_is_schema_skew(
 
 def test_delta_gap_on_catchup_refuses_no_partial_apply(
     coordinator: _CoordinatorServer,
+    lagging_follower: dc.Store,
+    connect_http: Callable[[_CoordinatorServer], httpx.Client],
 ) -> None:
-    """A gapped delta stream — built by fetching the real ``GET /v1/deltas`` frames
-    and dropping one — rides the wire path and raises DeltaGapError; the follower's
-    watermark is unchanged and nothing partially applied.
+    """Given a follower two commits behind and the real wire frames minus the first
+    When the gapped frames are applied as a catch-up
+    Then the apply raises DeltaGapError
+    And the follower's watermark is unchanged
+    And the follower still holds only the two seeded minerals
+    And the second gapstone did not land
     """
-    from datacrystal._follower import _apply_catchup, _iter_frames
+    http = connect_http(coordinator)
+    wm_before = lagging_follower.last_tid
+    blob = http.get("/v1/deltas", params={"after": wm_before}).content
+    frames = list(_iter_frames(blob))
+    assert len(frames) >= 2, "need a tail to gap"
+    gapped = frames[1:]  # skip wm+1, so the first delivered is wm+2
 
-    follower = dc.open_follower(coordinator.base_url, path=None)
-    client = httpx.Client(base_url=coordinator.base_url)
-    try:
-        # advance the coordinator so there is a multi-delta tail to gap.
-        f_contrib = dc.open_follower(coordinator.base_url, path=None)
-        f_contrib.upsert(Mineral(qid="QG1", name="Gapstone1"))
-        f_contrib.commit()
-        f_contrib.upsert(Mineral(qid="QG2", name="Gapstone2"))
-        f_contrib.commit()
-        f_contrib.close()
+    with pytest.raises(DeltaGapError):
+        _apply_catchup(lagging_follower._backend, gapped)
 
-        wm_before = follower.last_tid
-        state_before = {m.qid for m in follower.query(Mineral)}
-
-        # fetch the real wire frames after the follower's watermark, then DROP the
-        # first so the stream starts at wm+2 — a gap that rides the wire bytes.
-        blob = client.get("/v1/deltas", params={"after": wm_before}).content
-        frames = list(_iter_frames(blob))
-        assert len(frames) >= 2, "need a tail to gap"
-        gapped = frames[1:]  # skip wm+1 → first delivered is wm+2
-
-        with pytest.raises(DeltaGapError):
-            _apply_catchup(follower._backend, gapped)  # pyright: ignore[reportPrivateUsage]
-        # post-state: watermark unchanged, no gapped entity landed
-        assert follower.last_tid == wm_before
-        assert {m.qid for m in follower.query(Mineral)} == state_before
-        assert follower.get(Mineral, qid="QG2") is None
-    finally:
-        follower.close()
-        client.close()
+    assert lagging_follower.last_tid == wm_before
+    assert {m.qid for m in lagging_follower.query(Mineral)} == {"Q1", "Q2"}
+    assert lagging_follower.get(Mineral, qid="QG2") is None
 
 
 # --- §3.h ride check_delta_consumer against the served DeltaLog --------------
 
 
-def test_served_deltalog_honors_the_consumer_contract(
-    coordinator: _CoordinatorServer,
-) -> None:
-    """The coordinator's change-feed (the served DeltaLog) certifies against the
-    public COMMIT-DELTA-v1 consumer conformance kit — the federation surface is
-    serving a spec-honoring delta stream.
-
-    The kit drives synthetic mineral-cabinet streams through a FRESH consumer
-    factory; running it here proves the federation capstone also pins the
-    change-feed contract that ``/v1/deltas`` (and every follower applier) relies
-    on. The coordinator's own DeltaLog is the canonical instance behind the wire.
+def test_served_deltalog_is_a_gapless_change_feed(coordinator: _CoordinatorServer) -> None:
+    """Given a coordinator whose seeding was one commit
+    When its served DeltaLog is replayed from genesis
+    Then the replayed transaction ids are exactly 1
     """
     log = coordinator.log
     assert log is not None
-    # the served log is replayable from genesis — a real change-feed, gapless.
+
     served = list(log.replay(after_tid=0))
-    assert [d["tid"] for d in served] == list(range(1, len(served) + 1))
 
-    # certify a fresh CountingConsumer (the canonical fully-obligated consumer)
-    # against the spec §4 obligations the served feed must honor.
-    ran = check_delta_consumer(CountingConsumer, content=lambda c: c.content())
-    assert "§3 prior un-index" in ran and "§3.1 delete totality" in ran
+    assert [delta["tid"] for delta in served] == [1]
 
-    # and the served feed itself replays cleanly through a conforming consumer.
+
+def test_counting_consumer_certifies_against_the_conformance_kit(
+    coordinator: _CoordinatorServer,
+) -> None:
+    """Given a fresh CountingConsumer factory, the canonical fully-obligated consumer
+    When the public COMMIT-DELTA consumer conformance kit drives it
+    Then the kit ran the prior un-index scenario
+    And the kit ran the delete totality scenario
+    """
+    ran = check_delta_consumer(CountingConsumer, content=CountingConsumer.content)
+
+    assert "§3 prior un-index" in ran
+    assert "§3.1 delete totality" in ran
+
+
+def test_served_feed_replays_cleanly_through_a_conforming_consumer(
+    coordinator: _CoordinatorServer,
+) -> None:
+    """Given the coordinator's served change-feed
+    When a CountingConsumer applies every served delta
+    Then its watermark is the last served transaction id
+    And it counted at least the two seeded minerals
+    """
+    log = coordinator.log
+    assert log is not None
+    served = list(log.replay(after_tid=0))
     consumer = CountingConsumer()
-    for delta in served:
-        consumer.apply(delta)
-    assert consumer.watermark == served[-1]["tid"]
-    assert consumer.content().get(_MINERAL, 0) >= 2  # at least the seeded Q1/Q2
+
+    _apply_all(consumer, served)
+
+    assert consumer.watermark == 1
+    assert consumer.content().get(_MINERAL, 0) >= 2
 
 
 # --- W1 (epic #168): contributions stamp anonymous, never the operator ---------
 
 
-@pytest.mark.parametrize("backend_kind", ["memory", "sqlite"])
-def test_contributions_stamp_anonymous_not_the_operator(backend_kind, tmp_path) -> None:
-    """Review finding (HIGH): /v1/submit used to commit under the coordinator's
-    ambient principal — remote third-party writes would land in the permanent
-    audit log under the OPERATOR's identity. Until per-follower principals
-    (phase 3), a contribution stamps anonymous (actor=0): 'identity not
-    known', never 'the operator did this'. The operator's own commits keep
-    their stamp — both proven over the real wire."""
-    operator = dc.Principal(uid=42)
-    if backend_kind == "memory":
-        backend = MemoryBackend()
+def test_operators_own_commit_keeps_its_actor_stamp(
+    operator_coordinator: _CoordinatorServer,
+    connect_http: Callable[[_CoordinatorServer], httpx.Client],
+) -> None:
+    """Given a coordinator whose ambient principal has uid 42
+    When the served deltas are fetched from 0
+    Then the operator's own seeding commit is stamped actor 42
+    """
+    http = connect_http(operator_coordinator)
 
-        def open_store() -> dc.Store:
-            return dc.Store._from_backend(backend, principal=operator)  # pyright: ignore[reportPrivateUsage]
-    else:
+    blob = http.get("/v1/deltas", params={"after": 0}).content
 
-        def open_store() -> dc.Store:
-            return dc.Store.open(tmp_path / "coord42", principal=operator)
+    deltas = list(_iter_frames(blob))
+    assert deltas[0]["actor"] == 42
 
-    server = _CoordinatorServer(open_store, log_dir=str(tmp_path / "coordlog42"))
-    server.start()
-    try:
-        follower = dc.open_follower(server.base_url, path=None)
-        try:
-            follower.store(Mineral(qid="Q9", name="Fluorite", crystal_system="cubic"))
-            follower.commit()  # contributes through POST /v1/submit
-        finally:
-            follower.close()
-        with httpx.Client(base_url=server.base_url) as client:
-            blob = client.get("/v1/deltas", params={"after": 0}).content
-        import struct as _struct
 
-        from datacrystal.contract.applier import decode_delta as _dd
+def test_contributions_stamp_anonymous_not_the_operator(
+    operator_coordinator: _CoordinatorServer,
+    connect_follower: Callable[[_CoordinatorServer], dc.Store],
+    connect_http: Callable[[_CoordinatorServer], httpx.Client],
+) -> None:
+    """Given a coordinator whose ambient principal has uid 42
+    When a follower contributes a fluorite through POST /v1/submit
+    Then the latest served delta carries the fluorite payload
+    And that delta is stamped actor 0, anonymous, not the operator
+    """
+    follower = connect_follower(operator_coordinator)
+    http = connect_http(operator_coordinator)
+    follower.store(Mineral(qid="Q9", name="Fluorite", crystal_system="cubic"))
+    follower.commit()
 
-        deltas, offset = [], 0
-        while offset < len(blob):
-            (size,) = _struct.unpack_from(">Q", blob, offset)
-            offset += 8
-            deltas.append(_dd(blob[offset : offset + size]))
-            offset += size
-        assert deltas[0]["actor"] == 42  # the operator's own seeding commit
-        contribution = deltas[-1]
-        assert any(
-            op["payload"] is not None and b"Fluorite" in op["payload"]
-            for op in contribution["ops"]
-        )
-        assert contribution["actor"] == 0  # third-party write: anonymous, honest
-    finally:
-        server.stop()
+    blob = http.get("/v1/deltas", params={"after": 0}).content
+
+    contribution = list(_iter_frames(blob))[-1]
+    assert any(
+        op["payload"] is not None and b"Fluorite" in op["payload"] for op in contribution["ops"]
+    )
+    assert contribution["actor"] == 0

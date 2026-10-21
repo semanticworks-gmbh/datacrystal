@@ -9,7 +9,12 @@ harden after 14 green nights; until then breaches warn, 3× fails).
 
 from __future__ import annotations
 
+import dataclasses
 import sqlite3
+from collections.abc import Callable
+from pathlib import Path
+from statistics import median
+from typing import Any
 
 import msgspec
 import pytest
@@ -26,16 +31,32 @@ from benchmarks.conftest import (
 from datacrystal._records import decode_payload
 
 
-def test_commit_tput_small(tmp_path) -> None:
-    """KICKOFF ``commit_tput_small``: three-phase overhead ≤ 3× a floor of
-    msgspec encode + sqlite executemany with identical txn boundaries."""
+
+def _decode_loop_floor(keys: list[str]) -> Callable[[], None]:
+    @dataclasses.dataclass(slots=True)
+    class PlainSpecimen:
+        specimen_no: str
+        quality: str
+        mass_g: float
+        mineral: object
+        acquired_from: object
+
+    raw_payloads = [msgspec.msgpack.encode([k, "A", 123.4, None, None]) for k in keys]
+
+    def floor_run() -> None:
+        for payload in raw_payloads:
+            PlainSpecimen(*decode_payload(payload))
+
+    return floor_run
+
+
+def _commit_tput_small_ratio(tmp_path: Path) -> float:
+    """Time the engine's commits against the sqlite floor; return engine / floor."""
     rounds, batch = 30, 50
     store = dc.Store.open(tmp_path / "engine.store")
-    field_lists = [
-        [f"T-{i:07d}", "A", 12.5, None, None] for i in range(batch)
-    ]
-
+    field_lists = [[f"T-{i:07d}", "A", 12.5, None, None] for i in range(batch)]
     counter = iter(range(10_000_000))
+    minerals = [_gen.Mineral(qid="QX0001", name="quartz", crystal_system="trigonal")]
 
     def engine_run() -> None:
         for _ in range(rounds):
@@ -43,14 +64,12 @@ def test_commit_tput_small(tmp_path) -> None:
                 i = next(counter)
                 store.store(_gen.Specimen(
                     specimen_no=f"T-{i:07d}",
-                    mineral=dc.Lazy.of(_minerals[0]),
+                    mineral=dc.Lazy.of(minerals[0]),
                     quality="A", mass_g=12.5,
                 ))
             store.commit()
 
-    _minerals = [_gen.Mineral(qid="QX0001", name="quartz",
-                              crystal_system="trigonal")]
-    store.root = _minerals
+    store.root = minerals
     store.commit()
 
     floor_conn = sqlite3.connect(tmp_path / "floor.sqlite")
@@ -60,7 +79,6 @@ def test_commit_tput_small(tmp_path) -> None:
         "CREATE TABLE objects (oid INTEGER PRIMARY KEY, cid INTEGER, "
         "tid INTEGER, payload BLOB, crc INTEGER)"
     )
-
     encode = msgspec.msgpack.Encoder().encode
 
     def floor_run() -> None:
@@ -70,22 +88,18 @@ def test_commit_tput_small(tmp_path) -> None:
             with floor_conn:
                 floor_conn.executemany(
                     "INSERT OR REPLACE INTO objects VALUES (?, ?, ?, ?, ?)",
-                    [
-                        (r * batch + j, 1, r, encode(field_lists[j]), 0)
-                        for j in range(batch)
-                    ],
+                    [(r * batch + j, 1, r, encode(field_lists[j]), 0) for j in range(batch)],
                 )
 
     engine = time_it(engine_run, rounds=1)
     floor = time_it(floor_run, rounds=1)
     store.close()
     floor_conn.close()
-    gate("commit_tput_small (engine/floor)", engine / floor, 3.0)
+    return engine / floor
 
 
-def test_commit_tput_large_shape(tmp_path) -> None:
-    """KICKOFF ``commit_tput_large``: P1 never quadratic —
-    t(10·N)/t(N) ≤ 12."""
+def _commit_tput_large_ratio(tmp_path: Path) -> float:
+    """Build the two extents of the shape gate; return t(10N) / t(N)."""
     times = []
     for n in LARGE_SHAPE_EXTENTS:
         store = dc.Store.open(tmp_path / f"large-{n}.store")
@@ -95,97 +109,74 @@ def test_commit_tput_large_shape(tmp_path) -> None:
 
         times.append(time_it(run, rounds=1))
         store.close()
-    gate("commit_tput_large (t(10N)/t(N))", times[1] / times[0], 12.0)
+    return times[1] / times[0]
 
 
-def test_hydrate_batch(big_store) -> None:
-    """KICKOFF ``hydrate_batch``: get_many ≤ 4× a raw msgspec
-    decode-TO-DATACLASS loop over equivalent records (floor parity: the
-    anchor constructs plain dataclass instances, not just value lists)."""
-    import dataclasses
-
-    @dataclasses.dataclass(slots=True)
-    class PlainSpecimen:
-        specimen_no: str
-        quality: str
-        mass_g: float
-        mineral: object
-        acquired_from: object
-
-    plucked = big_store.pluck(_gen.Specimen.quality == "A", "specimen_no")
-    keys = plucked[:1_000]
-    raw_payloads = [
-        msgspec.msgpack.encode([k, "A", 123.4, None, None]) for k in keys
-    ]
-
-    def floor_run() -> None:
-        for payload in raw_payloads:
-            PlainSpecimen(*decode_payload(payload))
+def _hydrate_batch_ratio(store: dc.Store) -> float:
+    """Time get_many against the raw decode-to-dataclass floor; return engine / floor."""
+    keys = store.pluck(_gen.Specimen.quality == "A", "specimen_no")[:1_000]  # pyrefly: ignore[bad-argument-type]  # magic-query predicate is untypeable by design
+    floor_run = _decode_loop_floor(keys)
 
     def engine_run() -> None:
-        big_store.get_many(_gen.Specimen, specimen_no=keys)
+        store.get_many(_gen.Specimen, specimen_no=keys)
 
     floor = time_it(floor_run)
     engine = time_it(engine_run)
-    gate("hydrate_batch (engine/raw-decode)", engine / floor, 4.0)
+    return engine / floor
 
 
-def test_hydrate_n_plus_1(big_store) -> None:
-    """KICKOFF ``hydrate_n_plus_1``: batch hydration of 1k entities ≥ 5×
-    faster than 1k single lookups — N+1 is never the user's problem."""
-    keys = big_store.pluck(_gen.Specimen, "specimen_no")[:1_000]
+def _hydrate_n_plus_1_ratio(store: dc.Store) -> float:
+    """Time 1k single lookups against one batch; return batch / singles."""
+    keys = store.pluck(_gen.Specimen, "specimen_no")[:1_000]
 
     def singles() -> None:
         for key in keys:
-            big_store.get(_gen.Specimen, specimen_no=key)
+            store.get(_gen.Specimen, specimen_no=key)
 
     def batch() -> None:
-        big_store.get_many(_gen.Specimen, specimen_no=keys)
+        store.get_many(_gen.Specimen, specimen_no=keys)
 
     t_singles = time_it(singles, rounds=3)
     t_batch = time_it(batch, rounds=3)
-    gate("hydrate_n_plus_1 (singles/batch ≥ 5 → batch/singles ≤ 0.2)",
-         t_batch / t_singles, 0.2)
+    return t_batch / t_singles
 
 
-def test_query_bitmap_vs_scan(big_store) -> None:
-    """KICKOFF ``query_bitmap_vs_scan``: the canonical ~1% predicate must
-    answer ≥ 10× faster from bitmaps than a full hydrating scan."""
-    predicate = (_gen.Specimen.quality == "A") & (_gen.Specimen.mass_g >= 100.0)
-    expected = big_store.count(predicate)
-    assert 0 < expected < SPECIMENS * 0.05, "predicate selectivity drifted"
-    all_keys = big_store.pluck(_gen.Specimen, "specimen_no")
+_CANONICAL_PREDICATE = (_gen.Specimen.quality == "A") & (_gen.Specimen.mass_g >= 100.0)
+
+
+def _bitmap_vs_scan(store: dc.Store) -> tuple[int, int, float]:
+    """Return (selected rows, rows the scan finds, indexed / scan time)."""
+    expected = store.count(_CANONICAL_PREDICATE)  # pyrefly: ignore[bad-argument-type]  # magic-query predicate is untypeable by design
+    all_keys = store.pluck(_gen.Specimen, "specimen_no")
+    scanned: list[int] = []
 
     def indexed() -> None:
-        big_store.query(predicate)
+        store.query(_CANONICAL_PREDICATE)  # pyrefly: ignore[bad-argument-type]  # magic-query predicate is untypeable by design
 
     def scan() -> None:
         hits = [
-            s for s in big_store.get_many(_gen.Specimen, specimen_no=all_keys)
+            s for s in store.get_many(_gen.Specimen, specimen_no=all_keys)
             if s.quality == "A" and s.mass_g >= 100.0
         ]
-        assert len(hits) == expected
+        scanned.append(len(hits))
 
     t_scan = time_it(scan, rounds=2)
     t_indexed = time_it(indexed, rounds=5)
-    gate("query_bitmap_vs_scan (indexed/scan ≤ 0.1 ⇔ ≥10× speedup)",
-         t_indexed / t_scan, 0.1)
+    return expected, scanned[-1], t_indexed / t_scan
 
 
-def test_unique_key_lookup(big_store) -> None:
-    """KICKOFF ``unique_key_lookup``: natural-key lookup ≤ 50× a same-run
-    dict lookup."""
-    keys = big_store.pluck(_gen.Specimen, "specimen_no")[:200]
+def _unique_key_lookup_ratio(store: dc.Store) -> tuple[list[object], float]:
+    """Return the live entities and the engine / dict lookup time."""
+    keys = store.pluck(_gen.Specimen, "specimen_no")[:200]
     mirror = {k: i for i, k in enumerate(keys)}
     # hold strong refs during timing: the gate measures LOOKUP of live
     # entities, not re-hydration (entities are weakly registered, so a
     # dropped result list would force a reload every call — invariant 6)
-    live = big_store.get_many(_gen.Specimen, specimen_no=keys)
-    assert all(live)
+    live = store.get_many(_gen.Specimen, specimen_no=keys)
 
     def engine_run() -> None:
         for key in keys:
-            big_store.get(_gen.Specimen, specimen_no=key)
+            store.get(_gen.Specimen, specimen_no=key)
 
     def floor_run() -> None:
         for key in keys:
@@ -193,13 +184,14 @@ def test_unique_key_lookup(big_store) -> None:
 
     engine = time_it(engine_run)
     floor = time_it(floor_run)
-    gate("unique_key_lookup (engine/dict)", engine / floor, 50.0)
+    return list(live), engine / floor
 
 
 def _timed_deltas(store: dc.Store, prefix: str) -> list[float]:
-    """Commit 12 one-specimen deltas, timing each commit (the consumer is
-    already attached)."""
+    """Commit 12 one-specimen deltas, timing each commit (the consumer is already attached)."""
     anchor = store.get(_gen.Mineral, qid="QM0000")
+    if anchor is None:
+        raise RuntimeError("anchor mineral QM0000 is missing from the benchmark store")
     times: list[float] = []
     for i in range(12):
         store.store(_gen.Specimen(
@@ -211,83 +203,66 @@ def _timed_deltas(store: dc.Store, prefix: str) -> list[float]:
     return times
 
 
-def test_to_pydantic_vs_view_read(big_store) -> None:
-    """datacrystal[web] ``to_pydantic`` ratio gate (#97): the FULL cost of turning
-    a record into a validated Pydantic DTO must stay ≤ 2× the EntityView read
-    floor — materializing the same record into an EntityView (decode + freeze).
-    A breach means accidental ref-hydration or per-call re-reflection crept on top
-    of the read — both forbidden by #97 (a load is never forced, the model is
-    cached per class).
+def _oids_of_first_specimens(store: dc.Store) -> list[int]:
+    keys = store.pluck(_gen.Specimen, "specimen_no")[:1_000]
+    return [s.__dc_oid__ for s in store.get_many(_gen.Specimen, specimen_no=keys)]
 
-    Same-run ratio: each round opens a FRESH snapshot so ``get`` truly decodes
-    (the view cache resets), so the floor is a genuine read and the engine pays
-    read + project + validate (invariant 12, no wall-clock)."""
-    pytest.importorskip("pydantic", reason="datacrystal[web] extra not installed")
+
+def _to_pydantic_ratio(store: dc.Store) -> float:
+    """Time the view-read floor against read + to_pydantic; return engine / floor."""
     from datacrystal.web import to_pydantic
 
-    keys = big_store.pluck(_gen.Specimen, "specimen_no")[:1_000]
-    oids = [s.__dc_oid__ for s in big_store.get_many(_gen.Specimen, specimen_no=keys)]
+    oids = _oids_of_first_specimens(store)
 
     def floor_run() -> None:
         # the EntityView read floor: decode each record into a frozen view
-        with big_store.snapshot() as snap:
+        with store.snapshot() as snap:
             for oid in oids:
                 snap.get(oid)
 
     def engine_run() -> None:
         # read + project + validate: the full to_pydantic cost over the same reads
-        with big_store.snapshot() as snap:
+        with store.snapshot() as snap:
             for oid in oids:
                 to_pydantic(snap.get(oid))
 
     floor = time_it(floor_run, rounds=3)
     engine = time_it(engine_run, rounds=3)
-    gate("to_pydantic (read+convert+validate / view-read floor)", engine / floor, 2.0)
+    return engine / floor
 
 
-def test_watermark_apply_fixed_delta(small_store, big_store) -> None:
-    """KICKOFF ``watermark_apply_fixed_delta``: applying a fixed-size delta
-    must cost the same on a big store as on a small one — O(delta), never
-    O(corpus). Median over ≥ 10 consecutive deltas, bitmap-consumer path
-    (the in-tree CountingConsumer keeps this gate extra-free)."""
-    from statistics import median
-
-    from datacrystal.testing import CountingConsumer
+def _delta_scaling(
+    small: dc.Store, big: dc.Store, make_consumer: Callable[[Any], Any], prefix: str
+) -> float:
+    """Apply fixed deltas on both stores; return median(big) / median(small)."""
 
     def apply_times(store: dc.Store) -> list[float]:
         with store.snapshot() as snap:
-            consumer = CountingConsumer.bootstrap(snap)
+            consumer = make_consumer(snap)
         store.attach(consumer)
-        times = _timed_deltas(store, "WM")
+        times = _timed_deltas(store, prefix)
         store.detach(consumer)
+        if hasattr(consumer, "close"):
+            consumer.close()
         return times
 
-    t_small = median(apply_times(small_store))
-    t_big = median(apply_times(big_store))
-    gate(
-        f"watermark_apply_fixed_delta (t@{SPECIMENS}/t@{SMALL_SPECIMENS})",
-        t_big / t_small, 1.2,
-    )
+    return median(apply_times(big)) / median(apply_times(small))
 
 
-@pytest.mark.parametrize("extra", ["fts", "arrow"])
-def test_watermark_apply_fixed_delta_extras(small_store, big_store, tmp_path,
-                                            extra) -> None:
-    """The same O(delta) shape through the real extras — datacrystal[fts]
-    (FTS5 merge policy pinned: 'optimize' before timing, per KICKOFF) and
-    datacrystal[arrow] (parquet segment per flush)."""
-    from statistics import median
+def _counting_consumer(snap: Any) -> Any:
+    from datacrystal.testing import CountingConsumer
 
-    from typing import Any, Callable
+    return CountingConsumer.bootstrap(snap)
 
+
+def _extra_consumer_factory(extra: str, tmp_path: Path) -> Callable[[Any], Any]:
     counter = iter(range(10_000_000))
-    make_consumer: Callable[[Any], Any]
 
     if extra == "fts":
         pytest.importorskip("snowballstemmer")
         from datacrystal.fts import FullTextIndex
 
-        def _make_fts(snap):
+        def make_fts(snap: Any) -> Any:
             idx = FullTextIndex.bootstrap(
                 tmp_path / f"fts-{next(counter)}.fts", snap,
                 fulltext={"benchmarks._gen:Specimen": {"specimen_no": None}},
@@ -296,161 +271,77 @@ def test_watermark_apply_fixed_delta_extras(small_store, big_store, tmp_path,
             idx._conn.execute("INSERT INTO docs (docs) VALUES ('optimize')")
             return idx
 
-        make_consumer = _make_fts
-    else:
-        pytest.importorskip("pyarrow")
-        from datacrystal.arrow import ArrowMirror
+        return make_fts
 
-        def _make_arrow(snap):
-            return ArrowMirror.bootstrap(
-                tmp_path / f"arrow-{next(counter)}.mirror", snap,
-                only=[_gen.Specimen],
-            )
+    pytest.importorskip("pyarrow")
+    from datacrystal.arrow import ArrowMirror
 
-        make_consumer = _make_arrow
+    def make_arrow(snap: Any) -> Any:
+        return ArrowMirror.bootstrap(
+            tmp_path / f"arrow-{next(counter)}.mirror", snap, only=[_gen.Specimen],
+        )
 
-    def apply_times(store: dc.Store) -> list[float]:
-        with store.snapshot() as snap:
-            consumer = make_consumer(snap)
-        store.attach(consumer)
-        times = _timed_deltas(store, f"WX-{extra}")
-        store.detach(consumer)
-        consumer.close()
-        return times
-
-    t_small = median(apply_times(small_store))
-    t_big = median(apply_times(big_store))
-    gate(
-        f"watermark_apply_fixed_delta[{extra}] "
-        f"(t@{SPECIMENS}/t@{SMALL_SPECIMENS})",
-        t_big / t_small, 1.2,
-    )
+    return make_arrow
 
 
-def test_snapshot_open_read(big_store) -> None:
-    """KICKOFF ``snapshot_open_read`` (#92): the per-request read tax a
-    ``datacrystal[web]`` route pays — open a fresh ``store.snapshot()``, read one
-    record, close it — must stay within 25× a same-run **owner** read of the same
-    record. The web tier reads every request off a snapshot (any-thread, ADR-002)
-    rather than the live graph; this gate keeps that choice negligible, so a
-    snapshot-per-request never becomes the cost center.
-
-    Same-run, apples-to-apples ratio (invariant 12, no wall-clock): both runs do
-    the **same number of single-record reads** of the same OIDs — the floor reads
-    each via a live owner ``get_many([oid])`` (no snapshot lifecycle, the read a
-    route would do if it could touch the owner graph), the engine opens a **fresh
-    snapshot per read** and closes it. The ONLY difference between the two is the
-    per-request snapshot open+close, so the ratio isolates exactly that tax — the
-    lifecycle ``read_snapshot`` drives once per request.
-
-    Why 25× and not a tighter ratio: the owner ``get_many([oid])`` floor is a
-    **warm identity-registry hit** (the entity is already live — no decode), so it
-    is near-free; the snapshot open+close (a WAL read txn + a fresh view cache) is
-    a small but real constant against that near-zero baseline (~11× observed). The
-    gate's job is to catch a *regression* in the snapshot lifecycle (e.g. an
-    accidental O(extent) index rebuild on every open), not to make the negligible
-    look big — the absolute cost stays ≈ 0.094 ms per request (the AC's measured
-    floor)."""
-    keys = big_store.pluck(_gen.Specimen, "specimen_no")[:1_000]
-    oids = [s.__dc_oid__ for s in big_store.get_many(_gen.Specimen, specimen_no=keys)]
+def _snapshot_open_read_ratio(store: dc.Store) -> float:
+    """Time a fresh snapshot per read against a live owner read; return engine / floor."""
+    oids = _oids_of_first_specimens(store)
 
     def floor_run() -> None:
         # owner read floor: one live single-record read per OID, no snapshot
         for oid in oids:
-            big_store.get_many([oid])
+            store.get_many([oid])
 
     def engine_run() -> None:
         # the per-request snapshot tax: a fresh snapshot per single-record read
         for oid in oids:
-            with big_store.snapshot() as snap:
+            with store.snapshot() as snap:
                 snap.get(oid)
 
     floor = time_it(floor_run, rounds=3)
     engine = time_it(engine_run, rounds=3)
-    gate("snapshot_open_read (snapshot open+read+close / owner read)",
-         engine / floor, 25.0)
+    return engine / floor
 
 
-def test_read_fence_discovery_overhead(tmp_path) -> None:
-    """ADR-008 W4 read-fence discovery gate: a principal-bound discovery query
-    over a PROTECTED class stays ≤ 2.0× the same query over its UNPROTECTED twin,
-    same-run.
+_PROTECTED_PREDICATE = (
+    (_gen.CuratedSpecimen.quality == "A") & (_gen.CuratedSpecimen.mass_g >= 100.0)
+)
 
-    This is the read-side counterpart of ``commit_gate_overhead`` (the write
-    gate). It measures the *realistic* hot path a ``datacrystal[web]`` read pays:
-    a fresh ``store.snapshot(principal=…)`` per request, one discovery
-    ``query``, close. On a protected class the snapshot must compile the
-    principal's readable bitmap (O(extent), once per snapshot — R15) and
-    intersect it before window/hydration; on an unprotected class the fence is
-    structurally skipped (zero cost — fitness ``test_permission_zero_cost``). The
-    same-run ratio isolates exactly that readable-set compile+intersect.
 
-    Apples-to-apples: ``_gen.CuratedSpecimen`` is ``Specimen``'s protected twin
-    — the identical five fields under the identical rng, differing only in the
-    four injected ``_dc_`` columns — so both stores hold the same shape and the
-    same ~1% predicate selects the SAME candidate count (asserted below). A
-    non-root CURATOR owner reads its own records, so the filtered result set
-    equals the unfiltered one; only the fence work differs.
-
-    Budget: the readable bitmap is one O(extent) pass building a pyroaring
-    bitmap, then one bitmap-AND per query — the same order as the query's own
-    candidate bitmap build, so the principal-bound open pays ≈ one extra bitmap's
-    worth on top of the unprotected open+query. Ratio ≤ 2.0 (observed ≈ 1.3×;
-    warn-stage, hardens via ``DC_BENCH_STRICT`` after 14 green nights)."""
+def _read_fence_ratio(tmp_path: Path) -> tuple[int, int, float]:
+    """Return both candidate counts and the protected / unprotected query time."""
     n = 5000
     owner = dc.Principal(uid=1001, memberships={dc.WORLD: dc.CURATOR})
-
     prot_store = dc.Store.open(tmp_path / "fence_prot.store", principal=owner)
     _gen.build(prot_store, specimens=n, protected=True)
     plain_store = dc.Store.open(tmp_path / "fence_plain.store")
     _gen.build(plain_store, specimens=n, protected=False)
 
-    prot_pred = (_gen.CuratedSpecimen.quality == "A") & (_gen.CuratedSpecimen.mass_g >= 100.0)
-    plain_pred = (_gen.Specimen.quality == "A") & (_gen.Specimen.mass_g >= 100.0)
-
-    # Equal candidate counts ⇒ the ratio is pure fence overhead, not a different
-    # amount of query work (a non-root owner reads all its own protected rows).
     with prot_store.snapshot(principal=owner) as ps, plain_store.snapshot() as us:
-        n_prot, n_plain = ps.count(prot_pred), us.count(plain_pred)  # pyright: ignore[reportArgumentType]
-    assert n_prot == n_plain > 0, f"predicate shape drifted: {n_prot} vs {n_plain}"
+        n_prot = ps.count(_PROTECTED_PREDICATE)  # pyrefly: ignore[bad-argument-type]  # magic-query predicate is untypeable by design
+        n_plain = us.count(_CANONICAL_PREDICATE)  # pyrefly: ignore[bad-argument-type]  # magic-query predicate is untypeable by design
 
     def filtered_run() -> None:
         # the protected, principal-bound discovery path: snapshot compiles the
         # readable set, intersects it before the window (ADR-008 W4)
         with prot_store.snapshot(principal=owner) as snap:
-            snap.query(prot_pred)  # pyright: ignore[reportArgumentType]
+            snap.query(_PROTECTED_PREDICATE)  # pyrefly: ignore[bad-argument-type]  # magic-query predicate is untypeable by design
 
     def unfiltered_run() -> None:
         # the unprotected twin: no fence, snapshot open + query only
         with plain_store.snapshot() as snap:
-            snap.query(plain_pred)  # pyright: ignore[reportArgumentType]
+            snap.query(_CANONICAL_PREDICATE)  # pyrefly: ignore[bad-argument-type]  # magic-query predicate is untypeable by design
 
     t_filtered = time_it(filtered_run, rounds=5)
     t_unfiltered = time_it(unfiltered_run, rounds=5)
-    gate("read_fence_discovery (protected principal-bound / unprotected query)",
-         t_filtered / t_unfiltered, 2.0)
     prot_store.close()
     plain_store.close()
+    return n_prot, n_plain, t_filtered / t_unfiltered
 
 
-def test_commit_gate_overhead(tmp_path) -> None:
-    """KICKOFF ``commit_gate_overhead`` (ADR-008 W2-9): a protected-class
-    UPDATE commit stays ≤ 2.0× its unprotected twin, same-run.
-
-    Budget derivation (the docstring the KICKOFF row cites): the fence's
-    marginal work on an update commit is (a) ONE batched ``load_many`` of the
-    delta's prior records — the same order of work as the commit's own apply,
-    (b) one msgpack decode of each prior payload, from which the four ``_dc_``
-    columns are read (msgpack has no partial-column decode) — one decode per
-    prior, of the same order as and bounded by the encode+apply the commit
-    already performs for those same records, (c) integer compares — negligible.
-    Gate work ≤ the commit's own encode+apply ⇒ ratio ≤ 2.0.
-    Discipline: UPDATE (DIRTY) commits — priors are the gate's cost center;
-    mutate a NON-indexed field so index maintenance is identical noise; NO
-    consumers attached (with consumers the plain path also reads priors and
-    the ratio flattens); a NON-root owner principal (root short-circuits
-    before the prior read — a root benchmark would time the bypass).
-    """
+def _commit_gate_ratio(tmp_path: Path) -> float:
+    """Time update commits on a protected and an unprotected twin; return protected / plain."""
     n = 200
     owner = dc.Principal(uid=1001, memberships={dc.WORLD: dc.CURATOR})
 
@@ -493,7 +384,196 @@ def test_commit_gate_overhead(tmp_path) -> None:
 
     t_prot = time_it(prot_run, rounds=3)
     t_plain = time_it(plain_run, rounds=3)
-    gate("commit_gate_overhead (protected/unprotected update commit)",
-         t_prot / t_plain, 2.0)
     prot_store.close()
     plain_store.close()
+    return t_prot / t_plain
+
+
+def test_commit_throughput_stays_within_floor_ratio(tmp_path: Path) -> None:
+    """Keep small-batch commits within 3x of the raw sqlite floor (KICKOFF ``commit_tput_small``).
+
+    Given a store committing batches of specimens and an sqlite floor of msgspec encode plus
+    executemany with identical transaction boundaries
+    When both run the same number of rounds
+    Then the three-phase overhead stays at most 3x the floor
+    """
+    ratio = _commit_tput_small_ratio(tmp_path)
+
+    gate("commit_tput_small (engine/floor)", ratio, 3.0)
+
+
+def test_commit_throughput_never_quadratic_across_extents(tmp_path: Path) -> None:
+    """Keep bulk commits linear in the extent (KICKOFF ``commit_tput_large``).
+
+    Given two stores built at extents N and 10N
+    When both are timed on the same machine in the same run
+    Then t(10N) / t(N) stays at most 12
+    """
+    ratio = _commit_tput_large_ratio(tmp_path)
+
+    gate("commit_tput_large (t(10N)/t(N))", ratio, 12.0)
+
+
+def test_hydrate_batch_stays_within_raw_decode_floor(big_cabinet: dc.Store) -> None:
+    """Keep ``get_many`` within 4x of a raw decode loop (KICKOFF ``hydrate_batch``).
+
+    Floor parity: the anchor constructs plain dataclass instances, not just value lists.
+
+    Given the big cabinet and 1k keys of its A-quality specimens
+    When ``get_many`` and a raw msgspec decode-to-dataclass loop each read them
+    Then the engine takes at most 4x the raw loop
+    """
+    ratio = _hydrate_batch_ratio(big_cabinet)
+
+    gate("hydrate_batch (engine/raw-decode)", ratio, 4.0)
+
+
+def test_hydrate_batch_beats_single_lookups_five_to_one(big_cabinet: dc.Store) -> None:
+    """Keep N+1 hydration off the user (KICKOFF ``hydrate_n_plus_1``).
+
+    Given the big cabinet and 1k specimen keys
+    When they are read as 1k single lookups and as one batch
+    Then the batch takes at most 0.2 of the singles, a 5x speedup
+    """
+    ratio = _hydrate_n_plus_1_ratio(big_cabinet)
+
+    gate("hydrate_n_plus_1 (singles/batch ≥ 5 → batch/singles ≤ 0.2)", ratio, 0.2)
+
+
+def test_bitmap_query_beats_hydrating_scan_ten_to_one(big_cabinet: dc.Store) -> None:
+    """Keep the canonical ~1% predicate on bitmaps (KICKOFF ``query_bitmap_vs_scan``).
+
+    Given the big cabinet and a predicate selecting about 1% of the specimens
+    When it is answered from bitmaps and by a full hydrating scan
+    Then the scan finds the same rows and the bitmap answer is at least 10x faster
+    """
+    expected, scanned, ratio = _bitmap_vs_scan(big_cabinet)
+
+    assert 0 < expected < SPECIMENS * 0.05, "predicate selectivity drifted"
+    assert scanned == expected
+    gate("query_bitmap_vs_scan (indexed/scan ≤ 0.1 ⇔ ≥10× speedup)", ratio, 0.1)
+
+
+def test_unique_key_lookup_stays_within_dict_floor(big_cabinet: dc.Store) -> None:
+    """Keep a natural-key lookup within 50x of a dict lookup (KICKOFF ``unique_key_lookup``).
+
+    Given the big cabinet with 200 live specimens held by strong references
+    When each is looked up by its natural key and in a plain dict
+    Then the engine takes at most 50x the dict
+    """
+    live, ratio = _unique_key_lookup_ratio(big_cabinet)
+
+    assert all(live)
+    gate("unique_key_lookup (engine/dict)", ratio, 50.0)
+
+
+def test_to_pydantic_stays_within_view_read_floor(big_cabinet: dc.Store) -> None:
+    """Keep ``to_pydantic`` within 2x of the EntityView read floor (#97).
+
+    A breach means accidental ref-hydration or per-call re-reflection crept on top of the
+    read, both forbidden by #97. Each round opens a fresh snapshot so ``get`` truly decodes.
+
+    Given the big cabinet and 1k specimen records
+    When they are read into views, and read and converted into validated DTOs
+    Then the conversion takes at most 2x the view read
+    """
+    pytest.importorskip("pydantic", reason="datacrystal[web] extra not installed")
+
+    ratio = _to_pydantic_ratio(big_cabinet)
+
+    gate("to_pydantic (read+convert+validate / view-read floor)", ratio, 2.0)
+
+
+def test_watermark_apply_cost_independent_of_corpus_size(
+    small_cabinet: dc.Store, big_cabinet: dc.Store
+) -> None:
+    """Keep applying a fixed delta O(delta), never O(corpus) (``watermark_apply_fixed_delta``).
+
+    Median over 12 consecutive deltas on the bitmap-consumer path; the in-tree
+    CountingConsumer keeps this gate extra-free.
+
+    Given a small and a big cabinet, each with a counting consumer attached
+    When twelve one-specimen deltas are committed on each
+    Then the big cabinet's median apply time is at most 1.2x the small one's
+    """
+    ratio = _delta_scaling(small_cabinet, big_cabinet, _counting_consumer, "WM")
+
+    gate(f"watermark_apply_fixed_delta (t@{SPECIMENS}/t@{SMALL_SPECIMENS})", ratio, 1.2)
+
+
+@pytest.mark.parametrize("extra", ["fts", "arrow"])
+def test_watermark_apply_cost_independent_of_corpus_size_through_extras(
+    small_cabinet: dc.Store, big_cabinet: dc.Store, tmp_path: Path, extra: str
+) -> None:
+    """Keep the O(delta) shape through the real extras, ``datacrystal[fts]`` and ``[arrow]``.
+
+    The FTS5 merge policy is pinned ('optimize' before timing, per KICKOFF); the arrow mirror
+    writes a parquet segment per flush.
+
+    Given a small and a big cabinet, each with the extra's consumer attached
+    When twelve one-specimen deltas are committed on each
+    Then the big cabinet's median apply time is at most 1.2x the small one's
+    """
+    make_consumer = _extra_consumer_factory(extra, tmp_path)
+
+    ratio = _delta_scaling(small_cabinet, big_cabinet, make_consumer, f"WX-{extra}")
+
+    gate(
+        f"watermark_apply_fixed_delta[{extra}] (t@{SPECIMENS}/t@{SMALL_SPECIMENS})",
+        ratio, 1.2,
+    )
+
+
+def test_snapshot_per_read_stays_within_owner_read_floor(big_cabinet: dc.Store) -> None:
+    """Keep the per-request snapshot tax within 25x of an owner read (``snapshot_open_read``, #92).
+
+    A ``datacrystal[web]`` route reads every request off a snapshot (any-thread, ADR-002).
+    Both runs do the same number of single-record reads of the same OIDs, so the ratio isolates
+    the snapshot open and close. The owner floor is a warm identity-registry hit, near-free, so
+    25x (about 11x observed) catches a regression in the snapshot lifecycle, such as an
+    O(extent) index rebuild on every open; the absolute cost stays near 0.094 ms per request.
+
+    Given the big cabinet and 1k specimen OIDs
+    When each is read through a fresh snapshot and through the live owner
+    Then the snapshot path takes at most 25x the owner path
+    """
+    ratio = _snapshot_open_read_ratio(big_cabinet)
+
+    gate("snapshot_open_read (snapshot open+read+close / owner read)", ratio, 25.0)
+
+
+def test_read_fence_discovery_stays_within_twice_unprotected_query(tmp_path: Path) -> None:
+    """Keep a principal-bound discovery query within 2x of its unprotected twin (ADR-008 W4).
+
+    The read-side counterpart of the write gate: a fresh ``store.snapshot(principal=...)``
+    per request compiles the principal's readable bitmap once (O(extent), R15) and intersects
+    it before the window. ``CuratedSpecimen`` is ``Specimen``'s protected twin, so both stores
+    hold the same shape and the same predicate selects the same candidate count. Observed
+    about 1.3x; warn-stage, hardens via ``DC_BENCH_STRICT`` after 14 green nights.
+
+    Given a protected and an unprotected store of 5000 specimens and a non-root owner
+    When the same discovery query runs on each, in a fresh snapshot per run
+    Then both find the same candidates and the protected run takes at most 2x
+    """
+    n_protected, n_plain, ratio = _read_fence_ratio(tmp_path)
+
+    assert n_protected == n_plain
+    assert n_plain > 0
+    gate("read_fence_discovery (protected principal-bound / unprotected query)", ratio, 2.0)
+
+
+def test_commit_gate_stays_within_twice_unprotected_update(tmp_path: Path) -> None:
+    """Keep a protected-class update commit within 2x of its unprotected twin (ADR-008 W2-9).
+
+    The fence's marginal work is one batched ``load_many`` of the delta's priors, one msgpack
+    decode per prior and integer compares, bounded by the commit's own encode and apply.
+    Discipline: update commits only, a non-indexed field mutated, no consumers attached (they
+    would flatten the ratio) and a non-root owner (root short-circuits before the prior read).
+
+    Given a protected and an unprotected store of 200 specimens each and a non-root owner
+    When every specimen's mass is mutated and committed on each
+    Then the protected commit takes at most 2x the unprotected one
+    """
+    ratio = _commit_gate_ratio(tmp_path)
+
+    gate("commit_gate_overhead (protected/unprotected update commit)", ratio, 2.0)

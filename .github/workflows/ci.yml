@@ -26,13 +26,10 @@ jobs:
         run: uv sync --all-extras
 
       - name: Lint (ruff)
-        run: uv run ruff check .
+        run: uvx ruff check .
 
-      - name: Type check (pyright — standard mode, all paths; tests keep the magic-query pragmas)
-        run: uvx pyright src tests examples benchmarks
-
-      - name: Type check (pyright — STRICT, library only; src/ is strict-clean at the v0.1.0 tag)
-        run: uvx pyright -p pyrightconfig.strict.json
+      - name: Type check (Pyrefly — src, examples, benchmarks, tests)
+        run: uv run pyrefly check
 
       - name: Tests (unit, property, integration, extras, fitness gates)
         run: uv run pytest -q
@@ -65,3 +62,26 @@ jobs:
           assert not bad, f"native code in the wheel: {bad}"
           print(f"wheel OK: {wheel}")
           EOF
+
+  test-rules:
+    # Standard readable-tests: testrules on every test module the PR changes (no-op on push to main).
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: testrules self-tests
+        run: uv run scripts/test_testrules.py
+
+      - name: Changed test modules
+        run: git diff --name-only --diff-filter=d "origin/${{ github.base_ref }}...HEAD" -- ':(glob)tests/**/test_*.py' ':(glob)benchmarks/test_*.py' > changed.txt
+
+      - name: Gate
+        run: |
+          if [ -s changed.txt ]; then xargs uv run scripts/testrules.py < changed.txt; else echo "no test module changed"; fi

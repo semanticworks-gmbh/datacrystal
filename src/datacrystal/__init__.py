@@ -98,7 +98,7 @@ if TYPE_CHECKING:  # the real import stays lazy — see __getattr__ below
 __version__ = "0.10.0"
 
 
-def __getattr__(name: str):  # PEP 562
+def __getattr__(name: str) -> object:  # PEP 562
     """Load the asyncio facade on first use: plain ``import datacrystal``
     must not pay the ``asyncio`` import (fitness #12, import-time budget).
     """

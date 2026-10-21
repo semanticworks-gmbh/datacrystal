@@ -22,28 +22,49 @@ REPO_ROOT = Path(__file__).parents[2]
 GENERATOR = "from tests.contract.golden_gen import main; main()"
 
 
-def test_same_process_replay_is_byte_identical():
-    assert stream() == stream()
+def _env_with_hash_seed(seed: str) -> dict[str, str]:
+    return {**os.environ, "PYTHONHASHSEED": seed}
 
 
-@pytest.mark.parametrize("seeds", [("0", "42"), ("1", "271828")])
-def test_delta_stream_is_identical_across_hash_seeds(seeds):
-    digests = []
-    for seed in seeds:
-        result = subprocess.run(
-            [sys.executable, "-c", GENERATOR],
-            capture_output=True,
-            text=True,
-            cwd=REPO_ROOT,
-            env={**os.environ, "PYTHONHASHSEED": seed},
-            timeout=120,
-            check=True,
-        )
-        digest = result.stdout.strip()
-        assert len(digest) == 64, f"generator produced no digest: {result.stderr}"
-        digests.append(digest)
-    assert digests[0] == digests[1], (
-        f"PYTHONHASHSEED={seeds[0]} and ={seeds[1]} produced different delta "
-        "streams — hash-order iteration leaked into the emission path "
+def test_same_process_replay_is_byte_identical() -> None:
+    """Given the golden session
+    When its delta stream is generated twice in one process
+    Then both streams are byte-identical
+    """
+    first_stream = stream()
+    second_stream = stream()
+
+    assert first_stream == second_stream
+
+
+@pytest.mark.parametrize(("first_seed", "second_seed"), [("0", "42"), ("1", "271828")])
+def test_delta_stream_is_identical_across_hash_seeds(first_seed: str, second_seed: str) -> None:
+    """Given the golden session generator run in child processes
+    When it runs under two different PYTHONHASHSEED values
+    Then both runs print the same stream digest
+    """
+    first_run = subprocess.run(
+        [sys.executable, "-c", GENERATOR],
+        capture_output=True,
+        text=True,
+        cwd=REPO_ROOT,
+        env=_env_with_hash_seed(first_seed),
+        timeout=120,
+        check=True,
+    )
+    second_run = subprocess.run(
+        [sys.executable, "-c", GENERATOR],
+        capture_output=True,
+        text=True,
+        cwd=REPO_ROOT,
+        env=_env_with_hash_seed(second_seed),
+        timeout=120,
+        check=True,
+    )
+
+    assert len(first_run.stdout.strip()) == 64, f"no digest: {first_run.stderr}"
+    assert len(second_run.stdout.strip()) == 64, f"no digest: {second_run.stderr}"
+    assert first_run.stdout.strip() == second_run.stdout.strip(), (
+        "hash-order iteration leaked into the emission path "
         "(replay determinism is a public-contract property, invariant 5)"
     )

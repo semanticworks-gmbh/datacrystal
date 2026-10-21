@@ -27,6 +27,7 @@ loader.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterable
 from typing import Annotated, Any
 
 import pytest
@@ -46,12 +47,13 @@ from datacrystal.web import (
     snapshot_context,
 )
 
-
 # --- a self-contained slice of the mineral cabinet (reference + frozen) -------
 
 
 @dc.entity
 class Locality:
+    """Where a mineral was first found."""
+
     qid: Annotated[str, dc.Unique]
     name: str
     country: Annotated[str | None, dc.Index] = None
@@ -59,15 +61,19 @@ class Locality:
 
 @dc.entity
 class Mineral:
+    """A mineral species, optionally pointing at its type locality."""
+
     qid: Annotated[str, dc.Unique]
     name: str
     mohs: float | None = None
     type_locality: dc.Lazy[Locality] | None = None
 
 
-def _schema_exposing(gql_type: Any, value: Any) -> strawberry.Schema:
-    """A one-field ``Query`` whose ``root`` returns ``value`` behind ``gql_type``
-    — the #99 consumer pattern (``strawberry.field`` + ``create_type``)."""
+# --- data-building helpers ------------------------------------------------------
+
+
+def _schema_exposing(gql_type: object, value: object) -> strawberry.Schema:
+    """Build a one-field ``Query`` whose ``root`` returns ``value`` behind ``gql_type``."""
 
     def root() -> object:
         return value
@@ -76,274 +82,288 @@ def _schema_exposing(gql_type: Any, value: Any) -> strawberry.Schema:
     return strawberry.Schema(query=create_type("Query", [root_field]))
 
 
-def _execute(schema: strawberry.Schema, query: str, snap: Snapshot) -> Any:
-    """Run ``query`` async (the resolver is async) with a fresh per-request
-    context carrying a :class:`SnapshotLoader` over ``snap``."""
-    return asyncio.run(schema.execute(query, context_value=snapshot_context(snap)))
+def _five_minerals_sharing_a_locality(store: dc.Store) -> list[int]:
+    """Commit five minerals pointing at one locality and return their OIDs."""
+    locality = Locality(qid="L1", name="St Gotthard", country="CH")
+    oids = [
+        store.store(Mineral(qid=f"Q{i}", name=f"M{i}", type_locality=dc.Lazy.of(locality)))
+        for i in range(5)
+    ]
+    store.commit()
+    return oids
+
+
+def _views_of(snap: Snapshot, oids: list[int]) -> list[Any]:
+    return [snap.get(oid) for oid in oids]
+
+
+def _spy_on_get_many(snap: Snapshot) -> list[int]:
+    """Make ``snap.get_many`` record the key count of each batch into the returned list."""
+    batches: list[int] = []
+    real_get_many = snap.get_many
+
+    def spy(refs: Iterable[int]) -> list[EntityView | None]:
+        keys = list(refs)
+        batches.append(len(keys))
+        return real_get_many(keys)
+
+    snap.get_many = spy  # type: ignore[method-assign]
+    return batches
+
+
+def _loader_of(snap: Snapshot) -> SnapshotLoader:
+    """Return the fresh per-request loader ``snapshot_context`` builds over ``snap``."""
+    loader = snapshot_context(snap)[LOADER_CONTEXT_KEY]
+    if not isinstance(loader, SnapshotLoader):
+        raise TypeError(f"snapshot_context carries {type(loader)}, not a SnapshotLoader")
+    return loader
 
 
 # --- the headline integration test --------------------------------------------
 
 
-def test_two_level_nested_query_resolves_off_the_snapshot(store_factory) -> None:
-    """A 2-level nested GraphQL query (Mineral → type_locality → Locality fields)
-    returns correct data resolved entirely off a frozen snapshot — the reference
-    edge is hydrated through the per-request DataLoader, not hand-walked."""
-    store = store_factory()
-    try:
-        gotthard = Locality(qid="L1", name="St Gotthard", country="CH")
-        quartz = Mineral(
-            qid="Q1", name="Quartz", mohs=7.0, type_locality=dc.Lazy.of(gotthard)
-        )
-        oid = store.store(quartz)
-        store.commit()
+def test_two_level_nested_query_resolves_off_the_snapshot(store: dc.Store) -> None:
+    """Given a quartz pointing at its type locality St Gotthard
+    When the nested query reads the mineral and its type locality through a snapshot
+    Then the query returns no errors
+    And the data holds the mineral with its locality hydrated through the loader
+    """
+    gotthard = Locality(qid="L1", name="St Gotthard", country="CH")
+    quartz = Mineral(qid="Q1", name="Quartz", mohs=7.0, type_locality=dc.Lazy.of(gotthard))
+    oid = store.store(quartz)
+    store.commit()
+    gql = StrawberryReflector().reflect(Mineral)
 
-        gql = StrawberryReflector().reflect(Mineral)
-        with store.snapshot() as snap:
-            view = snap.get(oid)
-            assert isinstance(view, EntityView)
-            schema = _schema_exposing(gql, view)
-            result = _execute(
-                schema,
-                "{ root { qid name mohs typeLocality { qid name country } } }",
-                snap,
-            )
-            assert result.errors is None
-            assert result.data == {
-                "root": {
-                    "qid": "Q1",
-                    "name": "Quartz",
-                    "mohs": 7.0,
-                    "typeLocality": {
-                        "qid": "L1",
-                        "name": "St Gotthard",
-                        "country": "CH",
-                    },
-                }
-            }
-    finally:
-        store.close()
+    with store.snapshot() as snap:
+        view = snap.get(oid)
+        assert isinstance(view, EntityView)
+        schema = _schema_exposing(gql, view)
+        query = "{ root { qid name mohs typeLocality { qid name country } } }"
+
+        result = asyncio.run(schema.execute(query, context_value=snapshot_context(snap)))
+
+    assert result.errors is None
+    assert result.data == {
+        "root": {
+            "qid": "Q1",
+            "name": "Quartz",
+            "mohs": 7.0,
+            "typeLocality": {"qid": "L1", "name": "St Gotthard", "country": "CH"},
+        }
+    }
 
 
 # --- the N+1 killer: tick-coalescing into one get_many ------------------------
 
 
-def test_sibling_refs_batch_into_one_get_many(store_factory) -> None:
-    """N minerals each pointing at the same locality, queried in one list field,
-    produce exactly **one** ``Snapshot.get_many`` of N OIDs — Strawberry's
-    ``call_soon`` tick-coalescing (``dataloader.py:248``) collapses the sibling
-    ``.load()`` calls into a single batch. This is the N+1 killer: without the
-    loader each edge would be its own store read."""
-    store = store_factory()
-    try:
-        loc = Locality(qid="L1", name="St Gotthard", country="CH")
-        oids = [
-            store.store(
-                Mineral(qid=f"Q{i}", name=f"M{i}", type_locality=dc.Lazy.of(loc))
-            )
+def test_sibling_refs_resolve_their_shared_locality(store: dc.Store) -> None:
+    """Given five minerals pointing at the same locality
+    When one list query reads each mineral's type locality
+    Then every mineral resolves the shared locality
+    """
+    oids = _five_minerals_sharing_a_locality(store)
+    gql = StrawberryReflector().reflect(Mineral)
+
+    with store.snapshot() as snap:
+        schema = _schema_exposing(list[gql], _views_of(snap, oids))
+        query = "{ root { qid typeLocality { qid name } } }"
+
+        result = asyncio.run(schema.execute(query, context_value=snapshot_context(snap)))
+
+    assert result.errors is None
+    assert result.data == {
+        "root": [
+            {"qid": f"Q{i}", "typeLocality": {"qid": "L1", "name": "St Gotthard"}}
             for i in range(5)
         ]
-        store.commit()
+    }
 
-        gql = StrawberryReflector().reflect(Mineral)
-        with store.snapshot() as snap:
-            views = [snap.get(o) for o in oids]
-            # Spy on get_many to record each batch's key count.
-            batches: list[int] = []
-            real_get_many = snap.get_many
 
-            def spy(refs: Any) -> Any:
-                keys = list(refs)
-                batches.append(len(keys))
-                return real_get_many(keys)
+def test_sibling_refs_batch_into_one_get_many(store: dc.Store) -> None:
+    """Given five minerals pointing at the same locality and a spy on get_many
+    When one list query reads each mineral's type locality
+    Then get_many ran once with all five sibling OIDs
+    """
+    oids = _five_minerals_sharing_a_locality(store)
+    gql = StrawberryReflector().reflect(Mineral)
 
-            snap.get_many = spy  # type: ignore[method-assign]
+    with store.snapshot() as snap:
+        batches = _spy_on_get_many(snap)
+        schema = _schema_exposing(list[gql], _views_of(snap, oids))
+        query = "{ root { qid typeLocality { qid name } } }"
 
-            schema = _schema_exposing(list[gql], views)
-            result = _execute(schema, "{ root { qid typeLocality { qid name } } }", snap)
+        result = asyncio.run(schema.execute(query, context_value=snapshot_context(snap)))
 
-            assert result.errors is None
-            # Every mineral resolved its locality...
-            assert all(
-                row["typeLocality"] == {"qid": "L1", "name": "St Gotthard"}
-                for row in result.data["root"]
-            )
-            # ...in exactly one get_many of all five sibling OIDs (not 5 reads).
-            assert batches == [5]
-    finally:
-        store.close()
+    assert result.errors is None
+    assert batches == [5]
 
 
 # --- request scoping is BUILT, not defaulted ----------------------------------
 
 
-def test_loader_is_built_with_cache_false_not_the_vendored_default(store_factory) -> None:
-    """:class:`SnapshotLoader` constructs its DataLoader with ``cache=False`` —
-    explicitly overriding the vendored ``cache=True`` default
-    (``dataloader.py:139``). The default is a *lifetime* cache; we want a loader
-    whose only scope is the request, so caching is off and a fresh loader is
-    built per request (:func:`snapshot_context`)."""
-    store = store_factory()
-    try:
-        store.store(Locality(qid="L1", name="St Gotthard"))
+def test_loader_is_built_with_cache_false(store: dc.Store) -> None:
+    """Given a snapshot of a committed locality
+    When a SnapshotLoader is built over it
+    Then its DataLoader has the cache switched off
+    """
+    store.store(Locality(qid="L1", name="St Gotthard"))
+    store.commit()
+
+    with store.snapshot() as snap:
+        snap_loader = SnapshotLoader(snap)
+
+        assert snap_loader.loader.cache is False
+
+
+def test_vendored_dataloader_caches_by_default(store: dc.Store) -> None:
+    """Given a snapshot of a committed locality
+    When a DataLoader is built over it with the vendored defaults
+    Then its cache is switched on
+    """
+    store.store(Locality(qid="L1", name="St Gotthard"))
+    store.commit()
+
+    with store.snapshot() as snap:
+        default_loader = DataLoader(load_fn=snap.get_many)  # type: ignore[arg-type]
+
+        assert default_loader.cache is True
+
+
+def test_default_cache_true_is_a_lifetime_cache_per_oid(store: dc.Store) -> None:
+    """Given a cache=True DataLoader that counts its load_fn calls
+    When the same OID is loaded in two separate ticks
+    Then load_fn ran once, for one key
+    And both loads returned the same locality
+    """
+    oid = store.store(Locality(qid="L1", name="St Gotthard"))
+    store.commit()
+
+    with store.snapshot() as snap:
+        calls: list[int] = []
+
+        async def counting_load(oids: list[int]) -> list[EntityView | None]:
+            calls.append(len(oids))
+            return snap.get_many(oids)
+
+        cached: DataLoader[int, EntityView | None] = DataLoader(load_fn=counting_load, cache=True)
+
+        async def two_ticks() -> tuple[Any, Any]:
+            first = await cached.load(oid)
+            second = await cached.load(oid)
+            return first, second
+
+        first, second = asyncio.run(two_ticks())
+
+    assert calls == [1]
+    assert first is not None
+    assert second is not None
+    assert first.name == "St Gotthard"
+    assert second.name == "St Gotthard"
+
+
+def test_per_request_loaders_do_not_leak_across_snapshots(store: dc.Store) -> None:
+    """Given a snapshot taken before a rename and another taken after it
+    When each snapshot's own loader loads the same OID
+    Then the loader over the first snapshot reads the old name
+    And the loader over the second snapshot reads the new name
+    """
+    locality = Locality(qid="L1", name="Old name")
+    oid = store.store(locality)
+    store.commit()
+
+    with store.snapshot() as snap_before:
+        locality.name = "New name"
         store.commit()
-        with store.snapshot() as snap:
-            snap_loader = SnapshotLoader(snap)
-            assert snap_loader.loader.cache is False
-            # The default constructor, by contrast, would cache for a lifetime.
-            assert DataLoader(load_fn=snap.get_many).cache is True  # type: ignore[arg-type]
-    finally:
-        store.close()
+        with store.snapshot() as snap_after:
+            before = asyncio.run(_loader_of(snap_before).load(oid))
+            after = asyncio.run(_loader_of(snap_after).load(oid))
 
-
-def test_default_cache_true_is_a_lifetime_cache_per_oid(store_factory) -> None:
-    """The reason ``cache=False`` is load-bearing: the vendored default
-    ``cache=True`` is a *lifetime* OID→future cache (``dataloader.py:164``). Two
-    ``.load(oid)`` calls in separate ticks against a ``cache=True`` loader hit the
-    cached future and call ``load_fn`` **once** — the cache outlives the tick. If
-    such a loader were reused across requests it would serve request 1's
-    snapshot read to request 2 (a cross-watermark leak), which is exactly why
-    :class:`SnapshotLoader` turns caching off and is built fresh per request
-    (the next test). Here we pin the lifetime-cache behaviour itself."""
-    store = store_factory()
-    try:
-        oid = store.store(Locality(qid="L1", name="St Gotthard"))
-        store.commit()
-        with store.snapshot() as snap:
-            calls: list[int] = []
-
-            async def counting_load(oids: list[int]) -> list[EntityView | None]:
-                calls.append(len(oids))
-                return snap.get_many(oids)
-
-            cached: DataLoader[int, EntityView | None] = DataLoader(
-                load_fn=counting_load, cache=True
-            )
-
-            async def two_ticks() -> tuple[Any, Any]:
-                first = await cached.load(oid)  # tick 1 → load_fn
-                second = await cached.load(oid)  # tick 2 → served from the cache
-                return first, second
-
-            first, second = asyncio.run(two_ticks())
-            assert first is not None and second is not None
-            assert first.name == second.name == "St Gotthard"
-            # The lifetime cache served the second read without a second load_fn.
-            assert calls == [1]
-    finally:
-        store.close()
-
-
-def test_per_request_loaders_do_not_leak_across_snapshots(store_factory) -> None:
-    """The contract :class:`SnapshotLoader` builds: a loader per request, each
-    over its own snapshot, ``cache=False`` — so a read on one watermark never
-    bleeds into another. Two snapshots taken either side of a commit each resolve
-    the SAME OID to their OWN watermark's value through their OWN loader."""
-    store = store_factory()
-    try:
-        loc = Locality(qid="L1", name="Old name")
-        oid = store.store(loc)
-        store.commit()
-        snap_before = store.snapshot()
-
-        loc.name = "New name"
-        store.commit()
-        snap_after = store.snapshot()
-
-        try:
-
-            async def read(snap: Snapshot) -> EntityView | None:
-                # A fresh per-request loader over this snapshot (cache=False).
-                loader = snapshot_context(snap)[LOADER_CONTEXT_KEY]
-                assert isinstance(loader, SnapshotLoader)
-                return await loader.load(oid)
-
-            before = asyncio.run(read(snap_before))
-            after = asyncio.run(read(snap_after))
-            assert before is not None and after is not None
-            # Each loader pinned its own watermark — no cross-snapshot leak.
-            assert before.name == "Old name"
-            assert after.name == "New name"
-        finally:
-            snap_before.close()
-            snap_after.close()
-    finally:
-        store.close()
+    assert before is not None
+    assert after is not None
+    assert before.name == "Old name"
+    assert after.name == "New name"
 
 
 # --- dangling reference resolves to GraphQL null, never a 500 -----------------
 
 
-def test_dangling_reference_resolves_to_null_not_an_error(store_factory) -> None:
-    """A reference whose target was deleted (v0.x unchecked deletes, ADR-003)
-    rides ``get_many``'s None-on-miss: the field resolves to GraphQL ``null`` with
-    no errors — never a 500. The owning Mineral still resolves its own scalars."""
-    store = store_factory()
-    try:
-        gotthard = Locality(qid="L1", name="St Gotthard")
-        quartz = Mineral(qid="Q1", name="Quartz", type_locality=dc.Lazy.of(gotthard))
-        oid = store.store(quartz)
-        store.store(gotthard)
-        store.commit()
-        store.delete(gotthard)  # the edge now dangles
-        store.commit()
+def test_dangling_reference_resolves_to_null_not_an_error(store: dc.Store) -> None:
+    """Given a mineral whose type locality was deleted after the reference was stored
+    When the nested query reads the mineral and its type locality
+    Then the query returns no errors
+    And the data holds the mineral's scalars with a null type locality
+    """
+    gotthard = Locality(qid="L1", name="St Gotthard")
+    quartz = Mineral(qid="Q1", name="Quartz", type_locality=dc.Lazy.of(gotthard))
+    oid = store.store(quartz)
+    store.store(gotthard)
+    store.commit()
+    store.delete(gotthard)
+    store.commit()
+    gql = StrawberryReflector().reflect(Mineral)
 
-        gql = StrawberryReflector().reflect(Mineral)
-        with store.snapshot() as snap:
-            view = snap.get(oid)
-            schema = _schema_exposing(gql, view)
-            result = _execute(schema, "{ root { qid name typeLocality { qid } } }", snap)
-            assert result.errors is None
-            assert result.data == {
-                "root": {"qid": "Q1", "name": "Quartz", "typeLocality": None}
-            }
-    finally:
-        store.close()
+    with store.snapshot() as snap:
+        schema = _schema_exposing(gql, snap.get(oid))
+        query = "{ root { qid name typeLocality { qid } } }"
+
+        result = asyncio.run(schema.execute(query, context_value=snapshot_context(snap)))
+
+    assert result.errors is None
+    assert result.data == {"root": {"qid": "Q1", "name": "Quartz", "typeLocality": None}}
 
 
-def test_absent_reference_resolves_to_null_without_touching_the_loader(
-    store_factory,
-) -> None:
-    """A ``None`` edge (no reference at all) short-circuits to ``null`` without a
-    DataLoader round-trip — the resolver returns ``None`` before calling
-    ``load``, so an unset edge costs no store read."""
-    store = store_factory()
-    try:
-        oid = store.store(Mineral(qid="Q1", name="Quartz"))  # no type_locality
-        store.commit()
+def test_absent_reference_resolves_to_null(store: dc.Store) -> None:
+    """Given a mineral with no type locality
+    When the query reads the mineral and its type locality
+    Then the query returns no errors
+    And the data holds a null type locality
+    """
+    oid = store.store(Mineral(qid="Q1", name="Quartz"))
+    store.commit()
+    gql = StrawberryReflector().reflect(Mineral)
 
-        gql = StrawberryReflector().reflect(Mineral)
-        with store.snapshot() as snap:
-            view = snap.get(oid)
-            batches: list[int] = []
-            real_get_many = snap.get_many
+    with store.snapshot() as snap:
+        schema = _schema_exposing(gql, snap.get(oid))
+        query = "{ root { qid typeLocality { qid } } }"
 
-            def spy(refs: Any) -> Any:
-                keys = list(refs)
-                batches.append(len(keys))
-                return real_get_many(keys)
+        result = asyncio.run(schema.execute(query, context_value=snapshot_context(snap)))
 
-            snap.get_many = spy  # type: ignore[method-assign]
+    assert result.errors is None
+    assert result.data == {"root": {"qid": "Q1", "typeLocality": None}}
 
-            schema = _schema_exposing(gql, view)
-            result = _execute(schema, "{ root { qid typeLocality { qid } } }", snap)
-            assert result.errors is None
-            assert result.data == {"root": {"qid": "Q1", "typeLocality": None}}
-            # No edge to follow → the loader was never asked.
-            assert batches == []
-    finally:
-        store.close()
+
+def test_absent_reference_never_asks_the_loader(store: dc.Store) -> None:
+    """Given a mineral with no type locality and a spy on get_many
+    When the query reads the mineral and its type locality
+    Then get_many was never called
+    """
+    oid = store.store(Mineral(qid="Q1", name="Quartz"))
+    store.commit()
+    gql = StrawberryReflector().reflect(Mineral)
+
+    with store.snapshot() as snap:
+        batches = _spy_on_get_many(snap)
+        schema = _schema_exposing(gql, snap.get(oid))
+        query = "{ root { qid typeLocality { qid } } }"
+
+        asyncio.run(schema.execute(query, context_value=snapshot_context(snap)))
+
+    assert batches == []
 
 
 def test_relation_resolver_without_loader_context_fails_loudly() -> None:
-    """A request executed without a per-request loader on the context (forgot
-    ``snapshot_context``) raises a clear error pointing at the fix, rather than
-    silently N+1-ing or returning wrong data."""
+    """Given a mineral view and a request without snapshot_context
+    When the query reads the type locality
+    Then the query reports an error
+    And the error names snapshot_context
+    """
     gql = StrawberryReflector().reflect(Mineral)
     view = EntityView(0, "x:Mineral", {"qid": "Q1", "name": "Quartz", "type_locality": 1})
     schema = _schema_exposing(gql, view)
+
     result = asyncio.run(
         schema.execute("{ root { typeLocality { qid } } }", context_value={})
     )
+
     assert result.errors is not None
     assert "snapshot_context" in str(result.errors[0])

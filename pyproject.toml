@@ -42,8 +42,9 @@ dev = [
     "duckdb>=1.5.3",
     "httpx>=0.28",
     "hypothesis>=6.155.2",
+    "pyrefly>=1.3.2",
+    "mutmut>=3.8.0",
     "pytest>=9.0.3",
-    "ruff>=0.15.16",
     "uvicorn>=0.34",
 ]
 
@@ -57,45 +58,15 @@ packages = ["src/datacrystal"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
-[tool.ruff]
-line-length = 100
-src = ["src", "tests"]
+[tool.pyrefly]
+project-includes = ["src", "examples", "benchmarks", "tests"]
+search-path = ["typings", "src", "."]  # typings first (stubs), then src so datacrystal is not src.datacrystal, then "." for `from benchmarks import _gen`
 
-[tool.ruff.lint]
-extend-select = ["D"]
-# Residual-docstring baseline: rules that still fire in src/ after the D205/D209
-# mechanical pass. The Google structural rules (D2xx layout, D4xx form) are
-# ENFORCED from here on; these few are baselined so `ruff check .` is 0 and CI
-# gates the rest immediately. Burn the nits down by deleting a line — never by
-# adding `# noqa` (src pragmas are reserved for the magic-query typing exception).
-extend-ignore = [
-    "D205", # blank-line-after-summary: OFF on purpose (a voice choice, not debt) — the
-            # descriptive house style runs the summary straight into a multi-line first
-            # paragraph; a mechanical blank line would split a sentence mid-thought.
-    "D102", # undocumented-public-method: a handful of self-evident methods
-            # (mostly protocol/dunder-adjacent) still lack a docstring.
-    "D105", # undocumented-magic-method: __repr__/__eq__/__iter__ etc. — obvious
-            # by signature; document only where the why is non-trivial.
-    "D107", # undocumented-public-init: __init__ intent lives on the class
-            # docstring in the house style; not every __init__ repeats it.
-    "D403", # first-word-uncapitalized: one summary keys off a lowercase field
-            # name ("name → factory"); capitalizing would misname it.
-    "D415", # missing-terminal-punctuation: a couple of summaries open a `::`
-            # literal block instead of ending in a period.
-]
-
-[tool.ruff.lint.pydocstyle]
-convention = "google"
-
-[tool.ruff.lint.per-file-ignores]
-# Docstrings are a src/ library contract; don't require them outside src/.
-# evals/ are on-demand proving grounds (NOT unit tests, outside CI) — same
-# rationale as tests/examples/benchmarks.
-"tests/**" = ["D"]
-"examples/**" = ["D"]
-"benchmarks/**" = ["D"]
-"evals/**" = ["D"]
-
-[tool.pyright]
-venvPath = "."
-venv = ".venv"
+[tool.mutmut]
+source_paths = ["src/datacrystal/"]
+# tests leave global state (the entity registry); a fork per mutant from a clean server keeps runs independent
+process_isolation = "forkserver"
+pytest_add_cli_args_test_selection = ["tests/"]
+also_copy = ["mutation", "tests", "docs", "scripts", "examples", "benchmarks", "evals", "assets", "typings", "README.md", "CHANGELOG.md", "CONTRIBUTING.md", "AGENTS.md", "CLAUDE.md", "llms.txt", "LICENSE", ".python-version"]
+# trampolines add `import mutmut...` to src/, which the engine-free gate rightly rejects
+pytest_add_cli_args = ["-p", "no:cacheprovider", "-p", "mutation.mutmut_order", "--deselect", "tests/fitness/test_contract_engine_free.py::test_contract_package_imports_no_engine"]

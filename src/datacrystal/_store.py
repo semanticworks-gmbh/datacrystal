@@ -2941,7 +2941,7 @@ class Store:
             stacklevel=3,
         )
 
-    def _iter_raw(self, ti: TypeInfo, oids: list[int]):
+    def _iter_raw(self, ti: TypeInfo, oids: list[int]) -> Iterator[tuple[int, dict[str, Any]]]:
         """Decode-level row scan: committed records → field-value dicts via
         the per-cid hydration plan (additive evolution honored). Loads in
         chunks to bound peak memory; constructs no entities, touches no

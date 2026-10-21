@@ -224,7 +224,7 @@ def to_pydantic(
         # Wire-null projection (W4-4), not a DTO — see the docstring for why the
         # annotation stays ``BaseModel``: the twin arrives only from a fenced
         # deref boundary, which maps this None to null before any field access.
-        return None  # pyright: ignore[reportReturnType]  # documented wire-null return
+        return None  # pyrefly: ignore[bad-return]  # documented wire-null return
     cls: type
     values: dict[str, Any]
     oid: int | None

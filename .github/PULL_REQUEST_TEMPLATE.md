@@ -1,6 +1,6 @@
 <!--
 CI enforces the machine gates (pytest both backends + SIGKILL · ruff incl. D ·
-pyright standard + strict · demos×2 · wheel purity · the fitness suite). Green CI
+Pyrefly · demos×2 · wheel purity · the fitness suite). Green CI
 == those boxes are already ticked — don't restate them here.
 Only the items CI cannot see go below.
 -->

@@ -23,6 +23,7 @@ target (or a markdown file outside our scope, e.g. a directory link) is left to 
 from __future__ import annotations
 
 import re
+from functools import cache
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -77,41 +78,81 @@ def _file_slugs(text: str) -> set[str]:
     return slugs
 
 
-def test_internal_doc_links_resolve():
-    files = _doc_files()
-    # Slugs cached by RESOLVED path so a cross-file link's #fragment can be checked against the
-    # heading slugs of the file it actually points at (not just the linking file's own slugs).
-    slug_cache = {f: _file_slugs(f.read_text()) for f in files}
-    slug_by_resolved = {f.resolve(): slugs for f, slugs in slug_cache.items()}
+@cache
+def _slugs_by_path() -> dict[Path, set[str]]:
+    return {f.resolve(): _file_slugs(f.read_text()) for f in _doc_files()}
 
-    problems: list[str] = []
-    for f in files:
-        text = f.read_text()
-        own_slugs = slug_cache[f]
-        for m in _LINK.finditer(text):
-            target = m.group(1).strip()
-            if _EXTERNAL.match(target):
-                continue
-            if target.startswith("#"):
-                slug = target[1:]
-                if slug not in own_slugs:
-                    problems.append(f"{f.relative_to(ROOT)}: dangling anchor '{target}'")
-                continue
-            # relative path, optionally with its own #fragment
-            path_part, _, frag = target.partition("#")
-            if path_part == "":  # pure fragment handled above; empty means nothing to check
-                continue
-            resolved = (f.parent / path_part).resolve()
-            if not resolved.exists():
-                problems.append(f"{f.relative_to(ROOT)}: missing path target '{target}'")
-                continue
-            # Cross-file fragment: if the target is an in-scope markdown file, the #fragment
-            # must match a heading slug in THAT file (a moved/renamed section is a broken link).
-            if frag and resolved in slug_by_resolved:
-                if frag not in slug_by_resolved[resolved]:
-                    problems.append(
-                        f"{f.relative_to(ROOT)}: cross-file link '{target}' resolves, but "
-                        f"'#{frag}' is not a heading in {resolved.relative_to(ROOT)}"
-                    )
 
-    assert not problems, "internal documentation links do not resolve:\n  " + "\n  ".join(problems)
+@cache
+def _internal_links() -> list[tuple[Path, str]]:
+    """Every non-external link target with the file that holds it."""
+    links: list[tuple[Path, str]] = []
+    for f in _doc_files():
+        targets = (m.group(1).strip() for m in _LINK.finditer(f.read_text()))
+        links.extend((f, target) for target in targets if not _EXTERNAL.match(target))
+    return links
+
+
+def _dangling_anchors() -> list[str]:
+    return [
+        f"{f.relative_to(ROOT)}: dangling anchor '{target}'"
+        for f, target in _internal_links()
+        if target.startswith("#") and target[1:] not in _slugs_by_path()[f.resolve()]
+    ]
+
+
+def _relative_path_links() -> list[tuple[Path, str, Path, str]]:
+    """Each relative link as (file, target, resolved path, fragment)."""
+    found = []
+    for f, target in _internal_links():
+        path_part, _, fragment = target.partition("#")
+        if path_part:
+            found.append((f, target, (f.parent / path_part).resolve(), fragment))
+    return found
+
+
+def _missing_path_targets() -> list[str]:
+    return [
+        f"{f.relative_to(ROOT)}: missing path target '{target}'"
+        for f, target, resolved, _ in _relative_path_links()
+        if not resolved.exists()
+    ]
+
+
+def _stale_cross_file_fragments() -> list[str]:
+    return [
+        f"{f.relative_to(ROOT)}: cross-file link '{target}' resolves, but "
+        f"'#{fragment}' is not a heading in {resolved.relative_to(ROOT)}"
+        for f, target, resolved, fragment in _relative_path_links()
+        if fragment and resolved in _slugs_by_path() and fragment not in _slugs_by_path()[resolved]
+    ]
+
+
+def test_same_file_anchor_links_match_a_heading() -> None:
+    """Given every ](#slug) link in README.md, CLAUDE.md and docs/**/*.md
+    When each slug is looked up among its own file's heading slugs
+    Then none is dangling
+    """
+    problems = _dangling_anchors()
+
+    assert problems == [], "dangling anchors:\n  " + "\n  ".join(problems)
+
+
+def test_relative_path_links_point_at_existing_paths() -> None:
+    """Given every ](relative/path) link in README.md, CLAUDE.md and docs/**/*.md
+    When each path is resolved relative to the linking file
+    Then none is missing on disk
+    """
+    problems = _missing_path_targets()
+
+    assert problems == [], "missing path targets:\n  " + "\n  ".join(problems)
+
+
+def test_cross_file_fragments_match_a_heading_in_the_target() -> None:
+    """Given every ](relative/path#fragment) link into one of our markdown files
+    When each fragment is looked up among the target file's heading slugs
+    Then none points at a moved or renamed section
+    """
+    problems = _stale_cross_file_fragments()
+
+    assert problems == [], "stale cross-file fragments:\n  " + "\n  ".join(problems)

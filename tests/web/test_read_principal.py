@@ -12,16 +12,11 @@ ADR-008 R15).
 Transport: ``asyncio.run`` + ``httpx.AsyncClient(ASGITransport)`` (the async
 read routes run on the loop; a snapshot read is any-thread anyway, ADR-002).
 """
-# The reflected GraphQL/Pydantic types are dynamically built (pyright can't see
-# their fields), and the magic-query ``Doc.slug == slug`` returns an untypeable
-# Condition. File-scoped pragmas, as in test_app_wiring / test_rest_e2e.
-# pyright: reportAttributeAccessIssue=false, reportUnknownMemberType=false
-# pyright: reportUnknownVariableType=false, reportUnknownArgumentType=false
-# pyright: reportUnknownParameterType=false, reportMissingParameterType=false
-# pyright: reportArgumentType=false, reportPrivateUsage=false
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Callable, Iterator
 from typing import Annotated, Any
 
 import pytest
@@ -31,8 +26,6 @@ pytest.importorskip("fastapi", reason="datacrystal[web] extra not installed")
 pytest.importorskip("strawberry", reason="datacrystal[web] extra not installed")
 pytest.importorskip("httpx", reason="pip install httpx (ASGITransport)")
 
-import asyncio
-
 import httpx
 import strawberry
 from fastapi import Depends, FastAPI
@@ -41,7 +34,7 @@ from strawberry.tools import create_type
 from strawberry.types import Info
 
 import datacrystal as dc
-from datacrystal._snapshot import Snapshot
+from datacrystal._snapshot import EntityView, Snapshot
 from datacrystal._storage.memory import MemoryBackend
 from datacrystal.web import (
     SNAPSHOT_CONTEXT_KEY as SNAP_KEY,
@@ -60,26 +53,32 @@ TEAM = 7
 OPERATOR = dc.Principal(uid=1, memberships={dc.WORLD: dc.ADMIN})
 BEA = dc.Principal(uid=42, memberships={TEAM: dc.CURATOR})  # owner/seeder
 ANNA = dc.Principal(uid=41, memberships={TEAM: dc.VIEWER})  # can read the team row
-DENY = dc.Principal(uid=98, memberships={99: dc.CURATOR})  # a foreign team — denied
+DENY = dc.Principal(uid=98, memberships={99: dc.CURATOR})  # a foreign team, denied
 
 
 @dc.entity(protected=True)
 class Secret:
+    """A protected row fenced to a team."""
+
     label: Annotated[str, dc.Unique]
     body: str = ""
 
 
 @dc.entity
 class Doc:
+    """An unprotected document referencing a protected Secret."""
+
     slug: Annotated[str, dc.Unique]
     title: str
     about: dc.Lazy[Secret] | None = None
 
 
-def _seed() -> dc.Store:
-    """A store (opened by the OPERATOR) holding one TEAM-fenced Secret and one
-    unprotected Doc that references it. BEA (CURATOR in TEAM) owns + fences the
-    Secret to ``read=VIEWER`` — any TEAM member may read it, a non-member cannot.
+@pytest.fixture
+def seeded_store() -> Iterator[dc.Store]:
+    """Provide a store opened by the OPERATOR with one TEAM-fenced Secret and a Doc on it.
+
+    BEA (CURATOR in TEAM) owns and fences the Secret to ``read=VIEWER``: any TEAM
+    member may read it, a non-member cannot.
     """
     store = dc.Store._from_backend(MemoryBackend(), principal=OPERATOR)
     with store.acting_as(BEA):
@@ -89,12 +88,40 @@ def _seed() -> dc.Store:
         doc = Doc(slug="d1", title="cover", about=dc.Lazy.of(secret))
         store.store(doc)
         store.commit()
-    return store
+    yield store
+    store.close()
 
 
-def _client(app: FastAPI) -> httpx.AsyncClient:
-    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
-                             base_url="http://web")
+def _requests_as(principal: dc.Principal) -> Callable[[], dc.Principal]:
+    """Build a get_principal override that always resolves ``principal``."""
+
+    def resolve() -> dc.Principal:
+        return principal
+
+    return resolve
+
+
+def _requests_as_in_turn(*principals: dc.Principal) -> Callable[[], dc.Principal]:
+    """Build a get_principal override that resolves ``principals`` one request at a time."""
+    remaining = iter(principals)
+
+    def resolve() -> dc.Principal:
+        return next(remaining)
+
+    return resolve
+
+
+def _send(
+    app: FastAPI, method: str, path: str, json: dict[str, str] | None = None
+) -> httpx.Response:
+    """Send one request to ``app`` over an ASGI transport on the calling thread."""
+
+    async def send() -> httpx.Response:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://web") as client:
+            return await client.request(method, path, json=json)
+
+    return asyncio.run(send())
 
 
 # --- REST read app ------------------------------------------------------------
@@ -105,18 +132,20 @@ def _rest_app(store: dc.Store, captured: list[Snapshot] | None = None) -> FastAP
     app.state.dc_store = store  # the get_store state key; _get_pool builds lazily
 
     @app.get("/secrets")
-    async def secrets(snap: Snapshot = Depends(read_snapshot)):  # noqa: ANN202
+    async def secrets(snap: Annotated[Snapshot, Depends(read_snapshot)]) -> dict[str, list[str]]:
         # A DISCOVERY surface: query() intersects the handle principal's readable
         # set, so a denied row never appears in the list.
         return {"labels": [v.label for v in snap.query(Secret)]}
 
     @app.get("/doc/{slug}")
-    async def doc(slug: str, snap: Snapshot = Depends(read_snapshot)):  # noqa: ANN202
-        matches = snap.query(Doc.slug == slug)
+    async def doc(
+        slug: str, snap: Annotated[Snapshot, Depends(read_snapshot)]
+    ) -> dict[str, object]:
+        matches = snap.query(Doc.slug == slug)  # pyrefly: ignore[bad-argument-type]
         if not matches:
             return {"found": False}
         d = matches[0]
-        about: Any = None
+        about: dict[str, object] | None = None
         if d.about is not None:
             # Deref the (possibly protected) referent: a denied one comes back a
             # redacted twin, and to_pydantic projects it to wire-null (W4-4).
@@ -126,7 +155,7 @@ def _rest_app(store: dc.Store, captured: list[Snapshot] | None = None) -> FastAP
         return {"found": True, "title": d.title, "about": about}
 
     @app.get("/whoami")
-    async def whoami(snap: Snapshot = Depends(read_snapshot)):  # noqa: ANN202
+    async def whoami(snap: Annotated[Snapshot, Depends(read_snapshot)]) -> dict[str, int]:
         if captured is not None:
             captured.append(snap)
         return {"uid": snap.principal.uid}
@@ -138,12 +167,11 @@ def _rest_app(store: dc.Store, captured: list[Snapshot] | None = None) -> FastAP
 
 
 def _graphql_app(store: dc.Store) -> FastAPI:
-    reflector = StrawberryReflector()
-    doc_gql = reflector.reflect(Doc)
+    doc_gql = StrawberryReflector().reflect(Doc)
 
-    def doc_resolver(slug: str, info: Info[Any, Any]) -> Any:
+    def doc_resolver(slug: str, info: Info[Any, Any]) -> EntityView | None:
         snap: Snapshot = info.context[SNAP_KEY]
-        matches = snap.query(Doc.slug == slug)
+        matches = snap.query(Doc.slug == slug)  # pyrefly: ignore[bad-argument-type]
         return matches[0] if matches else None
 
     doc_field: Any = strawberry.field(
@@ -161,129 +189,187 @@ def _graphql_app(store: dc.Store) -> FastAPI:
 
 # --- tests --------------------------------------------------------------------
 
-
-def test_rest_discovery_sees_only_the_principals_readable_rows():
-    async def run() -> None:
-        store = _seed()
-        app = _rest_app(store)
-
-        # A TEAM member reads the fenced Secret; a non-member sees an empty list
-        # (the row is filtered at the discovery surface, not errored).
-        app.dependency_overrides[get_principal] = lambda: ANNA
-        async with _client(app) as client:
-            assert (await client.get("/secrets")).json() == {"labels": ["s1"]}
-
-        app.dependency_overrides[get_principal] = lambda: DENY
-        async with _client(app) as client:
-            assert (await client.get("/secrets")).json() == {"labels": []}
-        store.close()
-
-    asyncio.run(run())
+DOC_QUERY = '{ doc(slug: "d1") { title about { label } } }'
 
 
-def test_rest_denied_reference_projects_to_null_no_error_no_leak():
-    async def run() -> None:
-        store = _seed()
-        app = _rest_app(store)
+def test_rest_discovery_lists_the_readable_row_for_a_team_member(
+    seeded_store: dc.Store,
+) -> None:
+    """Given a TEAM-fenced Secret and a request resolved as the TEAM viewer Anna
+    When the client GETs /secrets
+    Then the list holds the Secret's label
+    """
+    app = _rest_app(seeded_store)
+    app.dependency_overrides[get_principal] = _requests_as(ANNA)
 
-        # ANNA may read the referent — the ``about`` edge carries the label.
-        app.dependency_overrides[get_principal] = lambda: ANNA
-        async with _client(app) as client:
-            body = (await client.get("/doc/d1")).json()
-        assert body["found"] is True and body["about"]["label"] == "s1"
+    resp = _send(app, "GET", "/secrets")
 
-        # DENY may NOT — the SAME Doc resolves with ``about`` wire-null: the
-        # denied referent (a redacted twin) projects to null, never a 500, and
-        # the Doc itself still resolves (no existence leak on the edge).
-        app.dependency_overrides[get_principal] = lambda: DENY
-        async with _client(app) as client:
-            r = await client.get("/doc/d1")
-        assert r.status_code == 200
-        assert r.json() == {"found": True, "title": "cover", "about": None}
-        store.close()
-
-    asyncio.run(run())
+    assert resp.json() == {"labels": ["s1"]}
 
 
-def test_anonymous_pool_base_reads_no_protected_row():
-    async def run() -> None:
-        store = _seed()
-        app = _rest_app(store)  # NO get_principal override → anonymous base
+def test_rest_discovery_filters_the_row_out_for_a_non_member(seeded_store: dc.Store) -> None:
+    """Given a TEAM-fenced Secret and a request resolved as a foreign-team principal
+    When the client GETs /secrets
+    Then the list is empty, filtered rather than errored
+    """
+    app = _rest_app(seeded_store)
+    app.dependency_overrides[get_principal] = _requests_as(DENY)
 
-        async with _client(app) as client:
-            # The pool base is pinned to Principal(uid=0), so a request with no
-            # resolved identity reads the anonymous readable set — nothing here.
-            assert (await client.get("/secrets")).json() == {"labels": []}
-            assert (await client.get("/whoami")).json() == {"uid": 0}
-        store.close()
+    resp = _send(app, "GET", "/secrets")
 
-    asyncio.run(run())
+    assert resp.json() == {"labels": []}
 
 
-def test_graphql_denied_reference_is_null_and_member_sees_it():
-    async def run() -> None:
-        store = _seed()
-        app = _graphql_app(store)
-        query = '{ doc(slug: "d1") { title about { label } } }'
+def test_rest_member_reads_the_referent_through_the_edge(seeded_store: dc.Store) -> None:
+    """Given a Doc referencing a TEAM-fenced Secret and a request resolved as Anna
+    When the client GETs /doc/d1
+    Then the Doc is found
+    And its about edge carries the Secret's label
+    """
+    app = _rest_app(seeded_store)
+    app.dependency_overrides[get_principal] = _requests_as(ANNA)
 
-        app.dependency_overrides[get_principal] = lambda: ANNA
-        async with _client(app) as client:
-            body = (await client.post("/graphql", json={"query": query})).json()
-        assert body.get("errors") is None
-        assert body["data"] == {"doc": {"title": "cover", "about": {"label": "s1"}}}
+    body = _send(app, "GET", "/doc/d1").json()
 
-        # A denied ref ≡ dangling ref ≡ GraphQL null — no 500 from getattr on the
-        # twin, no existence leak, the Doc itself still resolves.
-        app.dependency_overrides[get_principal] = lambda: DENY
-        async with _client(app) as client:
-            resp = await client.post("/graphql", json={"query": query})
-        assert resp.status_code == 200
-        body = resp.json()
-        assert body.get("errors") is None
-        assert body["data"] == {"doc": {"title": "cover", "about": None}}
-        store.close()
-
-    asyncio.run(run())
+    assert body["found"] is True
+    assert body["about"]["label"] == "s1"
 
 
-def test_two_principals_at_one_watermark_share_the_pooled_core():
-    async def run() -> None:
-        store = _seed()
-        captured: list[Snapshot] = []
-        app = _rest_app(store, captured)
+def test_rest_denied_reference_projects_to_null_no_error_no_leak(
+    seeded_store: dc.Store,
+) -> None:
+    """Given a Doc referencing a TEAM-fenced Secret and a request resolved as a non-member
+    When the client GETs /doc/d1
+    Then the response is 200
+    And the Doc resolves with its about edge null
+    """
+    app = _rest_app(seeded_store)
+    app.dependency_overrides[get_principal] = _requests_as(DENY)
 
-        principals = iter((ANNA, DENY))
-        app.dependency_overrides[get_principal] = lambda: next(principals)
-        async with _client(app) as client:
-            assert (await client.get("/whoami")).json() == {"uid": ANNA.uid}
-            assert (await client.get("/whoami")).json() == {"uid": DENY.uid}
+    resp = _send(app, "GET", "/doc/d1")
 
-        assert len(captured) == 2
-        # Distinct per-request handles bound to distinct principals ...
-        assert captured[0] is not captured[1]
-        assert captured[0].principal.uid != captured[1].principal.uid
-        # ... over the SAME shared per-watermark core: the expensive index build
-        # happened ONCE for the commit, not once per principal or per request
-        # (ADR-008 R15 — for_principal is O(1), builds nothing, scans nothing).
-        assert captured[0]._core is captured[1]._core
-        store.close()
-
-    asyncio.run(run())
+    assert resp.status_code == 200
+    assert resp.json() == {"found": True, "title": "cover", "about": None}
 
 
-def test_from_pydantic_cannot_spoof_lib_managed_dc_labels():
-    # Reflection drops every _dc_* column, so the create-face model has no floor
-    # fields — a client-smuggled _dc_owner is dropped at validation AND never
-    # reaches the constructor (from_pydantic builds kwargs only from descriptors).
+def test_anonymous_pool_base_reads_no_protected_row(seeded_store: dc.Store) -> None:
+    """Given a TEAM-fenced Secret and a request with no resolved identity
+    When the client GETs /secrets
+    Then the list is empty
+    """
+    app = _rest_app(seeded_store)
+
+    resp = _send(app, "GET", "/secrets")
+
+    assert resp.json() == {"labels": []}
+
+
+def test_anonymous_pool_base_is_pinned_to_uid_zero(seeded_store: dc.Store) -> None:
+    """Given a request with no resolved identity
+    When the client GETs /whoami
+    Then the snapshot's principal has uid 0
+    """
+    app = _rest_app(seeded_store)
+
+    resp = _send(app, "GET", "/whoami")
+
+    assert resp.json() == {"uid": 0}
+
+
+def test_graphql_member_sees_the_referent(seeded_store: dc.Store) -> None:
+    """Given a Doc referencing a TEAM-fenced Secret and a request resolved as Anna
+    When the client queries the Doc and its about edge
+    Then the response has no errors
+    And the data holds the title and the Secret's label
+    """
+    app = _graphql_app(seeded_store)
+    app.dependency_overrides[get_principal] = _requests_as(ANNA)
+
+    body = _send(app, "POST", "/graphql", json={"query": DOC_QUERY}).json()
+
+    assert body.get("errors") is None
+    assert body["data"] == {"doc": {"title": "cover", "about": {"label": "s1"}}}
+
+
+def test_graphql_denied_reference_is_null(seeded_store: dc.Store) -> None:
+    """Given a Doc referencing a TEAM-fenced Secret and a request resolved as a non-member
+    When the client queries the Doc and its about edge
+    Then the response is 200
+    And it has no errors
+    And the Doc resolves with a null about edge
+    """
+    app = _graphql_app(seeded_store)
+    app.dependency_overrides[get_principal] = _requests_as(DENY)
+
+    resp = _send(app, "POST", "/graphql", json={"query": DOC_QUERY})
+
+    body = resp.json()
+    assert resp.status_code == 200
+    assert body.get("errors") is None
+    assert body["data"] == {"doc": {"title": "cover", "about": None}}
+
+
+def test_two_principals_at_one_watermark_get_their_own_handles(seeded_store: dc.Store) -> None:
+    """Given requests resolved as Anna and then as a non-member at one watermark
+    When the client GETs /whoami twice
+    Then each response names its own principal's uid
+    And the two requests got distinct snapshot handles
+    And the handles are bound to distinct principals
+    """
+    captured: list[Snapshot] = []
+    app = _rest_app(seeded_store, captured)
+    app.dependency_overrides[get_principal] = _requests_as_in_turn(ANNA, DENY)
+
+    first = _send(app, "GET", "/whoami")
+    second = _send(app, "GET", "/whoami")
+
+    assert first.json() == {"uid": ANNA.uid}
+    assert second.json() == {"uid": DENY.uid}
+    assert captured[0] is not captured[1]
+    assert captured[0].principal.uid != captured[1].principal.uid
+
+
+def test_two_principals_at_one_watermark_share_the_pooled_core(seeded_store: dc.Store) -> None:
+    """Given requests resolved as Anna and then as a non-member at one watermark
+    When the client GETs /whoami twice
+    Then exactly two handles were served
+    And both handles share one pooled core, the index built once per commit
+    """
+    captured: list[Snapshot] = []
+    app = _rest_app(seeded_store, captured)
+    app.dependency_overrides[get_principal] = _requests_as_in_turn(ANNA, DENY)
+
+    _send(app, "GET", "/whoami")
+    _send(app, "GET", "/whoami")
+
+    assert len(captured) == 2
+    assert captured[0]._core is captured[1]._core
+
+
+def test_create_face_has_no_lib_managed_floor_fields() -> None:
+    """Given the create face of the protected Secret
+    When its fields are listed
+    Then it has no _dc_owner field
+    And it has no _dc_read_floor field
+    """
     create_model = entity_model(Secret, face="create")
+
     assert "_dc_owner" not in create_model.model_fields
     assert "_dc_read_floor" not in create_model.model_fields
 
+
+def test_from_pydantic_cannot_spoof_lib_managed_dc_labels() -> None:
+    """Given a create body smuggling _dc_owner 999 and an EXECUTIVE _dc_read_floor
+    When from_pydantic rebuilds the Secret
+    Then the owner is not the smuggled 999
+    And the read floor is not the smuggled EXECUTIVE
+    """
+    create_model = entity_model(Secret, face="create")
     dto = create_model.model_validate(
         {"label": "spoof", "body": "x", "_dc_owner": 999, "_dc_read_floor": dc.EXECUTIVE}
     )
+
     entity = from_pydantic(dto, Secret)
-    # The floors are the library's birth defaults, NOT the smuggled values —
-    # a request can never set its own read/write floor through the edge (W4-4).
-    assert entity._dc_owner != 999  # pyright: ignore[reportAttributeAccessIssue]
-    assert entity._dc_read_floor != dc.EXECUTIVE  # pyright: ignore[reportAttributeAccessIssue]
+
+    assert entity._dc_owner != 999  # pyrefly: ignore[missing-attribute]
+    assert entity._dc_read_floor != dc.EXECUTIVE  # pyrefly: ignore[missing-attribute]
