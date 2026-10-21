@@ -224,7 +224,7 @@ def _storable(value: object, tag: str) -> object:
     if tag.startswith("list<"):
         assert isinstance(value, (list, tuple))
         inner = tag[5:-1]
-        return [_storable(item, inner) for item in cast("Iterable[object]", value)]
+        return [_storable(item, inner) for item in value]
     if tag == "float" and isinstance(value, int):
         return float(value)
     if tag == "int" and isinstance(value, bool):
@@ -248,7 +248,7 @@ def _semantic(value: object, tag: str) -> object:
     if tag.startswith("list<"):
         assert isinstance(value, list)
         inner = tag[5:-1]
-        return [_semantic(item, inner) for item in cast("list[object]", value)]
+        return [_semantic(item, inner) for item in value]
     return value
 
 
