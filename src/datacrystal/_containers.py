@@ -1,20 +1,10 @@
 """Owner-bound persistent containers (M2 deliverable, KICKOFF risk 1).
 
-In-place mutation of a list/dict inside a CLEAN entity used to be invisible
-to the one-shot ``__setattr__`` hook — the #1 silent-lost-write footgun in
-both ancestor systems (ZODB, EclipseStore). The fix: every list/dict that
-enters an entity field (by assignment, construction or hydration) is wrapped
-in a :class:`PersistentList`/:class:`PersistentDict` bound to its owning
-entity. Every mutator flips the owner to DIRTY *before* mutating (so the
-ADR-001 owner-thread check still raises pre-mutation); mutating a container
-owned by an ``@entity(frozen=True)`` record raises ``FrozenEntityError``.
-
-Semantics: wrapping COPIES the container — containers are by-value parts of
-their owner (they round-trip by value, never by reference). After assigning
-``e.tags = data``, mutate through ``e.tags``, not through ``data``.
-
-Containers hold a strong reference to their owner: as long as you can reach
-a container, its owner cannot be collected out from under it.
+An in-place mutation of a list or dict inside a CLEAN entity would bypass the one-shot
+``__setattr__`` hook, so every list/dict entering an entity field is wrapped in a
+:class:`PersistentList`/:class:`PersistentDict` bound to its owner.
+Every mutator flips the owner to DIRTY *before* mutating, or raises ``FrozenEntityError``.
+Wrapping COPIES: after ``e.tags = data``, mutate through ``e.tags``, not ``data``.
 """
 
 from __future__ import annotations
@@ -27,12 +17,11 @@ from datacrystal._state import touch
 
 
 def wrap_value(value: Any, owner: Any) -> Any:
-    """Wrap lists/dicts (recursively) as persistent containers bound to
-    ``owner``. Already-bound containers of the same owner pass through;
-    everything else is copied into a fresh bound wrapper.
+    """Wrap lists and dicts (recursively) as persistent containers bound to ``owner``.
+
+    Containers already bound to the same owner pass through; everything else is copied.
     """
     if isinstance(value, (PersistentList, PersistentDict)):
-        # reportPrivateUsage: same-module wrap_value/owner cooperation
         if value._dc_owner is owner:
             return value
         return type(value)(value, owner=owner)

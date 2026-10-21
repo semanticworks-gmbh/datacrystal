@@ -1,25 +1,10 @@
 """``aopen()``: the asyncio facade (ADR-001 owner-loop confinement).
 
-An :class:`AsyncStore` is the engine bound to the event loop's thread:
-every task on the owner loop may touch the live graph (one thread by
-construction), foreign threads get ``WrongThreadError``. The asyncio
-doctrine applies and is documented from day one (ADR-001 bound decision 6):
-**a critical section is the code between awaits** — mutate and commit with
-no ``await`` in between, or wrap the scope in :meth:`AsyncStore.transaction`.
-
-``await commit()`` keeps the three-phase shape: P1 captures and flips
-before the first ``await`` (so the capture is a consistent cut of the
-graph), P2 applies the batch in the store's IO executor while the loop
-stays free, P3 finalizes back on the loop. A write racing P2 — another
-task mutating between our awaits — re-dirties through the re-armed hooks
-and lands in the *next* commit; that is the ratified semantics, not a race.
-
-``transaction()`` is ADR-001 rider 1: an ``asyncio.Lock`` scope that
-commits on clean exit. Confinement gives memory safety; scopes give
-request isolation across awaits (the FastAPI integration's default).
-On exception the scope does NOT commit — your buffered in-memory
-mutations stay buffered (live objects have no rollback; decide to fix,
-commit, or discard-by-close).
+An :class:`AsyncStore` is bound to the loop's thread; foreign threads get ``WrongThreadError``.
+A critical section is the code between awaits (ADR-001 bound decision 6): mutate and commit with
+no ``await`` in between, or use :meth:`AsyncStore.transaction` (ADR-001 rider 1).
+``await commit()`` runs P1 before the first ``await``, P2 in the IO executor, P3 on the loop;
+a write racing P2 lands in the next commit, and a raising ``transaction()`` does not commit.
 """
 
 from __future__ import annotations
@@ -147,9 +132,9 @@ class AsyncStore:
         self._store.detach(consumer)
 
     def snapshot(self) -> Snapshot:
-        """A frozen read view at the durable watermark — like the sync
-        store's, callable from any thread (e.g. inside
-        ``run_in_executor`` work that must not touch live entities).
+        """Return a frozen read view at the durable watermark, callable from any thread.
+
+        Use it inside ``run_in_executor`` work that must not touch live entities.
         """
         return self._store.snapshot()
 

@@ -20,12 +20,10 @@ STATE_DELETED = 3  # store.delete()d (ADR-003); reads work, writes raise
 def touch(obj: Any) -> None:
     """Flip a CLEAN entity to DIRTY via its store, BEFORE the mutation lands.
 
-    The store call enforces the ADR-001 owner-thread check (raising leaves
-    the entity unmodified). NEW and DIRTY entities are already buffered, so
-    touching them is free. CLEAN implies stamped — the ``__dc_store__`` slot
-    is guaranteed to exist. DELETED entities are write-barred here, the one
-    choke point both the entity hook and the containers pass through
-    (ADR-003: pre-mutation, like every write barrier).
+    The store call enforces the ADR-001 owner-thread check (raising leaves the entity unmodified).
+    NEW and DIRTY entities are already buffered; CLEAN implies the ``__dc_store__`` slot exists.
+    DELETED entities are write-barred here, the one choke point for the entity hook and the
+    containers (ADR-003: pre-mutation, like every write barrier).
     """
     state = object.__getattribute__(obj, "__dc_state__")
     if state == STATE_DELETED:

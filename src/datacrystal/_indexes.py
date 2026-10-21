@@ -1,25 +1,9 @@
 """In-memory secondary indexes: pyroaring bitmaps + the unique key map.
 
-ROADMAP item 4 (bitmap indexes + Condition AST) and the SDA delta (unique
-secondary-key index). v0.1 indexes are **rebuildable derived data**: built
-lazily per class from a backend scan at first use, then maintained
-incrementally from each commit. They may be cached on disk (ADR-005:
-watermark-validated, rebuilt on mismatch, never authoritative) but never
-participate in the commit transaction — the records stay the source of truth.
-
-The KICKOFF plan sketched these as "the second commit-delta consumer";
-they deliberately are NOT one (decided at M4): a DeltaConsumer would force
-prior-payload reads and delta builds on EVERY commit, while spec §5
-promises an unwatched store pays nothing for the pipeline. The index keeps
-its own ``oid → last-indexed-values`` memory instead and is folded in
-directly at P3. The pipeline's prior-value contract is validated by the
-M3 FTS5 spike; the Arrow mirror becomes the first real second consumer.
-
-Un-indexing on update needs the *prior* values; the index keeps its own
-``oid → last-indexed-values`` map rather than requiring deltas to carry old
-values — the public-contract question that raises is documented in
-KICKOFF.md (M3 prior-value spike).
-
+Indexes are rebuildable derived data (ROADMAP item 4): built lazily per class, then folded in at
+P3 of each commit; they may be cached on disk (ADR-005) but never join the commit transaction.
+They are deliberately not a commit-delta consumer (decided at M4): that would force prior-payload
+reads on every commit, so each keeps its own ``oid → last-indexed-values`` memory (KICKOFF.md).
 OIDs live above 2**32, hence ``BitMap64``.
 """
 
@@ -47,15 +31,11 @@ from datacrystal._storage.protocol import StorageBackend, StoredRecord
 
 
 def _guard_temporal_comparable(field: str, new_key: Any, existing_key: Any) -> None:
-    """Reject a SortedIndex datetime field that mixes naive and aware values
-    (#106 / ADR-004 §4) — Python cannot order a tz-aware against a tz-naive
-    ``datetime``, so a mixed sorted run would raise a bare ``TypeError`` deep in
-    ``bisect``/``insort``. We catch it at the door with a named datacrystal error.
+    """Reject a SortedIndex datetime field that mixes naive and aware values (#106, ADR-004 §4).
 
-    Only ``datetime`` carries an offset; ``date``/``time``/``str``/numeric keys
-    are uniformly comparable, so the guard is a no-op for them. Compares the
-    incoming key against any one already-indexed key (all keys in a single sorted
-    run share one convention once this guard has held).
+    A mixed run would raise a bare ``TypeError`` deep in ``bisect``; this names it at the door.
+    Only ``datetime`` carries an offset, so other key types pass.
+    The incoming key is compared with one existing key, since a run shares one convention.
     """
     if (isinstance(new_key, _dt.datetime) and isinstance(existing_key, _dt.datetime)
             and (new_key.tzinfo is None) != (existing_key.tzinfo is None)):
@@ -68,11 +48,10 @@ def _guard_temporal_comparable(field: str, new_key: Any, existing_key: Any) -> N
 
 
 def _sorted_run(field: str, keys: Iterable[Any]) -> list[Any]:
-    """Sort a sorted field's distinct non-None keys into its run, turning the
-    bare ``TypeError`` a naive-vs-aware datetime mix raises in ``sorted()`` into a
-    named :class:`MixedTemporalIndexError` (#106 / ADR-004 §4). Used by the bulk
-    build's ``finalize_build`` and the cache ``load`` — the from-scan/from-cache
-    rebuild paths where the whole run is sorted at once.
+    """Sort a sorted field's distinct non-None keys into its run (#106, ADR-004 §4).
+
+    A naive-vs-aware datetime mix becomes a :class:`MixedTemporalIndexError`, not a bare
+    ``TypeError``. Used where the whole run is sorted at once: ``finalize_build``, cache ``load``.
     """
     try:
         return sorted(keys)
@@ -94,14 +73,10 @@ def _sorted_run(field: str, keys: Iterable[Any]) -> list[Any]:
 class QueryPlan:
     """The deterministic execution plan ``store.explain()`` reports.
 
-    There is no optimizer behind this — exactly three deterministic rules,
-    always (``==``/``.in_()`` on Index/Unique/SortedIndex fields answer from
-    bitmaps; ``>=``/``>``/``<=``/``<`` on a ``SortedIndex`` field answer from a
-    sorted range slice — ADR-004; everything else evaluates as a Python
-    residual). No cost model, no plan search; the analytics-tier planner is
-    DuckDB over the ``[arrow]`` mirror, never core. ``explain`` exists so the
-    cost of a condition is inspectable, not guessed (decided 2026-06-12 with
-    query()'s class-form symmetry).
+    No optimizer sits behind it, only three rules: ``==``/``.in_()`` on an indexed field answer
+    from bitmaps, ``>=``/``>``/``<=``/``<`` on a ``SortedIndex`` field from a sorted range slice
+    (ADR-004), and everything else is a Python residual.
+    The analytics-tier planner is DuckDB over the ``[arrow]`` mirror, never core.
     """
 
     typename: str
@@ -130,18 +105,12 @@ class QueryPlan:
 def explain_plan(typename: str, ci: ClassIndexes,
                  cond: Condition | None,
                  readable: BitMap64 | None = None) -> QueryPlan:
-    """Build the :class:`QueryPlan` for one (class extent, condition) pair —
-    shared by the live store and snapshots (same two rules on both).
+    """Build the :class:`QueryPlan` for one (class extent, condition) pair.
 
-    ``readable`` (ADR-008 R12/D8) post-filters ONLY the reported ``candidates``/
-    ``extent`` numbers — a protected caller's readable OIDs, or ``None`` for
-    "no filter" (root, or an unprotected class/a snapshot caller, W3-2). The
-    planner itself is untouched: ``condition``/``residual``/``indexed`` and
-    ``__str__`` never change shape, and this stays exactly the two-(plus-
-    ADR-004-third)-rule planner — no new Condition type, no new QueryPlan
-    field, no cost model. Defaulting to ``None`` keeps every pre-W3 caller
-    (incl. :class:`~datacrystal.Snapshot`, unenforced until W4/R15) byte-
-    identical.
+    The live store and snapshots share it.
+    ``readable`` (ADR-008 R12/D8) post-filters only the reported ``candidates`` and ``extent``
+    counts; ``None`` means no filter (root, an unprotected class, or a snapshot caller).
+    The planner itself, ``condition``, ``residual`` and ``indexed`` are untouched.
     """
     extent_bm = ci.extent if readable is None else (ci.extent & readable)
     extent = len(extent_bm)
@@ -242,22 +211,12 @@ class ClassIndexes:
         self._needs_lv_rebuild = False
 
     def committed_labels(self, oid: int) -> tuple[int, list[int], int] | None:
-        """The ``(owner, groups, read_floor)`` of a COMMITTED row, read from
-        this index's own last-indexed-values memory — O(1), no backend I/O
-        (ADR-008 W3 D1: committed labels, never staged ones, are the read-
-        enforcement truth — a buffered ``share()``/``protect()`` is
-        unvalidated until the W2-5 commit gate rules on it). ``None`` means
-        ``oid`` is not committed in this class; callers treat that as absent
-        (fail closed, never fail open).
+        """Return the committed ``(owner, groups, read_floor)`` of ``oid``, or None if absent.
 
-        Valid because ADR-008 D3 gives ``_dc_owner``/``_dc_groups``/
-        ``_dc_read_floor`` index markers, so all three are "maintained"
-        fields and present in ``_last_values`` for every committed row of a
-        protected class — legacy rows included, via the build-time R7 fill.
-        ``_dc_write_floor`` carries no marker and is never here; the write
-        gate keeps decoding it from the prior record. Triggers the deferred
-        (#12) rebuild after an index-cache load, exactly like the first
-        write would.
+        Read O(1) from the index's last-indexed-values memory, no backend I/O.
+        Committed labels, never staged ones, are the read-enforcement truth (ADR-008 W3 D1);
+        callers treat None as absent (fail closed).
+        It triggers the deferred (#12) rebuild after a cache load, like the first write.
         """
         if self._needs_lv_rebuild:
             self._rebuild_last_values()
@@ -316,12 +275,10 @@ class ClassIndexes:
             if eq_col is not None:
                 postings = eq_col.get(value)
                 if postings is None:
-                    # a genuinely new key on a sorted field enters the sorted run
-                    # (None never participates in ordering — SQL-NULL-like). During
-                    # a bulk build the insort is deferred to finalize_build()
-                    # (O(K^2)→one sort); incremental commits insort directly. A
-                    # datetime field that would mix naive+aware values is rejected
-                    # before insort's comparison fails (#106 / ADR-004 §4).
+                    # a new key on a sorted field enters the sorted run (None never does);
+                    # a bulk build defers the insort to finalize_build() (O(K^2) → one sort).
+                    # A datetime field mixing naive and aware values is rejected before
+                    # insort's comparison fails (#106 / ADR-004 §4).
                     if (field in self.sorted_fields and value is not None
                             and not self._building):
                         run = self.sorted_keys[field]
@@ -434,13 +391,11 @@ def build_class_indexes(
     lineage: list[tuple[int, list[str]]],
     scan_type: Callable[[int], Iterable[StoredRecord]],
 ) -> ClassIndexes:
-    """Build one class's indexes by scanning its whole lineage (additive
-    schema evolution): per cid, indexed fields map to that shape's
-    positions; fields the old shape lacked are filled from the class
-    defaults. Each OID appears under exactly one cid (updates rewrite the
-    row). ``scan_type`` is the seam: the live store scans its backend, a
-    snapshot scans its pinned read view (ADR-002) — same rules, one code
-    path.
+    """Build one class's indexes by scanning its whole lineage (additive schema evolution).
+
+    Per cid, indexed fields map to that shape's positions; fields the old shape lacked take
+    the class defaults. ``scan_type`` is the seam: the live store scans its backend, a snapshot
+    its pinned read view (ADR-002).
     """
     specs = ti.specs
     eq_fields = _eq_index_fields(ti)
@@ -562,9 +517,9 @@ class IndexManager:
         return ci
 
     def dump_for_cache(self) -> dict[str, Any]:
-        """The built per-class indexes as ``{typename: blob}`` for the sidecar —
-        the live store's forward indexes only (the reverse index is not cached
-        in this first cut).
+        """Return the built per-class indexes as ``{typename: blob}`` for the sidecar.
+
+        Only the forward indexes; the reverse index travels through :meth:`dump_reverse`.
         """
         from datacrystal._entity import type_info  # lazy: _entity imports us
 
@@ -608,17 +563,12 @@ class IndexManager:
     def check_sorted_temporal(
         self, entries: list[tuple[int, TypeInfo, dict[str, Any]]]
     ) -> None:
-        """P1 validation: a SortedIndex datetime field may not mix timezone-naive
-        and timezone-aware values (#106 / ADR-004 §4) — they are not mutually
-        orderable, so a mixed sorted run would fail with a bare ``TypeError`` in
-        ``bisect``/``insort``. Raising here (BEFORE the TID is allocated) keeps the
-        TID sequence gapless on rejection (invariant 5) and never half-mutates the
-        live index.
+        """P1 validation: a SortedIndex datetime field may not mix naive and aware values (#106).
 
-        Validates the commit batch against itself and against any already-built
-        index, without forcing a build: a not-yet-built index's first build path
-        (:func:`build_class_indexes`/``finalize_build``) carries the same guard, so
-        a mix already on disk is caught the same way when the index is first read.
+        Raising before the TID is allocated keeps the sequence gapless (invariant 5) and never
+        half-mutates the live index.
+        It checks the batch against itself and against built indexes, without forcing a build;
+        an unbuilt index carries the same guard in ``finalize_build``.
         """
         first: dict[tuple[type, str], Any] = {}  # one already-seen key per field
         for _oid, ti, values in entries:
@@ -649,11 +599,10 @@ class IndexManager:
                     first[key] = value
 
     def _invalidate_stale_blob(self, ti: TypeInfo) -> None:
-        """A commit changed this class's records before its index was built, so
-        the boot-loaded cache blob now predates the change (#71). Drop it — a
-        later ``ensure()`` rebuilds from the now-current records rather than
-        loading a stale blob (which would resurrect a deleted OID or miss a new
-        one). The cache is never authoritative (invariant 11).
+        """Drop the boot-loaded cache blob for a class whose records changed before its build (#71).
+
+        A later ``ensure()`` then rebuilds from current records; a stale blob would resurrect a
+        deleted OID or miss a new one.
         """
         if self._cache_blobs is not None:
             self._cache_blobs.pop(ti.typename, None)
@@ -687,13 +636,10 @@ class IndexManager:
         return self._reverse is not None
 
     def ensure_reverse(self) -> dict[int, BitMap64]:
-        """Lazily build the global reverse-reference postings by scanning every
-        committed record once and harvesting its outgoing refs (#20) — the same
-        rebuildable-derived-data contract as the forward indexes (invariant 11,
-        ADR-005: may be cached on disk — watermark-validated, never authoritative —
-        but never in the commit txn). Unlike ``build_class_indexes``
-        (per-class, indexed positions only) this is global and decodes every
-        field of every record.
+        """Build the global reverse-reference postings lazily from one scan of all records (#20).
+
+        Same derived-data contract as the forward indexes (invariant 11, ADR-005).
+        Unlike ``build_class_indexes`` it is global and decodes every field of every record.
         """
         if self._reverse is not None:
             return self._reverse
@@ -721,10 +667,10 @@ class IndexManager:
         return rev
 
     def dump_reverse(self) -> dict[str, Any] | None:
-        """The built reverse postings (target → referrers) for the sidecar (#63),
-        or None if the reverse index was never built this session. Only this
-        direction is cached — what ``incoming()`` reads; the referrer → targets
-        diff memory is rebuilt from it on the first fold (see ``__init__``).
+        """Return the built reverse postings (target → referrers) for the sidecar (#63).
+
+        Return None if they were never built this session.
+        Only this direction is cached; the referrer → targets memory is rebuilt on the first fold.
         """
         if self._reverse is None:
             return None
@@ -792,10 +738,10 @@ class IndexManager:
 
 
 def _range_slice(ci: ClassIndexes, field: str, op: str, value: Any) -> BitMap64:
-    """The OIDs whose SortedIndex ``field`` key satisfies ``op value`` — bisect
-    the sorted run for the matching key interval, union those eq postings
-    (ADR-004 / #18). None is never in the run (SQL-NULL-like ordering), and a
-    None bound matches nothing — mirroring :meth:`Pred.evaluate`.
+    """Return the OIDs whose SortedIndex ``field`` key satisfies ``op value`` (ADR-004, #18).
+
+    Bisect the sorted run and union the matching eq postings.
+    None is never in the run, and a None bound matches nothing, as in :meth:`Pred.evaluate`.
     """
     acc = BitMap64()
     if value is None:
@@ -816,30 +762,13 @@ def _range_slice(ci: ClassIndexes, field: str, op: str, value: Any) -> BitMap64:
 
 
 def readable_bitmap(p: Any, ci: ClassIndexes) -> BitMap64 | None:
-    """The OIDs of ``ci``'s extent readable by ``p`` (ADR-008 W3-1) — the
-    bitmap-compiler twin of :func:`datacrystal._permissions.can_read_row`,
-    same predicate, two shapes. ``None`` means root (R9): "no filter",
-    callers skip the intersect entirely rather than materializing the full
-    extent. Only ever called for a protected class — callers guard on
-    ``ti.protected`` (the W2-9/W3 zero-cost invariant, #21); calling it for
-    an unprotected class would still work (empty ``eq`` lookups) but IS the
-    thing the fitness gate forbids.
+    """Return the OIDs of ``ci``'s extent readable by ``p`` (ADR-008 W3-1), None for root (R9).
 
-    Compiles ``owner-postings ∪ ⋃ per-membership (group-postings ∩
-    read_floor ≤ level)``. Correctness: row-wise ``can_read = is_owner ∨
-    ∃g∈rec.groups: level(p, g) ≥ read_floor`` (ADR-008 Context). A group
-    outside ``p.memberships`` contributes ``NO_STANDING`` (-1), which is
-    below every floor (floors are ≥ ``VIEWER`` by the label verbs'
-    ``_check_level``), so iterating only ``p``'s held memberships (∪ the
-    implicit ``WORLD`` one) already covers every group that could pass —
-    skipping the rest is not an approximation. An explicit
-    ``memberships[WORLD]`` entry (even a low one) overrides the implicit
-    ``VIEWER`` exactly like :func:`datacrystal._permissions.level` does, and
-    ``_range_slice(..., "<=", NO_STANDING)`` is empty, so a weird negative
-    override still composes correctly. Anonymous (``uid=0``, no
-    memberships): the owner branch is skipped (R7a — uid 0 owns nothing) and
-    the effective membership set is ``{WORLD: VIEWER}`` — "reads only
-    WORLD-at-VIEWER rows", never raises.
+    The bitmap twin of :func:`datacrystal._permissions.can_read_row`: owner postings, union
+    per held membership the group postings whose read floor is at most that level.
+    Only call it for a protected class (zero-cost invariant, #21).
+    Iterating just ``p``'s memberships plus the implicit ``WORLD`` one is exact, because any
+    other group has ``NO_STANDING``, below every floor.
     """
     if is_root(p):
         return None
@@ -911,12 +840,10 @@ def plan(cond: Condition, ci: ClassIndexes) -> tuple[BitMap64 | None, Condition 
                         acc |= postings
                 return acc, None
         if cond.field in ci.unique:
-            # A pure-Unique field has no eq postings (#12): answer equality from
-            # the value→oid map. == → 0/1 oid; in_ → the union; contains/startswith
-            # iterate the distinct keys (which ARE the distinct values) — the same
-            # O(distinct) shape as the eq path, never a record load. (A Unique+Index
-            # or Unique+SortedIndex field is in ci.eq and took the branch above, so
-            # this runs only for Unique-only fields.)
+            # A pure-Unique field has no eq postings (#12): answer from the value→oid map,
+            # with contains/startswith iterating the distinct keys (O(distinct), no record
+            # load). A Unique+Index or Unique+SortedIndex field is in ci.eq and took the
+            # branch above, so this runs only for Unique-only fields.
             holder = ci.unique[cond.field]
             if cond.op == "==":
                 oid = holder.get(cond.value)
@@ -972,16 +899,11 @@ def plan(cond: Condition, ci: ClassIndexes) -> tuple[BitMap64 | None, Condition 
 
 def order_via_index(ci: ClassIndexes, matched: BitMap64, field: str,
                     descending: bool) -> list[int]:
-    """``matched`` OIDs ordered by an **indexed** ``field`` straight from its
-    postings — no record decode (#25). A ``SortedIndex`` field's keys are already
-    sorted (ADR-004), so ordering is effectively free; any other indexed field
-    sorts its distinct keys once. NULLs sort last; within an equal key the OIDs
-    come out ascending (a roaring posting iterates ascending), giving the stable
-    ascending-OID tiebreak the offset-paging contract requires.
+    """Order ``matched`` OIDs by an **indexed** ``field`` straight from its postings (#25).
 
-    ``matched`` is the condition's candidate BitMap64; every matched OID appears
-    under exactly one ``eq[field]`` key (None included), so the result is a pure
-    reordering of ``matched``.
+    No record decode: a ``SortedIndex`` field's keys are already sorted (ADR-004), any other
+    indexed field sorts its distinct keys once.
+    NULLs sort last, and OIDs ascend within a key, the tiebreak offset paging requires.
     """
     postings = ci.eq[field]
     if field in ci.sorted_fields:
@@ -1001,16 +923,11 @@ def order_via_index(ci: ClassIndexes, matched: BitMap64, field: str,
 
 def windowed_index_order(ci: ClassIndexes, matched: BitMap64, field: str,
                          descending: bool, limit: int | None, offset: int) -> list[int]:
-    """The ``(offset, limit)`` window of ``matched`` ordered by an **indexed**
-    ``field`` (#66) — short-circuiting to **O(offset + limit + keys_touched)**
-    when ``limit`` is set, instead of materializing the full order. Walks the
-    field's keys in order, unioning ``posting & matched``, and stops once
-    ``offset + limit`` OIDs are in hand. A ``SortedIndex`` field's keys are
-    already sorted (free); any other indexed field sorts its distinct keys once.
-    NULLs (``eq[None]``) come last, reached only if the window isn't filled by
-    non-None keys. Same order as :func:`order_via_index` then sliced — verified
-    by the order_by oracle — but without touching the long tail of keys past the
-    window.
+    """Take the ``(offset, limit)`` window of ``matched`` ordered by an **indexed** ``field`` (#66).
+
+    With a ``limit`` it stops after ``offset + limit`` OIDs, O(offset + limit + keys_touched).
+    The order equals :func:`order_via_index` sliced, without touching keys past the window.
+    NULLs come last, reached only if non-None keys leave the window unfilled.
     """
     if limit is None:  # no window to stop at → the full order, offset-sliced
         ordered = order_via_index(ci, matched, field, descending)

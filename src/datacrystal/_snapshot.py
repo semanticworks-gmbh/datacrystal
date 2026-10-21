@@ -1,18 +1,10 @@
 """``store.snapshot()``: frozen entity views at a commit watermark.
 
-ADR-001 rider 2, shipped at M3 (KICKOFF): a snapshot is the sanctioned way
-for ANY thread to read committed state while the owner keeps writing. It
-stands on the storage read view (ADR-002) — a pinned, isolated view of
-exactly one durable commit boundary — and exposes records as immutable
-:class:`EntityView` DTOs: plain decoded data, never live entities, so
-nothing here can violate owner confinement or dirty tracking by design.
-
-Since M4 a snapshot also answers **bitmap queries**: :meth:`Snapshot.query`
-and :meth:`Snapshot.count` plan over snapshot-local indexes (rebuilt from
-this read view — invariant 11, rebuildable derived data — never shared with
-the owner's live indexes), and :meth:`Snapshot.index_bitmaps` exposes them
-as frozen views, completing the slot reserved at M3 (ADR-001 bound
-decision 4).
+A snapshot (ADR-001 rider 2) is how any thread reads committed state while the owner writes.
+It stands on a pinned storage read view of one durable commit boundary (ADR-002) and exposes
+immutable :class:`EntityView` DTOs, never live entities, so owner confinement holds by design.
+:meth:`Snapshot.query` and :meth:`Snapshot.count` plan over snapshot-local indexes rebuilt from
+that view (invariant 11), never shared with the owner's; ``index_bitmaps`` exposes them frozen.
 """
 
 from __future__ import annotations
@@ -154,19 +146,13 @@ class EntityView:
 
 
 class RedactedView(Redacted, EntityView):
-    """The snapshot-tier redacted twin (ADR-008 R14, carried onto the DTO
-    tier): a found-but-denied protected record surfaces from
-    :meth:`Snapshot.get_many` as one of these instead of a leak.
+    """The snapshot-tier redacted twin (ADR-008 R14) of a found-but-denied protected record.
 
-    ``isinstance(twin, EntityView)`` AND ``isinstance(twin, dc.Redacted)`` both
-    hold — it reuses the SAME ``dc.Redacted`` marker as the live twin, so ONE
-    denial identity spans live + snapshot. Traversal is graceful (``oid`` /
-    ``typename`` stay readable), USING redacted data is loud: any DATA-field
-    access (``twin.note``), ``fields()``, or ``dc_permissions`` raises
-    :class:`ReadDeniedError`. Frozen and field-EMPTY by construction (built
-    with no ``_values``); never committable (a snapshot view is read-only, and
-    the label verbs reject snapshot views regardless). Per-principal ephemera —
-    two derefs of the same denied OID build two distinct twins.
+    :meth:`Snapshot.get_many` returns it instead of a leak. It is both an :class:`EntityView` and
+    a ``dc.Redacted``, the live twin's marker, so one denial identity spans live and snapshot.
+    ``oid`` and ``typename`` stay readable; any data-field access, ``fields()`` or
+    ``dc_permissions`` raises :class:`ReadDeniedError`.
+    It is field-empty, never committable, and per-principal: two derefs build two twins.
     """
 
     __slots__ = ()
@@ -189,14 +175,12 @@ class RedactedView(Redacted, EntityView):
 
 
 def _redacted_view(oid: int, typename: str) -> RedactedView:
-    """One snapshot-tier redacted twin for ``oid`` — field-EMPTY (no
-    ``_values``), so every data access raises through :meth:`__getattr__`.
-    """
+    """Build a field-empty redacted twin for ``oid``, so every data access raises."""
     return RedactedView(oid, typename, {})
 
 
 def _freeze(value: Any) -> Any:
-    """Decoded payload value → immutable snapshot value."""
+    """Turn a decoded payload value into an immutable snapshot value."""
     if isinstance(value, RefToken):
         return Ref(value.oid)
     if isinstance(value, list):
@@ -241,9 +225,9 @@ def _view_value(value: Any) -> Any:
 
 def _order_views(views: list[EntityView], field: str,
                  descending: bool) -> list[EntityView]:
-    """EntityViews ordered by ``field`` for the un-indexed / residual snapshot
-    order_by path (#25): NULLs last, stable ascending-OID tiebreak (``views``
-    arrive ascending-OID from ``_views_for``).
+    """Order views by ``field`` for the un-indexed or residual order_by path (#25).
+
+    NULLs go last; ``views`` arrive ascending-OID, which the stable sort keeps as the tiebreak.
     """
     present = [v for v in views if getattr(v, field) is not None]
     absent = [v for v in views if getattr(v, field) is None]
@@ -267,16 +251,12 @@ def _view_condition(cond: Condition) -> Condition:
 
 
 class SnapshotIndexes:
-    """One class's index bitmaps, frozen at a snapshot's watermark (the M4
-    completion of ADR-001 bound decision 4).
+    """One class's index bitmaps, frozen at a snapshot's watermark (ADR-001 bound decision 4).
 
-    ``extent`` holds every committed OID of the class across its full type
-    lineage; ``eq[field][value]`` the OIDs whose indexed ``field`` equals
-    ``value``; ``unique[field][value]`` the single OID owning a unique key.
-    Everything is immutable (``FrozenBitMap64`` / read-only mappings) and
-    snapshot-local — derived data rebuilt from the pinned read view, never
-    shared with the owner's live indexes — so any thread may keep using it
-    while the owner commits.
+    ``extent`` holds every committed OID of the class across its type lineage,
+    ``eq[field][value]`` the OIDs whose indexed ``field`` equals ``value``, and
+    ``unique[field][value]`` the OID owning a unique key.
+    All of it is immutable and snapshot-local, so any thread may use it while the owner commits.
     """
 
     __slots__ = ("eq", "extent", "unique")
@@ -302,13 +282,11 @@ class SnapshotIndexes:
 
 
 class _SnapshotCore:
-    """The principal-FREE shared state of one snapshot watermark (ADR-008 R15,
-    W4 amendment): the pinned read view, the type lineage, and every expensive
-    derived cache (materialized views, per-class indexes, frozen index views,
-    reverse postings). Built once per commit boundary; any number of
-    per-principal :class:`Snapshot` handles ride the SAME core (a handle adds
-    only a principal binding + a per-principal readable-bitmap cache), so index
-    builds stay O(n) per commit, never O(n) per principal (R15 economics).
+    """The principal-free shared state of one snapshot watermark (ADR-008 R15, W4 amendment).
+
+    It holds the pinned read view, the type lineage and every expensive derived cache.
+    Any number of per-principal :class:`Snapshot` handles share one core, so index builds stay
+    O(n) per commit, never O(n) per principal.
     """
 
     def __init__(self, view: StorageReadView) -> None:
@@ -356,9 +334,7 @@ class _SnapshotCore:
     # -- shared derived state (caller holds the lock) ----------------------
 
     def class_indexes(self, ti: Any) -> ClassIndexes:
-        """The snapshot-local mutable indexes for one class; the planner's
-        working form behind the frozen views.
-        """
+        """Return the snapshot-local mutable indexes for one class, the planner's working form."""
         ci = self.indexes.get(ti.cls)
         if ci is None:
             lineage = [
@@ -388,11 +364,10 @@ class _SnapshotCore:
         return rev
 
     def no_live_class_fenced(self, typename: str) -> bool:
-        """True when there is NO live ``@entity`` class for ``typename`` yet the
-        persisted lineage carries the ``_dc_*`` label columns (ADR-008 W4-5):
-        the fail-closed case — the raw persisted shape would leak protected
-        data AND the label columns, and no live class exists to honestly
-        post-filter it. Callers fail closed for every principal except root.
+        """Return True if no live ``@entity`` class exists but the lineage has ``_dc_*`` columns.
+
+        This is the ADR-008 W4-5 fail-closed case: the raw shape would leak protected data and
+        label columns, and no live class can post-filter it. Callers fail closed except for root.
         """
         if TYPES_BY_NAME.get(typename) is not None:
             return False
@@ -432,9 +407,9 @@ class _SnapshotCore:
         return [self.cache[oid] for oid in oids]
 
     def views_for_tolerant(self, oids: list[int]) -> list[EntityView | None]:
-        """The miss-tolerant sibling of :meth:`_views_for` (caller holds the
-        lock): an absent/deleted OID yields ``None`` in its slot. The engine
-        seam behind the public :meth:`Snapshot.get_many` (#94).
+        """Return the views for ``oids``, None for an absent or deleted OID (caller holds the lock).
+
+        The miss-tolerant sibling of :meth:`_views_for`, behind :meth:`Snapshot.get_many` (#94).
         """
         self.load_missing(oids, tolerant=True)
         return [self.cache.get(oid) for oid in oids]
@@ -506,29 +481,13 @@ class _SnapshotCore:
 
 
 class Snapshot:
-    """A frozen, thread-safe view of the store at one commit watermark, bound
-    to ONE acting principal (ADR-008 R15).
+    """A frozen, thread-safe view of the store at one commit watermark for ONE principal.
 
-    Create via ``store.snapshot(principal=...)`` — from any thread, even while
-    the owner commits (the storage read view pins one durable commit boundary,
-    ADR-002). A handle is a thin ``(core, principal)`` pair: the expensive
-    per-watermark state lives on a shared :class:`_SnapshotCore`, so
-    :meth:`for_principal` derives a sibling handle over the same core in O(1)
-    (it builds nothing and scans nothing). Discovery surfaces
-    (``query``/``count``/``all``/``explain``/``incoming``) intersect this
-    principal's readable OIDs before any window/order/hydration; deref surfaces
-    (``get``/``get_many``/``open_blob``) check ``can_read_row`` per row.
-
-    Close promptly (it is a context manager): on the sqlite backend an open
-    snapshot holds a WAL read transaction, which blocks checkpoint truncation.
-    Closing any handle closes the shared core.
-
-    Deliberately un-slotted (the ADR-008 W4 design's ``__slots__`` was
-    "suggested", not required): the ``datacrystal[web]`` DataLoader tier — a
-    later phase this build must not destabilise — monkeypatches ``get_many`` on
-    a live handle, which needs an instance ``__dict__``. The handle is thin
-    either way (all heavy state lives on the shared core); TRAP 1 is honoured by
-    keying ``_readable`` on the class, not the Principal.
+    Create it with ``store.snapshot(principal=...)`` from any thread (ADR-002, ADR-008 R15).
+    Discovery surfaces (``query``, ``count``, ``all``, ``explain``, ``incoming``) intersect the
+    principal's readable OIDs first; deref surfaces (``get``, ``get_many``, ``open_blob``) check
+    ``can_read_row`` per row. Close it promptly: on sqlite it holds a WAL read transaction.
+    It is un-slotted on purpose: the ``datacrystal[web]`` DataLoader patches ``get_many`` on it.
     """
 
     def __init__(self, core: _SnapshotCore, principal: Principal) -> None:
@@ -540,11 +499,10 @@ class Snapshot:
         self._readable: dict[Any, BitMap64 | None] = {}
 
     def for_principal(self, principal: Principal) -> Snapshot:
-        """A sibling handle over the SAME shared core, bound to ``principal``
-        (ADR-008 R15) — O(1): builds nothing, scans nothing, shares every
-        materialized view / index / reverse posting with this handle. Each
-        handle enforces its own principal's readable set (a fresh per-principal
-        readable cache); a handle's binding is immutable.
+        """Return a sibling handle over the SAME shared core, bound to ``principal`` (ADR-008 R15).
+
+        It costs O(1) and shares every view, index and reverse posting with this handle;
+        each handle enforces its own principal's readable set.
         """
         return Snapshot(self._core, principal)
 
@@ -562,38 +520,29 @@ class Snapshot:
 
     @property
     def types(self) -> tuple[tuple[int, str, tuple[str, ...]], ...]:
-        """The full type lineage at this watermark — ``(cid, typename,
-        field names)`` rows, exactly what a COMMIT-DELTA consumer needs to
-        bootstrap before applying deltas from ``tid`` onward.
+        """The type lineage at this watermark as ``(cid, typename, field names)`` rows.
+
+        A COMMIT-DELTA consumer bootstraps from it before applying deltas from ``tid`` onward.
         """
         return self._core.types
 
     @property
     def root(self) -> Any:
-        """The committed root value (refs as :class:`Ref`, containers
-        frozen), or ``None`` if no root was ever assigned. May raise
-        :class:`ReadDeniedError` if the root record is protected and
-        unreadable by this handle's principal (the strict-deref contract).
+        """The committed root value (refs as :class:`Ref`, containers frozen), or ``None``.
+
+        Raises :class:`ReadDeniedError` if the root record is unreadable by this principal.
         """
         if self._core.root_oid is None:
             return None
         return self.get(self._core.root_oid).value
 
     def get(self, ref: Ref | int) -> EntityView:
-        """Resolve an OID or :class:`Ref` to its :class:`EntityView` — the
-        STRICT deref (ADR-008 R14): a protected record unreadable by this
-        handle's principal RAISES :class:`ReadDeniedError` (like the live
-        twin, the strict deref reveals existence; use :meth:`get_many` for the
-        redacted-twin / ``None`` form). Root sees everything.
+        """Resolve an OID or :class:`Ref` to its :class:`EntityView`, the STRICT deref (R14).
 
-        Raises:
-            DanglingRefError: no record for that OID at this watermark —
-                deleted (v0.x deletes are unchecked, ADR-003) or never
-                committed.
-            ReadDeniedError: the record is protected and unreadable by this
-                handle's principal (or a persisted ``_dc_*`` record has no
-                live class — fail closed for non-root, W4-5).
-            StoreClosedError: this snapshot has already been closed.
+        A record this principal cannot read raises :class:`ReadDeniedError`, revealing existence;
+        :meth:`get_many` gives the redacted-twin form. Root reads everything.
+        Raises ``DanglingRefError`` for a deleted or never-committed OID (ADR-003) and
+        ``StoreClosedError`` on a closed snapshot.
         """
         oid = ref.oid if isinstance(ref, Ref) else ref
         core = self._core
@@ -618,23 +567,12 @@ class Snapshot:
         )
 
     def get_many(self, refs: Iterable[EntityView | Ref | int]) -> list[EntityView | None]:
-        """Batch-resolve OIDs to :class:`EntityView` DTOs in one storage
-        round-trip per chunk — the DEREF seam for the ``datacrystal[web]``
-        DataLoader (#94). Returns a ``list[EntityView | None]`` aligned 1:1
-        with the input order.
+        """Batch-resolve OIDs to views in one round-trip per chunk, aligned with the input (#94).
 
-        **Miss-tolerant** (an absent/deleted OID yields ``None``, ADR-003) AND
-        read-fenced (ADR-008 R14, carried onto the DTO tier): a protected OID
-        unreadable by this handle's principal yields a :class:`~datacrystal.Redacted`
-        twin in its slot (``isinstance(twin, dc.Redacted)`` True; reading a
-        data field raises :class:`ReadDeniedError`), never a silent leak — you
-        already hold that reference, so this mirrors ``lazy_ref.get()``. A
-        persisted ``_dc_*`` record with no live class yields ``None`` (fail
-        closed, no twin class buildable — W4-5). Root sees every real view.
-
-        Raises:
-            StoreClosedError: this snapshot has already been closed. (Misses
-                yield ``None``, denials a twin/``None`` — never raise.)
+        It is the deref seam for the ``datacrystal[web]`` DataLoader.
+        A missing OID yields ``None`` (ADR-003); a denied protected OID yields a redacted twin
+        (ADR-008 R14), as ``lazy_ref.get()`` does; a ``_dc_*`` record without a live class yields
+        ``None`` (W4-5). It raises only ``StoreClosedError``.
         """
         oids = [r.oid if isinstance(r, (EntityView, Ref)) else r for r in refs]
         core = self._core
@@ -656,22 +594,13 @@ class Snapshot:
         return out
 
     def open_blob(self, view: EntityView | Ref | int, field: str) -> BinaryIO:
-        """Open a committed ``dc.Blob`` field as a binary stream (ADR-007 §3),
-        read-fenced (ADR-008 W4-3): a blob is readable only if its owning
-        record is readable by this handle's principal. Resolving the owner runs
-        the strict deref, so a denied protected owner RAISES
-        :class:`ReadDeniedError` before any blob byte is touched. Streams over
-        THIS snapshot's pinned read view; closing the stream does NOT close the
-        snapshot.
+        """Open a committed ``dc.Blob`` field as a binary stream over this pinned view (ADR-007 §3).
 
-        Raises:
-            QueryError: ``field`` is not a field of the resolved view.
-            ValueError: the blob value is ``None`` (no blob to open).
-            TypeError: ``field`` is not a ``dc.Blob`` field.
-            ReadDeniedError: the owning record is protected and unreadable.
-            DanglingRefError: ``view`` is a :class:`Ref`/OID with no record
-                at this watermark (deleted or never committed, ADR-003).
-            StoreClosedError: this snapshot has already been closed.
+        The blob is fenced with its owning record (ADR-008 W4-3): resolving the owner is the
+        strict deref, so a denied owner raises :class:`ReadDeniedError` before any byte is read.
+        Closing the stream does not close the snapshot.
+        Raises ``QueryError`` for an unknown field, ``TypeError`` for a non-blob field and
+        ``ValueError`` for a None blob, besides the errors of :meth:`get`.
         """
         core = self._core
         ev = view if isinstance(view, EntityView) else self.get(view)
@@ -703,23 +632,12 @@ class Snapshot:
 
     def all(self, cls_or_typename: type | str, *, limit: int | None = None,
             offset: int = 0, order_by: Any = None) -> list[EntityView]:
-        """Every committed entity of one type, across its full lineage
-        (old field shapes decode by name, exactly like the live engine).
+        """Return every committed entity of one type across its lineage; old shapes decode by name.
 
-        ``limit=``/``offset=`` window the result (#14); ``order_by=(field,
-        'asc'|'desc')`` sorts the whole extent before the window (#25): NULLs
-        last, ascending-OID tiebreak (ordering needs the live ``@entity``
-        class).
-
-        On a ``protected=True`` class the extent is intersected with this
-        handle's readable OIDs BEFORE the window (ADR-008 R12) — a denied row
-        never pins a page. A persisted ``_dc_*`` typename with no live class
-        fails closed for non-root (``all(str)``, W4-5). Root sees everything.
-
-        Raises:
-            ReadDeniedError: ``cls_or_typename`` is a persisted ``_dc_*``
-                typename with no live ``@entity`` class and the principal is
-                not root (W4-5).
+        ``limit``/``offset`` window the result (#14); ``order_by=(field, 'asc'|'desc')`` sorts the
+        whole extent first (#25) and needs the live class.
+        A protected class is intersected with the readable OIDs before the window (ADR-008 R12).
+        A ``_dc_*`` typename without a live class raises ``ReadDeniedError`` for non-root (W4-5).
         """
         validate_window(limit, offset)
         if isinstance(cls_or_typename, str):
@@ -788,18 +706,11 @@ class Snapshot:
         return apply_window(out, limit, offset)
 
     def index_bitmaps(self, cls: type) -> SnapshotIndexes:
-        """Frozen index-bitmap views for ``cls`` at this watermark.
+        """Return frozen index-bitmap views for ``cls`` at this watermark.
 
-        REFUSED on a ``protected=True`` class (ADR-008 R12): raw value-keyed
-        postings leak row existence AND label structure, and no honest
-        post-filter of them exists, so this one ancillary read raises for every
-        principal (root included — the postings are structurally unfilterable).
-
-        Built on first use for an unprotected class by scanning this snapshot's
-        read view (one-time O(extent)), then cached for the snapshot's lifetime.
-
-        Raises:
-            ReadDeniedError: ``cls`` is ``protected=True`` (R12).
+        A ``protected=True`` class is refused for every principal, root included (ADR-008 R12):
+        raw postings leak row existence and label structure, and no post-filter of them exists.
+        Built on first use by one O(extent) scan of the read view, then cached for the snapshot.
         """
         ti = type_info(cls)  # loud for non-entity classes
         if ti.protected:
@@ -820,11 +731,9 @@ class Snapshot:
             return frozen
 
     def count(self, target: type | Condition) -> int:
-        """How many entities match at this watermark — ``count`` semantics of
-        the live store, answered from the snapshot-local bitmaps.
+        """Count the entities matching ``target`` at this watermark, from snapshot-local bitmaps.
 
-        On a ``protected=True`` class the count is over this handle's readable
-        subset (ADR-008 R12: counts leak existence). Root sees the true count.
+        On a ``protected=True`` class the count covers the readable subset only (ADR-008 R12).
         """
         cls, cond = query_target(target, "count")
         ti = type_info(cls)
@@ -856,23 +765,12 @@ class Snapshot:
 
     def query(self, target: type | Condition, *, limit: int | None = None,
               offset: int = 0, order_by: Any = None) -> list[EntityView]:
-        """:class:`EntityView` DTOs matching ``target`` at this watermark — a
-        Condition, or an entity class for the full extent (symmetric with the
-        live store; never live entities, ADR-001).
+        """Return the :class:`EntityView` DTOs matching a Condition, or the full extent of a class.
 
-        On a ``protected=True`` class the candidate set is intersected with
-        this handle's readable OIDs (ADR-008 R12/W3-2) BEFORE any
-        window/order/hydration — a denied row never pins a page slot or gets
-        hydrated. Root sees the full match set.
-
-        Raises:
-            NotAnEntityError: ``target`` is an entity class that is not an
-                ``@entity`` class.
-            TypeError: ``target`` is neither an ``@entity`` class nor a
-                Condition, or ``limit``/``offset`` are not ints.
-            ValueError: ``limit`` or ``offset`` is negative.
-            QueryError: ``order_by`` names an invalid field or direction.
-            StoreClosedError: this snapshot has already been closed.
+        On a ``protected=True`` class the candidates are intersected with the readable OIDs
+        before any window, order or hydration, so a denied row is never hydrated (ADR-008 R12).
+        Raises ``NotAnEntityError`` or ``TypeError`` for a bad ``target``, ``ValueError`` for a
+        negative window and ``QueryError`` for a bad ``order_by``.
         """
         validate_window(limit, offset)
         cls, cond = query_target(target, "query")
@@ -919,12 +817,10 @@ class Snapshot:
         return apply_window(matched, limit, offset)
 
     def explain(self, target: type | Condition) -> QueryPlan:
-        """The deterministic plan for ``target`` over this snapshot's indexes.
+        """Return the deterministic plan for ``target`` over this snapshot's indexes.
 
-        On a ``protected=True`` class the reported ``candidates``/``extent``
-        numbers are post-filtered to this handle's readable subset (ADR-008
-        R12: counts leak existence) — root sees the true numbers; the plan
-        itself (condition/residual/indexed) is untouched.
+        On a ``protected=True`` class the reported ``candidates`` and ``extent`` counts are
+        filtered to the readable subset (ADR-008 R12); the plan itself is untouched.
         """
         cls, cond = query_target(target, "explain")
         ti = type_info(cls)
@@ -942,18 +838,11 @@ class Snapshot:
             return explain_plan(ti.typename, ci, cond, readable=readable)
 
     def incoming(self, target: EntityView | Ref | int) -> list[EntityView]:
-        """Every committed entity that **references** ``target`` at this
-        watermark — the snapshot twin of :meth:`Store.incoming`.
+        """Return every committed entity that **references** ``target``, as :meth:`Store.incoming`.
 
-        The reverse index is class-blind, so this is a DISCOVERY surface
-        (ADR-008 R12): a ``protected=True`` referrer this handle's principal
-        cannot read is silently DROPPED (backlinks never leak existence), as is
-        a persisted ``_dc_*`` referrer with no live class (W4-5). Root sees
-        every referrer.
-
-        Raises:
-            StoreClosedError: this snapshot has already been closed. (A
-                ``target`` with no record yields an empty list, never raises.)
+        The reverse index is class-blind, so this is a discovery surface (ADR-008 R12): a referrer
+        the principal cannot read, or a ``_dc_*`` one without a live class (W4-5), is dropped.
+        A ``target`` with no record yields an empty list.
         """
         oid = target.oid if isinstance(target, (EntityView, Ref)) else target
         core = self._core
@@ -988,11 +877,10 @@ class Snapshot:
     # -- internals ---------------------------------------------------------
 
     def _readable_for(self, ti: Any, ci: ClassIndexes) -> BitMap64 | None:
-        """This handle's readable-OID bitmap for a PROTECTED class ``ti``
-        (caller guards on ``ti.protected`` — the zero-cost invariant). Compiled
-        once per class via :func:`readable_bitmap` and cached on the handle
-        (keyed by class, never by the unhashable Principal — TRAP 1); ``None``
-        means root, callers skip the intersect.
+        """Return this handle's readable-OID bitmap for a PROTECTED class, None for root.
+
+        Callers guard on ``ti.protected`` (zero-cost invariant). It is compiled once per class and
+        cached by class, never by the unhashable Principal (TRAP 1).
         """
         key = ti.cls
         cache = self._readable
@@ -1003,14 +891,12 @@ class Snapshot:
         return rb
 
     def _classify(self, view: EntityView) -> str:
-        """The per-row deref verdict for THIS handle's principal — run on
-        EVERY deref return (cache hit AND miss, TRAP 2), so a view materialized
-        for principal A is never leaked to principal B's sibling handle.
+        """Return this principal's deref verdict for a view: ``"ok"``, ``"twin"`` or ``"deny"``.
 
-        ``"ok"`` readable (also every unprotected view — zero cost, no
-        permission call); ``"twin"`` a protected record with a live class,
-        denied → a redacted twin; ``"deny"`` a persisted ``_dc_*`` record with
-        NO live class, denied → fail closed (no twin buildable, W4-5).
+        It runs on every deref, cache hit or miss (TRAP 2), so a view materialized for one
+        principal never leaks to a sibling handle.
+        ``"twin"`` is a denied protected record with a live class; ``"deny"`` one without a live
+        class, which fails closed (W4-5).
         """
         ti = TYPES_BY_NAME.get(view.typename)
         if ti is None:
@@ -1028,19 +914,11 @@ class Snapshot:
         return "twin"
 
     def _stream(self, typename: str) -> Iterator[tuple[int, dict[str, Any]]]:
-        """Yield ``(oid, field-values)`` for every committed entity of a type
-        WITHOUT populating ``_cache`` or building a full list — the
-        bounded-memory bootstrap scan (#16), feeding the fts/arrow/deltalog
-        mirror bootstraps a later phase wires.
+        """Yield ``(oid, field-values)`` of a type without filling the cache (#16).
 
-        FAIL CLOSED (ADR-008 W4-5): for a protected typename (a live protected
-        class OR a persisted ``_dc_*`` lineage with no live class) under a
-        NON-root principal this RAISES — a silently partial mirror is worse
-        than an error. Root-bound handles stream freely.
-
-        Raises:
-            ReadDeniedError: a protected/label-bearing typename under a
-                non-root principal.
+        It is the bounded-memory bootstrap scan for the fts, arrow and deltalog mirrors.
+        It fails closed (ADR-008 W4-5): a protected or label-bearing typename under a non-root
+        principal raises ``ReadDeniedError``, because a silently partial mirror is worse.
         """
         core = self._core
         ti = TYPES_BY_NAME.get(typename)
