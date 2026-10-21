@@ -134,9 +134,9 @@ shebangs — `rm -rf .venv && uv sync`.
 ## Style & gotchas
 
 - **The rules are in [`STANDARDS.md`](STANDARDS.md)** (self-documenting-code, typed-python, readable-tests, structured-logging, english-only, python-layout); cite them by slug.
-- A rule's gate switches on in the wave named there: #191 docstring form and `print` in `src/`, #192 `Any`, complexity, magic values.
+- A rule's gate switches on in the wave named there: #191 docstring form and `print` in `src/`, #192 `Any`, complexity, magic values (on since #192).
 - The magic class-attribute query syntax (`Mineral.mohs >= 6`) is untypeable by design: use `dc.fields(Mineral)` in typed code, a Pyrefly suppression with its reason only in tests that deliberately exercise the magic path.
-- A Pyrefly suppression is one line with its reason; a `# noqa: <code> - <reason>` in `src/` is allowed only where the ruff rule contradicts a documented contract (BLE001 on a deliberate broad `except`, TRY004 on a documented exception type), never as a blanket.
+- A Pyrefly suppression is one line with its reason; a `# noqa: <code> - <reason>` in `src/` is allowed only for BLE001 (a deliberate broad `except`), TRY004 (a documented exception type), UP007 (a runtime `Union`) and ANN401 (a public return or `__getattr__` that is dynamic by design), never as a blanket; `scripts/check_suppressions.py` gates it in CI.
 - Docstrings explain *why* and cite the design doc that ratified the behavior (self-documenting-code).
 - Commit/PR style: small logical commits; CI runs on PRs and pushes to main.
 - **Working with Sven**: on a genuine scope fork, ask 1–3 sharp questions first (he wants to be

@@ -51,6 +51,20 @@ def peak_rss_mb() -> float:
     return r / 1024 / 1024 if sys.platform == "darwin" else r / 1024  # bytes vs KB
 
 
+def apply_term_line(term: dict, line: str) -> None:
+    """Record one ``key: value`` line of a ``[Term]`` stanza on its dict."""
+    if line.startswith("id: "):
+        term["id"] = line[4:].strip()
+    elif line.startswith("name: "):
+        term["name"] = line[6:].strip()
+    elif line.startswith("namespace: "):
+        term["namespace"] = line[11:].strip()
+    elif line.startswith("is_a: "):
+        term["is_a"].append(line[6:].split("!", maxsplit=1)[0].strip())
+    elif line == "is_obsolete: true":
+        term["obsolete"] = True
+
+
 def parse_obo(path: Path) -> dict[str, dict]:
     out: dict[str, dict] = {}
     cur: dict | None = None
@@ -69,16 +83,7 @@ def parse_obo(path: Path) -> dict[str, dict]:
                 finalize(cur)
                 cur = None
             elif cur is not None and line:
-                if line.startswith("id: "):
-                    cur["id"] = line[4:].strip()
-                elif line.startswith("name: "):
-                    cur["name"] = line[6:].strip()
-                elif line.startswith("namespace: "):
-                    cur["namespace"] = line[11:].strip()
-                elif line.startswith("is_a: "):
-                    cur["is_a"].append(line[6:].split("!")[0].strip())
-                elif line == "is_obsolete: true":
-                    cur["obsolete"] = True
+                apply_term_line(cur, line)
         finalize(cur)
     return out
 
@@ -115,20 +120,8 @@ def walk_ancestors(term: Term) -> tuple[int, int]:
     return maxd, len(seen)
 
 
-def main() -> None:
-    if not OBO.exists():
-        sys.exit(f"missing {OBO} — download go-basic.obo first (see module docstring)")
-    shutil.rmtree(STORE, ignore_errors=True)
-    print(f"datacrystal proving ground: Gene Ontology  ({sys.platform})\n")
-
-    t0 = time.perf_counter()
-    parsed = parse_obo(OBO)
-    t_parse = time.perf_counter() - t0
-    print(f"parsed OBO:            {len(parsed):>8,} terms          {t_parse:6.2f}s")
-
-    deep_id, _ = deepest_term(parsed)
-
-    # --- INGEST ---------------------------------------------------------------
+def ingest(parsed: dict[str, dict]) -> None:
+    """Store every term with its lazy ``is_a`` parents, then close the store."""
     t0 = time.perf_counter()
     store = dc.Store.open(STORE)
     terms = {gid: Term(go_id=gid, name=d["name"], namespace=d["namespace"])
@@ -151,18 +144,21 @@ def main() -> None:
     print(f"  on disk:             {on_disk:>8.1f} MB   "
           f"peak RSS {rss_ingest:.0f} MB   ({on_disk * 1e6 / len(terms):.0f} B/term on disk)")
     store.close()
-    del terms, parsed
-    gc.collect()
 
-    # --- REOPEN (cold) --------------------------------------------------------
+
+def reopen_cold() -> tuple[dc.Store, int]:
+    """Reopen the store cold and return it with the term count."""
     t0 = time.perf_counter()
     s = dc.Store.open(STORE)
     n = s.count(Term)  # forces the one-time index build (a backend scan)
     t_open = time.perf_counter() - t0
     print(f"\nreopened cold:         {n:>8,} terms          {t_open:6.2f}s "
           "(open + index build)")
+    return s, n
 
-    # --- LAZY ON-DEMAND TRAVERSAL (#29 + #30 on real data) --------------------
+
+def traverse_ancestors(s: dc.Store, n: int, deep_id: str) -> None:
+    """Walk the ancestors of the deepest term lazily and report the live entity count."""
     gc.collect()
     term = s.get(Term, go_id=deep_id)
     assert term is not None
@@ -176,7 +172,12 @@ def main() -> None:
     print(f"  live entities now:   {len(s._registry):>8,}  "  # pyright: ignore[reportPrivateUsage]
           f"(of {n:,} — lazy adjacency kept the rest off the RAM budget)")
 
-    # --- BACKLINK WITHOUT A REVERSE INDEX (the #20 motivation) ---------------
+
+def backlinks_by_scan(s: dc.Store) -> tuple[Term, set[int]]:
+    """Find all descendants of the biological-process root by a full edge scan.
+
+    Returns the root term and the OIDs of its descendants.
+    """
     t0 = time.perf_counter()
     children: dict[int, list[Term]] = {}
     for t in s.query(Term):  # full-extent scan — the unavoidable cost without #20
@@ -201,8 +202,11 @@ def main() -> None:
           "→ exactly what #20 incoming() turns into an index lookup")
     del children  # free the reverse map so the hydration timing below is cold
     gc.collect()
+    return bp, seen
 
-    # --- SAME BACKLINK VIA THE REVERSE INDEX (#20 incoming()) -----------------
+
+def backlinks_by_index(s: dc.Store, bp: Term, seen: set[int]) -> None:
+    """Find the same descendants via ``incoming()`` and assert both answers agree."""
     t0 = time.perf_counter()
     direct = s.incoming(bp)  # first call builds the global reverse index (one scan)
     t_build = time.perf_counter() - t0
@@ -230,7 +234,9 @@ def main() -> None:
           f"{len(cc_children):,} direct children in {t_reuse:.2f} ms (no re-scan)")
     gc.collect()
 
-    # --- HYDRATE vs DECODE (the ~24x ratio on real data) ----------------------
+
+def compare_hydrate_and_decode(s: dc.Store, deep_id: str) -> None:
+    """Time a decode-level pluck against a hydrated query and check one instance per OID."""
     gc.collect()
     t0 = time.perf_counter()
     names_decode = s.pluck(Term, "name")  # decode-level, no entities
@@ -250,6 +256,28 @@ def main() -> None:
     assert a is via_query, "identity broken: one OID must be one live instance"
     print("\ncorrectness: one instance per OID across paths ✓ · "
           "graph reopened + traversed without RecursionError ✓")
+
+
+def main() -> None:
+    if not OBO.exists():
+        sys.exit(f"missing {OBO} — download go-basic.obo first (see module docstring)")
+    shutil.rmtree(STORE, ignore_errors=True)
+    print(f"datacrystal proving ground: Gene Ontology  ({sys.platform})\n")
+
+    t0 = time.perf_counter()
+    parsed = parse_obo(OBO)
+    t_parse = time.perf_counter() - t0
+    print(f"parsed OBO:            {len(parsed):>8,} terms          {t_parse:6.2f}s")
+
+    deep_id, _ = deepest_term(parsed)
+    ingest(parsed)
+    del parsed
+    gc.collect()
+    s, n = reopen_cold()
+    traverse_ancestors(s, n, deep_id)
+    bp, seen = backlinks_by_scan(s)
+    backlinks_by_index(s, bp, seen)
+    compare_hydrate_and_decode(s, deep_id)
     s.close()
 
 

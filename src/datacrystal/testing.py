@@ -10,7 +10,7 @@ Every check raises ``AssertionError`` naming the violated spec section.
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import msgspec
 
@@ -19,7 +19,11 @@ from datacrystal.contract.applier import (
     FORMAT_MARKER,
     DeltaFormatError,
     DeltaGapError,
+    check_delta_header,
 )
+
+if TYPE_CHECKING:
+    from datacrystal._snapshot import Snapshot
 
 __all__ = [
     "STREAM_FIELDS",
@@ -34,6 +38,7 @@ STREAM_TYPENAME = "datacrystal.testing:Mineral"
 STREAM_FIELDS = ("qid", "name", "notes")
 
 _CID = 1
+_CREATE_TID, _UPDATE_TID, _DELETE_TID = 1, 2, 3
 _OID = 4096
 _TYPES_ROW = [_CID, STREAM_TYPENAME, list(STREAM_FIELDS)]
 
@@ -75,9 +80,9 @@ def _delete(oid: int, prior: bytes) -> dict[str, Any]:
 def _stream_create_update_delete() -> list[dict[str, Any]]:
     """t1 creates X, t2 updates it (prior = t1's payload), t3 deletes it."""
     return [
-        _delta(1, [_upsert(_OID, _P1, None)], types=[_TYPES_ROW]),
-        _delta(2, [_upsert(_OID, _P2, _P1)]),
-        _delta(3, [_delete(_OID, _P2)]),
+        _delta(_CREATE_TID, [_upsert(_OID, _P1, None)], types=[_TYPES_ROW]),
+        _delta(_UPDATE_TID, [_upsert(_OID, _P2, _P1)]),
+        _delta(_DELETE_TID, [_delete(_OID, _P2)]),
     ]
 
 
@@ -96,6 +101,195 @@ def _stream_types_only(length: int) -> list[dict[str, Any]]:
     return out
 
 
+_Factory = Callable[[], Any]
+_Content = Callable[[Any], Any]
+
+
+def _require(label: str, ok: bool, detail: str) -> None:
+    if not ok:
+        raise AssertionError(f"[{label}] {detail}")
+
+
+def _check_ordering(factory: _Factory, content: _Content | None) -> None:
+    """§4.1 + §4.3: fresh watermark, gapless ordering."""
+    consumer = factory()
+    _require("§4.1 watermark", consumer.watermark == 0,
+             f"a fresh consumer must start at watermark 0, got {consumer.watermark}")
+    for delta in _stream_create_update_delete():
+        consumer.apply(delta)
+        _require("§4.3 ordering", consumer.watermark == delta["tid"],
+                 f"after applying tid {delta['tid']} the watermark must equal it, "
+                 f"got {consumer.watermark}")
+
+
+def _check_idempotency(factory: _Factory, content: _Content | None) -> None:
+    """§4.2: apply-twice ≡ apply-once."""
+    consumer = factory()
+    stream = _stream_create_update_delete()
+    for delta in stream[:2]:
+        consumer.apply(delta)
+    before = content(consumer) if content is not None else None
+    for replayed in _stream_create_update_delete()[:2]:
+        consumer.apply(replayed)  # at-least-once delivery happens; must no-op
+        _require("§4.2 idempotency", consumer.watermark == _UPDATE_TID,
+                 "re-applying an already-applied delta moved the watermark")
+    if content is not None:
+        _require("§4.2 idempotency", content(consumer) == before,
+                 "re-applying an already-applied delta changed the derived state")
+
+
+def _check_gap_refusal(factory: _Factory, content: _Content | None) -> None:
+    """§4.4: a delta skipping past the watermark raises and leaves no trace."""
+    consumer = factory()
+    stream = _stream_create_update_delete()
+    consumer.apply(stream[0])
+    before = content(consumer) if content is not None else None
+    gap_refused = False
+    try:
+        consumer.apply(stream[2])  # tid 3 against watermark 1
+    except Exception:  # noqa: BLE001 - the contract only demands a raise, not a type
+        gap_refused = True
+    _require("§4.4 gap refusal", gap_refused,
+             "a delta skipping past the watermark MUST raise — history is missing")
+    _require("§4.4 gap refusal", consumer.watermark == _CREATE_TID,
+             "the refused gap delta moved the watermark")
+    if content is not None:
+        _require("§4.4 gap refusal", content(consumer) == before,
+                 "the refused gap delta changed the derived state")
+    consumer.apply(stream[1])  # the orderly path still works after a refusal
+    consumer.apply(stream[2])
+    _require("§4.4 gap refusal", consumer.watermark == _DELETE_TID,
+             "the consumer did not recover once the missing delta arrived")
+
+
+def _check_version_refusal(factory: _Factory, content: _Content | None) -> None:
+    """§4.5: version exactness — refusal in BOTH directions.
+
+    Under the no-compat ruling (COMMIT-DELTA-v2 §4.5) a v2 consumer accepts exactly v == 2.
+    The refusal must land BEFORE any state is folded, so derived state is probed like §4.4:
+    a late-validating consumer that folds ops first and checks the version last fails here.
+    """
+    consumer = factory()
+    before = content(consumer) if content is not None else None
+    newer = _stream_create_update_delete()[0]
+    newer["v"] = CONTRACT_VERSION + 1
+    version_refused = False
+    try:
+        consumer.apply(newer)
+    except Exception:  # noqa: BLE001 - the contract only demands a raise, not a type
+        version_refused = True
+    _require("§4.5 version refusal", version_refused,
+             "a delta with a newer contract version MUST raise")
+    _require("§4.5 version refusal", consumer.watermark == 0,
+             "the refused newer-version delta moved the watermark")
+    if content is not None:
+        _require("§4.5 version refusal", content(consumer) == before,
+                 "the refused newer-version delta changed the derived state — "
+                 "reject the version before folding anything (never partially "
+                 "applied, COMMIT-DELTA-v2 §4.5)")
+    older = _stream_create_update_delete()[0]
+    older["v"] = CONTRACT_VERSION - 1
+    older_refused = False
+    try:
+        consumer.apply(older)
+    except Exception:  # noqa: BLE001 - the contract only demands a raise, not a type
+        older_refused = True
+    _require("§4.5 version refusal", older_refused,
+             "a delta with an OLDER contract version MUST raise — pre-v2 "
+             "streams are recreated, never migrated (COMMIT-DELTA-v2 §7)")
+    _require("§4.5 version refusal", consumer.watermark == 0,
+             "the refused older-version delta moved the watermark")
+    if content is not None:
+        _require("§4.5 version refusal", content(consumer) == before,
+                 "the refused older-version delta changed the derived state — "
+                 "reject the version before folding anything (never partially "
+                 "applied, COMMIT-DELTA-v2 §4.5)")
+
+
+def _check_unknown_op(factory: _Factory, content: _Content | None) -> None:
+    """§3: unknown ops are refused, never guessed."""
+    consumer = factory()
+    stream = _stream_create_update_delete()
+    consumer.apply(stream[0])
+    before = content(consumer) if content is not None else None
+    mutated = _stream_create_update_delete()[1]
+    mutated["ops"][0]["op"] = "merge"  # nothing in v1 merges
+    op_refused = False
+    try:
+        consumer.apply(mutated)
+    except Exception:  # noqa: BLE001 - the contract only demands a raise, not a type
+        op_refused = True
+    _require("§3 unknown op", op_refused, "an unknown op MUST raise, not be guessed")
+    _require("§3 unknown op", consumer.watermark == _CREATE_TID,
+             "the refused unknown-op delta moved the watermark")
+    if content is not None:
+        _require("§3 unknown op", content(consumer) == before,
+                 "the refused unknown-op delta changed the derived state")
+
+
+def _check_prior_unindex(factory: _Factory, content: _Content) -> None:
+    """§3 prior: updates un-index stale values.
+
+    Create-then-update must leave the same derived state as creating the final value directly.
+    A consumer that ignores ``prior`` keeps stale derived entries and fails here (KICKOFF's
+    missing-prior-value evil twin is pinned against this section).
+    """
+    updated = factory()
+    for delta in _stream_create_update_delete()[:2]:
+        updated.apply(delta)
+    direct = factory()
+    for delta in _stream_direct(_P2, length=2):
+        direct.apply(delta)
+    _require("§3 prior un-index", content(updated) == content(direct),
+             "after an update, derived state still reflects the prior payload — "
+             "un-index old values from the delta's `prior` (spec §3)")
+
+
+def _check_delete_totality(factory: _Factory, content: _Content) -> None:
+    """§3.1 delete: consumers are total over the op vocabulary."""
+    deleted = factory()
+    for delta in _stream_create_update_delete():
+        deleted.apply(delta)
+    empty = factory()
+    for delta in _stream_types_only(length=len(_stream_create_update_delete())):
+        empty.apply(delta)
+    _require("§3.1 delete totality", content(deleted) == content(empty),
+             "after a delete tombstone, derived state must hold nothing for the "
+             "deleted record (spec §3.1)")
+
+
+def _check_stamp_indifference(factory: _Factory, content: _Content) -> None:
+    """§2 stamps: audit fields never influence derived state.
+
+    COMMIT-DELTA-v2: actor/at are REQUIRED audit metadata; a consumer must accept any stamp
+    values and derive identical state from them.
+    """
+    default_stamps = factory()
+    for delta in _stream_create_update_delete():
+        default_stamps.apply(delta)
+    restamped = factory()
+    for delta in _stream_create_update_delete():
+        delta["actor"], delta["at"] = 900, _AT_NS + delta["tid"]
+        restamped.apply(delta)
+    _require("§2 stamp indifference", content(restamped) == content(default_stamps),
+             "different actor/at stamps changed the derived state — stamps are "
+             "audit metadata, never data (COMMIT-DELTA-v2 §5)")
+
+
+_SECTIONS = (
+    ("§4.1/§4.3 ordering", _check_ordering),
+    ("§4.2 idempotency", _check_idempotency),
+    ("§4.4 gap refusal", _check_gap_refusal),
+    ("§4.5 version refusal", _check_version_refusal),
+    ("§3 unknown op", _check_unknown_op),
+)
+_CONTENT_SECTIONS = (
+    ("§3 prior un-index", _check_prior_unindex),
+    ("§3.1 delete totality", _check_delete_totality),
+    ("§2 stamp indifference", _check_stamp_indifference),
+)
+
+
 def check_delta_consumer(
     factory: Callable[[], Any],
     *,
@@ -109,168 +303,14 @@ def check_delta_consumer(
     ``AssertionError`` naming the violated section otherwise.
     """
     ran: list[str] = []
-
-    def section(label: str, ok: bool, detail: str) -> None:
-        if not ok:
-            raise AssertionError(f"[{label}] {detail}")
-
-    # -- §4.1 + §4.3: fresh watermark, gapless ordering -----------------------
-    ran.append("§4.1/§4.3 ordering")
-    consumer = factory()
-    section("§4.1 watermark", consumer.watermark == 0,
-            f"a fresh consumer must start at watermark 0, got {consumer.watermark}")
-    for delta in _stream_create_update_delete():
-        consumer.apply(delta)
-        section("§4.3 ordering", consumer.watermark == delta["tid"],
-                f"after applying tid {delta['tid']} the watermark must equal it, "
-                f"got {consumer.watermark}")
-
-    # -- §4.2: apply-twice ≡ apply-once ---------------------------------------
-    ran.append("§4.2 idempotency")
-    consumer = factory()
-    stream = _stream_create_update_delete()
-    for delta in stream[:2]:
-        consumer.apply(delta)
-    before = content(consumer) if content is not None else None
-    for replayed in _stream_create_update_delete()[:2]:
-        consumer.apply(replayed)  # at-least-once delivery happens; must no-op
-        section("§4.2 idempotency", consumer.watermark == 2,
-                "re-applying an already-applied delta moved the watermark")
-    if content is not None:
-        section("§4.2 idempotency", content(consumer) == before,
-                "re-applying an already-applied delta changed the derived state")
-
-    # -- §4.4: gap refusal -----------------------------------------------------
-    ran.append("§4.4 gap refusal")
-    consumer = factory()
-    stream = _stream_create_update_delete()
-    consumer.apply(stream[0])
-    before = content(consumer) if content is not None else None
-    gap_refused = False
-    try:
-        consumer.apply(stream[2])  # tid 3 against watermark 1
-    except Exception:  # noqa: BLE001 - the contract only demands a raise, not a type
-        gap_refused = True
-    section("§4.4 gap refusal", gap_refused,
-            "a delta skipping past the watermark MUST raise — history is missing")
-    section("§4.4 gap refusal", consumer.watermark == 1,
-            "the refused gap delta moved the watermark")
-    if content is not None:
-        section("§4.4 gap refusal", content(consumer) == before,
-                "the refused gap delta changed the derived state")
-    consumer.apply(stream[1])  # the orderly path still works after a refusal
-    consumer.apply(stream[2])
-    section("§4.4 gap refusal", consumer.watermark == 3,
-            "the consumer did not recover once the missing delta arrived")
-
-    # -- §4.5: version exactness — refusal in BOTH directions -------------------
-    # (COMMIT-DELTA-v2 §4.5 under the no-compat ruling: a v2 consumer accepts
-    # exactly v == 2; older streams are recreated, never migrated. "Never
-    # partially applied": the refusal must land BEFORE any state is folded,
-    # so derived state is probed like §4.4 does — a late-validating consumer
-    # that folds ops first and checks the version last must fail here.)
-    ran.append("§4.5 version refusal")
-    consumer = factory()
-    before = content(consumer) if content is not None else None
-    newer = _stream_create_update_delete()[0]
-    newer["v"] = CONTRACT_VERSION + 1
-    version_refused = False
-    try:
-        consumer.apply(newer)
-    except Exception:  # noqa: BLE001 - the contract only demands a raise, not a type
-        version_refused = True
-    section("§4.5 version refusal", version_refused,
-            "a delta with a newer contract version MUST raise")
-    section("§4.5 version refusal", consumer.watermark == 0,
-            "the refused newer-version delta moved the watermark")
-    if content is not None:
-        section("§4.5 version refusal", content(consumer) == before,
-                "the refused newer-version delta changed the derived state — "
-                "reject the version before folding anything (never partially "
-                "applied, COMMIT-DELTA-v2 §4.5)")
-    older = _stream_create_update_delete()[0]
-    older["v"] = CONTRACT_VERSION - 1
-    older_refused = False
-    try:
-        consumer.apply(older)
-    except Exception:  # noqa: BLE001 - the contract only demands a raise, not a type
-        older_refused = True
-    section("§4.5 version refusal", older_refused,
-            "a delta with an OLDER contract version MUST raise — pre-v2 "
-            "streams are recreated, never migrated (COMMIT-DELTA-v2 §7)")
-    section("§4.5 version refusal", consumer.watermark == 0,
-            "the refused older-version delta moved the watermark")
-    if content is not None:
-        section("§4.5 version refusal", content(consumer) == before,
-                "the refused older-version delta changed the derived state — "
-                "reject the version before folding anything (never partially "
-                "applied, COMMIT-DELTA-v2 §4.5)")
-
-    # -- §3: unknown ops are refused, never guessed ----------------------------
-    ran.append("§3 unknown op")
-    consumer = factory()
-    stream = _stream_create_update_delete()
-    consumer.apply(stream[0])
-    before = content(consumer) if content is not None else None
-    mutated = _stream_create_update_delete()[1]
-    mutated["ops"][0]["op"] = "merge"  # nothing in v1 merges
-    op_refused = False
-    try:
-        consumer.apply(mutated)
-    except Exception:  # noqa: BLE001 - the contract only demands a raise, not a type
-        op_refused = True
-    section("§3 unknown op", op_refused, "an unknown op MUST raise, not be guessed")
-    section("§3 unknown op", consumer.watermark == 1,
-            "the refused unknown-op delta moved the watermark")
-    if content is not None:
-        section("§3 unknown op", content(consumer) == before,
-                "the refused unknown-op delta changed the derived state")
-
+    for label, check in _SECTIONS:
+        ran.append(label)
+        check(factory, content)
     if content is None:
         return ran
-
-    # -- §3 prior: updates un-index stale values -------------------------------
-    # Equivalence: create-then-update must leave the same derived state as
-    # creating the final value directly. A consumer that ignores ``prior``
-    # keeps stale derived entries and fails here (KICKOFF's
-    # missing-prior-value evil twin is pinned against this section).
-    ran.append("§3 prior un-index")
-    updated = factory()
-    for delta in _stream_create_update_delete()[:2]:
-        updated.apply(delta)
-    direct = factory()
-    for delta in _stream_direct(_P2, length=2):
-        direct.apply(delta)
-    section("§3 prior un-index", content(updated) == content(direct),
-            "after an update, derived state still reflects the prior payload — "
-            "un-index old values from the delta's `prior` (spec §3)")
-
-    # -- §3.1 delete: consumers are total over the op vocabulary ---------------
-    ran.append("§3.1 delete totality")
-    deleted = factory()
-    for delta in _stream_create_update_delete():
-        deleted.apply(delta)
-    empty = factory()
-    for delta in _stream_types_only(length=3):
-        empty.apply(delta)
-    section("§3.1 delete totality", content(deleted) == content(empty),
-            "after a delete tombstone, derived state must hold nothing for the "
-            "deleted record (spec §3.1)")
-
-    # -- §2 stamps: audit fields never influence derived state -----------------
-    # (COMMIT-DELTA-v2: actor/at are REQUIRED audit metadata; a consumer must
-    # accept any stamp values and derive identical state from them.)
-    ran.append("§2 stamp indifference")
-    default_stamps = factory()
-    for delta in _stream_create_update_delete():
-        default_stamps.apply(delta)
-    restamped = factory()
-    for delta in _stream_create_update_delete():
-        delta["actor"], delta["at"] = 900, _AT_NS + delta["tid"]
-        restamped.apply(delta)
-    section("§2 stamp indifference", content(restamped) == content(default_stamps),
-            "different actor/at stamps changed the derived state — stamps are "
-            "audit metadata, never data (COMMIT-DELTA-v2 §5)")
+    for label, content_check in _CONTENT_SECTIONS:
+        ran.append(label)
+        content_check(factory, content)
     return ran
 
 
@@ -291,7 +331,7 @@ class CountingConsumer:
         self._typename_by_oid: dict[int, str] = {}
 
     @classmethod
-    def bootstrap(cls, snapshot: Any) -> CountingConsumer:
+    def bootstrap(cls, snapshot: Snapshot) -> CountingConsumer:
         """Build a consumer that joins mid-stream from one ``store.snapshot()``, the canonical
         sidecar bootstrap.
 
@@ -312,19 +352,12 @@ class CountingConsumer:
         """Apply one delta and return whether it changed anything; a replayed tid is a no-op (spec
         section 4).
         """
-        if delta.get("f") != FORMAT_MARKER:
-            raise DeltaFormatError(f"not a datacrystal delta: f={delta.get('f')!r}")
-        version = delta.get("v")
-        if version != CONTRACT_VERSION:
-            if isinstance(version, int) and version > CONTRACT_VERSION:
-                raise DeltaFormatError(
-                    f"delta version {version} is newer than this consumer "
-                    f"supports ({CONTRACT_VERSION}); upgrade the consumer"
-                )
-            raise DeltaFormatError(
-                f"delta version {version!r} predates v{CONTRACT_VERSION} — "
-                "incompatible (COMMIT-DELTA-v2 §7, no-compat): recreate the stream"
-            )
+        check_delta_header(
+            delta,
+            consumer="consumer",
+            upgrade="upgrade the consumer",
+            remedy="recreate the stream",
+        )
         tid = delta["tid"]
         if tid <= self.watermark:
             return False  # §4.2: apply-twice ≡ apply-once

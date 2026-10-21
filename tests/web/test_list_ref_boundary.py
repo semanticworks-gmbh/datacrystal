@@ -423,4 +423,4 @@ def test_round_trips_through_to_and_from_pydantic(store: dc.Store) -> None:
 
     rebuilt = from_pydantic(dto, Collector, store=store)
 
-    assert [h.peek().qid for h in rebuilt.favorites] == ["Q0", "Q1"]
+    assert [m.qid for h in rebuilt.favorites if (m := h.peek()) is not None] == ["Q0", "Q1"]

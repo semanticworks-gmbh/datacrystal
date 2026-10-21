@@ -11,11 +11,20 @@ The planner resolves indexed predicates to bitmaps and runs the rest as a residu
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+import operator
+from collections.abc import Callable, Iterable
 from itertools import islice
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from datacrystal._errors import QueryError
+
+if TYPE_CHECKING:
+    from _typeshed import SupportsRichComparison
+
+    from datacrystal._entity import TypeInfo
+
+_ORDER_BY_PAIR_SIZE = 2  # (field, direction)
+_ORDERINGS = {"<": operator.lt, "<=": operator.le, ">": operator.gt, ">=": operator.ge}
 
 
 class Condition:
@@ -59,7 +68,7 @@ class Condition:
     def _collect_classes(self, into: set[type]) -> None:
         raise NotImplementedError
 
-    def evaluate(self, obj: Any) -> bool:
+    def evaluate(self, obj: object) -> bool:
         raise NotImplementedError
 
 
@@ -110,10 +119,13 @@ class Pred(Condition):
 
     __slots__ = ("cls", "field", "op", "value")
 
+    # Any: _indexes, _snapshot and _store iterate, hash and order it per `op`.
+    value: Any
+
     _OPS = frozenset({"==", "!=", "<", "<=", ">", ">=", "in",
                       "contains", "startswith"})
 
-    def __init__(self, cls: type, field: str, op: str, value: Any) -> None:
+    def __init__(self, cls: type, field: str, op: str, value: object) -> None:
         assert op in self._OPS
         _refuse_float_against_decimal(cls, field, value)
         self.cls = cls
@@ -124,7 +136,7 @@ class Pred(Condition):
     def _collect_classes(self, into: set[type]) -> None:
         into.add(self.cls)
 
-    def evaluate(self, obj: Any) -> bool:
+    def evaluate(self, obj: object) -> bool:
         actual = getattr(obj, self.field)
         op = self.op
         if op == "==":
@@ -133,27 +145,27 @@ class Pred(Condition):
             return actual != self.value
         if op == "in":
             return actual in self.value
-        # String matching: exact and case-sensitive (linguistic matching is
-        # the datacrystal[fts] extra's job); a non-str value never matches,
-        # mirroring the SQL-NULL-like ordering semantics below.
         if op == "contains":
-            # Multi-valued (list) field: membership of the needle. Scalar string
-            # field: substring match. A non-matching type never matches.
-            if isinstance(actual, (list, tuple)):
-                return self.value in actual
-            return isinstance(actual, str) and self.value in actual
+            return self._contains(actual)
         if op == "startswith":
             return isinstance(actual, str) and actual.startswith(self.value)
+        return self._ordered(actual)
+
+    def _contains(self, actual: object) -> bool:
+        """Match a needle against a multi-valued (list) field or a scalar string field.
+
+        String matching is exact and case-sensitive (linguistic matching is the datacrystal[fts]
+        extra's job); a non-matching type never matches, like the NULL-like ordering below.
+        """
+        if isinstance(actual, (list, tuple)):
+            return self.value in actual
+        return isinstance(actual, str) and self.value in actual
+
+    def _ordered(self, actual: SupportsRichComparison | None) -> bool:
         # Ordering comparisons: None never matches (SQL-NULL-like semantics).
         if actual is None or self.value is None:
             return False
-        if op == "<":
-            return actual < self.value
-        if op == "<=":
-            return actual <= self.value
-        if op == ">":
-            return actual > self.value
-        return actual >= self.value
+        return _ORDERINGS[self.op](actual, self.value)
 
     def __repr__(self) -> str:
         return f"({self.cls.__name__}.{self.field} {self.op} {self.value!r})"
@@ -169,7 +181,7 @@ class And(Condition):
         for p in self.parts:
             p._collect_classes(into)
 
-    def evaluate(self, obj: Any) -> bool:
+    def evaluate(self, obj: object) -> bool:
         return all(p.evaluate(obj) for p in self.parts)
 
     def __repr__(self) -> str:
@@ -186,7 +198,7 @@ class Or(Condition):
         for p in self.parts:
             p._collect_classes(into)
 
-    def evaluate(self, obj: Any) -> bool:
+    def evaluate(self, obj: object) -> bool:
         return any(p.evaluate(obj) for p in self.parts)
 
     def __repr__(self) -> str:
@@ -202,7 +214,7 @@ class Not(Condition):
     def _collect_classes(self, into: set[type]) -> None:
         self.part._collect_classes(into)
 
-    def evaluate(self, obj: Any) -> bool:
+    def evaluate(self, obj: object) -> bool:
         return not self.part.evaluate(obj)
 
     def __repr__(self) -> str:
@@ -246,7 +258,9 @@ def window_iter[T](candidate: Iterable[T], limit: int | None, offset: int) -> li
     return list(islice(candidate, offset, stop))
 
 
-def order_by_values(matched: Iterable[int], value_of: Any, descending: bool) -> list[int]:
+def order_by_values(
+    matched: Iterable[int], value_of: Callable[[int], SupportsRichComparison], descending: bool
+) -> list[int]:
     """Sort ``matched`` OIDs by ``value_of(oid)`` for an order_by on a non-indexed field (#25).
 
     NULLs go last. ``matched`` MUST already be ascending-OID so the stable sort keeps OID order
@@ -260,24 +274,24 @@ def order_by_values(matched: Iterable[int], value_of: Any, descending: bool) -> 
     return present + absent
 
 
-def parse_order_by(order_by: Any, ti: Any) -> tuple[str, bool]:
+def parse_order_by(order_by: object, ti: TypeInfo) -> tuple[str, bool]:
     """Resolve the frozen ``order_by`` contract (#25) to ``(field_name, descending)``.
 
     Accept ``(field, direction)`` or a bare ``field`` (ascending); ``field`` is a
     :class:`FieldExpr` or a name, and ``direction`` is ``'asc'`` or ``'desc'``.
     """
-    field_ref: Any
-    direction: Any
+    field_ref: object
+    direction: object
     if isinstance(order_by, tuple):
-        items = cast("tuple[Any, ...]", order_by)
-        if len(items) != 2:
+        items = cast("tuple[object, ...]", order_by)
+        if len(items) != _ORDER_BY_PAIR_SIZE:
             raise QueryError(
                 "order_by=(field, direction) takes a (field, 'asc'|'desc') pair"
             )
         field_ref, direction = items
     else:
         field_ref, direction = order_by, "asc"
-    name: Any = field_ref.name if isinstance(field_ref, FieldExpr) else field_ref
+    name = field_ref.name if isinstance(field_ref, FieldExpr) else field_ref
     if not isinstance(name, str):
         raise QueryError(
             "order_by field must be a field name or EntityClass.field, "
@@ -299,7 +313,7 @@ def parse_order_by(order_by: Any, ti: Any) -> tuple[str, bool]:
     return field_name, direction == "desc"
 
 
-def query_target(target: Any, method: str) -> tuple[type, Condition | None]:
+def query_target(target: object, method: str) -> tuple[type, Condition | None]:
     """``count()``/``pluck()``/snapshot reads accept an @entity class (the
     whole extent) or a Condition — shared validation for both surfaces.
     """
@@ -365,25 +379,25 @@ class FieldExpr:
         self.cls = cls
         self.name = name
 
-    def __eq__(self, value: object) -> Pred:  # pyrefly: ignore[bad-override]  # builds a predicate, not a bool
+    def __eq__(self, value: object) -> Pred:  # pyrefly: ignore[bad-override] - builds a predicate, not a bool
         return Pred(self.cls, self.name, "==", value)
 
-    def __ne__(self, value: object) -> Pred:  # pyrefly: ignore[bad-override]  # builds a predicate, not a bool
+    def __ne__(self, value: object) -> Pred:  # pyrefly: ignore[bad-override] - builds a predicate, not a bool
         return Pred(self.cls, self.name, "!=", value)
 
-    def __lt__(self, value: Any) -> Pred:
+    def __lt__(self, value: object) -> Pred:
         return Pred(self.cls, self.name, "<", value)
 
-    def __le__(self, value: Any) -> Pred:
+    def __le__(self, value: object) -> Pred:
         return Pred(self.cls, self.name, "<=", value)
 
-    def __gt__(self, value: Any) -> Pred:
+    def __gt__(self, value: object) -> Pred:
         return Pred(self.cls, self.name, ">", value)
 
-    def __ge__(self, value: Any) -> Pred:
+    def __ge__(self, value: object) -> Pred:
         return Pred(self.cls, self.name, ">=", value)
 
-    def in_(self, values: Any) -> Pred:
+    def in_(self, values: Iterable[object]) -> Pred:
         return Pred(self.cls, self.name, "in", tuple(values))
 
     def contains(self, substring: str) -> Pred:

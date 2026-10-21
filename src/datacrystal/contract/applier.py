@@ -60,6 +60,28 @@ _encoder = msgspec.msgpack.Encoder()
 _decoder = msgspec.msgpack.Decoder()
 
 
+def check_delta_header(delta: dict[str, Any], *, consumer: str, upgrade: str, remedy: str) -> None:
+    """Refuse a delta whose marker is foreign or whose version is not ``CONTRACT_VERSION``.
+
+    ``consumer`` names the refuser in the message, ``upgrade`` is the advice for a newer version
+    and ``remedy`` the advice for an older one (§4.5 exactness, both directions).
+    """
+    if delta.get("f") != FORMAT_MARKER:
+        raise DeltaFormatError(f"not a datacrystal delta: f={delta.get('f')!r}")
+    version = delta.get("v")
+    if version == CONTRACT_VERSION:
+        return
+    if isinstance(version, int) and version > CONTRACT_VERSION:
+        raise DeltaFormatError(
+            f"delta version {version} is newer than this {consumer} "
+            f"supports ({CONTRACT_VERSION}); {upgrade}"
+        )
+    raise DeltaFormatError(
+        f"delta version {version!r} predates v{CONTRACT_VERSION} — "
+        f"incompatible (COMMIT-DELTA-v2 §7, no-compat): {remedy}"
+    )
+
+
 def encode_delta(delta: dict[str, Any]) -> bytes:
     """Encode a delta map to its wire form (one msgpack map)."""
     return _encoder.encode(delta)
@@ -98,20 +120,12 @@ class ReferenceApplier:
         # Marker and version are judged BEFORE the required-key sweep so a
         # pre-v2 delta gets the honest "incompatible version" refusal, not a
         # confusing "missing key 'actor'" (§4.5 exactness, both directions).
-        if delta.get("f") != FORMAT_MARKER:
-            raise DeltaFormatError(f"not a datacrystal delta: f={delta.get('f')!r}")
-        version = delta.get("v")
-        if version != CONTRACT_VERSION:
-            if isinstance(version, int) and version > CONTRACT_VERSION:
-                raise DeltaFormatError(
-                    f"delta version {version} is newer than this consumer "
-                    f"supports ({CONTRACT_VERSION}); upgrade the consumer"
-                )
-            raise DeltaFormatError(
-                f"delta version {version!r} predates v{CONTRACT_VERSION} — "
-                "incompatible (COMMIT-DELTA-v2 §7, no-compat): recreate the "
-                "stream from the live store"
-            )
+        check_delta_header(
+            delta,
+            consumer="consumer",
+            upgrade="upgrade the consumer",
+            remedy="recreate the stream from the live store",
+        )
         for key in _REQUIRED_KEYS:
             if key not in delta:
                 raise DeltaFormatError(f"delta is missing required key {key!r}")

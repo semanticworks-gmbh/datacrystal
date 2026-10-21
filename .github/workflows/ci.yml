@@ -28,6 +28,11 @@ jobs:
       - name: Lint (ruff)
         run: uvx ruff check .
 
+      - name: Suppressions (standard typed-python — noqa codes and reasons in src/)
+        run: |
+          uv run scripts/test_check_suppressions.py
+          uv run scripts/check_suppressions.py
+
       - name: Type check (Pyrefly — src, examples, benchmarks, tests)
         run: uv run pyrefly check
 
@@ -99,7 +104,7 @@ jobs:
         run: uv run scripts/test_testrules.py
 
       - name: Changed test modules
-        run: git diff --name-only --diff-filter=d "origin/${{ github.base_ref }}...HEAD" -- ':(glob)tests/**/test_*.py' ':(glob)benchmarks/test_*.py' > changed.txt
+        run: git diff --name-only --diff-filter=d "origin/${{ github.base_ref }}...HEAD" -- ':(glob)tests/**/test_*.py' ':(glob)benchmarks/test_*.py' scripts/test_check_suppressions.py > changed.txt
 
       - name: Gate
         run: |

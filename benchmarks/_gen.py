@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import datetime as dt
 import random
+from collections.abc import Callable
 from typing import Annotated, Any
 
 import datacrystal as dc
@@ -129,30 +130,54 @@ def vocabulary(size: int = 200) -> list[tuple[str, str, float]]:
     return vocab[:size]
 
 
-def build(store: dc.Store, *, specimens: int, seed: int = 0xDC,
-          batch: int = 10_000, protected: bool = False) -> dict[str, int]:
-    """Populate ``store`` with the scaled cabinet; returns object counts.
-    Commits in batches so P1 capture stays bounded; idempotent only on an
-    empty store (it assigns the root)."""
-    rng = random.Random(seed)
-    # protected=True swaps ONLY the specimen layer's class (additive knob,
-    # W2-9): same rng sequence, Zipf hubs, chain/cycle topology and events —
-    # the corpus differs solely in the four injected _dc_ columns.
-    specimen_cls = CuratedSpecimen if protected else Specimen
+_ZIPF_EXPONENT = 1.1
+_LOCALITY_COUNT = 40
+_CHAIN_PROBABILITY = 0.30  # share of specimens acquired from an earlier specimen
+_MAX_CHAIN_DEPTH = 6
+_RECENT_WINDOW = 64  # chain sources: a bounded window of the latest specimens
+_CYCLE_PROBABILITY = 0.001
+# Cumulative upper bounds of qualities A, B, C (the rest is D).
+_QUALITY_BOUNDS = (0.05, 0.20, 0.60)
+# Poisson(0.2) extra events: P(0)=.819, P(1)=.164 (cumulative .983), else 2.
+_NO_EXTRA_EVENTS_BELOW = 0.819
+_ONE_EXTRA_EVENT_BELOW = 0.983
+
+
+def _quality_for(draw: float) -> str:
+    """Map a uniform draw to a quality grade by the cumulative bounds."""
+    for grade, bound in zip(_QUALITIES, _QUALITY_BOUNDS, strict=False):
+        if draw < bound:
+            return grade
+    return _QUALITIES[-1]
+
+
+def _extra_event_count(draw: float) -> int:
+    """Map a uniform draw to the Poisson(0.2) number of loan/return events."""
+    if draw < _NO_EXTRA_EVENTS_BELOW:
+        return 0
+    return 1 if draw < _ONE_EXTRA_EVENT_BELOW else 2
+
+
+def _reference_layers() -> tuple[list[Country], list[Locality], list[Mineral]]:
+    """Build the small backbone: countries, localities, the mineral vocabulary."""
     countries = [Country(iso=name[:2].upper() + str(i), name=name)
                  for i, name in enumerate(_COUNTRIES)]
     localities = [
         Locality(qid=f"QL{i:04d}", name=f"locality {i}",
                  country=_COUNTRIES[i % len(_COUNTRIES)])
-        for i in range(40)
+        for i in range(_LOCALITY_COUNT)
     ]
     minerals = [
         Mineral(qid=f"QM{i:04d}", name=name, crystal_system=system, mohs=mohs,
                 type_locality=dc.Lazy.of(localities[i % len(localities)]))
         for i, (name, system, mohs) in enumerate(vocabulary())
     ]
-    # Zipf weights (s=1.1): the head is the quartz-class hub density test
-    weights = [1.0 / (i + 1) ** 1.1 for i in range(len(minerals))]
+    return countries, localities, minerals
+
+
+def _zipf_picker(minerals: list[Mineral], rng: random.Random) -> Callable[[], Mineral]:
+    """Return a sampler over ``minerals`` with Zipf weights: the head is the quartz-class hub."""
+    weights = [1.0 / (i + 1) ** _ZIPF_EXPONENT for i in range(len(minerals))]
     total_w = sum(weights)
     cumulative: list[float] = []
     acc = 0.0
@@ -171,73 +196,122 @@ def build(store: dc.Store, *, specimens: int, seed: int = 0xDC,
                 hi = mid
         return minerals[lo]
 
+    return pick_mineral
+
+
+_AnySpecimen = Specimen | CuratedSpecimen
+
+
+class _SpecimenLayer:
+    """Generates specimens with their trade chains and events, one rng draw order throughout."""
+
+    def __init__(
+        self,
+        rng: random.Random,
+        specimen_cls: type[Specimen | CuratedSpecimen],
+        pick_mineral: Callable[[], Mineral],
+    ) -> None:
+        self.rng = rng
+        self.specimen_cls = specimen_cls
+        self.pick_mineral = pick_mineral
+        self.seq = 0
+        self.chain_depth: dict[str, int] = {}
+        self.recent: list[_AnySpecimen] = []   # chain sources (bounded window); Specimen or twin
+        self.cycle_candidates: list[_AnySpecimen] = []
+
+    def _acquisition(self) -> tuple[dc.Lazy[Any] | None, int]:
+        """Pick a chain source among the recent specimens, as ``(acquired_from, depth)``."""
+        rng = self.rng
+        if self.recent and rng.random() < _CHAIN_PROBABILITY:
+            source = self.recent[rng.randrange(len(self.recent))]
+            depth = self.chain_depth[source.specimen_no] + 1
+            if depth <= _MAX_CHAIN_DEPTH:
+                return dc.Lazy.of(source), depth
+        return None, 0
+
+    def _remember(self, specimen: _AnySpecimen) -> None:
+        """Make ``specimen`` a chain source and, rarely, a cycle candidate."""
+        rng = self.rng
+        if len(self.recent) < _RECENT_WINDOW:
+            self.recent.append(specimen)
+        else:
+            self.recent[rng.randrange(_RECENT_WINDOW)] = specimen
+        if rng.random() < _CYCLE_PROBABILITY:
+            self.cycle_candidates.append(specimen)
+
+    def specimen(self, index: int) -> _AnySpecimen:
+        """Create the specimen numbered ``index``."""
+        rng = self.rng
+        no = f"S-{index:07d}"
+        acquired_from, depth = self._acquisition()
+        specimen = self.specimen_cls(
+            specimen_no=no,
+            mineral=dc.Lazy.of(self.pick_mineral()),
+            quality=_quality_for(rng.random()),
+            mass_g=round(rng.lognormvariate(3.7, 1.0), 2),
+            acquired_from=acquired_from,
+        )
+        self.chain_depth[no] = depth
+        self._remember(specimen)
+        return specimen
+
+    def _event(self, specimen_no: str, kind: str) -> CatalogEvent:
+        self.seq += 1
+        return CatalogEvent(seq=self.seq, specimen_no=specimen_no, kind=kind,
+                            at=_EPOCH + dt.timedelta(seconds=self.seq))
+
+    def events(self, specimen_no: str) -> list[CatalogEvent]:
+        """Create the ``acquired`` event plus the Poisson extras for one specimen."""
+        events = [self._event(specimen_no, "acquired")]
+        for k in range(_extra_event_count(self.rng.random())):
+            events.append(self._event(specimen_no, "loaned" if k == 0 else "returned"))
+        return events
+
+    def close_trade_loops(self) -> None:
+        """Close ~0.1% trade loops: link a chained source back into the specimen."""
+        for specimen in self.cycle_candidates:
+            if specimen.acquired_from is not None:
+                source = specimen.acquired_from.get()
+                if source.acquired_from is None:
+                    link: dc.Lazy[Any] = dc.Lazy.of(specimen)
+                    source.acquired_from = link
+
+
+def build(store: dc.Store, *, specimens: int, seed: int = 0xDC,
+          batch: int = 10_000, protected: bool = False) -> dict[str, int]:
+    """Populate ``store`` with the scaled cabinet; returns object counts.
+    Commits in batches so P1 capture stays bounded; idempotent only on an
+    empty store (it assigns the root)."""
+    rng = random.Random(seed)
+    # protected=True swaps ONLY the specimen layer's class (additive knob,
+    # W2-9): same rng sequence, Zipf hubs, chain/cycle topology and events —
+    # the corpus differs solely in the four injected _dc_ columns.
+    specimen_cls = CuratedSpecimen if protected else Specimen
+    countries, localities, minerals = _reference_layers()
+    layer = _SpecimenLayer(rng, specimen_cls, _zipf_picker(minerals, rng))
+
     store.root = {"countries": countries, "localities": localities,
                   "minerals": minerals}
     store.commit()
 
-    seq = 0
-    chain_depth: dict[str, int] = {}
-    recent: list[Any] = []   # chain sources (bounded window); Specimen or twin
-    cycle_candidates: list[Any] = []
     all_events = 0
     for start in range(0, specimens, batch):
-        block: list[Any] = []
+        block: list[_AnySpecimen] = []
         events: list[CatalogEvent] = []
         for i in range(start, min(start + batch, specimens)):
-            no = f"S-{i:07d}"
-            acquired_from = None
-            depth = 0
-            if recent and rng.random() < 0.30:
-                source = recent[rng.randrange(len(recent))]
-                depth = chain_depth[source.specimen_no] + 1
-                if depth <= 6:
-                    acquired_from = dc.Lazy.of(source)
-                else:
-                    depth = 0
-            specimen = specimen_cls(
-                specimen_no=no,
-                mineral=dc.Lazy.of(pick_mineral()),
-                quality=_QUALITIES[
-                    0 if (q := rng.random()) < 0.05 else
-                    1 if q < 0.20 else 2 if q < 0.60 else 3
-                ],
-                mass_g=round(rng.lognormvariate(3.7, 1.0), 2),
-                acquired_from=acquired_from,
-            )
-            chain_depth[no] = depth
+            specimen = layer.specimen(i)
             block.append(specimen)
-            if len(recent) < 64:
-                recent.append(specimen)
-            else:
-                recent[rng.randrange(64)] = specimen
-            if rng.random() < 0.001:
-                cycle_candidates.append(specimen)
-            seq += 1
-            events.append(CatalogEvent(seq=seq, specimen_no=no, kind="acquired",
-                                       at=_EPOCH + dt.timedelta(seconds=seq)))
-            u = rng.random()  # Poisson(0.2): P(0)=.819, P(1)=.164, else 2
-            for k in range(0 if u < 0.819 else 1 if u < 0.983 else 2):
-                seq += 1
-                events.append(CatalogEvent(
-                    seq=seq, specimen_no=no,
-                    kind="loaned" if k == 0 else "returned",
-                    at=_EPOCH + dt.timedelta(seconds=seq),
-                ))
+            events.extend(layer.events(specimen.specimen_no))
         for entity in block:
             store.store(entity)
         for event in events:
             store.store(event)
         all_events += len(events)
         store.commit()
-    # ~0.1% cycles: close a trade loop back into an earlier specimen
-    for specimen in cycle_candidates:
-        if specimen.acquired_from is not None:
-            source = specimen.acquired_from.get()
-            if source.acquired_from is None:
-                source.acquired_from = dc.Lazy.of(specimen)
+    layer.close_trade_loops()
     store.commit()
     return {
         "countries": len(countries), "localities": len(localities),
         "minerals": len(minerals), "specimens": specimens,
-        "events": all_events, "cycles": len(cycle_candidates),
+        "events": all_events, "cycles": len(layer.cycle_candidates),
     }

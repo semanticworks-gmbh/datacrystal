@@ -103,8 +103,8 @@ def conftest_scoped_fixtures(path: Path) -> set[str]:
     return names
 
 
-def module_findings(tree: ast.Module) -> list[Finding]:
-    """Return the findings in test bodies and module-wide (control flow, sleep, asserts, rows)."""
+def control_flow_findings(tree: ast.Module) -> list[Finding]:
+    """Return the findings for control flow and comprehensions outside an assert in test bodies."""
     found = []
     for test in tests_of(tree):
         inside_assert = {id(inner) for node in ast.walk(test) if isinstance(node, ast.Assert) for inner in ast.walk(node)}
@@ -114,6 +114,12 @@ def module_findings(tree: ast.Module) -> list[Finding]:
                 found.append(Finding(node.lineno, f"{kind} — a test is straight-line code", test.lineno))
             if isinstance(node, COMPREHENSION) and id(node) not in inside_assert:
                 found.append(Finding(node.lineno, "comprehension outside an assert — a test is straight-line code"))
+    return found
+
+
+def sleep_and_row_findings(tree: ast.Module) -> list[Finding]:
+    """Return the findings for a sleep() call and for a parametrize row of non-plain values."""
+    found = []
     for node in ast.walk(tree):
         if call_name(node).endswith("sleep"):
             found.append(Finding(node.lineno, "sleep() — wait on a condition, never on time"))
@@ -121,11 +127,22 @@ def module_findings(tree: ast.Module) -> list[Finding]:
             for cell in row_values(node):
                 if not isinstance(cell, PLAIN_ROW_VALUE):
                     found.append(Finding(cell.lineno, f"row holds `{ast.unparse(cell)}` — plain values only; an event sequence is its own test"))
+    return found
+
+
+def helper_assert_findings(tree: ast.Module) -> list[Finding]:
+    """Return the findings for an assert inside a function that is not a test."""
+    found = []
     test_ids = {id(test) for test in tests_of(tree)}
     for node in ast.walk(tree):
         if isinstance(node, FUNCTIONS) and id(node) not in test_ids:
             found.extend(Finding(inner.lineno, f"assert inside {node.name}() — the test asserts, a helper builds") for inner in ast.walk(node) if isinstance(inner, ast.Assert))
     return found
+
+
+def module_findings(tree: ast.Module) -> list[Finding]:
+    """Return the findings in test bodies and module-wide (control flow, sleep, asserts, rows)."""
+    return control_flow_findings(tree) + sleep_and_row_findings(tree) + helper_assert_findings(tree)
 
 
 def test_findings(test: ast.FunctionDef | ast.AsyncFunctionDef, scoped_fixtures: set[str]) -> list[Finding]:

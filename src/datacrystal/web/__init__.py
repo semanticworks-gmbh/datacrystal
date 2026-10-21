@@ -9,7 +9,7 @@ Exports are append-only and grouped per submodule.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 # --- _pydantic: REST boundary (#96-#98) — needs only pydantic ------------------
 from datacrystal.web._pydantic import entity_model, from_pydantic, to_pydantic
@@ -25,6 +25,9 @@ if TYPE_CHECKING:
     # and ``from datacrystal.web import X`` type-check without an eager import.
     from datacrystal.web._app import (
         SNAPSHOT_CONTEXT_KEY as SNAPSHOT_CONTEXT_KEY,
+    )
+    from datacrystal.web._app import (
+        StoreOpenOptions as StoreOpenOptions,
     )
     from datacrystal.web._app import (
         create_app as create_app,
@@ -74,6 +77,7 @@ _LAZY: dict[str, str] = {
     "snapshot_context": "_strawberry",
     # _app: FastAPI app wiring (#92) — needs fastapi
     "SNAPSHOT_CONTEXT_KEY": "_app",
+    "StoreOpenOptions": "_app",
     "create_app": "_app",
     "get_principal": "_app",
     "get_store": "_app",
@@ -86,7 +90,7 @@ _LAZY: dict[str, str] = {
 }
 
 
-def __getattr__(name: str) -> Any:
+def __getattr__(name: str) -> object:
     """Import the submodule owning a strawberry- or fastapi-backed name on first access (PEP 562).
 
     A follower install (no strawberry/fastapi) can therefore import this package.
@@ -111,6 +115,7 @@ __all__ = [
     "SNAPSHOT_CONTEXT_KEY",
     "FieldDescriptor",
     "SnapshotLoader",
+    "StoreOpenOptions",
     "StrawberryReflector",
     "create_app",
     "entity_model",
