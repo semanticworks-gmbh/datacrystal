@@ -15,7 +15,7 @@ import shutil
 import struct
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, Self
+from typing import TYPE_CHECKING, Any, Self
 
 from datacrystal._errors import DataCrystalError
 from datacrystal.contract.applier import (
@@ -28,6 +28,9 @@ from datacrystal.contract.applier import (
     decode_delta,
     encode_delta,
 )
+
+if TYPE_CHECKING:
+    from datacrystal._snapshot import Snapshot
 
 __all__ = ["DeltaLog", "DeltaLogConfigError"]
 
@@ -190,7 +193,7 @@ class DeltaLog:
     # -- bootstrap (the §5 mid-life attach recipe) --------------------------------
 
     @classmethod
-    def bootstrap(cls, path: str | Path, snapshot: Any, *,
+    def bootstrap(cls, path: str | Path, snapshot: Snapshot, *,
                   flush_every: int = 1,
                   max_segment_bytes: int = 8 * 1024 * 1024) -> DeltaLog:
         """Start a log that joins a store mid-stream at ``snapshot.tid``.
