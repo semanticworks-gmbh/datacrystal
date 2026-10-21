@@ -1,111 +1,64 @@
 # How-to: evolve your schema
 
-Goal: change your entity classes between runs without losing or rewriting old data. datacrystal
-adapts old records **on load**; this guide is the task-by-task playbook. The error you may hit
-(`SchemaMismatchError`) is in [the Errors reference](../reference.md#errors); the load-time markers
-(`dc.RenamedFrom`, `dc.Glue`) are introduced in [Define entities](../reference.md#define-entities).
+After this page you can change entity classes between runs and keep reading the old records.
 
-## What change is safe?
+```python
+from typing import Annotated
 
-You can evolve entity classes between runs; old records adapt **on load**:
+import datacrystal as dc
+
+@dc.entity
+class Mineral:
+    qid: Annotated[str, dc.Unique]
+    name: str
+    hardness: float | None = None
+    coords: str = "0,0"
+
+with dc.Store.open("cabinet.store") as store:
+    if store.root is None:
+        store.root = {"seeded": True}
+        store.store(Mineral(qid="Q193563", name="azurite", hardness=3.5, coords="-19.2,17.7"))
+        store.commit()
+
+@dc.entity
+class Mineral:  # noqa: F811 - the same class, one release later
+    qid: Annotated[str, dc.Unique]
+    name: str
+    mohs: Annotated[float | None, dc.RenamedFrom("hardness")] = None
+    lat: Annotated[float, dc.Glue(lambda old: float(old["coords"].split(",")[0]))] = 0.0
+    lon: Annotated[float, dc.Glue(lambda old: float(old["coords"].split(",")[1]))] = 0.0
+    color: str = "unknown"
+
+with dc.Store.open("cabinet.store") as store:
+    azurite = store.get(Mineral, qid="Q193563")
+    print(azurite.mohs, azurite.lat, azurite.lon, azurite.color)
+    print(store.verify())
+    print(store.migrate(), store.migrate())
+```
+
+The script prints `1 0` on its first run and `0 0` on its second, because `migrate()` rewrites each old record once.
 
 | Change | What happens |
 |---|---|
-| add a field **with a default** | old records get the default when loaded ✔ |
-| remove a field | old values are ignored ✔ |
-| reorder fields | values map by name ✔ |
-| add a field **without a default** | `SchemaMismatchError` naming the field — add a default |
-| add a `dc.Unique` field | must default to `None`, else `SchemaMismatchError` (a shared non-None default would collide) |
-| rename a field | mark the new field `Annotated[T, dc.RenamedFrom("old")]` — the old values follow ✔ (see below) |
-| split / merge / derive a field | mark the new field `Annotated[T, dc.Glue(fn)]` — `fn(old_record)` computes it from the old record ✔ (see below) |
-| change a field's type | not checked (annotations are not validated on load) — avoid, or use `dc.Glue` to convert on load |
+| add a field with a default | old records get the default |
+| remove a field | old values are ignored |
+| reorder fields | values map by name |
+| add a field without a default | `SchemaMismatchError` naming the field |
+| add a `dc.Unique` field | must default to `None`, otherwise `SchemaMismatchError` |
+| rename a field | `Annotated[T, dc.RenamedFrom("old")]` binds the old values |
+| split, merge or derive a field | `Annotated[T, dc.Glue(fn)]` computes it from the old record as a read-only `{name: value}` mapping |
+| change a field's type | not checked on load; convert with `dc.Glue` |
 
-## Rename a field without losing data
+- `RenamedFrom` and `Glue` fire only when the field is absent from a record's persisted shape, and never rewrite the record.
+- `store.migrate()` re-encodes every record stored under an older shape to the newest one, so a derived field becomes a real column.
+  It is idempotent (the second call returns 0), crash-safe and commits in `batch=10_000` chunks.
+- `store.verify()` is the read-only pre-flight: it returns the `(typename, oid)` pairs that do not decode against the current code, and an empty list means the store reads cleanly.
+  Run it before `migrate()`.
+- `Glue` and `RenamedFrom` are read-time markers and raise at `@entity` on a `dc.Index` or `dc.Unique` field, because an index is built from the persisted value and would index the wrong data.
+  To index a derived field, keep it non-indexed with `Glue`, run `migrate()`, then redeclare it as `Annotated[float, dc.Index] = 0.0` without `Glue`.
+  The same order applies to a renamed field you want indexed.
+- The markers cover non-indexed fields on the `get`, `query` and `pluck` paths; the index, snapshot and Arrow decode paths and renaming an indexed field are `[planned — demand-driven]`.
+- The store keeps a type lineage, one row per field shape a class ever had, and decodes each record through the shape it was written with.
+  A store that used schema evolution still opens in this and any newer library version.
 
-To rename a field without losing data, mark the new field with its old persisted name:
-`mohs: Annotated[float | None, dc.RenamedFrom("hardness")]`. On load, a record that lacks
-`mohs` but still has `hardness` binds the old column, so the rename follows your code —
-additively, never rewriting the record (and the new name wins once data is written under it).
-
-## Reshape a field: split, merge, derive (dc.Glue)
-
-When a change needs the data *reshaped* — split one field into two, merge two into one, or
-convert a type — mark the new field with `dc.Glue(fn)`. On load, a record that lacks the field
-calls `fn(old)` with the old record as a read-only `{name: value}` mapping and uses the result:
-
-```python
-@dc.entity
-class Locality:
-    # old records persisted coords="48.1,11.5"; lat/lon now follow your code
-    lat: Annotated[float, dc.Glue(lambda old: float(old["coords"].split(",")[0]))] = 0.0
-    lon: Annotated[float, dc.Glue(lambda old: float(old["coords"].split(",")[1]))] = 0.0
-```
-
-Glue fires **only when the field is absent** from a record's persisted shape — so once data is
-written in the new shape it is a no-op, and old records are never rewritten in place (additive,
-like `RenamedFrom`).
-
-`RenamedFrom` and `Glue` are scoped to **non-indexed** fields read through live hydration
-and decode (`get`/`query`/`pluck`); honoring them in the index, snapshot, and arrow decode
-paths, and renaming an indexed field, are `[planned — demand-driven]`.
-
-## Materialize the new shape on disk: migrate and verify
-
-`RenamedFrom` and `Glue` adapt old records *on read*. When you want the new shape **materialized
-on disk** — so a derived field becomes a real persisted column you can then index — run the
-offline `store.migrate()`:
-
-```python
-moved = store.migrate()   # re-encode every stale-shape record to the newest shape
-```
-
-`migrate()` hydrates each record persisted under an older lineage shape (through renames, glue and
-defaults) and re-commits it under the current shape — additive (a new lineage row, never a blob
-rewrite), owner-confined, lease-held, and crash-safe (it rides the normal commit; a partial run
-just resumes). It is **idempotent** (a second run rewrites nothing) and commits in `batch`-sized
-chunks (`store.migrate(batch=10_000)`, the default) so peak memory tracks the batch, not the store.
-
-`store.verify()` is the read-only pre-flight: it decodes every record against the current code
-*without* mutating anything and returns the `(typename, oid)` pairs that **don't** decode — a field
-removed-then-re-added with no default or `Glue`, a type the running code no longer defines, or a
-corrupt record. An empty list means the whole store reads cleanly. Run `verify()` before
-`migrate()`.
-
-## Recipe: deriving an *indexed* field (Glue + migrate)
-
-`Glue` and `RenamedFrom` are read-time markers and live only on **non-indexed** fields — putting
-one on a `dc.Index`/`dc.Unique` field raises at `@entity`. The reason is correctness, not
-arbitrariness: an index is built from the *persisted* value, not the glued one, so a glued index
-would silently index the wrong data. To end up with a *derived* field that is **also indexed**,
-split it into two steps and let `migrate()` bridge them:
-
-```python
-# Step 1 — derive on read (NON-indexed), so old records adapt immediately on load
-@dc.entity
-class Locality:
-    name: str
-    lat: Annotated[float, dc.Glue(lambda old: float(old["coords"].split(",")[0]))] = 0.0
-
-store = dc.Store.open("cabinet.store")
-store.migrate()        # Step 2 — materialize `lat` into a real persisted column on disk
-
-# Step 3 — `lat` is now a plain column; (re)declare it indexed and reopen
-@dc.entity
-class Locality:
-    name: str
-    lat: Annotated[float, dc.Index] = 0.0   # no Glue — a real, indexable column
-```
-
-After `migrate()`, every record physically carries `lat`, so adding `dc.Index` builds a **correct**
-index over real data. The ordering matters: keep the field non-indexed while the value is glued
-(the glue derives it on every read), and only add the index once `migrate()` has written the column
-to disk. The same recipe applies to a renamed field you want indexed (`RenamedFrom` → `migrate()` →
-`Index`). `migrate()` keeps existing indexes consistent automatically — it rewrites through the
-normal commit path, so committed records fold into any built index and a reopen rebuilds indexes
-from the newest records.
-
-How it works (one paragraph, so the behavior is predictable): the store keeps a **type
-lineage** — every field shape a class ever had gets its own row in the type dictionary, and
-each record decodes through the shape it was written with, by field name. Old records are never
-rewritten in place; they migrate to the newest shape the next time you modify and commit them.
-A store that used schema evolution is still openable by this and any newer library version.
+Reference: [Define entities](../reference.md#define-entities), [Errors](../reference.md#errors).
