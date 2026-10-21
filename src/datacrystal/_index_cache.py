@@ -2,13 +2,9 @@
 watermark-stamped file beside the store so the first query after a restart loads
 them instead of rebuilding from an O(corpus) scan.
 
-The cache is rebuildable derived data and **never the source of truth** (invariant
-11, amended by ADR-005): it is read only when its stamped watermark matches the
-store's, its format matches, and — per class — the live class's index markers
-still match (``ClassIndexes.load`` enforces the last). Any mismatch, corruption,
-or a newer format is silently ignored and the index rebuilds from the records.
-Written outside the commit transaction; a partial write never lands (temp file +
-atomic rename).
+The cache is rebuildable derived data and **never the source of truth** (invariant 11, ADR-005):
+a watermark, format or class-marker mismatch, or corruption, is ignored and the index rebuilds.
+It is written outside the commit transaction, by temp file and rename.
 """
 
 from __future__ import annotations
@@ -37,11 +33,11 @@ class IndexCache:
         self._path = path
 
     def read(self, watermark: int) -> dict[str, Any] | None:
-        """``{"classes": {typename: blob}, "reverse": blob|None}`` IF the cache is
-        at ``watermark`` and the current format — else ``None`` (rebuild). Never
-        raises on a missing, truncated, or foreign-format cache: it is never
-        authoritative. ``reverse`` is optional (#63) — a pre-#63 sidecar simply
-        lacks it, so the reverse index rebuilds on demand as before.
+        """Return ``{"classes": {typename: blob}, "reverse": blob|None}`` if the cache is current.
+
+        Return ``None`` (rebuild) when the cache is at another watermark or format, and never
+        raise on a missing, truncated or foreign cache.
+        ``reverse`` is optional (#63): a pre-#63 sidecar lacks it and the reverse index rebuilds.
         """
         try:
             raw = self._path.read_bytes()
@@ -63,9 +59,9 @@ class IndexCache:
 
     def write(self, watermark: int, blobs: dict[str, Any],
               reverse: dict[str, Any] | None = None) -> None:
-        """Stamp the built forward index blobs (and the reverse index, if built —
-        #63) at ``watermark`` (temp file + atomic rename, so a crash mid-write
-        leaves the prior valid cache or none).
+        """Stamp the built forward blobs (and the reverse index, if built, #63) at ``watermark``.
+
+        A temp file plus atomic rename leaves the prior valid cache, or none, after a crash.
         """
         payload = encode_scalar_tree(
             {"format": _CACHE_FORMAT, "watermark": watermark,
