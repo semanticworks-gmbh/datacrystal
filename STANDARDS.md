@@ -4,13 +4,13 @@ Rules that bind every change to datacrystal, each short enough to check a diff a
 Copied from tetrahedron's `architecture/standards/STANDARDS.md` on 2026-10-20 (#186) and owned here from now on: a change goes through a PR on this file, not through tetrahedron.
 Cite a rule by its slug.
 
-Gates that switch on in a later wave say so by issue: D401, docstring form and length, T20 in `src/` in #191; ANN401, C901, PLR2004 in `src/` in #192.
-#191 also switches on ruff's own default rule set, now replaced by an explicit E4, E7, E9, F select (322 findings, mostly autofix).
+Gates that switch on in a later wave say so by issue: ANN401, C901, PLR2004 in `src/` in #192.
+#191 switched on D401, the docstring form (D102, D105, D107, D403, D415), T20 and ruff's own default rule set in `src/`; only the five-body-line docstring limit stays with review, since ruff has no rule for it.
 
 ### self-documenting-code
 - **Rule:** Code states its intent through names, explaining variables, named predicates and constants; a docstring or comment adds only what the code cannot say — a one-line summary in the imperative, at most five body lines, the why — never a restated name, type or next line.
 - **Applies to:** all code, tests included.
-- **Enforced by:** ci — `ruff.toml` selects the google docstring rules and W505 (docs and comments within 100 columns) that are at 0 today; review for the rest — the PR reviewer reads every new name, condition, docstring and comment and checks the five-line docstring limit (ruff has no rule for it), until #191 selects D401, D102, D105, D107, D403, D415 for `src/` (tests carry them today, except D103, D107 and D415, which `ruff.toml` ignores for tests); cannot see: stale or wrong text, name quality.
+- **Enforced by:** ci — `ruff.toml` selects the google docstring rules and W505 (docs and comments within 100 columns) that are at 0 today; review for the rest — the PR reviewer reads every new name, condition, docstring and comment and checks the five-line docstring limit (ruff has no rule for it); D401, D102, D105, D107, D403 and D415 gate in `src/` and `scripts/` since #191 (tests ignore D103, D107 and D415); cannot see: stale or wrong text, name quality, a docstring over five body lines.
 - **Example:** `scripts/testrules.py::check_file`
 - **Source:** tetrahedron decision 542, copied 2026-10-20 (#186).
 
@@ -32,7 +32,7 @@ Gates that switch on in a later wave say so by issue: D401, docstring form and l
 ### structured-logging
 - **Rule:** The library logs through the standard library only: `logging.getLogger(__name__)` under `datacrystal.*`, a `NullHandler` on `datacrystal` and nothing else — no handler, level, formatter or `basicConfig`, since the app chooses its logging framework; the message is a fixed snake_case event in the past tense, the data in `extra=` fields, never interpolated; no entity field value, secret or identifier in a record, only oids, type names, counts and reason codes; a warning (`warnings.warn`) is for a caller's mistake, a log record for an operational event, never both; no `print()` in `src/`, CLI output lives in `scripts/`.
 - **Applies to:** `src/`; a script for its diagnostics, not its output.
-- **Enforced by:** review — the PR reviewer checks new log calls, warnings and `print()` calls, until #191 selects ruff `T20` for `src/`; cannot see: user data inside a field. Nothing in `src/` logs today; #195 adds the first events.
+- **Enforced by:** review — the PR reviewer checks new log calls and warnings, while ruff `T20` gates `print()` in `src/` since #191; cannot see: user data inside a field. Nothing in `src/` logs today; #195 adds the first events.
 - **Source:** tetrahedron decision 553, copied 2026-10-20 (#186), in library form: core dependencies stay `{msgspec, pyroaring}` (invariant 2), so no structlog; an app on structlog renders the `extra` fields through its stdlib bridge (`ProcessorFormatter` with `ExtraAdder`).
 
 ### english-only
