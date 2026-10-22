@@ -36,7 +36,7 @@ Cite a rule by its slug.
 ### structured-logging
 - **Rule:** The library logs through the standard library only: `logging.getLogger(__name__)` under `datacrystal.*`, a `NullHandler` on `datacrystal` and nothing else — no handler, level, formatter or `basicConfig`, since the app chooses its logging framework; the message is a fixed snake_case event in the past tense, the data in `extra=` fields, never interpolated; no entity field value, secret or identifier in a record, only oids, type names, counts and reason codes; a warning (`warnings.warn`) is for a caller's mistake, a log record for an operational event, never both; no `print()` in `src/`, CLI output lives in `scripts/`.
 - **Applies to:** `src/`; a script for its diagnostics, not its output.
-- **Enforced by:** review — the PR reviewer checks new log calls and warnings, while ruff `T20` gates `print()` in `src/` since #191; cannot see: user data inside a field. Five events log today (`docs/reference.md`, Logging), each with a `caplog` test in `tests/**/test_operational_logging*.py`.
+- **Enforced by:** review — the PR reviewer checks new log calls and warnings, while ruff `T20` gates `print()` in `src/` since #191; cannot see: user data inside a field; five events log today (`docs/reference.md`, Logging), each with a `caplog` test in `tests/**/test_operational_logging*.py`.
 - **Source:** tetrahedron decision 553, copied 2026-10-20 (#186), in library form: core dependencies stay `{msgspec, pyroaring}` (invariant 2), so no structlog; an app on structlog renders the `extra` fields through its stdlib bridge (`ProcessorFormatter` with `ExtraAdder`).
 
 ### english-only
