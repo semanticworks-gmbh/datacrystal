@@ -88,11 +88,20 @@ def _type_names(applier: ReferenceApplier) -> set[str]:
 
 
 @pytest.fixture
-def watched_two_commits(store_factory: StoreFactory) -> tuple[dc.Store, _Collector, Mineral]:
-    """Attach a collector, commit a one-mineral root, then rename the mineral and commit again."""
+def collector_attached(store_factory: StoreFactory) -> tuple[dc.Store, _Collector]:
+    """Attach a collector to a store that has committed nothing."""
     consumer = _Collector()
     store = store_factory()
     store.attach(consumer)
+    return store, consumer
+
+
+@pytest.fixture
+def watched_two_commits(
+    collector_attached: tuple[dc.Store, _Collector],
+) -> tuple[dc.Store, _Collector, Mineral]:
+    """Commit a one-mineral root, then rename the mineral and commit again, with a collector."""
+    store, consumer = collector_attached
     store.root = [Mineral(qid="Q1", name="quartz", crystal_system="trigonal")]
     store.commit()
     quartz = _present(store.get(Mineral, qid="Q1"))
@@ -102,14 +111,19 @@ def watched_two_commits(store_factory: StoreFactory) -> tuple[dc.Store, _Collect
 
 
 def test_consumer_watermark_follows_every_commit(
-    watched_two_commits: tuple[dc.Store, _Collector, Mineral],
+    collector_attached: tuple[dc.Store, _Collector],
 ) -> None:
     """Given a consumer attached before two commits
     When both commits are done
     Then the consumer's watermark is 2
     And the store's last_tid is 2
     """
-    store, consumer, _ = watched_two_commits
+    store, consumer = collector_attached
+    store.root = [Mineral(qid="Q1", name="quartz", crystal_system="trigonal")]
+    store.commit()
+    quartz = _present(store.get(Mineral, qid="Q1"))
+    quartz.name = "rock crystal"
+    store.commit()
 
     assert consumer.watermark == 2
     assert store.last_tid == 2
@@ -117,14 +131,19 @@ def test_consumer_watermark_follows_every_commit(
 
 
 def test_consumer_receives_one_delta_per_commit_in_order(
-    watched_two_commits: tuple[dc.Store, _Collector, Mineral],
+    collector_attached: tuple[dc.Store, _Collector],
 ) -> None:
     """Given a consumer attached before two commits
     When both commits are done
     Then the consumer received the TIDs 1 and 2
     And none arrived out of order
     """
-    store, consumer, _ = watched_two_commits
+    store, consumer = collector_attached
+    store.root = [Mineral(qid="Q1", name="quartz", crystal_system="trigonal")]
+    store.commit()
+    quartz = _present(store.get(Mineral, qid="Q1"))
+    quartz.name = "rock crystal"
+    store.commit()
 
     assert [delta["tid"] for delta in consumer.deltas] == [1, 2]
     assert consumer.out_of_order == []
@@ -233,14 +252,23 @@ def test_update_op_prior_differs_from_its_new_payload(
 
 
 @pytest.fixture
-def mirrored_by_applier(store_factory: StoreFactory) -> tuple[dc.Store, ReferenceApplier]:
-    """Attach a ReferenceApplier, commit a cabinet, then update azurite and commit again.
-
-    The applier verifies priors strictly, so a bug would raise on the second commit.
-    """
+def applier_attached(store_factory: StoreFactory) -> tuple[dc.Store, ReferenceApplier]:
+    """Attach a ReferenceApplier to a store that has committed nothing."""
     applier = ReferenceApplier()
     store = store_factory()
     store.attach(applier)
+    return store, applier
+
+
+@pytest.fixture
+def mirrored_by_applier(
+    applier_attached: tuple[dc.Store, ReferenceApplier],
+) -> tuple[dc.Store, ReferenceApplier]:
+    """Commit a cabinet, then update azurite and commit again, with a ReferenceApplier attached.
+
+    The applier verifies priors strictly, so a bug would raise on the second commit.
+    """
+    store, applier = applier_attached
     tsumeb = Locality(qid="Q571997", name="Tsumeb Mine", country="NA")
     store.root = [
         Mineral(qid="Q43010", name="quartz", crystal_system="trigonal"),
@@ -259,13 +287,27 @@ def mirrored_by_applier(store_factory: StoreFactory) -> tuple[dc.Store, Referenc
 
 
 def test_reference_applier_reaches_the_stores_watermark(
-    mirrored_by_applier: tuple[dc.Store, ReferenceApplier],
+    applier_attached: tuple[dc.Store, ReferenceApplier],
 ) -> None:
     """Given a ReferenceApplier attached before two commits
     When both commits are done
     Then the applier's watermark equals the store's last_tid
     """
-    store, applier = mirrored_by_applier
+    store, applier = applier_attached
+    tsumeb = Locality(qid="Q571997", name="Tsumeb Mine", country="NA")
+    store.root = [
+        Mineral(qid="Q43010", name="quartz", crystal_system="trigonal"),
+        Mineral(
+            qid="Q193563",
+            name="azurite",
+            crystal_system="monoclinic",
+            type_locality=dc.Lazy.of(tsumeb),
+        ),
+    ]
+    store.commit()
+    azurite = _present(store.get(Mineral, qid="Q193563"))
+    azurite.mohs = 3.8
+    store.commit()
 
     assert applier.watermark == store.last_tid
     store.close()
@@ -288,13 +330,27 @@ def test_reference_applier_state_equals_the_durable_records(
 
 
 def test_reference_applier_tracks_the_root_oid(
-    mirrored_by_applier: tuple[dc.Store, ReferenceApplier],
+    applier_attached: tuple[dc.Store, ReferenceApplier],
 ) -> None:
     """Given a ReferenceApplier attached before two commits
     When both commits are done
     Then the applier's root oid is the store's root oid
     """
-    store, applier = mirrored_by_applier
+    store, applier = applier_attached
+    tsumeb = Locality(qid="Q571997", name="Tsumeb Mine", country="NA")
+    store.root = [
+        Mineral(qid="Q43010", name="quartz", crystal_system="trigonal"),
+        Mineral(
+            qid="Q193563",
+            name="azurite",
+            crystal_system="monoclinic",
+            type_locality=dc.Lazy.of(tsumeb),
+        ),
+    ]
+    store.commit()
+    azurite = _present(store.get(Mineral, qid="Q193563"))
+    azurite.mohs = 3.8
+    store.commit()
 
     assert applier.root_oid == store._root_oid
     store.close()
@@ -398,15 +454,13 @@ def test_attach_refuses_the_same_consumer_twice(store_at_tid_one: dc.Store) -> N
 
 @pytest.fixture
 def detached_after_one_commit(store_factory: StoreFactory) -> tuple[dc.Store, _Collector]:
-    """Attach a collector, commit once, detach it, then commit once more."""
+    """Attach a collector, commit once, then detach it."""
     consumer = _Collector()
     store = store_factory()
     store.attach(consumer)
     store.root = [Mineral(qid="Q1", name="quartz")]
     store.commit()
     store.detach(consumer)
-    store.root = [Mineral(qid="Q2", name="azurite")]
-    store.commit()
     return store, consumer
 
 
@@ -418,6 +472,9 @@ def test_detached_consumer_receives_no_further_deltas(
     Then the consumer holds exactly one delta
     """
     store, consumer = detached_after_one_commit
+    store.root = [Mineral(qid="Q2", name="azurite")]
+
+    store.commit()
 
     assert len(consumer.deltas) == 1
     store.close()
@@ -669,7 +726,7 @@ def test_retry_after_failed_p2_emits_exactly_one_delta() -> None:
 
 @pytest.fixture
 def midlife_counter(store_factory: StoreFactory) -> tuple[dc.Store, CountingConsumer]:
-    """Bootstrap a consumer from one snapshot (journal scene_pipeline), attach it, commit once more.
+    """Bootstrap a consumer from one snapshot (journal scene_pipeline) and attach it.
 
     Lineage, initial state and watermark come from the snapshot, so the attach is gap-free.
     """
@@ -679,8 +736,6 @@ def midlife_counter(store_factory: StoreFactory) -> tuple[dc.Store, CountingCons
     with store.snapshot() as snap:
         counter = CountingConsumer.bootstrap(snap)
     store.attach(counter)
-    store.store(Mineral(qid="Q3", name="topaz"))
-    store.commit()
     return store, counter
 
 
@@ -693,6 +748,9 @@ def test_midlife_consumer_reaches_the_stores_watermark(
     And it is 2
     """
     store, counter = midlife_counter
+    store.store(Mineral(qid="Q3", name="topaz"))
+
+    store.commit()
 
     assert counter.watermark == store.last_tid
     assert counter.watermark == 2
@@ -707,6 +765,9 @@ def test_midlife_consumer_counts_bootstrapped_and_live_minerals(
     Then it counts 3 minerals
     """
     store, counter = midlife_counter
+    store.store(Mineral(qid="Q3", name="topaz"))
+
+    store.commit()
 
     assert counter.content()["tests.conftest:Mineral"] == 3
     store.close()
