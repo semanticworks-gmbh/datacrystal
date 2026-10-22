@@ -6,6 +6,7 @@ in.
 Quickstart: README.md; design docs: docs/design/ (DESIGN.md, ROADMAP.md, ADR-001).
 """
 
+import logging
 from typing import TYPE_CHECKING
 
 from datacrystal._actors import (
@@ -77,6 +78,8 @@ if TYPE_CHECKING:  # the real import stays lazy — see __getattr__ below
     from datacrystal._async import AsyncStore, aopen
 
 __version__ = "0.10.0"
+
+logging.getLogger("datacrystal").addHandler(logging.NullHandler())
 
 
 def __getattr__(name: str) -> object:  # PEP 562
