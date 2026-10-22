@@ -88,13 +88,17 @@ def loaded(built: ClassIndexes) -> ClassIndexes:
     return reloaded
 
 
+def _stock_five_rocks(store: dc.Store) -> None:
+    for i in range(5):
+        store.store(Rock(name=f"r{i}", hardness=float(i), color="red" if i % 2 else "blue"))
+
+
 @pytest.fixture
 def cabinet_of_five_rocks(tmp_path: Path) -> Path:
     """Return a closed on-disk cabinet of rocks r0..r4 whose hardness index was cached."""
     path = tmp_path / "cabinet"
     s = dc.Store.open(path, cache_index=True)
-    for i in range(5):
-        s.store(Rock(name=f"r{i}", hardness=float(i), color="red" if i % 2 else "blue"))
+    _stock_five_rocks(s)
     s.commit()
     s.count(F.hardness >= 2.0)
     s.close()
@@ -245,12 +249,20 @@ def test_cache_is_refused_when_the_index_markers_changed(built: ClassIndexes) ->
     assert refused is None
 
 
-def test_closing_a_store_writes_the_index_cache(cabinet_of_five_rocks: Path) -> None:
+def test_closing_a_store_writes_the_index_cache(tmp_path: Path) -> None:
     """Given a cabinet whose hardness index was built in a session
     When the store was closed
     Then an index.cache file is on disk
     """
-    assert (cabinet_of_five_rocks / "index.cache").exists()
+    path = tmp_path / "cabinet"
+    s = dc.Store.open(path, cache_index=True)
+    _stock_five_rocks(s)
+    s.commit()
+    s.count(F.hardness >= 2.0)
+
+    s.close()
+
+    assert (path / "index.cache").exists()
 
 
 def test_reopen_serves_a_range_count_from_the_cache(cabinet_of_five_rocks: Path) -> None:

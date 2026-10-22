@@ -119,12 +119,15 @@ def snap_before_fluorite_and_quartz_delete(cabinet: dc.Store) -> Iterator[Snapsh
 # -- reading the committed state --------------------------------------------
 
 
-def test_snapshot_pins_the_last_committed_tid(cabinet: dc.Store, snap: Snapshot) -> None:
+def test_snapshot_pins_the_last_committed_tid(cabinet: dc.Store) -> None:
     """Given a cabinet with two committed minerals
     When a snapshot is taken
     Then its tid is the store's last tid
     """
-    assert snap.tid == cabinet.last_tid
+    with cabinet.snapshot() as snapshot:
+        tid = snapshot.tid
+
+    assert tid == cabinet.last_tid
 
 
 def test_snapshot_lists_the_committed_minerals(snap: Snapshot) -> None:
