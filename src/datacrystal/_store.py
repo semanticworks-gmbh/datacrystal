@@ -256,7 +256,7 @@ class _CommitAttempt:
             # so recover so the loop can re-run: drop the rejected edit, then pull
             # the coordinator's change that moved the entity under us.
             self._store.discard()
-            self._store.sync()
+            self._store._resync("conflict")
             self.conflict = conflict
             return True  # swallow — committing() retries or re-raises after exhaustion
         self.committed = True
@@ -456,6 +456,10 @@ class Store:
         writes. The OCC recovery loop: docs/design/COMMIT-DELTA-v2.md, section 8.
         """
         self._enter()
+        return self._resync("requested")
+
+    def _resync(self, reason: str | None) -> int:
+        """Pull the coordinator's deltas; with a ``reason``, log ``follower_resynced``."""
         if self._sync_fn is None:
             raise RuntimeError("sync() needs a follower store — see dc.open_follower")
         if self._new or self._dirty or self._deleted:
@@ -464,8 +468,9 @@ class Store:
         applied = self._sync_fn(before)
         if applied > before:
             self._refresh_from_backend()
-            logger.info("follower_resynced",
-                        extra={"from_watermark": before, "to_watermark": self._last_tid})
+            if reason is not None:
+                logger.info("follower_resynced", extra={
+                    "reason": reason, "from_watermark": before, "to_watermark": self._last_tid})
         return self._last_tid
 
     def discard(self) -> int:
@@ -991,7 +996,7 @@ class Store:
         self._new.clear()
         self._dirty.clear()
         if self._sync_fn is not None:
-            self.sync()  # read-your-writes: pull the committed delta back
+            self._resync(None)  # read-your-writes: the commit's own delta, not an event
         return applied_tid
 
     # -- the three commit phases (ADR-001 bound decision 2) ------------------

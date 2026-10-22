@@ -855,7 +855,7 @@ The library logs through the standard library under the logger `datacrystal`, on
 `import datacrystal` adds one `NullHandler` to `datacrystal` and nothing else: no level, formatter, handler or `basicConfig` on any other logger.
 Each record's message is a fixed snake_case event in the past tense and its data sits in `extra=` fields.
 No record carries an entity field value, a secret, an identifier or a path.
-The commit path (capture, backend write, flip and delivery) logs nothing.
+The commit path (capture, backend write, flip and delivery) logs nothing, and a follower's read-your-writes pull after its own commit is not a resync event.
 A warning class is for a caller's mistake and a record for an operational event, so no event is both; `ConsumerDetachedWarning` has no record.
 
 | Event | Logger | Level | Fields | Logged when |
@@ -864,7 +864,7 @@ A warning class is for a caller's mistake and a record for an operational event,
 | `records_migrated` | `datacrystal._store` | INFO | `type_name`, `count` | `Store.migrate()` rewrote `count` records of `type_name`; once per type, none when nothing was stale |
 | `stale_lease_reclaimed` | `datacrystal._storage.lock` | WARNING | `reason` (`ttl_expired`, `holder_process_gone`, `unreadable`), `lease_ttl_seconds` | `Store.open` took over a lock file whose holder died or stopped refreshing |
 | `fts_sidecar_rebuilt` | `datacrystal.fts` | INFO | `documents`, `watermark` | `FullTextIndex.bootstrap()` built the sidecar from a snapshot |
-| `follower_resynced` | `datacrystal._store` | INFO | `from_watermark`, `to_watermark` | `Store.sync()` on a follower applied new deltas |
+| `follower_resynced` | `datacrystal._store` | INFO | `reason` (`requested`, `conflict`), `from_watermark`, `to_watermark` | a follower applied new deltas, because the caller asked `Store.sync()` or a `committing()` block lost a conflict |
 
 See [operational logging](how-to/logging.md) for a structlog setup.
 

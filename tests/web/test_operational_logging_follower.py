@@ -20,6 +20,7 @@ from datacrystal.deltalog import DeltaLog
 from datacrystal.web import federation_router
 from tests.conftest import Mineral
 from tests.log_capture import logged
+from tests.web.test_federation_conformance import _CoordinatorServer, _started_server
 
 
 @pytest.fixture(autouse=True)
@@ -62,7 +63,7 @@ def test_a_sync_that_applies_new_deltas_is_logged_with_both_watermarks(
 ) -> None:
     """Given a follower opened while the coordinator held one quartz, which then gained an azurite
     When the follower syncs
-    Then an info record names the watermark before the sync and the one after it
+    Then an info record names the request as the reason and the watermarks before and after
     """
     follower = open_follower("http://coord", client=client, path=follower_path)
     before = follower.sync()
@@ -74,6 +75,7 @@ def test_a_sync_that_applies_new_deltas_is_logged_with_both_watermarks(
 
     record = logged(caplog)["follower_resynced"]
     assert record.level == logging.INFO
+    assert record.fields["reason"] == "requested"
     assert record.fields["from_watermark"] == before
     assert record.fields["to_watermark"] == after
     follower.close()
@@ -89,6 +91,31 @@ def test_a_sync_without_new_deltas_logs_nothing(
     follower = open_follower("http://coord", client=client, path=follower_path)
 
     follower.sync()
+
+    assert "follower_resynced" not in logged(caplog)
+    follower.close()
+
+
+@pytest.fixture
+def live_coordinator(tmp_path: Path) -> Iterator[_CoordinatorServer]:
+    """Serve an in-memory coordinator over real HTTP, which accepts a follower's submit."""
+    server = _started_server("memory", tmp_path)
+    yield server
+    server.stop()
+
+
+def test_a_follower_commit_logs_no_resync(
+    live_coordinator: _CoordinatorServer, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Given a follower holding one buffered azurite
+    When the follower commits it
+    Then no resync is logged, since the commit path logs nothing
+    """
+    follower = open_follower(live_coordinator.base_url, path=None)
+    follower.store(Mineral(qid="Q9", name="azurite"))
+    caplog.clear()
+
+    follower.commit()
 
     assert "follower_resynced" not in logged(caplog)
     follower.close()
