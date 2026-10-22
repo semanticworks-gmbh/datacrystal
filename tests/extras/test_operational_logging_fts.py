@@ -11,7 +11,9 @@ import pytest
 pytest.importorskip("snowballstemmer", reason="datacrystal[fts] extra not installed")
 
 import datacrystal as dc
+from datacrystal._entity import type_info
 from datacrystal.fts import FullTextIndex
+from tests.log_capture import logged
 
 
 @dc.entity
@@ -22,15 +24,13 @@ class Specimen:
     label: Annotated[str | None, dc.FullText(language="en")] = None
 
 
+SPECIMEN_FULLTEXT = {type_info(Specimen).typename: {"label": "en"}}
+
+
 @pytest.fixture(autouse=True)
 def datacrystal_logs(caplog: pytest.LogCaptureFixture) -> None:
     """Capture everything the library logs from INFO up."""
     caplog.set_level(logging.INFO, logger="datacrystal")
-
-
-def logged(caplog: pytest.LogCaptureFixture) -> dict[str, logging.LogRecord]:
-    """Index the captured records by their message."""
-    return {record.getMessage(): record for record in caplog.records}
 
 
 @pytest.fixture
@@ -58,11 +58,11 @@ def test_bootstrapping_the_sidecar_is_logged_with_its_size_and_watermark(
     Then an info record names two documents and the snapshot watermark
     """
     with lived_in_store.snapshot() as snapshot:
-        index = FullTextIndex.bootstrap(sidecar_path, snapshot)
+        index = FullTextIndex.bootstrap(sidecar_path, snapshot, fulltext=SPECIMEN_FULLTEXT)
         watermark = snapshot.tid
 
     record = logged(caplog)["fts_sidecar_rebuilt"]
-    assert record.levelno == logging.INFO
-    assert record.documents == 2
-    assert record.watermark == watermark
+    assert record.level == logging.INFO
+    assert record.fields["documents"] == 2
+    assert record.fields["watermark"] == watermark
     index.close()

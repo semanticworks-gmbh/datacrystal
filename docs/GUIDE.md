@@ -42,6 +42,7 @@ The pages follow the [Diátaxis](https://diataxis.fr) split, and a feature that 
 - [Search by vector and fuse rankings](how-to/vector-search.md): your embeddings, exact top-k and RRF.
 - [Run analytics on Arrow mirrors](how-to/analytics.md): `datacrystal[arrow]` and DuckDB.
 - [Read from any thread, follow the commit stream and keep an audit log](how-to/snapshots-and-delta-log.md): snapshots, consumers and `DeltaLog`.
+- [See datacrystal's operational events in your log](how-to/logging.md): the `datacrystal` logger, its events and a structlog setup.
 
 ## Reference
 

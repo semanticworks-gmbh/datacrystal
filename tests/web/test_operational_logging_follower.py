@@ -19,17 +19,13 @@ from datacrystal._store import Store
 from datacrystal.deltalog import DeltaLog
 from datacrystal.web import federation_router
 from tests.conftest import Mineral
+from tests.log_capture import logged
 
 
 @pytest.fixture(autouse=True)
 def datacrystal_logs(caplog: pytest.LogCaptureFixture) -> None:
     """Capture everything the library logs from INFO up."""
     caplog.set_level(logging.INFO, logger="datacrystal")
-
-
-def logged(caplog: pytest.LogCaptureFixture) -> dict[str, logging.LogRecord]:
-    """Index the captured records by their message."""
-    return {record.getMessage(): record for record in caplog.records}
 
 
 @pytest.fixture(params=["memory", "sqlite"])
@@ -77,9 +73,9 @@ def test_a_sync_that_applies_new_deltas_is_logged_with_both_watermarks(
     after = follower.sync()
 
     record = logged(caplog)["follower_resynced"]
-    assert record.levelno == logging.INFO
-    assert record.from_watermark == before
-    assert record.to_watermark == after
+    assert record.level == logging.INFO
+    assert record.fields["from_watermark"] == before
+    assert record.fields["to_watermark"] == after
     follower.close()
 
 

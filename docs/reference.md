@@ -849,6 +849,25 @@ The only semantic to remember is the runtime one, not a typing one: **assignment
 A pyright/mypy plugin (or `.pyi` overloads) that would type `EntityClass.field <op> value` as a `Condition` and reflect the real read-back types (`BlobHandle`, `PersistentList[T]`) — erasing quirks 1–3 without any pragma — is **out of scope here and deferred** to its own backlog issue.
 The runtime exactness above is unaffected by whether it ever ships.
 
+## Logging
+
+The library logs through the standard library under the logger `datacrystal`, one child logger per module (`datacrystal.<module>`).
+`import datacrystal` adds one `NullHandler` to `datacrystal` and nothing else: no level, formatter, handler or `basicConfig` on any other logger.
+Each record's message is a fixed snake_case event in the past tense and its data sits in `extra=` fields.
+No record carries an entity field value, a secret, an identifier or a path.
+The commit path (capture, backend write, flip and delivery) logs nothing.
+A warning class is for a caller's mistake and a record for an operational event, so no event is both; `ConsumerDetachedWarning` has no record.
+
+| Event | Logger | Level | Fields | Logged when |
+|---|---|---|---|---|
+| `index_cache_discarded` | `datacrystal._index_cache` | INFO | `reason` (`watermark_mismatch`), `cached_watermark`, `store_watermark` | `Store.open` finds an index cache stamped at another watermark than the store; the indexes rebuild on first use (ADR-005) |
+| `records_migrated` | `datacrystal._store` | INFO | `type_name`, `count` | `Store.migrate()` rewrote `count` records of `type_name`; once per type, none when nothing was stale |
+| `stale_lease_reclaimed` | `datacrystal._storage.lock` | WARNING | `reason` (`ttl_expired`, `holder_process_gone`, `unreadable`), `lease_ttl_seconds` | `Store.open` took over a lock file whose holder died or stopped refreshing |
+| `fts_sidecar_rebuilt` | `datacrystal.fts` | INFO | `documents`, `watermark` | `FullTextIndex.bootstrap()` built the sidecar from a snapshot |
+| `follower_resynced` | `datacrystal._store` | INFO | `from_watermark`, `to_watermark` | `Store.sync()` on a follower applied new deltas |
+
+See [operational logging](how-to/logging.md) for a structlog setup.
+
 ## Glossary
 
 The core jargon, in one place — terms that appear above before they are defined:
@@ -1025,6 +1044,6 @@ An `@entity(frozen=True)` class maps to `ConfigDict(frozen=True)`, so the DTO st
 ## See also
 
 - [Tutorial](tutorial.md) — a guided first session.
-- How-to guides — [querying & paging](how-to/querying-and-paging.md), [ingest & memory](how-to/ingest-and-memory.md), [schema evolution](how-to/schema-evolution.md), [blobs](how-to/blobs.md), [restrict who can read a record](how-to/permissions.md), [web deployment](how-to/web-deployment.md), [coordinator + edge followers](how-to/federation.md), [search](how-to/search.md), [vector & hybrid search](how-to/vector-search.md), [analytics](how-to/analytics.md), [snapshots & the delta log](how-to/snapshots-and-delta-log.md).
+- How-to guides — [querying & paging](how-to/querying-and-paging.md), [ingest & memory](how-to/ingest-and-memory.md), [schema evolution](how-to/schema-evolution.md), [blobs](how-to/blobs.md), [restrict who can read a record](how-to/permissions.md), [web deployment](how-to/web-deployment.md), [coordinator + edge followers](how-to/federation.md), [search](how-to/search.md), [vector & hybrid search](how-to/vector-search.md), [analytics](how-to/analytics.md), [snapshots & the delta log](how-to/snapshots-and-delta-log.md), [operational logging](how-to/logging.md).
 - [Explanation](explanation.md) — the design *why*.
 - The design docs: [VISION.md](design/VISION.md), [DESIGN.md](design/DESIGN.md), [ROADMAP.md](design/ROADMAP.md), the [ADRs](design/).

@@ -21,6 +21,7 @@ import pytest
 
 import datacrystal as dc
 from tests.conftest import Mineral
+from tests.log_capture import logged
 
 StoreFactory = Callable[[], dc.Store]
 REQUIRED = object()
@@ -30,11 +31,6 @@ REQUIRED = object()
 def datacrystal_logs(caplog: pytest.LogCaptureFixture) -> None:
     """Capture everything the library logs from INFO up."""
     caplog.set_level(logging.INFO, logger="datacrystal")
-
-
-def logged(caplog: pytest.LogCaptureFixture) -> dict[str, logging.LogRecord]:
-    """Index the captured records by their message."""
-    return {record.getMessage(): record for record in caplog.records}
 
 
 def evolve(**fields: tuple[object, object]) -> type[Any]:
@@ -59,7 +55,7 @@ def stale_cache_directory(tmp_path: Path) -> tuple[Path, int]:
     with dc.Store.open(directory) as first:
         first.store(Mineral(qid="Q1", name="quartz", crystal_system="trigonal"))
         first.commit()
-        first.query(Mineral.crystal_system == "trigonal")
+        first.query(dc.fields(Mineral).crystal_system == "trigonal")
         with first.snapshot() as snapshot:
             cached_watermark = snapshot.tid
     with dc.Store.open(directory, cache_index=False) as second:
@@ -80,10 +76,10 @@ def test_index_cache_behind_the_store_is_logged_as_discarded(
     with dc.Store.open(directory):
         record = logged(caplog)["index_cache_discarded"]
 
-    assert record.levelno == logging.INFO
-    assert record.reason == "watermark_mismatch"
-    assert record.cached_watermark == cached_watermark
-    assert record.store_watermark == cached_watermark + 1
+    assert record.level == logging.INFO
+    assert record.fields["reason"] == "watermark_mismatch"
+    assert record.fields["cached_watermark"] == cached_watermark
+    assert record.fields["store_watermark"] == cached_watermark + 1
 
 
 def test_index_cache_at_the_store_watermark_logs_nothing(
@@ -96,7 +92,7 @@ def test_index_cache_at_the_store_watermark_logs_nothing(
     with dc.Store.open(tmp_path / "cabinet") as first:
         first.store(Mineral(qid="Q1", name="quartz", crystal_system="trigonal"))
         first.commit()
-        first.query(Mineral.crystal_system == "trigonal")
+        first.query(dc.fields(Mineral).crystal_system == "trigonal")
 
     with dc.Store.open(tmp_path / "cabinet"):
         events = logged(caplog)
@@ -124,9 +120,9 @@ def test_migration_logs_the_rewritten_count_per_type(
     store.migrate()
 
     record = logged(caplog)["records_migrated"]
-    assert record.levelno == logging.INFO
-    assert record.type_name == f"{__name__}:Specimen"
-    assert record.count == 3
+    assert record.level == logging.INFO
+    assert record.fields["type_name"] == f"{__name__}:Specimen"
+    assert record.fields["count"] == 3
     store.close()
 
 
@@ -162,9 +158,9 @@ def test_reclaiming_an_expired_lease_is_logged_as_a_warning(
     with dc.Store.open(directory, lock_ttl=0.5):
         record = logged(caplog)["stale_lease_reclaimed"]
 
-    assert record.levelno == logging.WARNING
-    assert record.reason == "ttl_expired"
-    assert record.lease_ttl_seconds == 0.5
+    assert record.level == logging.WARNING
+    assert record.fields["reason"] == "ttl_expired"
+    assert record.fields["lease_ttl_seconds"] == 0.5
 
 
 def test_reclaiming_an_unreadable_lease_is_logged_with_that_reason(
@@ -181,7 +177,7 @@ def test_reclaiming_an_unreadable_lease_is_logged_with_that_reason(
     with dc.Store.open(directory, lock_ttl=0.5):
         record = logged(caplog)["stale_lease_reclaimed"]
 
-    assert record.reason == "unreadable"
+    assert record.fields["reason"] == "unreadable"
 
 
 def test_a_fresh_open_logs_no_lease_event(
