@@ -257,13 +257,20 @@ def test_view_carries_the_typename(quartz_view: dc.EntityView) -> None:
 
 
 def test_snapshot_keeps_its_watermark_after_later_commits(
-    cabinet: dc.Store, snap_before_later_edit: Snapshot
+    cabinet: dc.Store, snap: Snapshot
 ) -> None:
     """Given a snapshot taken before a later commit
     When the later commit has landed
     Then the snapshot's tid is one below the store's last tid
     """
-    assert snap_before_later_edit.tid == cabinet.last_tid - 1
+    quartz = cabinet.get(Mineral, qid="Q43010")
+    assert quartz is not None
+    quartz.name = "Bergkristall"
+    cabinet.store(Mineral(qid="Q7", name="topaz"))
+
+    cabinet.commit()
+
+    assert snap.tid == cabinet.last_tid - 1
 
 
 def test_snapshot_still_sees_the_world_at_its_watermark(snap_before_later_edit: Snapshot) -> None:
@@ -368,20 +375,24 @@ def mineral_indexes(snap: Snapshot) -> dc.SnapshotIndexes:
     return snap.index_bitmaps(Mineral)
 
 
-def test_index_bitmaps_view_is_a_snapshot_indexes(mineral_indexes: dc.SnapshotIndexes) -> None:
+def test_index_bitmaps_view_is_a_snapshot_indexes(snap: Snapshot) -> None:
     """Given a snapshot of a cabinet of two minerals
     When the Mineral index views are asked for
     Then they are a SnapshotIndexes
     """
-    assert isinstance(mineral_indexes, dc.SnapshotIndexes)
+    indexes = snap.index_bitmaps(Mineral)
+
+    assert isinstance(indexes, dc.SnapshotIndexes)
 
 
-def test_index_bitmaps_extent_covers_every_mineral(mineral_indexes: dc.SnapshotIndexes) -> None:
+def test_index_bitmaps_extent_covers_every_mineral(snap: Snapshot) -> None:
     """Given a snapshot of a cabinet of two minerals
     When the Mineral index views are asked for
     Then the extent holds two oids
     """
-    assert len(mineral_indexes.extent) == 2
+    indexes = snap.index_bitmaps(Mineral)
+
+    assert len(indexes.extent) == 2
 
 
 def test_index_bitmaps_posting_holds_the_matching_mineral(

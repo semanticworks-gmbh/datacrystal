@@ -28,18 +28,22 @@ def store_dir(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def first_run(store_dir: Path) -> subprocess.CompletedProcess[str]:
-    """Return the outcome of the journal example's first run on a clean directory."""
+    """Run the journal example once on a clean directory, leaving its store behind."""
     return subprocess.run(
         _journal_command(store_dir), capture_output=True, text=True, timeout=120, check=False
     )
 
 
-def test_first_run_exits_cleanly(first_run: subprocess.CompletedProcess[str]) -> None:
+def test_first_run_exits_cleanly(store_dir: Path) -> None:
     """Given a clean store directory
     When the journal example runs
     Then it exits with status 0
     """
-    assert first_run.returncode == 0, first_run.stderr
+    first = subprocess.run(
+        _journal_command(store_dir), capture_output=True, text=True, timeout=120, check=False
+    )
+
+    assert first.returncode == 0, first.stderr
 
 
 @pytest.mark.parametrize(
@@ -50,14 +54,16 @@ def test_first_run_exits_cleanly(first_run: subprocess.CompletedProcess[str]) ->
         "async session appended",
     ],
 )
-def test_first_run_prints_its_seeding_scenes(
-    first_run: subprocess.CompletedProcess[str], scene: str
-) -> None:
+def test_first_run_prints_its_seeding_scenes(store_dir: Path, scene: str) -> None:
     """Given a clean store directory
     When the journal example runs
     Then its output contains a seeding scene
     """
-    assert scene in first_run.stdout
+    first = subprocess.run(
+        _journal_command(store_dir), capture_output=True, text=True, timeout=120, check=False
+    )
+
+    assert scene in first.stdout
 
 
 def test_second_run_exits_cleanly(

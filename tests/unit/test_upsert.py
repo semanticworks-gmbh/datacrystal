@@ -414,7 +414,7 @@ def requartzed(store: dc.Store, committed_quartz: Mineral) -> Mineral:
 
 
 def test_upsert_of_a_key_freed_by_a_buffered_delete_inserts_a_new_instance(
-    requartzed: Mineral, committed_quartz: Mineral
+    store: dc.Store, committed_quartz: Mineral
 ) -> None:
     """The freed key inserts, never merges.
 
@@ -422,7 +422,11 @@ def test_upsert_of_a_key_freed_by_a_buffered_delete_inserts_a_new_instance(
     When a Mineral with quartz's qid is upserted
     Then a different instance than the deleted one comes back
     """
-    assert requartzed is not committed_quartz
+    store.delete(committed_quartz)
+
+    survivor = store.upsert(Mineral(qid="Q43010", name="quartz v2"))
+
+    assert survivor is not committed_quartz
 
 
 def test_upsert_of_a_freed_key_commits_one_row(store: dc.Store, requartzed: Mineral) -> None:
