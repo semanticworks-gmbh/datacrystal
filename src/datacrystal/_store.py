@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import logging
 import threading
 import time
 import warnings
@@ -131,6 +132,8 @@ from datacrystal.contract.applier import DeltaGapError
 if TYPE_CHECKING:
     from datacrystal._follower import HttpClient
     from datacrystal._storage.lock import LeaseLock  # imported lazily at runtime (see Store.open)
+
+logger = logging.getLogger(__name__)
 
 # Exact-type membership for the hydration fast path (decode produces exact
 # builtin types, never subclasses — subclass-shaped values still take _resolve).
@@ -461,6 +464,8 @@ class Store:
         applied = self._sync_fn(before)
         if applied > before:
             self._refresh_from_backend()
+            logger.info("follower_resynced",
+                        extra={"from_watermark": before, "to_watermark": self._last_tid})
         return self._last_tid
 
     def discard(self) -> int:
@@ -2039,6 +2044,7 @@ class Store:
             if not stale:
                 continue
             oids = [rec.oid for c in stale for rec in self._backend.scan_type(c)]
+            migrated_before = migrated
             for start in range(0, len(oids), batch):
                 # write plumbing (ADR-008 W3-3 bypass): migrate must see and
                 # re-persist EVERY stale record regardless of the migrating
@@ -2049,6 +2055,9 @@ class Store:
                     self.mark_dirty(obj)
                 self.commit()
                 migrated += len(chunk)
+            if migrated > migrated_before:
+                logger.info("records_migrated", extra={
+                    "type_name": typename, "count": migrated - migrated_before})
         return migrated
 
     def explain(self, target: type | Condition) -> QueryPlan:

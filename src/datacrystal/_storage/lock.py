@@ -10,6 +10,7 @@ TTL and clock are injectable, so the lock suite needs no real-time sleeps (fitne
 from __future__ import annotations
 
 import json
+import logging
 import os
 import socket
 import threading
@@ -22,6 +23,8 @@ from typing import cast
 from datacrystal._errors import StoreLockedError
 
 LOCK_FILENAME = "used.lock"
+
+logger = logging.getLogger(__name__)
 
 
 class LeaseLock:
@@ -45,7 +48,8 @@ class LeaseLock:
                 fd = os.open(self._path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             except FileExistsError:
                 holder = self._read()
-                if holder is not None and not self._is_stale(holder):
+                reason = "unreadable" if holder is None else self._stale_reason(holder)
+                if holder is not None and reason is None:
                     raise StoreLockedError(
                         f"store is in use by pid {holder.get('pid', '?')} "
                         f"(lock file {self._path}); datacrystal is single-writer — "
@@ -57,6 +61,9 @@ class LeaseLock:
                     os.unlink(self._path)
                 except FileNotFoundError:
                     pass
+                else:
+                    logger.warning("stale_lease_reclaimed", extra={
+                        "reason": reason, "lease_ttl_seconds": self._ttl})
                 continue
             with os.fdopen(fd, "w") as f:
                 f.write(self._payload())
@@ -96,18 +103,19 @@ class LeaseLock:
             return cast("dict[str, object]", data)
         return None
 
-    def _is_stale(self, holder: dict[str, object]) -> bool:
+    def _stale_reason(self, holder: dict[str, object]) -> str | None:
+        """Return why the lock is stale (a reason code), or None while its holder is alive."""
         ts = holder.get("ts")
         if not isinstance(ts, (int, float)):
-            return True  # unreadable/corrupt lock counts as stale
+            return "unreadable"  # unreadable/corrupt lock counts as stale
         if (self._clock() - ts) > (self._ttl * 2):
-            return True  # the refresher stopped long enough ago: holder is gone
+            return "ttl_expired"  # the refresher stopped long enough ago: holder is gone
         # A same-host holder whose pid is gone is stale at once — a crashed or
         # -9'd writer must not lock the store for the whole ~2*ttl window before a
         # restart can reclaim it. Only probed when the lock was taken on THIS host
         # (a pre-host lock file, or one from another host/NFS, falls back to the
         # ttl rule above — we can't meaningfully probe a foreign pid).
-        return self._holder_pid_is_dead(holder)
+        return "holder_process_gone" if self._holder_pid_is_dead(holder) else None
 
     def _holder_pid_is_dead(self, holder: dict[str, object]) -> bool:
         if holder.get("host") != socket.gethostname():

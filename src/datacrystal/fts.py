@@ -10,6 +10,7 @@ Column layout and the stem-then-fold order: docs/design/DESIGN.md, "Full-text si
 from __future__ import annotations
 
 import json
+import logging
 import re
 import sqlite3
 import unicodedata
@@ -43,6 +44,8 @@ except ImportError as exc:  # pragma: no cover — core-only installs
     ) from exc
 
 __all__ = ["FtsConfigError", "FullTextIndex", "SearchHit"]
+
+logger = logging.getLogger(__name__)
 
 SIDECAR_FORMAT = "datacrystal-fts-sidecar"
 SIDECAR_VERSION = 1
@@ -356,6 +359,7 @@ class FullTextIndex:
                 "store.snapshot(principal=dc.root_principal(...)) (ADR-008 R13)"
             )
         idx._exec("BEGIN")
+        documents = 0
         try:
             for cid, typename, fields in snapshot.types:
                 idx._types[cid] = (typename, list(fields))
@@ -372,6 +376,7 @@ class FullTextIndex:
                         if isinstance(value := view.fields().get(field), str)
                     }
                     idx._insert_doc(view.oid, typename, values)
+                    documents += 1
             idx._exec(
                 "INSERT OR REPLACE INTO sidecar_meta (key, value) "
                 "VALUES ('watermark', ?)",
@@ -382,6 +387,8 @@ class FullTextIndex:
             idx._exec("ROLLBACK")
             raise
         idx._watermark = snapshot.tid
+        logger.info("fts_sidecar_rebuilt",
+                    extra={"documents": documents, "watermark": snapshot.tid})
         return idx
 
     # -- search ----------------------------------------------------------------
