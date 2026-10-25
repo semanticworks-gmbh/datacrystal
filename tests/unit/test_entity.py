@@ -11,9 +11,14 @@ import pytest
 
 import datacrystal as dc
 from datacrystal._conditions import FieldExpr, Pred
+from datacrystal._entity import FieldSpec, type_info
 from tests.conftest import Locality, LogEntry, Mineral
 
 StoreFactory = Callable[[], dc.Store]
+
+
+def _specs_by_name(entity: type) -> dict[str, FieldSpec]:
+    return {spec.name: spec for spec in type_info(entity).specs}
 
 
 def _same_record(old: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -208,6 +213,25 @@ def test_lazy_marker_leaves_the_handle_unloaded_after_reopen(store_factory: Stor
     assert azurite.type_locality is not None
     assert not azurite.type_locality.loaded
     reopened.close()
+
+
+def test_bare_fulltext_has_no_language() -> None:
+    """Given an entity with a field annotated with the bare dc.FullText
+    When its field spec is read
+    Then the field is fulltext
+    And its language is None, which is fold-only without stemming
+
+    Kept as a named exception to the public-API rule: no public seam shows the registry's language.
+    """
+
+    @dc.entity
+    class NoteShelf:
+        summary: Annotated[str, dc.FullText]
+
+    summary = _specs_by_name(NoteShelf)["summary"]
+
+    assert summary.fulltext
+    assert summary.fulltext_language is None
 
 
 def test_fulltext_repr_names_its_language() -> None:
