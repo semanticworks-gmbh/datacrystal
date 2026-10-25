@@ -51,11 +51,17 @@ def _reload(ci: ClassIndexes) -> ClassIndexes | None:
 
 
 @pytest.fixture
-def built(store: dc.Store) -> ClassIndexes:
-    """Return the class indexes of six committed specimens C0..C5 (odd ones at Tsumeb)."""
+def six_committed_specimens(store: dc.Store) -> dc.Store:
+    """Return the store holding six committed specimens C0..C5 (odd ones at Tsumeb)."""
     _stock_six_specimens(store)
     store.commit()
-    return store._index.ensure(type_info(Specimen))
+    return store
+
+
+@pytest.fixture
+def built(six_committed_specimens: dc.Store) -> ClassIndexes:
+    """Return the class indexes of the six committed specimens."""
+    return six_committed_specimens._index.ensure(type_info(Specimen))
 
 
 @pytest.fixture
@@ -67,22 +73,26 @@ def loaded(built: ClassIndexes) -> ClassIndexes:
     return reloaded
 
 
-def test_pure_unique_field_has_no_eq_postings(built: ClassIndexes) -> None:
+def test_pure_unique_field_has_no_eq_postings(six_committed_specimens: dc.Store) -> None:
     """Given six committed specimens whose catalog is pure Unique
     When the class indexes are built
     Then catalog has no eq postings
     And catalog is answered from the unique map
     """
+    built = six_committed_specimens._index.ensure(type_info(Specimen))
+
     assert "catalog" not in built.eq
     assert "catalog" in built.unique
 
 
-def test_unique_plus_index_field_keeps_its_eq_postings(built: ClassIndexes) -> None:
+def test_unique_plus_index_field_keeps_its_eq_postings(six_committed_specimens: dc.Store) -> None:
     """Given six committed specimens whose sku is Unique and Index
     When the class indexes are built
     Then sku has eq postings
     And sku is also in the unique map
     """
+    built = six_committed_specimens._index.ensure(type_info(Specimen))
+
     assert "sku" in built.eq
     assert "sku" in built.unique
 

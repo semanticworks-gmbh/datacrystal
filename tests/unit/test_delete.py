@@ -729,12 +729,8 @@ class _Tombstoned:
 
 
 @pytest.fixture
-def tombstoned(store: dc.Store) -> _Tombstoned:
-    """Stream quartz's create, its update with azurite's insert, then its delete.
-
-    The reference applier verifies priors strictly and rejects deletes of unknown OIDs, so
-    it passing is the proof the engine emits per spec section 3.1.
-    """
+def updated_quartz_stream(store: dc.Store) -> _Tombstoned:
+    """Stream quartz's create and its update with azurite's insert, stopping before the delete."""
     applier = ReferenceApplier()
     collector = _Collector()
     store.attach(applier)
@@ -748,25 +744,45 @@ def tombstoned(store: dc.Store) -> _Tombstoned:
     azurite = _azurite()
     store.store(azurite)
     store.commit()
-    store.delete(Mineral, qid="Q43010")
-    store.commit()
     return _Tombstoned(applier, collector, doomed_oid, azurite, payload_before_update)
 
 
-def test_applier_drops_the_deleted_object(tombstoned: _Tombstoned) -> None:
+@pytest.fixture
+def tombstoned(store: dc.Store, updated_quartz_stream: _Tombstoned) -> _Tombstoned:
+    """Delete quartz after the stream, so the strict reference applier consumes the tombstone.
+
+    The reference applier verifies priors strictly and rejects deletes of unknown OIDs, so
+    it passing is the proof the engine emits per spec section 3.1.
+    """
+    store.delete(Mineral, qid="Q43010")
+    store.commit()
+    return updated_quartz_stream
+
+
+def test_applier_drops_the_deleted_object(
+    store: dc.Store, updated_quartz_stream: _Tombstoned
+) -> None:
     """Given a stream of create, update and delete of quartz
     When the strict reference applier has consumed it
     Then it no longer holds quartz
     """
-    assert tombstoned.doomed_oid not in tombstoned.applier.objects
+    store.delete(Mineral, qid="Q43010")
+    store.commit()
+
+    assert updated_quartz_stream.doomed_oid not in updated_quartz_stream.applier.objects
 
 
-def test_applier_keeps_the_surviving_object(tombstoned: _Tombstoned) -> None:
+def test_applier_keeps_the_surviving_object(
+    store: dc.Store, updated_quartz_stream: _Tombstoned
+) -> None:
     """Given a stream that inserted azurite and deleted quartz
     When the strict reference applier has consumed it
     Then it still holds azurite
     """
-    assert oid_of(tombstoned.azurite) in tombstoned.applier.objects
+    store.delete(Mineral, qid="Q43010")
+    store.commit()
+
+    assert oid_of(updated_quartz_stream.azurite) in updated_quartz_stream.applier.objects
 
 
 def test_tombstone_delta_holds_one_delete_op(tombstoned: _Tombstoned) -> None:

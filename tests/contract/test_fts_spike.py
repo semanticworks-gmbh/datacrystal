@@ -397,16 +397,18 @@ def test_delete_tombstone_without_a_prior_is_a_format_error(
 
 
 def test_reopened_sidecar_resumes_at_its_persisted_watermark(
-    persisted_fts: tuple[str, int], reopened_sidecar: FtsSidecar, store: dc.Store
+    persisted_fts: tuple[str, int], store: dc.Store
 ) -> None:
     """Given a sidecar file closed after indexing one commit, and the store reopened
     When the sidecar is reopened
     Then its watermark is the one it had when closed
     And it equals the store's last transaction id
     """
-    _, watermark_when_closed = persisted_fts
+    fts_path, watermark_when_closed = persisted_fts
 
-    reopened_watermark = reopened_sidecar.watermark
+    reopened = FtsSidecar(fts_path, fulltext=_fulltext_config())
+    reopened_watermark = reopened.watermark
+    reopened.close()
 
     assert reopened_watermark == watermark_when_closed
     assert reopened_watermark == store.last_tid

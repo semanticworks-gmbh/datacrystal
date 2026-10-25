@@ -779,68 +779,92 @@ def test_born_protected_row_carries_its_shared_group(flipped_relics: FlippedReli
     assert ORG in groups_by_name["w2-new"]
 
 
-@pytest.fixture
-def root_rebuilt_relics(
+def test_root_rebootstrap_copies_every_relic(
     flipped_relics: FlippedRelics, shop: MirrorShop
-) -> dict:
-    """Re-bootstrap the flipped store from a root snapshot and return its Relic rows by name."""
-    with flipped_relics.store.snapshot(principal=dc.root_principal(1)) as root_snap:
-        rebuilt = shop.bootstrap("relic.rebuilt", root_snap)
-    return {row["name"]: row for row in rebuilt.table(flipped_relics.relic_class).to_pylist()}
-
-
-def test_root_rebootstrap_copies_every_relic(root_rebuilt_relics: dict) -> None:
+) -> None:
     """Given a protected-flipped store with three relics
     When a root re-bootstrap rebuilds the mirror
     Then all three relics are in the Relic table
     """
-    assert len(root_rebuilt_relics) == 3
+    with flipped_relics.store.snapshot(principal=dc.root_principal(1)) as root_snap:
+        rebuilt = shop.bootstrap("relic.rebuilt", root_snap)
+
+    assert rebuilt.table(flipped_relics.relic_class).num_rows == 3
 
 
-def test_root_rebootstrap_fills_the_legacy_owner_with_nobody(root_rebuilt_relics: dict) -> None:
+def test_root_rebootstrap_fills_the_legacy_owner_with_nobody(
+    flipped_relics: FlippedRelics, shop: MirrorShop
+) -> None:
     """Given a relic from before the class turned protected
     When a root re-bootstrap decodes it (R7 legacy fill)
     Then its _dc_owner is nobody, 0
     """
-    assert root_rebuilt_relics["w1-a"]["_dc_owner"] == 0
+    with flipped_relics.store.snapshot(principal=dc.root_principal(1)) as root_snap:
+        rebuilt = shop.bootstrap("relic.rebuilt", root_snap)
+    relic_table = rebuilt.table(flipped_relics.relic_class)
+    owner_by_name = by_column(relic_table, "name", "_dc_owner")
+
+    assert owner_by_name["w1-a"] == 0
 
 
-def test_root_rebootstrap_fills_the_legacy_groups_with_world(root_rebuilt_relics: dict) -> None:
+def test_root_rebootstrap_fills_the_legacy_groups_with_world(
+    flipped_relics: FlippedRelics, shop: MirrorShop
+) -> None:
     """Given a relic from before the class turned protected
     When a root re-bootstrap decodes it (R7 legacy fill)
     Then it reads as before, in the WORLD group
     """
-    assert list(root_rebuilt_relics["w1-a"]["_dc_groups"]) == [dc.WORLD]
+    with flipped_relics.store.snapshot(principal=dc.root_principal(1)) as root_snap:
+        rebuilt = shop.bootstrap("relic.rebuilt", root_snap)
+    relic_table = rebuilt.table(flipped_relics.relic_class)
+    groups_by_name = by_column(relic_table, "name", "_dc_groups")
+
+    assert list(groups_by_name["w1-a"]) == [dc.WORLD]
 
 
 def test_root_rebootstrap_fills_the_legacy_read_floor_with_viewer(
-    root_rebuilt_relics: dict,
+    flipped_relics: FlippedRelics, shop: MirrorShop
 ) -> None:
     """Given a relic from before the class turned protected
     When a root re-bootstrap decodes it (R7 legacy fill)
     Then its read floor is viewer
     """
-    assert root_rebuilt_relics["w1-a"]["_dc_read_floor"] == dc.VIEWER
+    with flipped_relics.store.snapshot(principal=dc.root_principal(1)) as root_snap:
+        rebuilt = shop.bootstrap("relic.rebuilt", root_snap)
+    relic_table = rebuilt.table(flipped_relics.relic_class)
+    read_floor_by_name = by_column(relic_table, "name", "_dc_read_floor")
+
+    assert read_floor_by_name["w1-a"] == dc.VIEWER
 
 
 def test_root_rebootstrap_fences_the_legacy_write_floor_at_the_top(
-    root_rebuilt_relics: dict,
+    flipped_relics: FlippedRelics, shop: MirrorShop
 ) -> None:
     """Given a relic from before the class turned protected
     When a root re-bootstrap decodes it (R7 legacy fill)
     Then its write floor is admin
     """
-    assert root_rebuilt_relics["w1-a"]["_dc_write_floor"] == dc.ADMIN
+    with flipped_relics.store.snapshot(principal=dc.root_principal(1)) as root_snap:
+        rebuilt = shop.bootstrap("relic.rebuilt", root_snap)
+    relic_table = rebuilt.table(flipped_relics.relic_class)
+    write_floor_by_name = by_column(relic_table, "name", "_dc_write_floor")
+
+    assert write_floor_by_name["w1-a"] == dc.ADMIN
 
 
 def test_root_rebootstrap_keeps_the_persisted_stamp_of_the_born_protected_relic(
-    root_rebuilt_relics: dict,
+    flipped_relics: FlippedRelics, shop: MirrorShop
 ) -> None:
     """Given a relic born protected under Anna
     When a root re-bootstrap decodes it
     Then its _dc_owner is still Anna's uid
     """
-    assert root_rebuilt_relics["w2-new"]["_dc_owner"] == ANNA.uid
+    with flipped_relics.store.snapshot(principal=dc.root_principal(1)) as root_snap:
+        rebuilt = shop.bootstrap("relic.rebuilt", root_snap)
+    relic_table = rebuilt.table(flipped_relics.relic_class)
+    owner_by_name = by_column(relic_table, "name", "_dc_owner")
+
+    assert owner_by_name["w2-new"] == ANNA.uid
 
 
 def test_non_root_bootstrap_over_a_protected_class_fails_closed(
@@ -999,27 +1023,35 @@ def test_flush_makes_the_batched_commits_durable(batched_mirror: ArrowMirror, sh
 
 @pytest.fixture
 def only_quarry_mirror(store: dc.Store, shop: MirrorShop) -> ArrowMirror:
-    """Commit a quarry and a find into a mirror restricted to Quarry."""
+    """Attach a mirror restricted to Quarry to the store."""
     mirror = shop.open("only.mirror", only=[Quarry])
     store.attach(mirror)
-    store.root = [Quarry(qid="Q1", name="Tsumeb"), Find(label="azurite")]
-    store.commit()
     return mirror
 
 
-def test_only_filter_mirrors_the_listed_class(only_quarry_mirror: ArrowMirror) -> None:
+def test_only_filter_mirrors_the_listed_class(
+    store: dc.Store, only_quarry_mirror: ArrowMirror
+) -> None:
     """Given a mirror restricted to Quarry
     When a quarry and a find are committed
     Then the Quarry table has one row
     """
+    store.root = [Quarry(qid="Q1", name="Tsumeb"), Find(label="azurite")]
+    store.commit()
+
     assert only_quarry_mirror.table(Quarry).num_rows == 1
 
 
-def test_only_filter_leaves_other_classes_out(only_quarry_mirror: ArrowMirror) -> None:
+def test_only_filter_leaves_other_classes_out(
+    store: dc.Store, only_quarry_mirror: ArrowMirror
+) -> None:
     """Given a mirror restricted to Quarry
     When a quarry and a find are committed
     Then the Find table has no rows
     """
+    store.root = [Quarry(qid="Q1", name="Tsumeb"), Find(label="azurite")]
+    store.commit()
+
     assert only_quarry_mirror.table(Find).num_rows == 0
 
 
@@ -1400,52 +1432,50 @@ def test_groupby_aggregate_over_the_mirror_matches_the_known_totals(
     assert got == [("A", 2, 532.5, 266.25), ("B", 3, 366.0, 183.0), ("C", 1, 58.0, 58.0)]
 
 
-class GradeBHits(NamedTuple):
-    """The oids a datacrystal bitmap query found for grade B, and the snapshot tid of that query."""
-
-    oids: list[int]
-    tid: int
-
-
-@pytest.fixture
-def grade_b_hits(store: dc.Store, mirrored_cabinet: ArrowMirror) -> GradeBHits:
-    """Query grade B through the bitmap index, without hydration, at the mirror's watermark."""
-    with store.snapshot() as snap:
-        views = snap.query(dc.fields(Find).grade == "B")  # pyrefly: ignore[bad-argument-type]
-        return GradeBHits(oids_of(views), snap.tid)
-
-
 def test_bitmap_hits_come_from_the_mirrors_watermark(
-    grade_b_hits: GradeBHits, mirrored_cabinet: ArrowMirror
+    store: dc.Store, mirrored_cabinet: ArrowMirror
 ) -> None:
     """Given a datacrystal bitmap query on the indexed grade
     When its snapshot tid is compared with the mirror's watermark
     Then they are equal
     """
-    assert grade_b_hits.tid == mirrored_cabinet.watermark
+    with store.snapshot() as snap:
+        snap.query(dc.fields(Find).grade == "B")  # pyrefly: ignore[bad-argument-type]
+        snapshot_tid = snap.tid
+
+    assert snapshot_tid == mirrored_cabinet.watermark
 
 
-def test_bitmap_filter_restricts_the_handoff_to_the_grade_b_hits(grade_b_hits: GradeBHits) -> None:
+def test_bitmap_filter_restricts_the_handoff_to_the_grade_b_hits(
+    store: dc.Store, mirrored_cabinet: ArrowMirror
+) -> None:
     """Given a cabinet of seven finds of which three are grade B
     When the bitmap query on grade B yields OIDs
     Then there are three, not the whole extent
     """
-    assert len(grade_b_hits.oids) == 3
+    with store.snapshot() as snap:
+        views = snap.query(dc.fields(Find).grade == "B")  # pyrefly: ignore[bad-argument-type]
+        oids = oids_of(views)
+
+    assert len(oids) == 3
 
 
 def test_duckdb_sums_the_measure_over_only_the_handed_off_oids(
-    duckdb: ModuleType, grade_b_hits: GradeBHits, mirrored_cabinet: ArrowMirror
+    duckdb: ModuleType, store: dc.Store, mirrored_cabinet: ArrowMirror
 ) -> None:
     """Given the OIDs of the grade B finds from a datacrystal bitmap query
     When DuckDB sums the measure over those rows via OID_COLUMN
     Then the total is 366.0
     """
+    with store.snapshot() as snap:
+        views = snap.query(dc.fields(Find).grade == "B")  # pyrefly: ignore[bad-argument-type]
+        grade_b_oids = oids_of(views)
     finds_tbl = mirrored_cabinet.table(Find)  # noqa: F841 — DuckDB replacement-scans it
 
     (total,) = duckdb.execute(
         f"SELECT sum(mass_g) FROM finds_tbl WHERE {ArrowMirror.OID_COLUMN} IN "
         "(SELECT * FROM UNNEST(?))",
-        [grade_b_hits.oids],
+        [grade_b_oids],
     ).fetchone()
 
     assert total == 366.0
@@ -1549,30 +1579,36 @@ def test_decimal_prices_keep_their_digits_and_nulls(store: dc.Store, mirror: Arr
 
 
 @pytest.fixture
-def widened_prices(store: dc.Store, mirror: ArrowMirror) -> dict:
-    """Commit a 1.5 price, then a 26-digit price that widens the column; return the prices."""
+def widened_price_mirror(store: dc.Store, mirror: ArrowMirror) -> ArrowMirror:
+    """Commit a 1.5 price, then a 26-digit price that widens the column; return the mirror."""
     first = Valuation(specimen="a", price=Decimal("1.5"))
     store.root = [first]
     store.commit()
     store.root = [first, Valuation(specimen="b", price=Decimal("12345678901234567890.123456"))]
     store.commit()
-    return by_column(mirror.table(Valuation), "specimen", "price")
+    return mirror
 
 
-def test_widened_decimal_column_keeps_the_early_price(widened_prices: dict) -> None:
+def test_widened_decimal_column_keeps_the_early_price(widened_price_mirror: ArrowMirror) -> None:
     """Given a decimal column widened by a later segment
     When the early price is read back
     Then it is still 1.5
     """
-    assert widened_prices["a"] == Decimal("1.5")
+    prices = by_column(widened_price_mirror.table(Valuation), "specimen", "price")
+
+    assert prices["a"] == Decimal("1.5")
 
 
-def test_widened_decimal_column_keeps_every_digit_of_the_wide_price(widened_prices: dict) -> None:
+def test_widened_decimal_column_keeps_every_digit_of_the_wide_price(
+    widened_price_mirror: ArrowMirror,
+) -> None:
     """Given a decimal column widened by a later segment
     When the wide price is read back
     Then every digit survives
     """
-    assert widened_prices["b"] == Decimal("12345678901234567890.123456")
+    prices = by_column(widened_price_mirror.table(Valuation), "specimen", "price")
+
+    assert prices["b"] == Decimal("12345678901234567890.123456")
 
 
 def test_decimal_beyond_arrow_precision_falls_back_to_exact_text(
@@ -1592,8 +1628,8 @@ def test_decimal_beyond_arrow_precision_falls_back_to_exact_text(
 
 
 @pytest.fixture
-def widened_lot_table(store: dc.Store, mirror: ArrowMirror) -> pa.Table:
-    """Commit a 1.5 part, then a 26-digit part that widens the list column; return the table."""
+def widened_lot_mirror(store: dc.Store, mirror: ArrowMirror) -> ArrowMirror:
+    """Commit a 1.5 part, then a 26-digit part that widens the list column; return the mirror."""
     first = ValuationLot(specimen="a", parts=[Decimal("1.5")])
     store.root = [first]
     store.commit()
@@ -1602,42 +1638,46 @@ def widened_lot_table(store: dc.Store, mirror: ArrowMirror) -> pa.Table:
         ValuationLot(specimen="b", parts=[Decimal("12345678901234567890.123456")]),
     ]
     store.commit()
-    return mirror.table(ValuationLot)
+    return mirror
 
 
-def test_decimal_list_column_stays_a_list(widened_lot_table: pa.Table) -> None:
+def test_decimal_list_column_stays_a_list(widened_lot_mirror: ArrowMirror) -> None:
     """Given a decimal list column widened by a later segment
     When its schema is read
     Then parts is a list
     """
-    assert pa_types.is_list(widened_lot_table.schema.field("parts").type)
+    lot_table = widened_lot_mirror.table(ValuationLot)
+
+    assert pa_types.is_list(lot_table.schema.field("parts").type)
 
 
-def test_decimal_list_column_keeps_decimal_values(widened_lot_table: pa.Table) -> None:
+def test_decimal_list_column_keeps_decimal_values(widened_lot_mirror: ArrowMirror) -> None:
     """Given a decimal list column widened by a later segment
     When its schema is read
     Then the list values are decimals
     """
-    assert pa_types.is_decimal(widened_lot_table.schema.field("parts").type.value_type)
+    lot_table = widened_lot_mirror.table(ValuationLot)
+
+    assert pa_types.is_decimal(lot_table.schema.field("parts").type.value_type)
 
 
-def test_widened_decimal_list_keeps_the_early_part(widened_lot_table: pa.Table) -> None:
+def test_widened_decimal_list_keeps_the_early_part(widened_lot_mirror: ArrowMirror) -> None:
     """Given a decimal list column widened by a later segment
     When the early row is read back
     Then its part is still 1.5
     """
-    parts_by_specimen = by_column(widened_lot_table, "specimen", "parts")
+    parts_by_specimen = by_column(widened_lot_mirror.table(ValuationLot), "specimen", "parts")
 
     assert parts_by_specimen["a"] == [Decimal("1.5")]
 
 
 def test_widened_decimal_list_keeps_every_digit_of_the_wide_part(
-    widened_lot_table: pa.Table,
+    widened_lot_mirror: ArrowMirror,
 ) -> None:
     """Given a decimal list column widened by a later segment
     When the wide row is read back
     Then every digit survives
     """
-    parts_by_specimen = by_column(widened_lot_table, "specimen", "parts")
+    parts_by_specimen = by_column(widened_lot_mirror.table(ValuationLot), "specimen", "parts")
 
     assert parts_by_specimen["b"] == [Decimal("12345678901234567890.123456")]

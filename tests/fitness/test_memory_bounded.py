@@ -79,7 +79,6 @@ def cubic_cabinet(store: dc.Store) -> dc.Store:
     for i in range(2_000):
         store.store(Mineral(qid=f"Q{i}", name=f"m{i}", crystal_system="cubic"))
     store.commit()
-    gc.collect()
     return store
 
 
@@ -118,6 +117,8 @@ def test_committed_entities_are_not_kept_alive(cubic_cabinet: dc.Store) -> None:
     When the garbage collector has run
     Then the store's registry holds no live entity
     """
+    gc.collect()
+
     assert len(cubic_cabinet._registry) == 0
 
 
