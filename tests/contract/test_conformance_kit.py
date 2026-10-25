@@ -163,11 +163,17 @@ class _GapBlind(CountingConsumer):
 class _Reapplier(CountingConsumer):
     """§4.2 violation: an already-applied delta is applied again."""
 
+    def __init__(self) -> None:
+        super().__init__()
+        self.names_by_cid: dict[int, str] = {}
+
     def apply(self, delta: dict[str, Any]) -> bool:
+        for cid, typename, _fields in delta["types"]:
+            self.names_by_cid[cid] = typename
         if delta["tid"] <= self.watermark:
             for op in delta["ops"]:
                 if op["op"] == "upsert":
-                    typename = self._typename_by_cid[op["cid"]]
+                    typename = self.names_by_cid[op["cid"]]
                     self.counts[typename] = self.counts.get(typename, 0) + 1
             return True
         return super().apply(delta)
@@ -188,16 +194,21 @@ class _PartialApplierOnVersion(CountingConsumer):
     The natural late-validation bug; the W1 review's PoC, pinned closed.
     """
 
+    def __init__(self) -> None:
+        super().__init__()
+        self.names_by_cid: dict[int, str] = {}
+        self.seen_oids: set[int] = set()
+
     def apply(self, delta: dict[str, Any]) -> bool:
         if delta["v"] != CONTRACT_VERSION:
             for cid, typename, _fields in delta["types"]:
-                self._typename_by_cid[cid] = typename
+                self.names_by_cid[cid] = typename
             for op in delta["ops"]:
                 if op["op"] == "upsert":
-                    typename = self._typename_by_cid.get(op["cid"], "?")
-                    if op["oid"] not in self._typename_by_oid:
+                    typename = self.names_by_cid.get(op["cid"], "?")
+                    if op["oid"] not in self.seen_oids:
                         self.counts[typename] = self.counts.get(typename, 0) + 1
-                    self._typename_by_oid[op["oid"]] = typename
+                    self.seen_oids.add(op["oid"])
             raise DeltaFormatError("unsupported contract version (too late)")
         return super().apply(delta)
 

@@ -17,11 +17,11 @@ values in child processes::
 from __future__ import annotations
 
 import hashlib
+import tempfile
 from dataclasses import field
 from typing import Annotated
 
 import datacrystal as dc
-from datacrystal._storage.memory import MemoryBackend
 from datacrystal.contract import encode_delta
 
 
@@ -69,8 +69,14 @@ PINNED_ACTOR = dc.Principal(uid=2)  # a fixed non-anonymous stamp
 
 def stream() -> list[bytes]:
     """Run the scripted session and return the emitted deltas' wire bytes."""
+    with tempfile.TemporaryDirectory() as directory:
+        return _run_session(directory)
+
+
+def _run_session(directory: str) -> list[bytes]:
+    """Run the scripted session in a store under ``directory``; return the wire bytes."""
     collector = _Collector()
-    store = dc.Store._from_backend(MemoryBackend(), principal=PINNED_ACTOR)
+    store = dc.Store.open(directory, durability="never", principal=PINNED_ACTOR)
     store._clock = lambda: PINNED_AT_NS  # the private clock seam, pinned
     store.attach(collector)
 
