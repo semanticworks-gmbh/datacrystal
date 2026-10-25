@@ -3,7 +3,7 @@
 The readable-tests rule in [STANDARDS.md](../../STANDARDS.md) lets a test read private state only where no public seam exists (#199).
 This is the complete list, derived by an AST scan of `tests/` and `benchmarks/` for attributes with a single leading underscore on datacrystal objects and for imports from `datacrystal._*`.
 A read outside these categories is a defect: rewrite the test through the public API, or add the seam first.
-The scan covers attribute access and imports, `__dc_*` engine attributes included; a `_dc_*` column named as a query field (`dc.fields(C)._dc_read_floor`), a `pluck` or `EntityView.fields()` key, an Arrow column, an absence probe or a request-body key is a documented name, not a read, and is not listed.
+The scan covers attribute access and imports, `__dc_*` engine attributes included; a `_dc_*` column named as a query field (`dc.fields(C)._dc_read_floor`), a `pluck` or `EntityView.fields()` key, an Arrow column, an absence probe, a request-body key, or a module path in an import-boundary fitness check (`fitness/test_contract_engine_free.py`) is a documented name, not a read, and is not listed.
 
 | Category | What the tests reach | Modules (under `tests/` unless noted) |
 |---|---|---|
