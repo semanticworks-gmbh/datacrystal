@@ -32,6 +32,7 @@ purely **additive** surface — the v0.1.0 freeze is never broken. PyPI publicat
 
 - `store.discard()` returns a new, never-committed entity to the untracked state (#213): it loses its OID, so a later `store()` allocates a fresh one and the next commit writes it.
   Before, the entity kept its OID while the allocator rewound, the next new entity took the same OID, and re-storing the discarded entity returned that OID and wrote nothing.
+  The same holds for a new entity stored, deleted and then discarded, and a protected one gets back the labels it held before `store()` stamped or inherited them.
   An edit to a discarded entity that is not stored again is untracked like any never-stored entity; a committed entity keeps its OID on discard.
 
 ## [0.10.0] — 2026-10-20
