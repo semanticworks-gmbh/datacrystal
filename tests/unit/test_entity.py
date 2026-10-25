@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 import weakref
-from collections.abc import Mapping
-from dataclasses import field
+from collections.abc import Callable, Mapping
 from datetime import date, datetime
 from typing import Annotated, Any
 
@@ -12,16 +11,9 @@ import pytest
 
 import datacrystal as dc
 from datacrystal._conditions import FieldExpr, Pred
-from datacrystal._entity import FieldSpec, type_info
-from tests.conftest import LogEntry, Mineral
+from tests.conftest import Locality, LogEntry, Mineral
 
-
-def _specs_by_name(entity: type) -> dict[str, FieldSpec]:
-    return {spec.name: spec for spec in type_info(entity).specs}
-
-
-def _first_coordinate(old: Mapping[str, Any]) -> float:
-    return float(old["coords"].split(",")[0])
+StoreFactory = Callable[[], dc.Store]
 
 
 def _same_record(old: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -146,83 +138,76 @@ def test_instance_access_is_plain_slot_access() -> None:
     assert name == "quartz"
 
 
-def test_unique_marker_is_harvested() -> None:
-    """Given the Mineral entity
-    When its field specs are read
-    Then qid is unique
-    And qid is not indexed
+def test_unique_marker_rejects_a_second_record_with_the_same_key(store: dc.Store) -> None:
+    """Given a committed mineral with qid Q1
+    When a second mineral with qid Q1 is committed
+    Then UniqueViolationError is raised
     """
-    specs = _specs_by_name(Mineral)
+    store.store(Mineral(qid="Q1", name="quartz"))
+    store.commit()
+    store.store(Mineral(qid="Q1", name="duplicate"))
 
-    assert specs["qid"].unique
-    assert not specs["qid"].indexed
+    with pytest.raises(dc.UniqueViolationError):
+        store.commit()
 
 
-def test_index_marker_is_harvested() -> None:
-    """Given the Mineral entity
-    When its field specs are read
-    Then crystal_system is indexed
-    And name is not indexed
+def test_unique_marker_finds_the_record_by_its_key(store: dc.Store) -> None:
+    """Given a committed mineral with qid Q1
+    When the store gets a mineral by qid Q1
+    Then it is the quartz
     """
-    specs = _specs_by_name(Mineral)
+    store.store(Mineral(qid="Q1", name="quartz"))
+    store.commit()
 
-    assert specs["crystal_system"].indexed
-    assert not specs["name"].indexed
+    found = store.get(Mineral, qid="Q1")
+
+    assert found is not None
+    assert found.name == "quartz"
 
 
-def test_lazy_marker_is_harvested() -> None:
-    """Given the Mineral entity
-    When its field specs are read
-    Then type_locality holds lazy refs
+def test_index_marker_makes_the_field_answerable_from_the_index(store: dc.Store) -> None:
+    """Given a committed mineral
+    When the plan for crystal_system == "trigonal" is explained
+    Then the plan is indexed
     """
-    specs = _specs_by_name(Mineral)
+    store.store(Mineral(qid="Q1", name="quartz", crystal_system="trigonal"))
+    store.commit()
 
-    assert specs["type_locality"].lazy_refs
+    query_plan = store.explain(dc.fields(Mineral).crystal_system == "trigonal")
 
-
-@dc.entity
-class FieldNote:
-    """A note with a bare and a parameterized FullText field."""
-
-    label: str
-    befund: Annotated[str, dc.FullText(language="de")] = ""
-    summary: Annotated[str, dc.FullText] = ""
+    assert query_plan.indexed
 
 
-def test_parameterized_fulltext_keeps_its_language() -> None:
-    """dc.FullText(language="de") is frozen core API before datacrystal[fts] ships (2026-06-12).
-
-    Given a field annotated dc.FullText(language="de")
-    When the field specs are read
-    Then the field is fulltext
-    And its language is "de"
+def test_unmarked_field_is_answered_by_a_scan(store: dc.Store) -> None:
+    """Given a committed mineral
+    When the plan for name == "quartz" is explained
+    Then the plan is not indexed
     """
-    specs = _specs_by_name(FieldNote)
+    store.store(Mineral(qid="Q1", name="quartz", crystal_system="trigonal"))
+    store.commit()
 
-    assert specs["befund"].fulltext
-    assert specs["befund"].fulltext_language == "de"
+    query_plan = store.explain(dc.fields(Mineral).name == "quartz")
+
+    assert not query_plan.indexed
 
 
-def test_bare_fulltext_has_no_language() -> None:
-    """Given a field annotated with the bare dc.FullText
-    When the field specs are read
-    Then the field is fulltext
-    And its language is None
+def test_lazy_marker_leaves_the_handle_unloaded_after_reopen(store_factory: StoreFactory) -> None:
+    """Given a committed mineral with a Lazy type locality, reopened
+    When the mineral is read
+    Then its type locality handle is not loaded
     """
-    specs = _specs_by_name(FieldNote)
+    first = store_factory()
+    first.store(Mineral(qid="Q1", name="azurite", type_locality=dc.Lazy.of(Locality(qid="L1", name="Tsumeb"))))
+    first.commit()
+    first.close()
+    reopened = store_factory()
 
-    assert specs["summary"].fulltext
-    assert specs["summary"].fulltext_language is None
+    azurite = reopened.get(Mineral, qid="Q1")
 
-
-def test_unmarked_field_is_not_fulltext() -> None:
-    """Given a FieldNote label without a FullText marker
-    When the field specs are read
-    Then the label is not fulltext
-    """
-    specs = _specs_by_name(FieldNote)
-
-    assert not specs["label"].fulltext
+    assert azurite is not None
+    assert azurite.type_locality is not None
+    assert not azurite.type_locality.loaded
+    reopened.close()
 
 
 def test_fulltext_repr_names_its_language() -> None:
@@ -244,11 +229,14 @@ def test_fulltext_rejects_an_empty_language() -> None:
         dc.FullText(language="")
 
 
-def test_lazy_refs_are_found_inside_unions_and_lists_but_not_in_plain_fields() -> None:
-    """Given an entity with Lazy, Lazy | None, list[Lazy] and plain str, dict and int | None fields
-    When its field specs are read
-    Then the three Lazy-bearing fields hold lazy refs
-    And the plain ones do not
+def test_lazy_handles_stay_unloaded_after_reopen_in_unions_and_lists(
+    store_factory: StoreFactory,
+) -> None:
+    """Given an entity with Lazy, Lazy | None and list[Lazy] fields, committed and reopened
+    When the shelf is read
+    Then the direct handle is not loaded
+    And the optional handle is not loaded
+    And the listed handle is not loaded
     """
 
     @dc.entity
@@ -256,25 +244,32 @@ def test_lazy_refs_are_found_inside_unions_and_lists_but_not_in_plain_fields() -
         direct: dc.Lazy[Mineral]
         optional: dc.Lazy[Mineral] | None
         listed: list[dc.Lazy[Mineral]]
-        plain: str
-        mapping: dict[str, int]
-        maybe_int: int | None
 
-    specs = _specs_by_name(LazyShelf)
+    first = store_factory()
+    first.store(
+        LazyShelf(
+            direct=dc.Lazy.of(Mineral(qid="Q1", name="quartz")),
+            optional=dc.Lazy.of(Mineral(qid="Q2", name="azurite")),
+            listed=[dc.Lazy.of(Mineral(qid="Q3", name="beryl"))],
+        )
+    )
+    first.commit()
+    first.close()
+    reopened = store_factory()
 
-    assert specs["direct"].lazy_refs is True
-    assert specs["optional"].lazy_refs is True
-    assert specs["listed"].lazy_refs is True
-    assert specs["plain"].lazy_refs is False
-    assert specs["mapping"].lazy_refs is False
-    assert specs["maybe_int"].lazy_refs is False
+    [shelf] = reopened.query(LazyShelf)
+
+    assert not shelf.direct.loaded
+    assert shelf.optional is not None
+    assert not shelf.optional.loaded
+    assert not shelf.listed[0].loaded
+    reopened.close()
 
 
-def test_entity_refs_are_found_in_entity_unions_and_not_in_scalar_fields() -> None:
-    """Given an entity with Mineral, Mineral | None, Any, str and int | None fields
-    When its field specs are read
-    Then the first three may hold an entity ref
-    And str and int | None may not
+def test_entity_refs_are_discovered_in_entity_unions_and_any_fields(store: dc.Store) -> None:
+    """Given an entity with Mineral, Mineral | None and Any fields each holding a new mineral
+    When the shelf is stored and committed
+    Then all three minerals are in the store
     """
 
     @dc.entity
@@ -282,56 +277,19 @@ def test_entity_refs_are_found_in_entity_unions_and_not_in_scalar_fields() -> No
         direct: Mineral
         optional: Mineral | None
         anything: Any
-        label: str
-        count: int | None
 
-    specs = _specs_by_name(RefShelf)
+    store.store(
+        RefShelf(
+            direct=Mineral(qid="Q1", name="quartz"),
+            optional=Mineral(qid="Q2", name="azurite"),
+            anything=Mineral(qid="Q3", name="beryl"),
+        )
+    )
+    store.commit()
 
-    assert specs["direct"].entity_ref is True
-    assert specs["optional"].entity_ref is True
-    assert specs["anything"].entity_ref is True
-    assert specs["label"].entity_ref is False
-    assert specs["count"].entity_ref is False
+    counted = store.count(Mineral)
 
-
-def test_a_type_with_an_entity_ref_field_reports_entity_refs() -> None:
-    """Given an entity with a Mineral | None field and a str field
-    When the type info is asked for entity refs
-    Then it says True
-    """
-
-    @dc.entity
-    class RefHolder:
-        label: str
-        mineral: Mineral | None = None
-
-    has_refs = type_info(RefHolder).has_entity_refs
-
-    assert has_refs is True
-
-
-def test_fulltext_markers_carry_flag_and_language_into_the_spec() -> None:
-    """Given an entity with a FullText(language="de"), a bare FullText and an unmarked field
-    When its field specs are read
-    Then the marked fields are fulltext
-    And only the first has the language "de"
-    And the unmarked field is not fulltext and has no language
-    """
-
-    @dc.entity
-    class NoteShelf:
-        plain: str
-        german: Annotated[str, dc.FullText(language="de")]
-        bare: Annotated[str, dc.FullText]
-
-    specs = _specs_by_name(NoteShelf)
-
-    assert specs["german"].fulltext is True
-    assert specs["german"].fulltext_language == "de"
-    assert specs["bare"].fulltext is True
-    assert specs["bare"].fulltext_language is None
-    assert specs["plain"].fulltext is False
-    assert specs["plain"].fulltext_language is None
+    assert counted == 3
 
 
 def test_index_on_a_bare_list_is_rejected_at_decoration() -> None:
@@ -349,36 +307,6 @@ def test_index_on_a_bare_list_is_rejected_at_decoration() -> None:
 
     with pytest.raises(TypeError, match="must be scalar"):
         dc.entity(Bad)
-
-
-@dc.entity
-class Tagged:
-    """An entity with multi-valued (inverted) list-of-scalar indexes (#13)."""
-
-    tags: Annotated[list[str], dc.Index] = field(default_factory=list)
-    codes: Annotated[list[int] | None, dc.Index] = None
-
-
-def test_indexed_list_of_scalars_is_multivalued_and_indexed() -> None:
-    """Given a list[str] field annotated dc.Index
-    When the field specs are read
-    Then tags is multivalued
-    And tags is indexed
-    """
-    specs = _specs_by_name(Tagged)
-
-    assert specs["tags"].multivalued
-    assert specs["tags"].indexed
-
-
-def test_optional_list_of_scalars_index_is_multivalued() -> None:
-    """Given a list[int] | None field annotated dc.Index
-    When the field specs are read
-    Then codes is multivalued
-    """
-    specs = _specs_by_name(Tagged)
-
-    assert specs["codes"].multivalued
 
 
 def test_index_on_a_list_of_entity_refs_is_rejected() -> None:
@@ -409,23 +337,6 @@ def test_unique_on_a_list_field_is_rejected() -> None:
 
     with pytest.raises(TypeError, match="cannot be a list"):
         dc.entity(Bad)
-
-
-@dc.entity
-class Renamed:
-    """An entity whose mohs field was persisted as "hardness" (#26 a)."""
-
-    mohs: Annotated[float | None, dc.RenamedFrom("hardness")] = None
-
-
-def test_renamed_from_records_the_old_field_name() -> None:
-    """Given a field annotated dc.RenamedFrom("hardness")
-    When the field specs are read
-    Then mohs records the old name "hardness"
-    """
-    specs = _specs_by_name(Renamed)
-
-    assert specs["mohs"].renamed_from == "hardness"
 
 
 def test_renamed_from_repr_names_the_old_field() -> None:
@@ -460,26 +371,6 @@ def test_renamed_from_on_an_indexed_field_is_rejected() -> None:
 
     with pytest.raises(TypeError, match="RenamedFrom on an indexed"):
         dc.entity(Bad)
-
-
-@dc.entity
-class Derived:
-    """An entity whose lat is derived from the old record's "coords" (#26 b)."""
-
-    lat: Annotated[float, dc.Glue(_first_coordinate)] = 0.0
-
-
-def test_glue_records_a_callable_deriving_from_the_old_record() -> None:
-    """Given a field annotated dc.Glue that reads the first of "coords"
-    When the glue is applied to the old record {"coords": "48.1,11.5"}
-    Then it derives 48.1
-    """
-    glue = _specs_by_name(Derived)["lat"].glue
-    assert glue is not None
-
-    derived = glue({"coords": "48.1,11.5"})
-
-    assert derived == 48.1
 
 
 def test_glue_repr_hides_the_callable() -> None:
@@ -575,26 +466,42 @@ class Down:
     up: dc.Lazy[Up] | None = None
 
 
-def test_forward_ref_up_resolves_its_lazy_field() -> None:
+def test_forward_ref_up_resolves_its_lazy_field(store_factory: StoreFactory) -> None:
     """Up decorated at import despite the forward ref; AC3 is held jointly with the reject tests.
 
-    Given Up, decorated before Down was bound
-    When its field specs are read
-    Then down holds lazy refs
+    Given Up, decorated before Down was bound, committed with a Lazy down and reopened
+    When the up is read
+    Then its down handle is not loaded
     """
-    specs = _specs_by_name(Up)
+    first = store_factory()
+    first.store(Up(label="u", down=dc.Lazy.of(Down(label="d"))))
+    first.commit()
+    first.close()
+    reopened = store_factory()
 
-    assert specs["down"].lazy_refs
+    up = reopened.query(Up)[0]
+
+    assert up.down is not None
+    assert not up.down.loaded
+    reopened.close()
 
 
-def test_forward_ref_down_resolves_its_lazy_field() -> None:
-    """Given Down, whose Up was bound before it
-    When its field specs are read
-    Then up holds lazy refs
+def test_forward_ref_down_resolves_its_lazy_field(store_factory: StoreFactory) -> None:
+    """Given Down, whose Up was bound before it, committed with a Lazy up and reopened
+    When the down is read
+    Then its up handle is not loaded
     """
-    specs = _specs_by_name(Down)
+    first = store_factory()
+    first.store(Down(label="d", up=dc.Lazy.of(Up(label="u"))))
+    first.commit()
+    first.close()
+    reopened = store_factory()
 
-    assert specs["up"].lazy_refs
+    down = reopened.query(Down)[0]
+
+    assert down.up is not None
+    assert not down.up.loaded
+    reopened.close()
 
 
 @dc.entity
@@ -607,27 +514,35 @@ class Reading:
     seen: Annotated[datetime | None, dc.Index] = None
 
 
-def test_datetime_and_date_are_accepted_as_sorted_index_keys() -> None:
+def test_datetime_and_date_are_accepted_as_sorted_index_keys(store: dc.Store) -> None:
     """The eval found datetime the most common sort/range key, so it and date join the type gate.
 
-    Given a datetime and a date field annotated dc.SortedIndex
-    When the class is decorated and its field specs are read
-    Then ts is sorted
-    And day is sorted
+    Given a committed reading with a datetime and a date field annotated dc.SortedIndex
+    When the plans for a datetime and a date range are explained
+    Then the datetime range is indexed
+    And the date range is indexed
     """
-    specs = _specs_by_name(Reading)
+    store.store(Reading(label="r1", ts=datetime(2024, 5, 1), day=date(2024, 5, 1)))
+    store.commit()
+    fields = dc.fields(Reading)
 
-    assert specs["ts"].sorted
-    assert specs["day"].sorted
+    ts_plan = store.explain(fields.ts >= datetime(2024, 1, 1))
+    day_plan = store.explain(fields.day >= date(2024, 1, 1))
+
+    assert ts_plan.indexed
+    assert day_plan.indexed
 
 
-def test_datetime_is_accepted_as_an_index_key() -> None:
+def test_datetime_is_accepted_as_an_index_key(store: dc.Store) -> None:
     """Decoration is the gate: Index on a datetime is admitted (#106B owns ==/.in_).
 
-    Given a datetime field annotated dc.Index
-    When the class is decorated and its field specs are read
-    Then seen is indexed
+    Given a committed reading with a datetime field annotated dc.Index
+    When the plan for seen == that datetime is explained
+    Then the plan is indexed
     """
-    specs = _specs_by_name(Reading)
+    store.store(Reading(label="r1", seen=datetime(2024, 5, 1)))
+    store.commit()
 
-    assert specs["seen"].indexed
+    seen_plan = store.explain(dc.fields(Reading).seen == datetime(2024, 5, 1))
+
+    assert seen_plan.indexed

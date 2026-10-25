@@ -16,7 +16,6 @@ from typing import Annotated
 import pytest
 
 import datacrystal as dc
-from datacrystal._entity import FieldSpec, type_info
 
 
 @dc.entity
@@ -40,15 +39,6 @@ def _nos(hits: Iterable[Specimen]) -> str:
     return ", ".join(sorted(s.specimen_no for s in hits))
 
 
-def _spec_flags() -> dict[str, tuple[bool, bool]]:
-    """Map each Specimen field name to its (multivalued, indexed) flags."""
-    return {s.name: (s.multivalued, s.indexed) for s in type_info(Specimen).specs}
-
-
-def _spec_named(entity: type, name: str) -> FieldSpec:
-    return {s.name: s for s in type_info(entity).specs}[name]
-
-
 @pytest.fixture
 def drawer(store: dc.Store) -> dc.Store:
     """Return a store with specimens S1..S4 committed."""
@@ -62,41 +52,37 @@ def drawer(store: dc.Store) -> dc.Store:
     return store
 
 
-def test_a_list_index_field_is_marked_multivalued_and_indexed() -> None:
+def test_a_list_index_field_answers_membership_from_the_index(drawer: dc.Store) -> None:
     """Given the Specimen entity with an indexed list field tags
-    When its field specs are read
-    Then tags is multivalued
-    And tags is indexed
+    When the plan for tags containing "rare" is explained
+    Then the plan is indexed
     """
-    flags = _spec_flags()
+    plan = drawer.explain(S.tags.contains("rare"))
 
-    assert flags["tags"] == (True, True)
+    assert plan.indexed
 
 
-def test_an_optional_list_field_is_marked_multivalued() -> None:
-    """Given an entity decorated with an indexed list[str] | None field aliases
-    When its field specs are read
-    Then aliases is multivalued and indexed
+def test_an_optional_list_field_answers_membership_from_the_index(drawer: dc.Store) -> None:
+    """Given specimens where S1 has aliases ["alt"] and an indexed list[str] | None field aliases
+    When aliases containing "alt" is queried and its plan explained
+    Then S1 is found
+    And the plan is indexed
     """
+    hits = drawer.query(S.aliases.contains("alt"))
+    plan = drawer.explain(S.aliases.contains("alt"))
 
-    @dc.entity
-    class Labelled:
-        aliases: Annotated[list[str] | None, dc.Index] = None
-
-    spec = _spec_named(Labelled, "aliases")
-
-    assert spec.multivalued is True
-    assert spec.indexed is True
+    assert _nos(hits) == "S1"
+    assert plan.indexed
 
 
-def test_a_scalar_field_is_not_marked_multivalued() -> None:
-    """Given the Specimen entity with a scalar field specimen_no
-    When its field specs are read
-    Then specimen_no is not multivalued
+def test_a_scalar_field_contains_is_a_substring_match_not_membership(drawer: dc.Store) -> None:
+    """Given specimens S1..S4 and a scalar field specimen_no
+    When specimen_no containing "S" is queried
+    Then every specimen matches, as substring and not list membership
     """
-    flags = _spec_flags()
+    hits = drawer.query(S.specimen_no.contains("S"))
 
-    assert flags["specimen_no"][0] is False
+    assert _nos(hits) == "S1, S2, S3, S4"
 
 
 @TAG_ANSWERS
