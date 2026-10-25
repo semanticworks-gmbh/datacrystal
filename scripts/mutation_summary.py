@@ -29,7 +29,7 @@ MEANING = (
     "A survivor is a change to the function that no test notices: "
     "write the test that fails on it, or mark the line `# pragma: no mutate` with the reason."
 )
-REPRODUCE = "OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES mutmut run $(uv run scripts/mutation_changed.py origin/main)"
+REPRODUCE = "OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES uv run mutmut run $(uv run scripts/mutation_changed.py origin/main)"
 
 
 def statuses(results_text: str, patterns: list[str]) -> dict[str, str]:
@@ -57,7 +57,7 @@ def summarize(results_text: str, patterns: list[str], show: Callable[[str], str]
         lines += ["", f"<details><summary><code>{name}</code></summary>", "", "```diff", show(name).strip(), "```", "", "</details>"]
     if len(survivors) > SHOWN_LIMIT:
         lines += ["", f"{len(survivors) - SHOWN_LIMIT} more survivors not shown."]
-    lines += ["", MEANING, f"Reproduce: `{REPRODUCE}`, then `mutmut results` and `mutmut show <name>`."]
+    lines += ["", MEANING, f"Reproduce: `{REPRODUCE}`, then `uv run mutmut results` and `uv run mutmut show <name>`."]
     return "\n".join(lines) + "\n"
 
 
