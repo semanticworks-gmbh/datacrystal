@@ -47,22 +47,6 @@ class LogEntry:
     kind: Annotated[str, dc.Index] = "misc"
 
 
-@pytest.fixture(params=["memory", "sqlite"])
-def store_factory(request: pytest.FixtureRequest, tmp_path: Path) -> Callable[[], dc.Store]:
-    """Return a zero-arg callable that opens the *same* store each call."""
-    if request.param == "memory":
-        backend = MemoryBackend()
-
-        def open_store() -> dc.Store:
-            return dc.Store._from_backend(backend)
-    else:
-
-        def open_store() -> dc.Store:
-            return dc.Store.open(tmp_path / "store", lock_ttl=0.5)
-
-    return open_store
-
-
 class DevStoreOpener(Protocol):
     """Opens the same store each call, with the dev flags of :meth:`dc.Store.open`."""
 
@@ -102,6 +86,12 @@ def dev_store_factory(request: pytest.FixtureRequest, tmp_path: Path) -> DevStor
             )
 
     return open_store
+
+
+@pytest.fixture
+def store_factory(dev_store_factory: DevStoreOpener) -> Callable[[], dc.Store]:
+    """Return a zero-arg callable that opens the *same* store each call."""
+    return dev_store_factory
 
 
 @pytest.fixture

@@ -21,6 +21,7 @@ from __future__ import annotations
 import gc
 import subprocess
 import sys
+import weakref
 from collections.abc import Callable, Iterator
 from pathlib import Path
 
@@ -73,12 +74,26 @@ print(f"MEM-OK {per_obj:.0f} B/obj peak")
 """
 
 
+def weak_refs(minerals: list[Mineral]) -> list[weakref.ref[Mineral]]:
+    """Return a weak reference to each mineral."""
+    return [weakref.ref(mineral) for mineral in minerals]
+
+
+def commit_cubic_minerals(store: dc.Store) -> list[weakref.ref[Mineral]]:
+    """Commit 2000 cubic minerals and return weak references to them, holding none."""
+    refs = []
+    for i in range(2_000):
+        mineral = Mineral(qid=f"Q{i}", name=f"m{i}", crystal_system="cubic")
+        refs.append(weakref.ref(mineral))
+        store.store(mineral)
+    store.commit()
+    return refs
+
+
 @pytest.fixture
 def cubic_cabinet(store: dc.Store) -> dc.Store:
     """Return a store holding 2000 committed cubic minerals, none of them live."""
-    for i in range(2_000):
-        store.store(Mineral(qid=f"Q{i}", name=f"m{i}", crystal_system="cubic"))
-    store.commit()
+    commit_cubic_minerals(store)
     return store
 
 
@@ -112,14 +127,16 @@ def test_streaming_ingest_and_query_stay_in_peak_memory_budget(tmp_path: Path) -
     assert "MEM-OK" in result.stdout, result.stdout
 
 
-def test_committed_entities_are_not_kept_alive(cubic_cabinet: dc.Store) -> None:
-    """Given 2000 minerals stored and committed, with no reference held
+def test_committed_entities_are_not_kept_alive(store: dc.Store) -> None:
+    """Given 2000 minerals stored and committed, with no strong reference held
     When the garbage collector has run
-    Then the store's registry holds no live entity
+    Then every weak reference to them is dead
     """
+    refs = commit_cubic_minerals(store)
+
     gc.collect()
 
-    assert len(cubic_cabinet._registry) == 0
+    assert all(ref() is None for ref in refs)
 
 
 def test_query_hits_are_live_while_held(cubic_cabinet: dc.Store) -> None:
@@ -136,14 +153,15 @@ def test_query_hits_are_live_while_held(cubic_cabinet: dc.Store) -> None:
 def test_query_hits_are_collectable_after_release(cubic_cabinet: dc.Store) -> None:
     """Given a held query result of 2000 cubic minerals
     When the caller drops it and the garbage collector runs
-    Then the store's registry holds no live entity
+    Then every weak reference to a hit is dead
     """
     hits = cubic_cabinet.query(dc.fields(Mineral).crystal_system == "cubic")
+    hit_refs = weak_refs(hits)
 
     del hits
     gc.collect()
 
-    assert len(cubic_cabinet._registry) == 0
+    assert all(ref() is None for ref in hit_refs)
 
 
 def test_unique_get_returns_the_requested_mineral(reopened_cabinet: dc.Store) -> None:
