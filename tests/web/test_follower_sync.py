@@ -17,9 +17,7 @@ pytest.importorskip("httpx", reason="pip install httpx (TestClient transport)")
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from datacrystal._follower import _apply_catchup, _bootstrap_backend, open_follower
-from datacrystal._storage.memory import MemoryBackend
-from datacrystal._store import Store
+from datacrystal import Store, open_follower
 from datacrystal.contract.applier import (
     CONTRACT_VERSION,
     DeltaFormatError,
@@ -28,13 +26,20 @@ from datacrystal.contract.applier import (
 from datacrystal.deltalog import DeltaLog
 from datacrystal.web import federation_router
 from tests.conftest import Mineral
+from tests.web._fake_coordinator import FakeCoordinator
 
 
 def _stamped_delta() -> dict[str, object]:
     """Build a well-formed empty delta at TID 1 of the current contract version."""
     return {
-        "f": "datacrystal-delta", "v": CONTRACT_VERSION, "tid": 1,
-        "actor": 0, "at": 0, "types": [], "ops": [], "root": None,
+        "f": "datacrystal-delta",
+        "v": CONTRACT_VERSION,
+        "tid": 1,
+        "actor": 0,
+        "at": 0,
+        "types": [],
+        "ops": [],
+        "root": None,
     }
 
 
@@ -47,7 +52,7 @@ def follower_path(request: pytest.FixtureRequest, tmp_path: Path) -> Path | None
 @pytest.fixture
 def coordinator(tmp_path: Path) -> Iterator[tuple[Store, DeltaLog]]:
     """Provide a coordinator with a DeltaLog and one committed quartz (TID 1)."""
-    coord = Store._from_backend(MemoryBackend())
+    coord = Store.open(tmp_path / "coord", durability="never")
     log = DeltaLog(tmp_path / "coordlog")
     coord.attach(log)
     coord.store(Mineral(qid="Q1", name="Quartz"))
@@ -163,12 +168,12 @@ def test_sync_with_nothing_new_is_a_no_op(
 
 
 def test_sync_catchup_refuses_a_gap_no_partial_apply(
-    coordinator: tuple[Store, DeltaLog],
+    coordinator: tuple[Store, DeltaLog], follower_path: Path | None
 ) -> None:
-    """Given a replica at TID 1 and a catch-up frame of TID 3
-    When the frame is applied
-    Then the apply raises DeltaGapError
-    And the replica's watermark stays at 1
+    """Given a follower at TID 1 and a catch-up stream that skips TID 2 and serves TID 3
+    When the follower syncs
+    Then the sync raises DeltaGapError
+    And the follower's watermark stays at 1
     And only the first mineral is stored
     """
     coord, log = coordinator
@@ -177,16 +182,16 @@ def test_sync_catchup_refuses_a_gap_no_partial_apply(
     coord.store(Mineral(qid="Q3", name="Gold"))
     coord.commit()
     deltas = list(log.replay(after_tid=0))
-    backend = MemoryBackend()
-    backend.boot()
-    _bootstrap_backend(backend, [deltas[0]])
+    served = FakeCoordinator([deltas[0]])
 
-    with pytest.raises(DeltaGapError):
-        _apply_catchup(backend, [deltas[2]])
+    with open_follower("http://coord", client=served, path=follower_path) as follower:
+        served.deltas = [deltas[0], deltas[2]]
 
-    assert int(backend.boot().meta["next_tid"]) - 1 == 1
-    with Store._from_backend(backend) as replica:
-        assert {m.qid for m in replica.query(Mineral)} == {"Q1"}
+        with pytest.raises(DeltaGapError):
+            follower.sync()
+
+        assert follower.last_tid == 1
+        assert {m.qid for m in follower.query(Mineral)} == {"Q1"}
 
 
 def test_sync_on_non_follower_raises(store: Store) -> None:
@@ -222,8 +227,7 @@ def test_sync_refuses_with_buffered_writes(
 def test_discard_drops_uncommitted_writes(store: Store) -> None:
     """Given a quartz edited and a calcite upserted, both uncommitted
     When the store discards
-    Then the new-entity buffer is empty
-    And the dirty buffer is empty
+    Then nothing is left to commit
     And the uncommitted calcite is gone
     And the quartz is back at its committed hardness 5.0
     """
@@ -233,13 +237,11 @@ def test_discard_drops_uncommitted_writes(store: Store) -> None:
     assert m is not None
     m.mohs = 9.0
     store.upsert(Mineral(qid="Q2", name="Calcite"))
-    assert store._new or store._dirty
 
     store.discard()
 
     rolled = store.get(Mineral, qid="Q1")
-    assert not store._new
-    assert not store._dirty
+    assert store.commit() is None
     assert store.get(Mineral, qid="Q2") is None
     assert rolled is not None
     assert rolled.mohs == 5.0
@@ -326,54 +328,61 @@ def test_discard_unblocks_sync(
 
 def test_catchup_refuses_a_delta_that_predates_the_contract() -> None:
     """Given a delta one version older than the contract
-    When it is applied as a catch-up
-    Then the apply raises DeltaFormatError naming that it predates
-    And the backend still holds no commit
+    When a follower syncs it as a catch-up
+    Then the sync raises DeltaFormatError naming that it predates
+    And the follower still holds no commit
     """
-    backend = MemoryBackend()
+    served = FakeCoordinator()
+    with open_follower("http://coord", client=served) as follower:
+        served.deltas = [{**_stamped_delta(), "v": 1}]
 
-    with pytest.raises(DeltaFormatError, match="predates"):
-        _apply_catchup(backend, [{**_stamped_delta(), "v": 1}])
+        with pytest.raises(DeltaFormatError, match="predates"):
+            follower.sync()
 
-    with Store._from_backend(backend) as replica:
-        assert replica.last_tid == 0
+        assert follower.last_tid == 0
 
 
 def test_catchup_refuses_a_delta_newer_than_the_contract() -> None:
     """Given a delta one version newer than the contract
-    When it is applied as a catch-up
-    Then the apply raises DeltaFormatError naming that it is newer
-    And the backend still holds no commit
+    When a follower syncs it as a catch-up
+    Then the sync raises DeltaFormatError naming that it is newer
+    And the follower still holds no commit
     """
-    backend = MemoryBackend()
+    served = FakeCoordinator()
+    with open_follower("http://coord", client=served) as follower:
+        served.deltas = [{**_stamped_delta(), "v": CONTRACT_VERSION + 1}]
 
-    with pytest.raises(DeltaFormatError, match="newer"):
-        _apply_catchup(backend, [{**_stamped_delta(), "v": CONTRACT_VERSION + 1}])
+        with pytest.raises(DeltaFormatError, match="newer"):
+            follower.sync()
 
-    with Store._from_backend(backend) as replica:
-        assert replica.last_tid == 0
+        assert follower.last_tid == 0
 
 
 def test_catchup_refuses_a_frame_that_is_not_a_delta() -> None:
     """Given a frame whose format marker is not datacrystal-delta
-    When it is applied as a catch-up
-    Then the apply raises DeltaFormatError naming that it is not a datacrystal delta
-    And the backend still holds no commit
+    When a follower syncs it as a catch-up
+    Then the sync raises DeltaFormatError naming that it is not a datacrystal delta
+    And the follower still holds no commit
     """
-    backend = MemoryBackend()
+    served = FakeCoordinator()
+    with open_follower("http://coord", client=served) as follower:
+        served.deltas = [{**_stamped_delta(), "f": "something-else"}]
 
-    with pytest.raises(DeltaFormatError, match="not a datacrystal delta"):
-        _apply_catchup(backend, [{**_stamped_delta(), "f": "something-else"}])
+        with pytest.raises(DeltaFormatError, match="not a datacrystal delta"):
+            follower.sync()
 
-    with Store._from_backend(backend) as replica:
-        assert replica.last_tid == 0
+        assert follower.last_tid == 0
 
 
 def test_catchup_still_applies_a_well_formed_empty_delta() -> None:
     """Given a well-formed empty delta of the current contract version
-    When it is applied as a catch-up
-    Then the apply returns its TID 1
+    When a follower syncs it as a catch-up
+    Then the sync returns its TID 1
     """
-    applied = _apply_catchup(MemoryBackend(), [_stamped_delta()])
+    served = FakeCoordinator()
+    with open_follower("http://coord", client=served) as follower:
+        served.deltas = [_stamped_delta()]
 
-    assert applied == 1
+        applied = follower.sync()
+
+        assert applied == 1

@@ -42,13 +42,13 @@ from fastapi import FastAPI
 
 import datacrystal as dc
 from datacrystal import ConflictError
-from datacrystal._follower import _apply_catchup, _contribute, _iter_frames
 from datacrystal._storage.memory import MemoryBackend
 from datacrystal.contract.applier import DeltaGapError
 from datacrystal.deltalog import DeltaLog
 from datacrystal.testing import CountingConsumer, check_delta_consumer
 from datacrystal.web import federation_router
 from tests.conftest import Locality, Mineral
+from tests.web._fake_coordinator import FrameDroppingClient, decode_frames
 
 _MINERAL = f"{Mineral.__module__}:{Mineral.__qualname__}"
 
@@ -221,14 +221,17 @@ def connect_http() -> Iterator[Callable[[_CoordinatorServer], httpx.Client]]:
 def lagging_follower(
     coordinator: _CoordinatorServer,
     connect_follower: Callable[[_CoordinatorServer], dc.Store],
+    connect_http: Callable[[_CoordinatorServer], httpx.Client],
 ) -> dc.Store:
-    """Open a follower, then let another follower commit two minerals ahead of it."""
-    follower = connect_follower(coordinator)
+    """Open a follower whose catch-up loses its first frame, two commits behind the coordinator."""
+    lossy = FrameDroppingClient(connect_http(coordinator))
+    follower = dc.open_follower(coordinator.base_url, client=lossy, path=None)
     contributor = connect_follower(coordinator)
     contributor.upsert(Mineral(qid="QG1", name="Gapstone1"))
     contributor.commit()
     contributor.upsert(Mineral(qid="QG2", name="Gapstone2"))
     contributor.commit()
+    lossy.drop_first_frame = True
     return follower
 
 
@@ -647,21 +650,25 @@ def test_lost_ack_reinsert_with_base_none_raises_conflict(
     connect_http: Callable[[_CoordinatorServer], httpx.Client],
 ) -> None:
     """Given an untracked Quartz with base None, the wire shape of a lost-ack re-insert
-    When it is contributed although Q1 is already present
-    Then the contribution raises ConflictError
+    When it is POSTed to /v1/submit although Q1 is already present
+    Then the response is a 409 conflict
     And the coordinator's head is unchanged
     And exactly one Quartz remains, with the original hardness
     """
     http = connect_http(coordinator)
     follower = connect_follower(coordinator)
     head_before = int(http.get("/v1/head").json()["tid"])
-    fresh = Mineral(qid="Q1", name="Quartz", mohs=7.0)
+    fields = {"qid": "Q1", "name": "Quartz", "mohs": 7.0}
 
-    with pytest.raises(ConflictError):
-        _contribute([(fresh, None)], url=coordinator.base_url, api_key=None, client=http)
+    resp = http.post(
+        "/v1/submit",
+        json={"ops": [{"type": _MINERAL, "key": "qid", "fields": fields, "base": None}]},
+    )
 
     head_after = int(http.get("/v1/head").json()["tid"])
     follower.sync()
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["error"] == "conflict"
     assert head_after == head_before
     assert [m.mohs for m in follower.query(Mineral) if m.qid == "Q1"] == [7.0]
 
@@ -719,27 +726,18 @@ def test_schema_skew_submit_writes_nothing(
 # --- §3.g delta-gap on catch-up (over the wire) ------------------------------
 
 
-def test_delta_gap_on_catchup_refuses_no_partial_apply(
-    coordinator: _CoordinatorServer,
-    lagging_follower: dc.Store,
-    connect_http: Callable[[_CoordinatorServer], httpx.Client],
-) -> None:
-    """Given a follower two commits behind and the real wire frames minus the first
-    When the gapped frames are applied as a catch-up
-    Then the apply raises DeltaGapError
+def test_delta_gap_on_catchup_refuses_no_partial_apply(lagging_follower: dc.Store) -> None:
+    """Given a follower two commits behind whose catch-up frames lose the first one
+    When the follower syncs
+    Then the sync raises DeltaGapError
     And the follower's watermark is unchanged
     And the follower still holds only the two seeded minerals
     And the second gapstone did not land
     """
-    http = connect_http(coordinator)
     wm_before = lagging_follower.last_tid
-    blob = http.get("/v1/deltas", params={"after": wm_before}).content
-    frames = list(_iter_frames(blob))
-    assert len(frames) >= 2, "need a tail to gap"
-    gapped = frames[1:]  # skip wm+1, so the first delivered is wm+2
 
     with pytest.raises(DeltaGapError):
-        _apply_catchup(lagging_follower._backend, gapped)
+        lagging_follower.sync()
 
     assert lagging_follower.last_tid == wm_before
     assert {m.qid for m in lagging_follower.query(Mineral)} == {"Q1", "Q2"}
@@ -810,7 +808,7 @@ def test_operators_own_commit_keeps_its_actor_stamp(
 
     blob = http.get("/v1/deltas", params={"after": 0}).content
 
-    deltas = list(_iter_frames(blob))
+    deltas = decode_frames(blob)
     assert deltas[0]["actor"] == 42
 
 
@@ -831,7 +829,7 @@ def test_contributions_stamp_anonymous_not_the_operator(
 
     blob = http.get("/v1/deltas", params={"after": 0}).content
 
-    contribution = list(_iter_frames(blob))[-1]
+    contribution = decode_frames(blob)[-1]
     assert any(
         op["payload"] is not None and b"Fluorite" in op["payload"] for op in contribution["ops"]
     )

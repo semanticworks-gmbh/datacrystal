@@ -11,7 +11,6 @@ pytest-asyncio, matching tests/unit/test_async.py). Over both ``store_factory`` 
 from __future__ import annotations
 
 import functools
-import hashlib
 import threading
 from pathlib import Path
 from typing import Any
@@ -29,6 +28,7 @@ import datacrystal as dc
 from datacrystal.deltalog import DeltaLog
 from datacrystal.web import federation_router
 from tests.conftest import Mineral
+from tests.web._fake_coordinator import occ_base_of
 
 _MINERAL = f"{Mineral.__module__}:{Mineral.__qualname__}"
 _STALE_BASE = "0" * 64
@@ -57,16 +57,8 @@ def _op(qid: str, base: str | None = None, **fields: object) -> dict[str, Any]:
 
 
 def _digest(log: DeltaLog, oid: int) -> str | None:
-    """Return the current OCC base for ``oid``, what a follower carries on update.
-
-    FEDERATION-WIRE-v1: the hex SHA-256 of the latest replayed upsert payload of the record.
-    """
-    base = None
-    for delta in log.replay():
-        for op in delta["ops"]:
-            if op["op"] == "upsert" and op["oid"] == oid:
-                base = hashlib.sha256(op["payload"]).hexdigest()
-    return base
+    """Return the current OCC base for ``oid``, what a follower carries on update."""
+    return occ_base_of(log.replay(), oid)
 
 
 @pytest.fixture
