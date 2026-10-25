@@ -27,13 +27,9 @@ import pyarrow.types as pa_types
 
 import datacrystal as dc
 from datacrystal import Snapshot
-from datacrystal._records import RefToken
-from datacrystal._storage.memory import MemoryBackend
 from datacrystal.arrow import (
     ArrowMirror,
     MirrorConfigError,
-    _encode_fallback,
-    _TableState,
     decode_fallback,
 )
 from datacrystal.contract.applier import DeltaGapError
@@ -692,7 +688,7 @@ def test_unprotected_segment_has_no_label_columns(unprotected_relics: Unprotecte
     When the mirror's Relic columns are read
     Then there is no _dc_owner column
     """
-    columns = unprotected_relics.mirror._tables[_RELIC].columns
+    columns = unprotected_relics.mirror.table(_RELIC).column_names
 
     assert "_dc_owner" not in columns
 
@@ -926,19 +922,9 @@ def test_auto_compaction_bounds_the_segments(ten_commit_mirror: ArrowMirror) -> 
     When its Quarry segments are counted
     Then there are at most four
     """
-    segments = ten_commit_mirror._tables[QUARRY_TYPENAME].segments
+    segments = list(ten_commit_mirror.parquet_dir(Quarry).glob("seg-*.parquet"))
 
     assert len(segments) <= 4
-
-
-def test_compact_leaves_one_segment(ten_commit_mirror: ArrowMirror) -> None:
-    """Given ten commits into a mirror with max_segments=4
-    When the mirror is compacted
-    Then the Quarry type has one segment
-    """
-    ten_commit_mirror.compact()
-
-    assert len(ten_commit_mirror._tables[QUARRY_TYPENAME].segments) == 1
 
 
 def test_compact_preserves_the_content(ten_commit_mirror: ArrowMirror) -> None:
@@ -960,7 +946,7 @@ def test_compact_leaves_one_plain_parquet_file(ten_commit_mirror: ArrowMirror) -
     """
     ten_commit_mirror.compact()
 
-    files = list(ten_commit_mirror._segment_dir(QUARRY_TYPENAME).glob("seg-*.parquet"))
+    files = list(ten_commit_mirror.parquet_dir(Quarry).glob("seg-*.parquet"))
 
     assert len(files) == 1
 
@@ -971,7 +957,7 @@ def test_compacted_parquet_file_holds_the_current_state_only(ten_commit_mirror: 
     Then it holds ten rows
     """
     ten_commit_mirror.compact()
-    [parquet_file] = ten_commit_mirror._segment_dir(QUARRY_TYPENAME).glob("seg-*.parquet")
+    [parquet_file] = ten_commit_mirror.parquet_dir(Quarry).glob("seg-*.parquet")
 
     table = pq.read_table(parquet_file)
 
@@ -1078,7 +1064,7 @@ def mirror_with_orphan_segment(store: dc.Store, shop: MirrorShop) -> Path:
     store.commit()
     store.detach(mirror)
     mirror.close()
-    segment_dir = mirror._segment_dir(QUARRY_TYPENAME)
+    segment_dir = mirror.parquet_dir(Quarry)
     orphan = segment_dir / "seg-000002.parquet"
     orphan.write_bytes((segment_dir / "seg-000001.parquet").read_bytes())
     return orphan
@@ -1121,12 +1107,14 @@ def test_reopen_after_a_crash_keeps_the_durable_rows(
 
 
 @pytest.fixture
-def indexed_corpus(shop: MirrorShop) -> Iterator[Callable[[int], tuple[dc.Store, ArrowMirror]]]:
-    """Return a factory for a committed, mirrored in-memory corpus; close the stores after."""
+def indexed_corpus(
+    shop: MirrorShop, tmp_path: Path
+) -> Iterator[Callable[[int], tuple[dc.Store, ArrowMirror]]]:
+    """Return a factory for a committed, mirrored corpus; close the stores after."""
     stores: list[dc.Store] = []
 
     def build(size: int) -> tuple[dc.Store, ArrowMirror]:
-        corpus_store = dc.Store._from_backend(MemoryBackend())
+        corpus_store = dc.Store.open(tmp_path / f"corpus-{size}", durability="never")
         stores.append(corpus_store)
         mirror = shop.open()
         corpus_store.attach(mirror)
@@ -1187,17 +1175,23 @@ def test_list_of_refs_mirrors_as_a_list_of_int64(mirrored_hoard: ArrowMirror) ->
     assert field.type == pa.list_(pa.int64())
 
 
-def test_decode_fallback_restores_reftokens() -> None:
-    """Given a value with a RefToken, a date and a mixed list, encoded as a fallback
-    When decode_fallback decodes it
-    Then the original value is restored
+def test_decode_fallback_restores_the_oid_of_a_referenced_entity(
+    store: dc.Store, mirror: ArrowMirror
+) -> None:
+    """Given a find whose dict tags hold a date, a mixed list and a reference to a quarry
+    When the Find row's tags are decoded with decode_fallback
+    Then the date and the list are restored and the reference carries the quarry's OID
     """
-    value = {"ref": RefToken(42), "when": dt.date(2026, 1, 1), "xs": [1, "two"]}
-    encoded = _encode_fallback(value)
+    quarry = Quarry(qid="Q1", name="Tsumeb")
+    quarry_oid = store.store(quarry)
+    store.root = [Find(label="x", tags={"ref": quarry, "when": dt.date(2026, 1, 1), "xs": [1, "two"]})]
+    store.commit()
 
-    decoded = decode_fallback(encoded)
+    decoded = decode_fallback(rows(mirror, Find)[0]["tags"])
 
-    assert decoded == value
+    assert decoded["ref"].oid == quarry_oid
+    assert decoded["when"] == dt.date(2026, 1, 1)
+    assert decoded["xs"] == [1, "two"]
 
 
 # -- #16: streaming bootstrap (larger-than-RAM) -----------------------------------
@@ -1263,11 +1257,10 @@ def test_streamed_bootstrap_equals_a_single_shot_bootstrap(
 
 
 class FlushSpy:
-    """Records what ArrowMirror.flush saw: the pending rows and the watermark at each call."""
+    """Records the watermark ArrowMirror.flush saw at each call."""
 
     def __init__(self) -> None:
         """Start with nothing recorded."""
-        self.pending_sizes: list[int] = []
         self.watermarks: list[int] = []
 
 
@@ -1278,8 +1271,7 @@ def flush_spy(monkeypatch: pytest.MonkeyPatch) -> FlushSpy:
     real_flush = ArrowMirror.flush
 
     def recording_flush(self: ArrowMirror) -> None:
-        spy.pending_sizes.append(sum(len(pending) for pending in self._pending.values()))
-        spy.watermarks.append(self._watermark)
+        spy.watermarks.append(self.watermark)
         real_flush(self)
 
     monkeypatch.setattr(ArrowMirror, "flush", recording_flush)
@@ -1298,22 +1290,23 @@ def test_bootstrap_flushes_at_least_once(
     with store.snapshot() as snap:
         shop.bootstrap("boot", snap, batch=10)
 
-    assert flush_spy.pending_sizes != []
+    assert flush_spy.watermarks != []
 
 
-def test_bootstrap_pending_rows_stay_bounded_by_the_batch(
-    commit_finds: Callable[[int], dc.Store], shop: MirrorShop, flush_spy: FlushSpy
+def test_bootstrap_segments_stay_bounded_by_the_batch(
+    commit_finds: Callable[[int], dc.Store], shop: MirrorShop
 ) -> None:
     """Given a store of 50 finds, where chunking by flush_every=1 would write a segment per row
     When a mirror is bootstrapped with batch=10
-    Then no flush saw more than 10 pending rows, so peak residency is O(batch), not O(extent)
+    Then no parquet segment holds more than 10 rows, so peak residency is O(batch), not O(extent)
     """
     store = commit_finds(50)
 
     with store.snapshot() as snap:
-        shop.bootstrap("boot", snap, batch=10)
+        mirror = shop.bootstrap("boot", snap, batch=10)
 
-    assert max(flush_spy.pending_sizes) <= 10, f"peak pending {max(flush_spy.pending_sizes)} > batch"
+    segments = mirror.parquet_dir(Find).glob("seg-*.parquet")
+    assert max(pq.ParquetFile(segment).metadata.num_rows for segment in segments) <= 10
 
 
 def test_bootstrap_defers_the_real_watermark_to_the_final_flush(
@@ -1354,33 +1347,19 @@ def test_bootstrap_default_batch_writes_few_segments(
     assert len(segments) <= 2, f"default bootstrap wrote {len(segments)} segments for 50 rows"
 
 
-@pytest.fixture
-def compaction_spy(monkeypatch: pytest.MonkeyPatch) -> list[str]:
-    """Replace ArrowMirror._compact_type with a wrapper recording the typenames it compacts."""
-    compacted: list[str] = []
-    real_compact = ArrowMirror._compact_type
-
-    def recording_compact(self: ArrowMirror, typename: str, state: _TableState) -> None:
-        compacted.append(typename)
-        real_compact(self, typename, state)
-
-    monkeypatch.setattr(ArrowMirror, "_compact_type", recording_compact)
-    return compacted
-
-
 def test_bootstrap_suppresses_compaction_thrash(
-    commit_finds: Callable[[int], dc.Store], shop: MirrorShop, compaction_spy: list[str]
+    commit_finds: Callable[[int], dc.Store], shop: MirrorShop
 ) -> None:
     """Given a store of 40 finds, whose many small batches would compact repeatedly
     When a mirror is bootstrapped with batch=1 and max_segments=4
-    Then no type is compacted
+    Then all 40 one-row segments are still on disk
     """
     store = commit_finds(40)
 
     with store.snapshot() as snap:
-        shop.bootstrap("boot", snap, batch=1, max_segments=4)
+        mirror = shop.bootstrap("boot", snap, batch=1, max_segments=4)
 
-    assert compaction_spy == [], f"bootstrap compacted {compaction_spy} — must suppress"
+    assert len(list(mirror.parquet_dir(Find).glob("seg-*.parquet"))) == 40
 
 
 # -- analytics: "filter in datacrystal, aggregate in DuckDB" (#53) ----------------
