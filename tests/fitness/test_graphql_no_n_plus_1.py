@@ -45,7 +45,7 @@ from strawberry.types.field import StrawberryField
 
 import datacrystal as dc
 from datacrystal._entity import oid_of
-from datacrystal._snapshot import Snapshot
+from datacrystal import Snapshot
 from datacrystal._storage.memory import MemoryBackend
 from datacrystal._storage.protocol import (
     BootInfo,

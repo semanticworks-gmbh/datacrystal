@@ -11,7 +11,6 @@ import pytest
 pytest.importorskip("snowballstemmer", reason="datacrystal[fts] extra not installed")
 
 import datacrystal as dc
-from datacrystal._entity import type_info
 from datacrystal.fts import FullTextIndex
 from tests.log_capture import logged
 
@@ -24,7 +23,7 @@ class Specimen:
     label: Annotated[str | None, dc.FullText(language="en")] = None
 
 
-SPECIMEN_FULLTEXT = {type_info(Specimen).typename: {"label": "en"}}
+SPECIMEN_FULLTEXT = {"tests.extras.test_operational_logging_fts:Specimen": {"label": "en"}}
 
 
 @pytest.fixture(autouse=True)

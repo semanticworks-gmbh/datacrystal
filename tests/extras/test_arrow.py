@@ -26,8 +26,8 @@ import pyarrow.parquet as pq
 import pyarrow.types as pa_types
 
 import datacrystal as dc
+from datacrystal import Snapshot
 from datacrystal._records import RefToken
-from datacrystal._snapshot import Snapshot
 from datacrystal._storage.memory import MemoryBackend
 from datacrystal.arrow import (
     ArrowMirror,
