@@ -20,6 +20,7 @@ import functools
 import threading
 from collections.abc import Callable, Iterator
 from dataclasses import field
+from itertools import pairwise
 from typing import Annotated
 
 import pytest
@@ -40,6 +41,14 @@ class Locality:
 
     qid: Annotated[str, dc.Unique]
     name: str
+
+
+@dc.entity
+class Vein:
+    """A mineral vein that branches into a deeper vein, a chain of resident referents."""
+
+    qid: Annotated[str, dc.Unique]
+    deeper: Vein | None = None
 
 
 @dc.entity
@@ -525,3 +534,52 @@ def test_nested_over_view_stays_oid(store: dc.Store, stock: tuple[Mineral, Local
 
     assert dto.discovered_in == oid_of(loc)  # pyrefly: ignore[missing-attribute]
     assert dto.type_locality == oid_of(loc)  # pyrefly: ignore[missing-attribute]
+
+
+def _vein_chain(store: dc.Store, length: int) -> list[Vein]:
+    """Commit a chain of veins, each branching into the next; return them from the top."""
+    veins = [Vein(qid=f"V{i}") for i in range(length)]
+    for upper, lower in pairwise(veins):
+        upper.deeper = lower
+    store.root = veins
+    store.commit()
+    return veins
+
+
+def test_nested_depth_bound_projects_exactly_the_requested_levels(store: dc.Store) -> None:
+    """Given a committed chain of four veins, each resident in the one above
+    When to_pydantic projects the top vein with nested=2
+    Then the third vein is still a nested Vein DTO
+    """
+    veins = _vein_chain(store, 4)
+
+    dto = to_pydantic(veins[0], nested=2)
+
+    assert isinstance(dto.deeper.deeper, entity_model(Vein))  # pyrefly: ignore[missing-attribute]
+
+
+def test_nested_depth_bound_stops_at_an_oid_past_the_requested_levels(store: dc.Store) -> None:
+    """Given a committed chain of four veins, each resident in the one above
+    When to_pydantic projects the top vein with nested=2
+    Then the fourth vein crosses as its OID
+    """
+    veins = _vein_chain(store, 4)
+
+    dto = to_pydantic(veins[0], nested=2)
+
+    assert dto.deeper.deeper.deeper == oid_of(veins[3])  # pyrefly: ignore[missing-attribute]
+
+
+def test_nested_depth_bound_ends_a_reference_cycle(store: dc.Store) -> None:
+    """Given two committed veins that branch into each other
+    When to_pydantic projects the first with nested=3
+    Then the projection ends with the fourth level as the first vein's OID
+    """
+    first, second = Vein(qid="LOOP-A"), Vein(qid="LOOP-B")
+    first.deeper, second.deeper = second, first
+    store.root = [first, second]
+    store.commit()
+
+    dto = to_pydantic(first, nested=3)
+
+    assert dto.deeper.deeper.deeper.deeper == oid_of(first)  # pyrefly: ignore[missing-attribute]

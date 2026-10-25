@@ -173,6 +173,20 @@ def buffered_log(store: dc.Store, open_log: OpenLog) -> DeltaLog:
 
 
 @pytest.fixture
+def closed_buffered_log_name(store: dc.Store, open_log: OpenLog) -> str:
+    """Commit two drawers into a log that fsyncs every third commit, detach and close it."""
+    log = open_log("tail.deltalog", flush_every=3)
+    store.attach(log)
+    store.root = [Cabinet(qid="C1", name="a")]
+    store.commit()
+    store.root = [*store.root, Cabinet(qid="C2", name="b")]
+    store.commit()
+    store.detach(log)
+    log.close()
+    return "tail.deltalog"
+
+
+@pytest.fixture
 def store_ahead_of_lossy_log(store: dc.Store, open_log: OpenLog) -> dc.Store:
     """Commit tid 1 into a log that never fsynced it, then detach the log."""
     log = open_log("lossy.deltalog", flush_every=5)
@@ -473,6 +487,32 @@ def test_third_commit_flushes_the_durable_watermark(
 
     assert buffered_log.durable_watermark == 3
     assert buffered_log.bytes_flushed > 0
+
+
+def test_close_flushes_the_buffered_tail_to_disk(
+    closed_buffered_log_name: str, open_log: OpenLog
+) -> None:
+    """Given a log that fsyncs every third commit, closed after two buffered commits
+    When it is reopened
+    Then its durable watermark is 2
+    """
+    reopened = open_log(closed_buffered_log_name)
+
+    assert reopened.durable_watermark == 2
+
+
+def test_close_keeps_the_buffered_tail_replayable(
+    closed_buffered_log_name: str, open_log: OpenLog
+) -> None:
+    """Given a log that fsyncs every third commit, closed after two buffered commits
+    When it is reopened and replayed
+    Then tids 1 and 2 are yielded
+    """
+    reopened = open_log(closed_buffered_log_name)
+
+    deltas = list(reopened.replay())
+
+    assert tids_of(deltas) == [1, 2]
 
 
 def test_lossy_log_reopens_behind_the_store(

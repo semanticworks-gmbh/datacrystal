@@ -986,6 +986,18 @@ class TestDenialMechanics:
             contact.org = "loop-edit"
         store.discard()
 
+    def test_committing_denial_propagates_out_of_the_first_attempt(self, store: dc.Store) -> None:
+        """Given a committing() loop unrolled by hand to its first attempt
+        When an agent edits a curated contact inside that attempt
+        Then the WriteDeniedError propagates out of the block, the buffered edit left intact
+        """
+        contact = _curated_contact(store)
+        attempts = store.committing(retries=5)
+        with store.acting_as(AGENT_900), pytest.raises(dc.WriteDeniedError), next(attempts):
+            contact.org = "loop-edit"
+        store.discard()
+        assert contact.org == "loop-edit"
+
     def test_verify_is_never_gated(self, store: dc.Store) -> None:
         """Given a store holding a curated contact
         When it is verified by an anonymous session
