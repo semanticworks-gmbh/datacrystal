@@ -37,6 +37,10 @@ def _cabinet(store: dc.Store) -> None:
     ]
 
 
+def _oids(store: dc.Store, entities: list[Mineral]) -> list[int]:
+    return [store.store(entity) for entity in entities]
+
+
 def _twenty_minerals() -> list[Mineral]:
     return [Mineral(qid=f"Q{i}", name=f"m{i}") for i in range(20)]
 
@@ -331,7 +335,7 @@ def test_get_many_hydrates_in_the_order_of_the_oids(store_factory: StoreFactory)
     store.close()
     reopened = store_factory()
     hits = reopened.query(dc.fields(Mineral).crystal_system == None)  # noqa: E711 - the magic query path compares with ==
-    oids = [reopened.store(hit) for hit in hits]
+    oids = _oids(reopened, hits)
 
     again = reopened.get_many(oids)
 

@@ -36,6 +36,10 @@ def _names(hits: Iterable[Mineral]) -> list[str]:
     return sorted(m.name for m in hits)
 
 
+def _oids(store: dc.Store, entities: Iterable[Mineral]) -> list[int]:
+    return [store.store(entity) for entity in entities]
+
+
 def _three_minerals() -> list[Mineral]:
     return [Mineral(qid=f"Q{i}", name=f"m{i}") for i in range(3)]
 
@@ -889,10 +893,8 @@ def test_query_iter_of_the_full_extent_yields_every_oid_once(cabinet: dc.Store) 
     Then the oids equal those of query(Mineral)
     And none repeats
     """
-    streamed = list(cabinet.query_iter(Mineral))
-    queried = cabinet.query(Mineral)
-    streamed_oids = [cabinet.store(m) for m in streamed]
-    queried_oids = [cabinet.store(m) for m in queried]
+    streamed_oids = _oids(cabinet, cabinet.query_iter(Mineral))
+    queried_oids = _oids(cabinet, cabinet.query(Mineral))
 
     assert sorted(streamed_oids) == sorted(queried_oids)
     assert len(streamed_oids) == len(set(streamed_oids))

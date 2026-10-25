@@ -159,17 +159,17 @@ def test_reload_keeps_the_extent(cached_cabinet_of_six_rocks: Path) -> None:
 @pytest.mark.parametrize(
     ("field_name", "method", "argument", "expected"),
     [
-        ("color", "__eq__", "red", ["r1", "r3", "r5"]),
-        ("hardness", "__ge__", 3.0, ["r3", "r4", "r5"]),
-        ("hardness", "__lt__", 2.0, ["r0", "r1"]),
-        ("name", "__eq__", "r4", ["r4"]),
-        ("tags", "contains", "igneous", ["r0", "r1", "r2", "r3", "r4", "r5"]),
-        ("tags", "contains", "g1", ["r1", "r4"]),
+        ("color", "__eq__", "red", "r1, r3, r5"),
+        ("hardness", "__ge__", 3.0, "r3, r4, r5"),
+        ("hardness", "__lt__", 2.0, "r0, r1"),
+        ("name", "__eq__", "r4", "r4"),
+        ("tags", "contains", "igneous", "r0, r1, r2, r3, r4, r5"),
+        ("tags", "contains", "g1", "r1, r4"),
     ],
     ids=["color-eq", "hardness-ge", "hardness-lt", "name-eq", "tags-igneous", "tags-g1"],
 )
 def test_reload_answers_each_query_like_the_original(
-    cabinet_of_six_rocks: Path, field_name: str, method: str, argument: object, expected: list[str]
+    cabinet_of_six_rocks: Path, field_name: str, method: str, argument: object, expected: str
 ) -> None:
     """Given six committed rocks, the first session's indexes built from scratch and cached on close
     When the cabinet is reopened and the same condition is queried
@@ -185,16 +185,8 @@ def test_reload_answers_each_query_like_the_original(
     reloaded_answer = _names(reopened.query(condition))
 
     assert reloaded_answer == built_answer
-    assert reloaded_answer == expected
+    assert ", ".join(reloaded_answer) == expected
     reopened.close()
-
-
-def _reopened_with_r1(path: Path) -> tuple[dc.Store, Rock]:
-    """Reopen the cabinet on its cache and return the store with rock r1."""
-    reopened = dc.Store.open(path, cache_index=True)
-    r1 = reopened.get(Rock, name="r1")
-    assert r1 is not None
-    return reopened, r1
 
 
 def test_updating_a_loaded_index_un_indexes_the_old_color(
@@ -204,7 +196,9 @@ def test_updating_a_loaded_index_un_indexes_the_old_color(
     When r1 is re-indexed as green
     Then r1 is no longer among the red rocks
     """
-    reopened, r1 = _reopened_with_r1(cached_cabinet_of_six_rocks)
+    reopened = dc.Store.open(cached_cabinet_of_six_rocks, cache_index=True)
+    r1 = reopened.get(Rock, name="r1")
+    assert r1 is not None
     r1.color = "green"
     reopened.commit()
 
@@ -221,7 +215,9 @@ def test_updating_a_loaded_index_indexes_the_new_color(
     When r1 is re-indexed as green
     Then r1 is among the green rocks
     """
-    reopened, r1 = _reopened_with_r1(cached_cabinet_of_six_rocks)
+    reopened = dc.Store.open(cached_cabinet_of_six_rocks, cache_index=True)
+    r1 = reopened.get(Rock, name="r1")
+    assert r1 is not None
     r1.color = "green"
     reopened.commit()
 
@@ -238,7 +234,9 @@ def test_updating_a_loaded_index_updates_the_sorted_run(
     When r1 is re-indexed with hardness 99.0
     Then r1 is among the rocks of hardness at least 99.0
     """
-    reopened, r1 = _reopened_with_r1(cached_cabinet_of_six_rocks)
+    reopened = dc.Store.open(cached_cabinet_of_six_rocks, cache_index=True)
+    r1 = reopened.get(Rock, name="r1")
+    assert r1 is not None
     r1.hardness = 99.0
     reopened.commit()
 
@@ -255,7 +253,9 @@ def test_updating_a_loaded_index_re_indexes_the_tags(
     When r1 is re-indexed with the tags ["meta"]
     Then r1 is among the rocks tagged meta
     """
-    reopened, r1 = _reopened_with_r1(cached_cabinet_of_six_rocks)
+    reopened = dc.Store.open(cached_cabinet_of_six_rocks, cache_index=True)
+    r1 = reopened.get(Rock, name="r1")
+    assert r1 is not None
     r1.tags = ["meta"]
     reopened.commit()
 
