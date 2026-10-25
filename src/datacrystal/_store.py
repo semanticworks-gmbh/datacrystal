@@ -487,10 +487,10 @@ class Store:
     def committing(self, *, retries: int = 3) -> Iterator[_CommitAttempt]:
         """Run a block in a commit loop that retries on conflict, the same code on any topology.
 
-        Use ``for txn in store.committing(): with txn: ...``; a clean exit commits. A follower's
-        stale write re-runs the block on fresh state (``discard``, ``sync``) up to ``retries``
-        times, then raises ``ConflictError``. Never call :meth:`commit` inside;
-        ``WriteDeniedError`` is not retried (ADR-008).
+        Use ``for txn in store.committing(): with txn: ...``, the only supported form: a clean exit
+        commits, a stale follower write re-runs the block on fresh state up to ``retries`` times,
+        then ``ConflictError`` surfaces when the loop resumes, never from ``with txn:``.
+        Never call :meth:`commit` inside; ``WriteDeniedError`` is not retried (ADR-008).
         Details: docs/reference.md, "Behaviour notes".
         """
         self._enter()

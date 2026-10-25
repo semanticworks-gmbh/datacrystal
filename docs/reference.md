@@ -76,6 +76,8 @@ It works on any store (an uncommitted local graph is dropped); a live reference 
 **`store.committing(*, retries=3)`** is the recommended read-modify-write loop — *the same code on a single-node store and a follower*.
 Drive it with `for txn in store.committing(): with txn: ...`: the block reads and mutates and is committed when it exits cleanly.
 On a follower a stale write raises `ConflictError`; instead of surfacing it, `committing()` re-runs your block against fresh state (a `discard()` + `sync()` happen first), up to `retries` times, then re-raises if the conflict persists.
+The `for txn in store.committing(...)` loop is the **only supported form**: the final `ConflictError` is raised when the loop asks for the next attempt, never from `with txn:`.
+An attempt you enter by hand and never resume sees no error, and its write does not land.
 On a single-node store a commit can never conflict, so the block runs exactly once.
 Keep the whole read-modify-write inside the block (the re-read runs each attempt, so a retry re-applies your *intent* to the winning value — never last-writer-wins) and do not call `commit()` yourself; `retries=0` is a single strict attempt.
 
