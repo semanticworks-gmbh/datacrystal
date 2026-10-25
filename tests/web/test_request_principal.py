@@ -29,8 +29,7 @@ from fastapi import Depends, FastAPI
 
 import datacrystal as dc
 from datacrystal.deltalog import DeltaLog
-from datacrystal.web import federation_router, get_principal, submit_write
-from datacrystal.web._app import _OwnerWriter
+from datacrystal.web import Writer, federation_router, get_principal, submit_write
 from tests.conftest import Mineral
 
 _MINERAL = f"{Mineral.__module__}:{Mineral.__qualname__}"
@@ -101,7 +100,7 @@ def _write_app(store: dc.Store) -> FastAPI:
     app = FastAPI()
 
     async def create_mineral(
-        qid: str, write: Annotated[_OwnerWriter, Depends(submit_write)]
+        qid: str, write: Annotated[Writer, Depends(submit_write)]
     ) -> dict[str, str]:
         def fn(s: dc.Store) -> dict[str, str]:
             s.upsert(Mineral(qid=qid, name=qid))
@@ -111,7 +110,7 @@ def _write_app(store: dc.Store) -> FastAPI:
         return await write(fn)
 
     async def edit_entry(
-        label: str, note: str, write: Annotated[_OwnerWriter, Depends(submit_write)]
+        label: str, note: str, write: Annotated[Writer, Depends(submit_write)]
     ) -> dict[str, str]:
         def fn(s: dc.Store) -> dict[str, str]:
             rec = s.get(CuratedEntry, label=label)

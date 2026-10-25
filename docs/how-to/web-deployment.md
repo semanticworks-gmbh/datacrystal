@@ -21,7 +21,7 @@ from strawberry.types import Info
 import datacrystal as dc
 from datacrystal.web import (
     StrawberryReflector, create_app, entity_model, from_pydantic, graphql_context_getter,
-    read_snapshot, submit_write, to_pydantic,
+    Writer, read_snapshot, submit_write, to_pydantic,
 )
 
 @dc.entity
@@ -54,7 +54,7 @@ def read_one(qid: str, snap: Annotated[dc.Snapshot, Depends(read_snapshot)]):
     return to_pydantic(hits[0], face="public") if hits else Response(status_code=404)
 
 @app.post("/minerals")
-async def create(body: MineralCreate, write: Annotated[Any, Depends(submit_write)]):
+async def create(body: MineralCreate, write: Annotated[Writer, Depends(submit_write)]):
     def on_owner(store: dc.Store) -> int:
         store.upsert(from_pydantic(body, Mineral))
         return store.commit()

@@ -14,7 +14,7 @@ import threading
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import AbstractAsyncContextManager
 from pathlib import Path
-from typing import Annotated, Any, TypedDict, Unpack
+from typing import Annotated, Any, Protocol, TypedDict, Unpack
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 
@@ -27,6 +27,7 @@ from datacrystal.web._strawberry import snapshot_context
 __all__ = [
     "SNAPSHOT_CONTEXT_KEY",
     "StoreOpenOptions",
+    "Writer",
     "create_app",
     "get_principal",
     "get_store",
@@ -242,13 +243,22 @@ def read_snapshot(
         pool.release(pooled)
 
 
+class Writer(Protocol):
+    """The awaitable :func:`submit_write` returns.
+
+    ``await write(fn)`` runs ``fn(store)`` as the request principal and resolves once committed.
+    """
+
+    async def __call__[T](self, fn: Callable[[Store], T], /) -> T: ...
+
+
 async def submit_write(
     request: Request,
     principal: Annotated[Principal | None, Depends(get_principal)],
-) -> _OwnerWriter:
+) -> Writer:
     """Return a callable that ships a mutation to the owner and resolves once it has committed.
 
-    Use it as ``write: Annotated[_OwnerWriter, Depends(submit_write)]``.
+    Use it as ``write: Annotated[Writer, Depends(submit_write)]``.
     Then ``await write(fn)`` with ``fn(store) -> result``.
     The closure runs on the owner thread via ``store.submit()`` (ADR-001), so the route never
     mutates directly.
@@ -258,7 +268,10 @@ async def submit_write(
 
 
 class _OwnerWriter:
-    """The awaitable write callable :func:`submit_write` returns (#92)."""
+    """The :class:`Writer` :func:`submit_write` returns (#92).
+
+    Private, so the public name does not freeze the single-writer model (ADR-001).
+    """
 
     __slots__ = ("_principal", "_store")
 

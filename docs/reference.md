@@ -667,7 +667,7 @@ The frameworks live only inside `datacrystal.web` — a bare `import datacrystal
 
 ```python
 from datacrystal.web import (
-    create_app, store_lifespan, StoreOpenOptions, read_snapshot, submit_write, get_store,
+    create_app, store_lifespan, StoreOpenOptions, read_snapshot, submit_write, Writer, get_store,
     graphql_context_getter,
     entity_model, to_pydantic, from_pydantic,        # REST: @entity ↔ Pydantic DTO
     reflect_strawberry_type, StrawberryReflector,    # GraphQL: @entity → Strawberry type
@@ -686,7 +686,8 @@ from datacrystal.web import (
   REST and GraphQL reads both ride this snapshot pool, so they inherit its read fence (W4-4): a protected row the principal cannot read is filtered from discovery and a denied reference projects to **wire-null** (no 500, no existence leak), and no `_dc_*` column ever reaches the wire (reflection drops them).
   Distinct request principals at one watermark share the *same* pooled core — the index is built once per commit, never per principal or per request (R15).
   See the [Snapshots](#snapshots) permissions note.
-- **`submit_write`** — a dependency yielding an awaitable that ships a closure to the owner thread (via `store.submit()`); the mutation **and** commit run on the owner and `await write(fn)` resolves only once durable.
+- **`submit_write`** — a dependency yielding a `Writer`, an awaitable that ships a closure to the owner thread (via `store.submit()`); the mutation **and** commit run on the owner and `await write(fn)` resolves only once durable.
+  **`Writer`** is the `typing.Protocol` of that awaitable, `async def __call__[T](self, fn: Callable[[Store], T], /) -> T`: annotate a route with `write: Annotated[Writer, Depends(submit_write)]`.
   Return plain data from the closure — a live entity raises `EntityEscapeError`.
   Each shipped closure runs under the **request principal** (below) — the `acting_as` wrap sits inside the closure body, so identities never leak between queued writes.
 - **`get_principal`** — the per-request identity seam (ADR-008).
