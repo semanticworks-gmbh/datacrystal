@@ -1,15 +1,15 @@
 """datacrystal[web] GraphQL — the per-request DataLoader, the N+1 killer (#100 / #49 S6b).
 
 The relation resolver (#100) turns a reference field's raw
-:class:`~datacrystal._snapshot.Ref` (the resolver-less #99 behaviour) into the
-referenced :class:`~datacrystal._snapshot.EntityView` by routing the OID through
+:class:`~datacrystal.Ref` (the resolver-less #99 behaviour) into the
+referenced :class:`~datacrystal.EntityView` by routing the OID through
 a **per-request** :class:`~datacrystal.web.SnapshotLoader`. These tests pin the
 four contract properties from the story:
 
 * a 2-level nested query over the mineral cabinet resolves correct data off the
   snapshot (the headline integration test);
 * a tick's N sibling references batch into **one**
-  :meth:`~datacrystal._snapshot.Snapshot.get_many` (tick-coalescing, the N+1
+  :meth:`~datacrystal.Snapshot.get_many` (tick-coalescing, the N+1
   killer) — asserted by spying on the snapshot;
 * request scoping is **built, not defaulted**: the loader is ``cache=False`` and
   fresh per request — tested *against* the vendored ``cache=True`` lifetime cache
@@ -39,7 +39,7 @@ from strawberry.dataloader import DataLoader
 from strawberry.tools import create_type
 
 import datacrystal as dc
-from datacrystal._snapshot import EntityView, Snapshot
+from datacrystal import EntityView, Snapshot
 from datacrystal.web import (
     LOADER_CONTEXT_KEY,
     SnapshotLoader,

@@ -11,13 +11,14 @@ import hashlib
 import json
 import struct
 from collections.abc import Iterable
+from typing import Any
 
 import datacrystal as dc
 from datacrystal.contract.applier import decode_delta, encode_delta
 
 _FRAME = struct.Struct(">Q")
 
-Delta = dict[str, object]
+Delta = dict[str, Any]
 
 
 def encode_frames(deltas: Iterable[Delta]) -> bytes:
@@ -44,7 +45,7 @@ def occ_base_of(deltas: Iterable[Delta], oid: int) -> str | None:
     """
     base = None
     for delta in deltas:
-        for op in delta["ops"]:  # pyrefly: ignore[bad-index]
+        for op in delta["ops"]:
             if op["op"] == "upsert" and op["oid"] == oid:
                 base = hashlib.sha256(op["payload"]).hexdigest()
     return base
@@ -81,15 +82,15 @@ class FakeCoordinator:
         self.deltas = list(deltas)
         self.submit_status = submit_status
         self.submit_body = submit_body if submit_body is not None else {"applied_tid": 1, "keys": {}}
-        self.posts: list[dict[str, object]] = []
+        self.posts: list[dict[str, Any]] = []
 
     def get(self, url: str, /, *, params: dict[str, int]) -> FakeResponse:
         """Serve the frames of every delta after ``params["after"]``."""
         after = params["after"]
-        served = [delta for delta in self.deltas if int(delta["tid"]) > after]  # pyrefly: ignore[bad-argument-type]
+        served = [delta for delta in self.deltas if int(delta["tid"]) > after]
         return FakeResponse(200, encode_frames(served))
 
-    def post(self, url: str, /, *, json: dict[str, object]) -> FakeResponse:
+    def post(self, url: str, /, *, json: dict[str, Any]) -> FakeResponse:
         """Record the submitted body and answer the configured reply."""
         self.posts.append(json)
         return FakeResponse(self.submit_status, _dump(self.submit_body))
@@ -110,7 +111,7 @@ class FrameDroppingClient:
             blob = encode_frames(decode_frames(blob)[1:])
         return FakeResponse(200, blob)
 
-    def post(self, url: str, /, *, json: dict[str, object]) -> FakeResponse:
+    def post(self, url: str, /, *, json: dict[str, Any]) -> FakeResponse:
         """Forward the ``POST`` untouched."""
         reply = self.inner.post(url, json=json)
         return FakeResponse(reply.status_code, reply.content)

@@ -30,7 +30,7 @@ pytest.importorskip("pydantic", reason="datacrystal[web] extra not installed")
 import pydantic
 
 import datacrystal as dc
-from datacrystal._snapshot import EntityView
+from datacrystal import EntityView
 from datacrystal.web import entity_model, to_pydantic
 
 

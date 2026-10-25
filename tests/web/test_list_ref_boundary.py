@@ -39,7 +39,7 @@ import strawberry
 from strawberry.tools import create_type
 
 import datacrystal as dc
-from datacrystal._snapshot import EntityView, Snapshot
+from datacrystal import EntityView, Snapshot
 from datacrystal.web import (
     StrawberryReflector,
     entity_model,

@@ -78,7 +78,7 @@ def test_commit_contributes_new_entity_with_no_base(follower_path: Path | None) 
 
         assert tid == 7
         assert len(coordinator.posts) == 1
-        op = coordinator.posts[0]["ops"][0]  # pyrefly: ignore[bad-index]
+        op = coordinator.posts[0]["ops"][0]
         assert op["fields"]["qid"] == "QN"
         assert op["base"] is None
         assert follower.commit() is None
@@ -107,7 +107,7 @@ def test_commit_contributes_dirty_entity_with_the_read_base(
 
         tid = follower.commit()
 
-        op = served.posts[0]["ops"][0]  # pyrefly: ignore[bad-index]
+        op = served.posts[0]["ops"][0]
         assert tid == 9
         assert op["fields"]["qid"] == "QD"
         assert op["base"] == base_expected
@@ -141,7 +141,7 @@ def test_contribute_posts_one_serialized_op_to_submit(follower_path: Path | None
         follower.commit()
 
         assert len(coordinator.posts) == 1
-        op = coordinator.posts[0]["ops"][0]  # pyrefly: ignore[bad-index]
+        op = coordinator.posts[0]["ops"][0]
         assert op["type"].endswith(":Mineral")
         assert op["key"] == "qid"
         assert op["fields"]["qid"] == "QS"

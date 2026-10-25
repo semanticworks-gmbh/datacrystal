@@ -5,9 +5,9 @@ The reflection rules come from the engine's ``TypeInfo`` (shared with the REST
 side via ``web._reflect``), so these tests assert two things at once: the
 generated GraphQL type carries exactly the entity's fields with the right core
 types, *and* a scalar resolves through Strawberry's default ``getattr`` resolver
-straight off a real :class:`~datacrystal._snapshot.EntityView` — no Pydantic, no
+straight off a real :class:`~datacrystal.EntityView` — no Pydantic, no
 copy, no live entity crossing the edge. Entity-reference fields are typed object
-edges whose value is still a raw :class:`~datacrystal._snapshot.Ref` here (the
+edges whose value is still a raw :class:`~datacrystal.Ref` here (the
 relation resolver is #100).
 """
 
@@ -25,7 +25,7 @@ import strawberry
 from strawberry.tools import create_type
 
 import datacrystal as dc
-from datacrystal._snapshot import EntityView, Ref
+from datacrystal import EntityView, Ref
 from datacrystal.web import StrawberryReflector, reflect, reflect_strawberry_type
 
 # --- a self-contained slice of the mineral cabinet (reference + frozen) -------
