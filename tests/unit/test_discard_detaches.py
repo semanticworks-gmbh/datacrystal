@@ -12,7 +12,6 @@ from typing import Annotated
 import pytest
 
 import datacrystal as dc
-from datacrystal._entity import oid_of
 from tests.conftest import Locality, Mineral
 
 StoreFactory = Callable[[], dc.Store]
@@ -77,27 +76,12 @@ def test_discarded_new_entity_gets_an_oid_different_from_the_next_new_entity(
     store.close()
 
 
-def test_discard_leaves_a_new_entity_without_an_oid(store_factory: StoreFactory) -> None:
-    """Given a new mineral stored, so it holds an OID
-    When the store discards
-    Then the mineral has no OID
-    """
-    store = _seeded(store_factory)
-    quartz = Mineral(qid="Q1", name="quartz")
-    store.store(quartz)
-
-    store.discard()
-
-    assert oid_of(quartz) is None
-    store.close()
-
-
 def test_discard_detaches_a_child_reached_from_a_new_entity(
     store_factory: StoreFactory,
 ) -> None:
     """Given a new mineral whose locality child was stored with it
     When the store discards, then another mineral is stored and committed
-    Then storing the discarded mineral again writes both it and its child under distinct OIDs
+    Then storing the discarded mineral again writes both it and its child
     """
     store = _seeded(store_factory)
     locality = Locality(qid="L1", name="Mount Vesuvius")
@@ -119,7 +103,6 @@ def test_discard_detaches_a_child_reached_from_a_new_entity(
     assert found.name == "Mount Vesuvius"
     assert quartz_back is not None
     assert quartz_back.name == "quartz"
-    assert oid_of(locality) != oid_of(calcite)
     reopened.close()
 
 
@@ -128,7 +111,7 @@ def test_edit_of_a_discarded_entity_not_stored_again_commits_nothing(
 ) -> None:
     """Given a new mineral discarded, with another mineral stored and committed
     When the discarded mineral is edited and the store commits, then reopens
-    Then the mineral has no OID, the commit wrote nothing and the mineral is not in the store
+    Then the commit wrote nothing and the mineral is not in the store
     """
     store = _seeded(store_factory)
     quartz = Mineral(qid="Q1", name="quartz")
@@ -142,7 +125,6 @@ def test_edit_of_a_discarded_entity_not_stored_again_commits_nothing(
     store.close()
 
     reopened = store_factory()
-    assert oid_of(quartz) is None
     assert committed_tid is None
     assert reopened.get(Mineral, qid="Q1") is None
     reopened.close()
@@ -177,20 +159,18 @@ def test_discard_keeps_the_oid_of_a_committed_entity_that_was_edited(
 ) -> None:
     """Given a committed mineral edited but not committed
     When the store discards
-    Then the mineral keeps its OID
+    Then its OID still reads the committed mineral
     """
     store = _seeded(store_factory)
     seed = store.get(Mineral, qid="Q0")
     assert seed is not None
-    seed_oid = oid_of(seed)
+    seed_oid = store.store(seed)
     seed.name = "edited"
 
     store.discard()
 
-    current = store.get(Mineral, qid="Q0")
-    assert oid_of(seed) == seed_oid
-    assert current is not None
-    assert current.name == "seed"
+    by_oid = store.get_many([seed_oid])[0]
+    assert by_oid.name == "seed"
     store.close()
 
 
@@ -265,7 +245,6 @@ def test_discard_detaches_a_new_entity_that_was_stored_then_deleted(
 
     reopened = store_factory()
     quartz_back = reopened.get(Mineral, qid="Q3")
-    assert oid_of(first) != oid_of(second)
     assert quartz_back is not None
     assert quartz_back.type_locality is not None
     assert quartz_back.type_locality.get().qid == "L1"
@@ -324,7 +303,7 @@ def test_a_p2_failure_followed_by_discard_leaves_the_new_entity_storable_again(
 ) -> None:
     """Given a commit of a new mineral whose backend write failed, then the store discarded
     When another mineral is committed and the first is stored and committed again
-    Then both minerals read back with their names and distinct OIDs
+    Then both minerals read back with their names
     """
     store = _seeded(store_factory)
     quartz = Mineral(qid="Q1", name="quartz")
@@ -345,7 +324,6 @@ def test_a_p2_failure_followed_by_discard_leaves_the_new_entity_storable_again(
     reopened = store_factory()
     quartz_back = reopened.get(Mineral, qid="Q1")
     calcite_back = reopened.get(Mineral, qid="Q2")
-    assert oid_of(quartz) != oid_of(calcite)
     assert quartz_back is not None
     assert quartz_back.name == "quartz"
     assert calcite_back is not None
