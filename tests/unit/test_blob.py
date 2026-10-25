@@ -734,18 +734,35 @@ def test_the_old_inline_record_stays_raw_bytes_beside_a_new_blob_record(
 # -- debug fingerprint net (must not false-positive on blob fields) ----------
 
 
-def test_debug_mode_does_not_flag_unchanged_blob_entity(recwarn: pytest.WarningsRecorder) -> None:
+@pytest.fixture(params=["memory", "sqlite"])
+def debug_store_factory(request: pytest.FixtureRequest, tmp_path: Path) -> Callable[[], dc.Store]:
+    """Return a zero-arg callable that opens the *same* store each call with debug on."""
+    if request.param == "memory":
+        backend = MemoryBackend()
+
+        def open_store() -> dc.Store:
+            return dc.Store._from_backend(backend, debug=True)
+    else:
+
+        def open_store() -> dc.Store:
+            return dc.Store.open(tmp_path / "store", lock_ttl=0.5, debug=True)
+
+    return open_store
+
+
+def test_debug_mode_does_not_flag_unchanged_blob_entity(
+    debug_store_factory: StoreFactory, recwarn: pytest.WarningsRecorder
+) -> None:
     """Given a debug store holding a clean scan whose blob was rehydrated as a handle
     When another scan is stored and committed, so the sweep walks the clean one
     Then no untracked-mutation warning is raised
     """
-    backend = MemoryBackend()
-    seed = dc.Store._from_backend(backend, debug=True)
+    seed = debug_store_factory()
     seed.root = [Scan(qid="Q1", label="azurite", image=IMG)]
     seed.commit()
     seed.commit()
     seed.close()
-    reopened = dc.Store._from_backend(backend, debug=True)
+    reopened = debug_store_factory()
     _handle(reopened.root[0].image).bytes()
     reopened.store(Scan(qid="Q2", label="other", image=b"small"))
 
