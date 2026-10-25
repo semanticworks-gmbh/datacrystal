@@ -14,7 +14,6 @@ from collections.abc import Callable
 import pytest
 
 import datacrystal as dc
-from datacrystal._errors import FrozenEntityError
 from tests.conftest import LogEntry, Mineral
 
 StoreFactory = Callable[[], dc.Store]
@@ -438,7 +437,7 @@ def test_frozen_entity_rejects_edits_after_commit(store: dc.Store) -> None:
     store.root = {"log": [LogEntry(note="acquired", kind="acquisition")]}
     store.commit()
 
-    with pytest.raises(FrozenEntityError):
+    with pytest.raises(dc.FrozenEntityError):
         store.root["log"][0].note = "edited"  # pyrefly: ignore[read-only]
 
 
@@ -450,7 +449,7 @@ def test_frozen_container_rejects_mutation_in_the_same_process(store: dc.Store) 
     store.root = FrozenWithList(items=["a"])
     store.commit()
 
-    with pytest.raises(FrozenEntityError):
+    with pytest.raises(dc.FrozenEntityError):
         store.root.items.append("b")
 
 
@@ -467,7 +466,7 @@ def test_frozen_container_rejects_mutation_on_a_hydrated_copy(
     store.close()
     reopened = store_factory()
 
-    with pytest.raises(FrozenEntityError):
+    with pytest.raises(dc.FrozenEntityError):
         reopened.root.items.append("b")
 
     reopened.close()
@@ -485,7 +484,7 @@ def test_rejected_append_leaves_the_hydrated_frozen_list_unchanged(
     store.commit()
     store.close()
     reopened = store_factory()
-    with pytest.raises(FrozenEntityError):
+    with pytest.raises(dc.FrozenEntityError):
         reopened.root.items.append("b")
 
     items = reopened.root.items

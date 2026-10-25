@@ -16,7 +16,6 @@ import pytest
 
 import datacrystal as dc
 from datacrystal._entity import TYPES_BY_NAME
-from datacrystal._errors import WriteDeniedError
 
 StoreFactory = Callable[[], dc.Store]
 
@@ -212,7 +211,7 @@ class TestAnonymousRefusal:
         When it stores a protected gem
         Then store raises WriteDeniedError naming anonymous
         """
-        with pytest.raises(WriteDeniedError, match="anonymous"):
+        with pytest.raises(dc.WriteDeniedError, match="anonymous"):
             store.store(Gem(name="orphan"))
 
     def test_refused_store_buffers_nothing(self, store: dc.Store) -> None:
@@ -220,7 +219,7 @@ class TestAnonymousRefusal:
         When the session commits
         Then there is nothing to commit
         """
-        with pytest.raises(WriteDeniedError):
+        with pytest.raises(dc.WriteDeniedError):
             store.store(Gem(name="orphan"))
         committed = store.commit()
         assert committed is None
@@ -231,7 +230,7 @@ class TestAnonymousRefusal:
         Then the commit raises WriteDeniedError naming anonymous
         """
         _commit_shelf_then_anonymous_smuggle(store)
-        with pytest.raises(WriteDeniedError, match="anonymous"):
+        with pytest.raises(dc.WriteDeniedError, match="anonymous"):
             store.commit()
 
     def test_retry_under_the_owner_stamps_the_smuggled_gem(self, store: dc.Store) -> None:
@@ -240,7 +239,7 @@ class TestAnonymousRefusal:
         Then the smuggled gem is stamped with Anna as owner
         """
         _commit_shelf_then_anonymous_smuggle(store)
-        with pytest.raises(WriteDeniedError):
+        with pytest.raises(dc.WriteDeniedError):
             store.commit()
         with store.acting_as(ANNA):
             store.commit()
@@ -253,7 +252,7 @@ class TestAnonymousRefusal:
         Then the TID is the one right after the last commit (invariant 5)
         """
         tid_before = _commit_shelf_then_anonymous_smuggle(store)
-        with pytest.raises(WriteDeniedError):
+        with pytest.raises(dc.WriteDeniedError):
             store.commit()
         with store.acting_as(ANNA):
             tid_after = store.commit()

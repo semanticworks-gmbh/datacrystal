@@ -15,7 +15,6 @@ from typing import Annotated
 import pytest
 
 import datacrystal as dc
-from datacrystal._errors import DeletedEntityError, FrozenEntityError, NotAnEntityError
 
 StoreFactory = Callable[[], dc.Store]
 
@@ -244,7 +243,7 @@ class TestRaisingPathsStageNothing:
         Then share raises FrozenEntityError, labels being fixed at registration
         """
         note = _commit_sealed_note(store)
-        with pytest.raises(FrozenEntityError, match="fixed at registration"):
+        with pytest.raises(dc.FrozenEntityError, match="fixed at registration"):
             dc.share(note, TEAM, read=dc.VIEWER, write=dc.AGENT)
 
     def test_sharing_a_frozen_record_stages_nothing(self, store: dc.Store) -> None:
@@ -255,7 +254,7 @@ class TestRaisingPathsStageNothing:
         """
         note = _commit_sealed_note(store)
         before = _permissions(note)
-        with pytest.raises(FrozenEntityError):
+        with pytest.raises(dc.FrozenEntityError):
             dc.share(note, TEAM, read=dc.VIEWER, write=dc.AGENT)
         assert _permissions(note) == before
         assert store.commit() is None
@@ -266,7 +265,7 @@ class TestRaisingPathsStageNothing:
         Then unshare raises FrozenEntityError, labels being fixed at registration
         """
         note = _commit_sealed_note(store)
-        with pytest.raises(FrozenEntityError, match="fixed at registration"):
+        with pytest.raises(dc.FrozenEntityError, match="fixed at registration"):
             dc.unshare(note, dc.WORLD)
 
     def test_unsharing_a_frozen_record_stages_nothing(self, store: dc.Store) -> None:
@@ -277,7 +276,7 @@ class TestRaisingPathsStageNothing:
         """
         note = _commit_sealed_note(store)
         before = _permissions(note)
-        with pytest.raises(FrozenEntityError):
+        with pytest.raises(dc.FrozenEntityError):
             dc.unshare(note, dc.WORLD)
         assert _permissions(note) == before
         assert store.commit() is None
@@ -288,7 +287,7 @@ class TestRaisingPathsStageNothing:
         Then protect raises FrozenEntityError, labels being fixed at registration
         """
         note = _commit_sealed_note(store)
-        with pytest.raises(FrozenEntityError, match="fixed at registration"):
+        with pytest.raises(dc.FrozenEntityError, match="fixed at registration"):
             dc.protect(note, write=dc.ADMIN)
 
     def test_protecting_a_frozen_record_stages_nothing(self, store: dc.Store) -> None:
@@ -299,7 +298,7 @@ class TestRaisingPathsStageNothing:
         """
         note = _commit_sealed_note(store)
         before = _permissions(note)
-        with pytest.raises(FrozenEntityError):
+        with pytest.raises(dc.FrozenEntityError):
             dc.protect(note, write=dc.ADMIN)
         assert _permissions(note) == before
         assert store.commit() is None
@@ -340,7 +339,7 @@ class TestRaisingPathsStageNothing:
         When its write floor is protected
         Then protect raises NotAnEntityError
         """
-        with pytest.raises(NotAnEntityError):
+        with pytest.raises(dc.NotAnEntityError):
             dc.protect(object(), write=dc.ADMIN)
 
     def test_protecting_a_deleted_record_raises(self, store: dc.Store) -> None:
@@ -353,7 +352,7 @@ class TestRaisingPathsStageNothing:
             store.store(contact)
             store.commit()
             store.delete(contact)
-        with pytest.raises(DeletedEntityError):
+        with pytest.raises(dc.DeletedEntityError):
             dc.protect(contact, write=dc.ADMIN)
 
     def test_sharing_with_the_no_standing_level_raises_and_stages_nothing(self) -> None:

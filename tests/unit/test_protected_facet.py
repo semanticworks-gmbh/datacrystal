@@ -20,8 +20,6 @@ from typing import Annotated
 import pytest
 
 import datacrystal as dc
-from datacrystal._containers import PersistentList
-from datacrystal._errors import FrozenEntityError
 
 StoreFactory = Callable[[], dc.Store]
 
@@ -357,7 +355,7 @@ def test_injected_groups_column_is_a_persistent_list(store: dc.Store) -> None:
         store.store(specimen)
         store.commit()
     groups = specimen._dc_groups  # pyrefly: ignore[missing-attribute]
-    assert isinstance(groups, PersistentList)
+    assert isinstance(groups, dc.PersistentList)
 
 
 def test_container_backref_points_at_the_owning_entity(store: dc.Store) -> None:
@@ -476,7 +474,7 @@ def test_frozen_protected_event_refuses_a_field_assignment(
     _commit_sealed_event(store_factory)
     with store_factory() as reopened, reopened.acting_as(CURATOR_ANNA):
         back = reopened.query(SealedEvent)[0]
-        with pytest.raises(FrozenEntityError):
+        with pytest.raises(dc.FrozenEntityError):
             back.note = "edited"
 
 
@@ -490,7 +488,7 @@ def test_frozen_protected_event_refuses_an_append_to_its_tags(
     _commit_sealed_event(store_factory)
     with store_factory() as reopened, reopened.acting_as(CURATOR_ANNA):
         back = reopened.query(SealedEvent)[0]
-        with pytest.raises(FrozenEntityError):
+        with pytest.raises(dc.FrozenEntityError):
             back.tags.append("x")
 
 
@@ -504,5 +502,5 @@ def test_frozen_protected_event_refuses_an_append_to_its_groups(
     _commit_sealed_event(store_factory)
     with store_factory() as reopened, reopened.acting_as(CURATOR_ANNA):
         back = reopened.query(SealedEvent)[0]
-        with pytest.raises(FrozenEntityError):
+        with pytest.raises(dc.FrozenEntityError):
             back._dc_groups.append(3)
