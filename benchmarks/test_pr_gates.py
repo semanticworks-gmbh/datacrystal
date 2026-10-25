@@ -204,7 +204,7 @@ def _timed_deltas(store: dc.Store, prefix: str) -> list[float]:
 
 def _oids_of_first_specimens(store: dc.Store) -> list[int]:
     keys = store.pluck(_gen.Specimen, "specimen_no")[:1_000]
-    return [s.__dc_oid__ for s in store.get_many(_gen.Specimen, specimen_no=keys)]
+    return [store.store(s) for s in store.get_many(_gen.Specimen, specimen_no=keys)]
 
 
 def _to_pydantic_ratio(store: dc.Store) -> float:
