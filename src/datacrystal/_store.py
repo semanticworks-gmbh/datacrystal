@@ -3222,12 +3222,12 @@ def _note_streamed_swaps(
     sharing ONE BlobSource each pick up their OWN blob OID (id(value) keying would alias both to
     the last-allocated one).
     """
-    streamed_positions = [
+    swap_positions = [
         i for i in blob_positions if isinstance(values[i], (BlobSource, bytes, bytearray))
     ]
-    if streamed_positions:
+    if swap_positions:
         decoded = decode_payload(payload)
-        for i in streamed_positions:
+        for i in swap_positions:
             tok = cast("BlobToken", decoded[i])  # the field's BLOB_EXT descriptor
             blob_swaps.append(
                 (obj, ti.field_names[i], tok.blob_oid, tok.size, tok.hash)
