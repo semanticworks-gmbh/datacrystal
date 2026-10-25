@@ -15,7 +15,6 @@ from typing import Any
 import pytest
 
 import datacrystal as dc
-from datacrystal._entity import oid_of
 from datacrystal._storage.memory import MemoryBackend
 from datacrystal._storage.protocol import CommitBatch
 from datacrystal.contract import DeltaGapError, ReferenceApplier
@@ -214,7 +213,7 @@ def test_update_delta_carries_one_op_for_the_renamed_mineral(
     update = consumer.deltas[1]
 
     assert len(update["ops"]) == 1
-    assert update["ops"][0]["oid"] == oid_of(quartz)
+    assert update["ops"][0]["oid"] == store.store(quartz)
     store.close()
 
 
@@ -231,8 +230,10 @@ def test_update_op_prior_is_exactly_the_first_commits_payload(
     (update_op,) = consumer.deltas[1]["ops"]
     created_ops = consumer.deltas[0]["ops"]
 
+    quartz_oid = store.store(quartz)
+
     assert update_op["prior"] == next(
-        op["payload"] for op in created_ops if op["oid"] == oid_of(quartz)
+        op["payload"] for op in created_ops if op["oid"] == quartz_oid
     )
     store.close()
 
@@ -352,7 +353,10 @@ def test_reference_applier_tracks_the_root_oid(
     azurite.mohs = 3.8
     store.commit()
 
-    assert applier.root_oid == store._root_oid
+    with store.snapshot() as snap:
+        [holder] = snap.incoming(snap.root[0])
+
+    assert applier.root_oid == holder.oid
     store.close()
 
 
@@ -399,12 +403,13 @@ def test_watched_commit_reads_exactly_the_changed_prior(
     """
     quartz = store.get(Mineral, qid="Q1")
     assert quartz is not None
+    quartz_oid = store.store(quartz)
     store.attach(_Collector(watermark=store.last_tid))
     quartz.name = "Bergkristall"
 
     store.commit()
 
-    assert backend_reads == [[oid_of(quartz)]]
+    assert backend_reads == [[quartz_oid]]
 
 
 @pytest.fixture
@@ -778,7 +783,8 @@ def test_types_rows_precede_their_ops(store_factory: StoreFactory) -> None:
 
     Given a ReferenceApplier attached to a store
     When a mineral with a lazy locality is committed
-    Then the applier knows the Mineral, Locality and root types
+    Then the applier knows the Mineral and Locality types
+    And it knows exactly the type names the store's lineage holds, root included
     """
     applier = ReferenceApplier()
     store = store_factory()
@@ -789,9 +795,7 @@ def test_types_rows_precede_their_ops(store_factory: StoreFactory) -> None:
 
     store.commit()
 
-    assert {
-        "tests.conftest:Mineral",
-        "tests.conftest:Locality",
-        "datacrystal._store:_Root",
-    } <= _type_names(applier)
+    assert {"tests.conftest:Mineral", "tests.conftest:Locality"} <= _type_names(applier)
+    with store.snapshot() as snap:
+        assert _type_names(applier) == {typename for _cid, typename, _fields in snap.types}
     store.close()

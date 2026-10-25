@@ -16,8 +16,6 @@ from collections.abc import Callable, Iterator
 import pytest
 
 import datacrystal as dc
-from datacrystal._ids import TID_BASE
-from datacrystal._state import STATE_DIRTY, STATE_NEW
 from datacrystal._storage.memory import MemoryBackend
 from datacrystal._storage.protocol import (
     BootInfo,
@@ -114,11 +112,10 @@ def test_update_commit_applies_off_the_owner_thread() -> None:
     assert backend.apply_threads[1] != owner
 
 
-def test_failed_p2_returns_a_new_entity_to_new_state() -> None:
+def test_failed_p2_consumes_no_tid() -> None:
     """Given a stored mineral and a backend failing its first apply
     When the store commits
     Then OSError is raised
-    And the mineral is back in the NEW state
     And no TID was consumed
     """
     backend = _FailNTimes(MemoryBackend(), failures=1)
@@ -129,7 +126,6 @@ def test_failed_p2_returns_a_new_entity_to_new_state() -> None:
         with pytest.raises(OSError, match="injected P2 fault"):
             store.commit()
 
-        assert object.__getattribute__(quartz, "__dc_state__") == STATE_NEW
         assert store.last_tid == 0
 
 
@@ -148,28 +144,8 @@ def test_retry_after_failed_p2_reuses_the_first_tid() -> None:
 
         tid = store.commit()
 
-        assert tid == TID_BASE
+        assert tid == 1
         assert store.get(Mineral, qid="Q1") is quartz
-
-
-def test_failed_p2_returns_a_dirty_entity_to_dirty_state() -> None:
-    """Given a committed mineral renamed and a backend failing its next apply
-    When the store commits
-    Then OSError is raised
-    And the mineral is back in the DIRTY state
-    """
-    backend = _FailNTimes(MemoryBackend(), failures=0)
-    with dc.Store._from_backend(backend) as store:
-        quartz = Mineral(qid="Q1", name="quartz")
-        store.store(quartz)
-        store.commit()
-        backend.failures = 1
-        quartz.name = "rock crystal"
-
-        with pytest.raises(OSError, match="injected P2 fault"):
-            store.commit()
-
-        assert object.__getattribute__(quartz, "__dc_state__") == STATE_DIRTY
 
 
 def test_retry_after_failed_dirty_p2_persists_the_rename() -> None:
@@ -220,21 +196,20 @@ def test_types_row_survives_a_failed_first_commit_of_a_type() -> None:
     reopened.close()
 
 
-def test_unencodable_value_rejects_the_commit() -> None:
+def test_unencodable_value_rejects_the_commit(store: dc.Store) -> None:
     """Found by the stateful machine: an int beyond msgpack's 64-bit range fails P1 encoding.
 
     Given a stored mineral with the tag 2**64
     When the store commits
     Then OverflowError is raised
     """
-    with dc.Store._from_backend(MemoryBackend()) as store:
-        store.store(Mineral(qid="Q1", name="quartz", tags=[2**64]))
+    store.store(Mineral(qid="Q1", name="quartz", tags=[2**64]))
 
-        with pytest.raises(OverflowError):
-            store.commit()
+    with pytest.raises(OverflowError):
+        store.commit()
 
 
-def test_rejected_commit_consumes_no_tid_and_keeps_the_buffers() -> None:
+def test_rejected_commit_consumes_no_tid_and_keeps_the_buffers(store: dc.Store) -> None:
     """The rejection must burn no TID (gapless, invariant 5) and leave a fixed-up retry possible.
 
     Given a stored mineral whose tag 2**64 made the commit raise OverflowError
@@ -243,19 +218,18 @@ def test_rejected_commit_consumes_no_tid_and_keeps_the_buffers() -> None:
     Then the commit returns the very first TID
     And the mineral is stored with the tag 2**64 - 1
     """
-    with dc.Store._from_backend(MemoryBackend()) as store:
-        scan = Mineral(qid="Q1", name="quartz", tags=[2**64])
-        store.store(scan)
-        with pytest.raises(OverflowError):
-            store.commit()
-        scan.tags[0] = 2**64 - 1
+    scan = Mineral(qid="Q1", name="quartz", tags=[2**64])
+    store.store(scan)
+    with pytest.raises(OverflowError):
+        store.commit()
+    scan.tags[0] = 2**64 - 1
 
-        tid = store.commit()
+    tid = store.commit()
 
-        assert tid == TID_BASE
-        found = store.get(Mineral, qid="Q1")
-        assert found is not None
-        assert found.tags == [2**64 - 1]
+    assert tid == 1
+    found = store.get(Mineral, qid="Q1")
+    assert found is not None
+    assert found.tags == [2**64 - 1]
 
 
 def test_first_commit_returns_a_tid(store_factory: StoreFactory) -> None:

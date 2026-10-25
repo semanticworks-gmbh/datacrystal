@@ -16,7 +16,6 @@ import pytest
 
 import datacrystal as dc
 from datacrystal._entity import type_info
-from datacrystal._errors import QueryError
 
 
 @dc.entity
@@ -340,7 +339,7 @@ def test_bad_direction_raises(items_store: dc.Store) -> None:
     When they are queried with the direction "sideways"
     Then QueryError names the allowed directions
     """
-    with pytest.raises(QueryError, match=r"asc.*desc|direction"):
+    with pytest.raises(dc.QueryError, match=r"asc.*desc|direction"):
         items_store.query(Item, order_by=(F.grade, "sideways"))
 
 
@@ -349,7 +348,7 @@ def test_unknown_order_field_raises(items_store: dc.Store) -> None:
     When they are queried ordered by the field "nonexistent"
     Then QueryError says there is no persisted field
     """
-    with pytest.raises(QueryError, match="no persisted field"):
+    with pytest.raises(dc.QueryError, match="no persisted field"):
         items_store.query(Item, order_by="nonexistent")
 
 
@@ -358,7 +357,7 @@ def test_multivalued_order_field_rejected(items_store: dc.Store) -> None:
     When they are queried ordered by the multi-valued field tags
     Then QueryError says it is multi-valued
     """
-    with pytest.raises(QueryError, match="multi-valued"):
+    with pytest.raises(dc.QueryError, match="multi-valued"):
         items_store.query(Item, order_by=F.tags)
 
 

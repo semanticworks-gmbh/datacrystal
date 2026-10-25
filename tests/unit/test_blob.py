@@ -28,8 +28,6 @@ import pytest
 
 import datacrystal as dc
 from datacrystal import UntrackedMutationWarning
-from datacrystal._entity import type_info
-from datacrystal._records import BlobToken
 from datacrystal._storage.memory import MemoryBackend
 from datacrystal._storage.protocol import StoredBlob
 from datacrystal._storage.sqlite import SqliteBackend
@@ -310,16 +308,16 @@ def test_pluck_returns_inert_descriptors_without_reading_blobs(
 ) -> None:
     """Given a store of two scans with image blobs
     When label and image are plucked
-    Then every image is a BlobToken descriptor
-    And each descriptor carries the image size
+    Then every image descriptor carries the image size
+    And every image descriptor carries the image hash
     And the blobs table was never read
     """
     store, backend = two_scans_on_a_spy_backend
 
     plucked = store.pluck(Scan, "label", "image")
 
-    assert all(isinstance(image, BlobToken) for _label, image in plucked)
     assert all(image.size == len(IMG) for _label, image in plucked)
+    assert all(image.hash == hashlib.sha256(IMG).digest() for _label, image in plucked)
     assert backend.load_blob_calls == 0
     store.close()
 
@@ -736,18 +734,35 @@ def test_the_old_inline_record_stays_raw_bytes_beside_a_new_blob_record(
 # -- debug fingerprint net (must not false-positive on blob fields) ----------
 
 
-def test_debug_mode_does_not_flag_unchanged_blob_entity(recwarn: pytest.WarningsRecorder) -> None:
+@pytest.fixture(params=["memory", "sqlite"])
+def debug_store_factory(request: pytest.FixtureRequest, tmp_path: Path) -> Callable[[], dc.Store]:
+    """Return a zero-arg callable that opens the *same* store each call with debug on."""
+    if request.param == "memory":
+        backend = MemoryBackend()
+
+        def open_store() -> dc.Store:
+            return dc.Store._from_backend(backend, debug=True)
+    else:
+
+        def open_store() -> dc.Store:
+            return dc.Store.open(tmp_path / "store", lock_ttl=0.5, debug=True)
+
+    return open_store
+
+
+def test_debug_mode_does_not_flag_unchanged_blob_entity(
+    debug_store_factory: StoreFactory, recwarn: pytest.WarningsRecorder
+) -> None:
     """Given a debug store holding a clean scan whose blob was rehydrated as a handle
     When another scan is stored and committed, so the sweep walks the clean one
     Then no untracked-mutation warning is raised
     """
-    backend = MemoryBackend()
-    seed = dc.Store._from_backend(backend, debug=True)
+    seed = debug_store_factory()
     seed.root = [Scan(qid="Q1", label="azurite", image=IMG)]
     seed.commit()
     seed.commit()
     seed.close()
-    reopened = dc.Store._from_backend(backend, debug=True)
+    reopened = debug_store_factory()
     _handle(reopened.root[0].image).bytes()
     reopened.store(Scan(qid="Q2", label="other", image=b"small"))
 
@@ -812,10 +827,10 @@ def test_blob_plus_renamed_from_raises() -> None:
             oops: Annotated[bytes, dc.Blob, dc.RenamedFrom("old")] = b""
 
 
-def test_optional_bytes_blob_is_allowed() -> None:
-    """Given an entity declaring an optional bytes field as dc.Blob
-    When the entity class is created
-    Then the field spec resolves and is a blob
+def test_optional_bytes_blob_is_allowed(store: dc.Store) -> None:
+    """Given an entity declaring an optional bytes field as dc.Blob, holding bytes
+    When the entity class is created, stored, committed and read back
+    Then the field is a blob handle of the stored size
     """
 
     @dc.entity
@@ -823,10 +838,13 @@ def test_optional_bytes_blob_is_allowed() -> None:
         qid: Annotated[str, dc.Unique]
         data: Annotated[bytes | None, dc.Blob] = None
 
-    spec = type_info(Ok).spec("data")
+    store.store(Ok(qid="Q1", data=b"abc"))
+    store.commit()
 
-    assert spec is not None
-    assert spec.blob
+    [found] = store.query(Ok)
+
+    assert isinstance(found.data, dc.BlobHandle)
+    assert found.data.size == 3
 
 
 # -- regression: re-committing a REOPENED blob entity (adversarial review) ----

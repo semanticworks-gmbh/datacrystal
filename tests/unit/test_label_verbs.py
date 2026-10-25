@@ -15,9 +15,6 @@ from typing import Annotated
 import pytest
 
 import datacrystal as dc
-from datacrystal._entity import state_of
-from datacrystal._errors import DeletedEntityError, FrozenEntityError, NotAnEntityError
-from datacrystal._state import STATE_CLEAN, STATE_DIRTY
 
 StoreFactory = Callable[[], dc.Store]
 
@@ -51,10 +48,6 @@ class OpenNote:
 
 def _permissions(record: object) -> dc.Permissions:
     return record.dc_permissions  # pyrefly: ignore[missing-attribute]
-
-
-def _labels(record: object) -> tuple[dc.Permissions, int]:
-    return (_permissions(record), state_of(record))
 
 
 def _commit_contact(store: dc.Store, name: str) -> Contact:
@@ -104,13 +97,15 @@ class TestShare:
             dc.share(contact, TEAM, read=dc.VIEWER)  # pyrefly: ignore[missing-argument]
 
     def test_share_marks_a_committed_record_dirty(self, store: dc.Store) -> None:
-        """Given a committed contact in state CLEAN
+        """Given a committed contact with nothing to commit
         When it is shared with the team
-        Then the contact is DIRTY, buffered via dirty-tracking
+        Then the next commit has the contact to write, buffered via dirty-tracking
         """
         contact = _commit_contact(store, "Meyer")
         dc.share(contact, TEAM, read=dc.VIEWER, write=dc.AGENT)
-        assert state_of(contact) == STATE_DIRTY
+        with store.acting_as(ANNA):
+            tid = store.commit()
+        assert tid is not None
 
     def test_shared_group_and_floors_roundtrip_through_reopen(
         self, store_factory: StoreFactory
@@ -181,20 +176,24 @@ class TestUnshare:
     def test_unshare_marks_the_contact_dirty(self, store: dc.Store) -> None:
         """Given a committed contact shared with the team
         When the team is unshared
-        Then the contact is DIRTY
+        Then the next commit has the contact to write
         """
         contact = _commit_contact_shared_with_the_team(store)
         dc.unshare(contact, TEAM)
-        assert state_of(contact) == STATE_DIRTY
+        with store.acting_as(ANNA):
+            tid = store.commit()
+        assert tid is not None
 
     def test_unsharing_an_absent_group_is_a_clean_noop(self, store: dc.Store) -> None:
-        """Given a committed contact in state CLEAN never shared with group 999
+        """Given a committed contact with nothing to commit, never shared with group 999
         When group 999 is unshared
-        Then the contact is still CLEAN, with no spurious buffered write
+        Then there is nothing to commit, with no spurious buffered write
         """
         contact = _commit_contact(store, "Meyer")
         dc.unshare(contact, 999)
-        assert state_of(contact) == STATE_CLEAN
+        with store.acting_as(ANNA):
+            tid = store.commit()
+        assert tid is None
 
 
 class TestProtect:
@@ -236,7 +235,7 @@ class TestProtect:
 
 
 class TestRaisingPathsStageNothing:
-    """A verb that raises leaves the labels and the state as they were."""
+    """A verb that raises leaves the labels as they were and stages nothing."""
 
     def test_sharing_a_frozen_record_raises(self, store: dc.Store) -> None:
         """Given a committed frozen note
@@ -244,19 +243,21 @@ class TestRaisingPathsStageNothing:
         Then share raises FrozenEntityError, labels being fixed at registration
         """
         note = _commit_sealed_note(store)
-        with pytest.raises(FrozenEntityError, match="fixed at registration"):
+        with pytest.raises(dc.FrozenEntityError, match="fixed at registration"):
             dc.share(note, TEAM, read=dc.VIEWER, write=dc.AGENT)
 
     def test_sharing_a_frozen_record_stages_nothing(self, store: dc.Store) -> None:
         """Given a committed frozen note
         When sharing it with the team raises
-        Then its labels and state are unchanged
+        Then its labels are unchanged
+        And nothing is left to commit
         """
         note = _commit_sealed_note(store)
-        before = _labels(note)
-        with pytest.raises(FrozenEntityError):
+        before = _permissions(note)
+        with pytest.raises(dc.FrozenEntityError):
             dc.share(note, TEAM, read=dc.VIEWER, write=dc.AGENT)
-        assert _labels(note) == before
+        assert _permissions(note) == before
+        assert store.commit() is None
 
     def test_unsharing_a_frozen_record_raises(self, store: dc.Store) -> None:
         """Given a committed frozen note
@@ -264,19 +265,21 @@ class TestRaisingPathsStageNothing:
         Then unshare raises FrozenEntityError, labels being fixed at registration
         """
         note = _commit_sealed_note(store)
-        with pytest.raises(FrozenEntityError, match="fixed at registration"):
+        with pytest.raises(dc.FrozenEntityError, match="fixed at registration"):
             dc.unshare(note, dc.WORLD)
 
     def test_unsharing_a_frozen_record_stages_nothing(self, store: dc.Store) -> None:
         """Given a committed frozen note
         When unsharing the world group from it raises
-        Then its labels and state are unchanged
+        Then its labels are unchanged
+        And nothing is left to commit
         """
         note = _commit_sealed_note(store)
-        before = _labels(note)
-        with pytest.raises(FrozenEntityError):
+        before = _permissions(note)
+        with pytest.raises(dc.FrozenEntityError):
             dc.unshare(note, dc.WORLD)
-        assert _labels(note) == before
+        assert _permissions(note) == before
+        assert store.commit() is None
 
     def test_protecting_a_frozen_record_raises(self, store: dc.Store) -> None:
         """Given a committed frozen note
@@ -284,19 +287,21 @@ class TestRaisingPathsStageNothing:
         Then protect raises FrozenEntityError, labels being fixed at registration
         """
         note = _commit_sealed_note(store)
-        with pytest.raises(FrozenEntityError, match="fixed at registration"):
+        with pytest.raises(dc.FrozenEntityError, match="fixed at registration"):
             dc.protect(note, write=dc.ADMIN)
 
     def test_protecting_a_frozen_record_stages_nothing(self, store: dc.Store) -> None:
         """Given a committed frozen note
         When protecting its write floor at admin raises
-        Then its labels and state are unchanged
+        Then its labels are unchanged
+        And nothing is left to commit
         """
         note = _commit_sealed_note(store)
-        before = _labels(note)
-        with pytest.raises(FrozenEntityError):
+        before = _permissions(note)
+        with pytest.raises(dc.FrozenEntityError):
             dc.protect(note, write=dc.ADMIN)
-        assert _labels(note) == before
+        assert _permissions(note) == before
+        assert store.commit() is None
 
     def test_sharing_a_snapshot_view_raises_read_only(self, store: dc.Store) -> None:
         """Given a snapshot view of a committed contact, bound to its owner
@@ -334,7 +339,7 @@ class TestRaisingPathsStageNothing:
         When its write floor is protected
         Then protect raises NotAnEntityError
         """
-        with pytest.raises(NotAnEntityError):
+        with pytest.raises(dc.NotAnEntityError):
             dc.protect(object(), write=dc.ADMIN)
 
     def test_protecting_a_deleted_record_raises(self, store: dc.Store) -> None:
@@ -347,41 +352,41 @@ class TestRaisingPathsStageNothing:
             store.store(contact)
             store.commit()
             store.delete(contact)
-        with pytest.raises(DeletedEntityError):
+        with pytest.raises(dc.DeletedEntityError):
             dc.protect(contact, write=dc.ADMIN)
 
     def test_sharing_with_the_no_standing_level_raises_and_stages_nothing(self) -> None:
         """Given a new contact
         When it is shared with the no-standing read level
         Then share raises ValueError saying not a grantable level
-        And its labels and state are unchanged
+        And its labels are unchanged
         """
         contact = Contact(name="Meyer")
-        before = _labels(contact)
+        before = _permissions(contact)
         with pytest.raises(ValueError, match="not a grantable level"):
             dc.share(contact, TEAM, read=dc.NO_STANDING, write=dc.AGENT)
-        assert _labels(contact) == before
+        assert _permissions(contact) == before
 
     def test_protecting_with_a_level_name_raises_and_stages_nothing(self) -> None:
         """Given a new contact
         When its write floor is protected with the string "CURATOR"
         Then protect raises TypeError asking for an int ladder level
-        And its labels and state are unchanged
+        And its labels are unchanged
         """
         contact = Contact(name="Meyer")
-        before = _labels(contact)
+        before = _permissions(contact)
         with pytest.raises(TypeError, match="int ladder level"):
             dc.protect(contact, write="CURATOR")  # pyrefly: ignore[bad-argument-type]
-        assert _labels(contact) == before
+        assert _permissions(contact) == before
 
     def test_sharing_with_a_group_name_raises_and_stages_nothing(self) -> None:
         """Given a new contact
         When it is shared with the group "team-pv"
         Then share raises TypeError asking for an int group id
-        And its labels and state are unchanged
+        And its labels are unchanged
         """
         contact = Contact(name="Meyer")
-        before = _labels(contact)
+        before = _permissions(contact)
         with pytest.raises(TypeError, match="int group id"):
             dc.share(
                 contact,
@@ -389,19 +394,19 @@ class TestRaisingPathsStageNothing:
                 read=dc.VIEWER,
                 write=dc.AGENT,
             )
-        assert _labels(contact) == before
+        assert _permissions(contact) == before
 
     def test_sharing_with_a_bool_level_raises_and_stages_nothing(self) -> None:
         """Given a new contact
         When it is shared with True as its read level
         Then share raises TypeError asking for an int ladder level, bools not being levels
-        And its labels and state are unchanged
+        And its labels are unchanged
         """
         contact = Contact(name="Meyer")
-        before = _labels(contact)
+        before = _permissions(contact)
         with pytest.raises(TypeError, match="int ladder level"):
             dc.share(contact, TEAM, read=True, write=dc.AGENT)
-        assert _labels(contact) == before
+        assert _permissions(contact) == before
 
 
 class TestWritableDcPermissions:
@@ -432,7 +437,7 @@ class TestWritableDcPermissions:
 
     def test_assigned_permissions_do_not_alias_the_source_record(self, store: dc.Store) -> None:
         """Given a child assigned its parent's permissions (team group)
-        When the org group is appended to the child's groups
+        When the child is shared with the org group
         Then the parent's groups are still the team alone
         """
         with store.acting_as(ANNA):
@@ -442,7 +447,7 @@ class TestWritableDcPermissions:
             child = Contact(name="c2")
             store.store(child)
             child.dc_permissions = parent.dc_permissions  # pyrefly: ignore[missing-attribute]
-            child._dc_groups.append(ORG)  # pyrefly: ignore[missing-attribute]
+            dc.share(child, ORG, read=dc.VIEWER, write=dc.AGENT)
         assert _permissions(parent).groups == (TEAM,)
 
     def test_labels_staged_before_store_survive_registration(self, store: dc.Store) -> None:

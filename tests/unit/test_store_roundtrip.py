@@ -9,7 +9,6 @@ from collections.abc import Callable
 import pytest
 
 import datacrystal as dc
-from datacrystal._entity import oid_of
 from tests.conftest import Locality, Mineral
 
 StoreFactory = Callable[[], dc.Store]
@@ -332,7 +331,7 @@ def test_get_many_hydrates_in_the_order_of_the_oids(store_factory: StoreFactory)
     store.close()
     reopened = store_factory()
     hits = reopened.query(dc.fields(Mineral).crystal_system == None)  # noqa: E711 - the magic query path compares with ==
-    oids = list(map(oid_of, hits))
+    oids = list(map(reopened.store, hits))
 
     again = reopened.get_many(oids)
 

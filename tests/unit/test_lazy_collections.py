@@ -20,7 +20,6 @@ from typing import Annotated
 import pytest
 
 import datacrystal as dc
-from datacrystal._containers import PersistentDict, PersistentList
 from tests.conftest import Locality
 
 StoreFactory = Callable[[], dc.Store]
@@ -92,8 +91,8 @@ def test_lazy_collections_stay_owner_bound_persistent_containers(
     reopened = store_factory()
     trail = reopened.root
 
-    assert isinstance(trail.stops, PersistentList)
-    assert isinstance(trail.by_role, PersistentDict)
+    assert isinstance(trail.stops, dc.PersistentList)
+    assert isinstance(trail.by_role, dc.PersistentDict)
     reopened.close()
 
 

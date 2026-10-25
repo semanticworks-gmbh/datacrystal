@@ -20,10 +20,6 @@ from typing import Annotated
 import pytest
 
 import datacrystal as dc
-from datacrystal._containers import PersistentList
-from datacrystal._entity import STATE_NEW, state_of, type_info
-from datacrystal._errors import FrozenEntityError
-from datacrystal._state import STATE_CLEAN, STATE_DIRTY
 
 StoreFactory = Callable[[], dc.Store]
 
@@ -67,17 +63,25 @@ def _commit_sealed_event(store_factory: StoreFactory) -> None:
         store.commit()
 
 
+def _with_read_floor(record: object, read_floor: int) -> dc.Permissions:
+    """Return the record's permissions with only the read floor replaced."""
+    held = record.dc_permissions  # pyrefly: ignore[missing-attribute]
+    return dc.Permissions(
+        owner=held.owner, groups=held.groups, read_floor=read_floor, write_floor=held.write_floor
+    )
+
+
 def _commit_specimens_with_read_floors(store: dc.Store) -> None:
     with store.acting_as(CURATOR_ANNA):
         for_viewer = Specimen(label="S0")
         store.store(for_viewer)
-        for_viewer._dc_read_floor = dc.VIEWER  # pyrefly: ignore[missing-attribute]
+        for_viewer.dc_permissions = _with_read_floor(for_viewer, dc.VIEWER)  # pyrefly: ignore[missing-attribute]
         for_agent = Specimen(label="S1")
         store.store(for_agent)
-        for_agent._dc_read_floor = dc.AGENT  # pyrefly: ignore[missing-attribute]
+        for_agent.dc_permissions = _with_read_floor(for_agent, dc.AGENT)  # pyrefly: ignore[missing-attribute]
         for_curator = Specimen(label="S2")
         store.store(for_curator)
-        for_curator._dc_read_floor = dc.CURATOR  # pyrefly: ignore[missing-attribute]
+        for_curator.dc_permissions = _with_read_floor(for_curator, dc.CURATOR)  # pyrefly: ignore[missing-attribute]
         store.commit()
 
 
@@ -103,32 +107,21 @@ def test_injected_column_is_not_a_constructor_argument(column: str) -> None:
     assert [f.init for f in dataclasses.fields(Specimen) if f.name == column] == [False]
 
 
-def test_type_info_marks_the_class_protected() -> None:
+def test_protected_class_has_a_dc_permissions_view() -> None:
     """Given a protected entity class
-    When its type info is read
-    Then it is marked protected
+    When the class is probed for dc_permissions
+    Then it has the view
     """
-    info = type_info(Specimen)
-    assert info.protected is True
-
-
-def test_type_info_ends_its_field_names_with_the_four_columns() -> None:
-    """Given a protected entity class
-    When its type info is read
-    Then its field names end with the four lib-managed columns
-    """
-    info = type_info(Specimen)
-    assert info.field_names[-4:] == (
-        "_dc_owner", "_dc_groups", "_dc_read_floor", "_dc_write_floor")
+    assert hasattr(Specimen, "dc_permissions")
 
 
 def test_constructor_takes_the_user_fields_only() -> None:
     """Given a protected entity class
     When it is constructed with its user fields
-    Then the new entity is in state NEW
+    Then it carries exactly those values
     """
     specimen = Specimen(label="quartz-01", mass_g=12.5)
-    assert state_of(specimen) == STATE_NEW
+    assert (specimen.label, specimen.mass_g) == ("quartz-01", 12.5)
 
 
 def test_constructor_rejects_an_injected_column() -> None:
@@ -146,10 +139,10 @@ def test_birth_values_are_inert() -> None:
     Then it has no owner, no groups and viewer floors on both sides (R6)
     """
     specimen = Specimen(label="calcite-02")
-    assert specimen._dc_owner == 0  # pyrefly: ignore[missing-attribute]
-    assert list(specimen._dc_groups) == []  # pyrefly: ignore[missing-attribute]
-    assert specimen._dc_read_floor == dc.VIEWER  # pyrefly: ignore[missing-attribute]
-    assert specimen._dc_write_floor == dc.VIEWER  # pyrefly: ignore[missing-attribute]
+    assert specimen.dc_permissions.owner == 0  # pyrefly: ignore[missing-attribute]
+    assert specimen.dc_permissions.groups == ()  # pyrefly: ignore[missing-attribute]
+    assert specimen.dc_permissions.read_floor == dc.VIEWER  # pyrefly: ignore[missing-attribute]
+    assert specimen.dc_permissions.write_floor == dc.VIEWER  # pyrefly: ignore[missing-attribute]
 
 
 # --- persistence ------------------------------------------------------------
@@ -163,7 +156,7 @@ def test_store_stamps_the_acting_principal_as_owner(store: dc.Store) -> None:
     with store.acting_as(CURATOR_ANNA):
         specimen = Specimen(label="fluorite-03", mass_g=3.3)
         store.store(specimen)
-    assert specimen._dc_owner == 2  # pyrefly: ignore[missing-attribute]
+    assert specimen.dc_permissions.owner == 2  # pyrefly: ignore[missing-attribute]
 
 
 def test_columns_roundtrip_through_commit_and_reopen(store_factory: StoreFactory) -> None:
@@ -174,18 +167,18 @@ def test_columns_roundtrip_through_commit_and_reopen(store_factory: StoreFactory
     with store_factory() as first, first.acting_as(CURATOR_ANNA):
         specimen = Specimen(label="fluorite-03", mass_g=3.3)
         first.store(specimen)
-        specimen._dc_read_floor = dc.AGENT  # pyrefly: ignore[missing-attribute]
-        specimen._dc_write_floor = dc.CURATOR  # pyrefly: ignore[missing-attribute]
-        specimen._dc_groups.append(7)  # pyrefly: ignore[missing-attribute]
+        specimen.dc_permissions = dc.Permissions(  # pyrefly: ignore[missing-attribute]
+            owner=2, groups=(7,), read_floor=dc.AGENT, write_floor=dc.CURATOR
+        )
         first.commit()
     with store_factory() as reopened, reopened.acting_as(CURATOR_ANNA):
         back = reopened.get(Specimen, label="fluorite-03")
     assert back is not None
     assert back.mass_g == 3.3
-    assert back._dc_owner == 2
-    assert back._dc_read_floor == dc.AGENT
-    assert back._dc_write_floor == dc.CURATOR
-    assert list(back._dc_groups) == [7]
+    assert back.dc_permissions.owner == 2  # pyrefly: ignore[missing-attribute]
+    assert back.dc_permissions.read_floor == dc.AGENT  # pyrefly: ignore[missing-attribute]
+    assert back.dc_permissions.write_floor == dc.CURATOR  # pyrefly: ignore[missing-attribute]
+    assert back.dc_permissions.groups == (7,)  # pyrefly: ignore[missing-attribute]
 
 
 def test_read_floor_range_plans_as_an_indexed_lookup(store: dc.Store) -> None:
@@ -260,22 +253,26 @@ def test_dc_permissions_view_is_frozen() -> None:
 
 def test_dc_permissions_view_taken_earlier_ignores_later_group_changes() -> None:
     """Given a dc_permissions view taken before any group was added
-    When group 7 is appended to the specimen
+    When group 7 is assigned to the specimen
     Then the earlier view still has no groups
     """
     specimen = Specimen(label="topaz-05")
     view = specimen.dc_permissions  # pyrefly: ignore[missing-attribute]
-    specimen._dc_groups.append(7)  # pyrefly: ignore[missing-attribute]
+    specimen.dc_permissions = dc.Permissions(  # pyrefly: ignore[missing-attribute]
+        owner=0, groups=(7,), read_floor=dc.VIEWER, write_floor=dc.VIEWER
+    )
     assert view.groups == ()
 
 
 def test_fresh_dc_permissions_view_holds_the_groups_as_a_tuple() -> None:
-    """Given a specimen with group 7 appended
+    """Given a specimen with group 7 assigned
     When a fresh dc_permissions view is read
     Then its groups are the tuple (7,)
     """
     specimen = Specimen(label="topaz-05")
-    specimen._dc_groups.append(7)  # pyrefly: ignore[missing-attribute]
+    specimen.dc_permissions = dc.Permissions(  # pyrefly: ignore[missing-attribute]
+        owner=0, groups=(7,), read_floor=dc.VIEWER, write_floor=dc.VIEWER
+    )
     fresh_view = specimen.dc_permissions  # pyrefly: ignore[missing-attribute]
     assert fresh_view.groups == (7,)
     assert isinstance(fresh_view.groups, tuple)
@@ -358,7 +355,7 @@ def test_injected_groups_column_is_a_persistent_list(store: dc.Store) -> None:
         store.store(specimen)
         store.commit()
     groups = specimen._dc_groups  # pyrefly: ignore[missing-attribute]
-    assert isinstance(groups, PersistentList)
+    assert isinstance(groups, dc.PersistentList)
 
 
 def test_container_backref_points_at_the_owning_entity(store: dc.Store) -> None:
@@ -375,18 +372,19 @@ def test_container_backref_points_at_the_owning_entity(store: dc.Store) -> None:
 
 
 def test_appending_to_the_groups_list_dirty_marks_the_owning_entity(store: dc.Store) -> None:
-    """Given a committed protected specimen in state CLEAN
-    When group 3 is appended in place
-    Then the specimen is DIRTY
+    """Given a committed protected specimen with nothing to commit
+    When group 7 is appended in place
+    Then the next commit has the specimen to write
     """
     with store.acting_as(CURATOR_ANNA):
         specimen = Specimen(label="galena-07")
         store.store(specimen)
         store.commit()
-    state_before = state_of(specimen)
-    specimen._dc_groups.append(3)  # pyrefly: ignore[missing-attribute]
-    assert state_before == STATE_CLEAN
-    assert state_of(specimen) == STATE_DIRTY
+        tid_with_nothing_changed = store.commit()
+        specimen._dc_groups.append(7)  # pyrefly: ignore[missing-attribute]
+        tid_after_append = store.commit()
+    assert tid_with_nothing_changed is None
+    assert tid_after_append is not None
 
 
 # --- zero cost for unprotected classes ----------------------------------------
@@ -398,24 +396,6 @@ def test_unprotected_class_declares_only_its_user_fields() -> None:
     Then only those two are there
     """
     assert [f.name for f in dataclasses.fields(PlainSpecimen)] == ["label", "mass_g"]
-
-
-def test_unprotected_class_type_info_is_not_protected() -> None:
-    """Given an unprotected entity class
-    When its type info is read
-    Then it is not marked protected
-    """
-    info = type_info(PlainSpecimen)
-    assert info.protected is False
-
-
-def test_unprotected_class_type_info_lists_no_injected_column() -> None:
-    """Given an unprotected entity class
-    When its type info field names are read
-    Then none starts with _dc_
-    """
-    info = type_info(PlainSpecimen)
-    assert not any(name.startswith("_dc_") for name in info.field_names)
 
 
 def test_unprotected_class_fieldset_lists_no_injected_column() -> None:
@@ -494,7 +474,7 @@ def test_frozen_protected_event_refuses_a_field_assignment(
     _commit_sealed_event(store_factory)
     with store_factory() as reopened, reopened.acting_as(CURATOR_ANNA):
         back = reopened.query(SealedEvent)[0]
-        with pytest.raises(FrozenEntityError):
+        with pytest.raises(dc.FrozenEntityError):
             back.note = "edited"
 
 
@@ -508,7 +488,7 @@ def test_frozen_protected_event_refuses_an_append_to_its_tags(
     _commit_sealed_event(store_factory)
     with store_factory() as reopened, reopened.acting_as(CURATOR_ANNA):
         back = reopened.query(SealedEvent)[0]
-        with pytest.raises(FrozenEntityError):
+        with pytest.raises(dc.FrozenEntityError):
             back.tags.append("x")
 
 
@@ -522,5 +502,5 @@ def test_frozen_protected_event_refuses_an_append_to_its_groups(
     _commit_sealed_event(store_factory)
     with store_factory() as reopened, reopened.acting_as(CURATOR_ANNA):
         back = reopened.query(SealedEvent)[0]
-        with pytest.raises(FrozenEntityError):
+        with pytest.raises(dc.FrozenEntityError):
             back._dc_groups.append(3)

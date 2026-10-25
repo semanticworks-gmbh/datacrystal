@@ -433,7 +433,7 @@ class TestOwnershipImmutable:
                 store.commit()
             store.discard()
         with store.acting_as(OWNER_STAFF):
-            owner_after = store.query(CONTACT.name == "seize-me")[0]._dc_owner
+            owner_after = store.query(CONTACT.name == "seize-me")[0].dc_permissions.owner  # pyrefly: ignore[missing-attribute]
         assert owner_after == OWNER_STAFF.uid
 
     def test_direct_owner_field_poke_is_gated_too(self, store: dc.Store) -> None:
@@ -469,7 +469,7 @@ class TestOwnershipImmutable:
                 write_floor=dc.STAFF,
             )
             store.commit()
-            owner_after = store.query(CONTACT.name == "handover")[0]._dc_owner
+            owner_after = store.query(CONTACT.name == "handover")[0].dc_permissions.owner  # pyrefly: ignore[missing-attribute]
         assert owner_after == CURATOR.uid
 
     def test_same_owner_relabel_is_not_a_chown(self, store: dc.Store) -> None:
@@ -508,7 +508,7 @@ class TestOwnershipImmutable:
                 write_floor=dc.STAFF,
             )
             store.commit()
-            owner_after = store.query(CONTACT.name == "relabel")[0]._dc_owner
+            owner_after = store.query(CONTACT.name == "relabel")[0].dc_permissions.owner  # pyrefly: ignore[missing-attribute]
         assert owner_after == OWNER_STAFF.uid
 
 
@@ -536,7 +536,7 @@ class TestInheritanceBaseline:
             parent.link = dc.Lazy.of(Contact(name="kid"))
             store.commit()
             kid = store.query(CONTACT.name == "kid")[0]
-        assert set(kid._dc_groups) == {TEAM, ORG}
+        assert set(kid.dc_permissions.groups) == {TEAM, ORG}  # pyrefly: ignore[missing-attribute]
 
     def test_pure_inheritance_stamps_the_agent_as_owner(self, store: dc.Store) -> None:
         """Given a parent shared with TEAM and ORG, and an agent holding TEAM only
@@ -555,7 +555,7 @@ class TestInheritanceBaseline:
             parent.link = dc.Lazy.of(Contact(name="kid"))
             store.commit()
             kid = store.query(CONTACT.name == "kid")[0]
-        assert kid._dc_owner == AGENT_900.uid
+        assert kid.dc_permissions.owner == AGENT_900.uid  # pyrefly: ignore[missing-attribute]
 
     def test_explicit_share_beyond_inheritance_still_denied(self, store: dc.Store) -> None:
         """Given a parent shared with TEAM and an agent that shares a new kid into group 99
@@ -856,7 +856,9 @@ class TestBirthOwnerPin:
         with store.acting_as(AGENT_900):
             contact = Contact(name="planted")
             store.store(contact)
-            contact._dc_owner = 2  # pyrefly: ignore[missing-attribute]
+            contact.dc_permissions = dc.Permissions(  # pyrefly: ignore[missing-attribute]
+                owner=2, groups=(), read_floor=dc.VIEWER, write_floor=dc.VIEWER
+            )
             with pytest.raises(dc.WriteDeniedError, match="owner is the acting"):
                 store.commit()
             store.discard()
@@ -869,7 +871,9 @@ class TestBirthOwnerPin:
         with store.acting_as(AGENT_900):
             contact = Contact(name="orphan")
             store.store(contact)
-            contact._dc_owner = 0  # pyrefly: ignore[missing-attribute]
+            contact.dc_permissions = dc.Permissions(  # pyrefly: ignore[missing-attribute]
+                owner=0, groups=(), read_floor=dc.VIEWER, write_floor=dc.VIEWER
+            )
             with pytest.raises(dc.WriteDeniedError):
                 store.commit()
             store.discard()

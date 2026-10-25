@@ -13,8 +13,6 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 import datacrystal as dc
-from datacrystal._entity import oid_of, type_info
-from datacrystal._indexes import plan
 from tests.conftest import Locality, Mineral
 
 StoreFactory = Callable[[], dc.Store]
@@ -36,13 +34,6 @@ def cabinet(store: dc.Store) -> dc.Store:
 
 def _names(hits: Iterable[Mineral]) -> list[str]:
     return sorted(m.name for m in hits)
-
-
-def _oid(entity: object) -> int:
-    oid = oid_of(entity)
-    if oid is None:
-        raise LookupError("entity has no oid yet")
-    return oid
 
 
 def _three_minerals() -> list[Mineral]:
@@ -284,20 +275,19 @@ def test_startswith_on_an_indexed_field_is_answered_from_the_index_alone(
     """The None key in the cabinet's index is skipped, not a crash.
 
     Given a cabinet whose crystal_system index holds a None key for opal
-    When the planner plans crystal_system starts with "mono"
-    Then it yields a bitmap
+    When the store explains crystal_system starts with "mono"
+    Then the plan is indexed
     And no residual remains
-    And the bitmap holds 2 oids
+    And the plan has 2 candidates
     """
     # pyrefly: ignore[missing-attribute]
     condition = Mineral.crystal_system.startswith("mono")
-    column = cabinet._index.ensure(type_info(Mineral))
 
-    bitmap, residual = plan(condition, column)
+    query_plan = cabinet.explain(condition)
 
-    assert bitmap is not None
-    assert residual is None
-    assert len(bitmap) == 2
+    assert query_plan.indexed
+    assert query_plan.residual is None
+    assert query_plan.candidates == 2
 
 
 def test_contains_on_an_indexed_field_finds_matches(cabinet: dc.Store) -> None:
@@ -890,7 +880,7 @@ def test_query_iter_yields_the_oids_query_returns(cabinet: dc.Store) -> None:
     # pyrefly: ignore[bad-argument-type]
     queried = cabinet.query(Mineral.crystal_system == "monoclinic")
 
-    assert {_oid(m) for m in streamed} == {_oid(m) for m in queried}
+    assert {cabinet.store(m) for m in streamed} == {cabinet.store(m) for m in queried}
 
 
 def test_query_iter_of_the_full_extent_yields_every_oid_once(cabinet: dc.Store) -> None:
@@ -899,10 +889,10 @@ def test_query_iter_of_the_full_extent_yields_every_oid_once(cabinet: dc.Store) 
     Then the oids equal those of query(Mineral)
     And none repeats
     """
-    streamed_oids = list(map(_oid, cabinet.query_iter(Mineral)))
-    queried = cabinet.query(Mineral)
+    streamed_oids = list(map(cabinet.store, cabinet.query_iter(Mineral)))
+    queried_oids = list(map(cabinet.store, cabinet.query(Mineral)))
 
-    assert sorted(streamed_oids) == sorted(map(_oid, queried))
+    assert sorted(streamed_oids) == sorted(queried_oids)
     assert len(streamed_oids) == len(set(streamed_oids))
 
 

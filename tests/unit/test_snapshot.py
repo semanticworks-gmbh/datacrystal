@@ -13,13 +13,12 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from types import MappingProxyType
-from typing import BinaryIO, cast
+from typing import BinaryIO
 
 import pytest
 
 import datacrystal as dc
-from datacrystal._entity import oid_of
-from datacrystal._snapshot import _VIEW_CHUNK, Snapshot, _SnapshotCore
+from datacrystal._snapshot import _VIEW_CHUNK, _SnapshotCore
 from datacrystal._storage.protocol import BootInfo, StorageReadView, StoredBlob, StoredRecord
 from tests.conftest import Locality, Mineral
 
@@ -72,7 +71,7 @@ def cabinet(store: dc.Store) -> dc.Store:
 
 
 @pytest.fixture
-def snap(cabinet: dc.Store) -> Iterator[Snapshot]:
+def snap(cabinet: dc.Store) -> Iterator[dc.Snapshot]:
     """Yield a snapshot of the cabinet, closed after the test."""
     snapshot = cabinet.snapshot()
     yield snapshot
@@ -80,12 +79,12 @@ def snap(cabinet: dc.Store) -> Iterator[Snapshot]:
 
 
 @pytest.fixture
-def quartz_view(snap: Snapshot) -> dc.EntityView:
+def quartz_view(snap: dc.Snapshot) -> dc.EntityView:
     """Return the snapshot view of quartz."""
     return _by_qid(snap.all(Mineral))["Q43010"]
 
 
-def _edit_after_snapshot(cabinet: dc.Store) -> Snapshot:
+def _edit_after_snapshot(cabinet: dc.Store) -> dc.Snapshot:
     """Snapshot the cabinet, then rename quartz and add topaz in a later commit."""
     snapshot = cabinet.snapshot()
     quartz = cabinet.get(Mineral, qid="Q43010")
@@ -98,7 +97,7 @@ def _edit_after_snapshot(cabinet: dc.Store) -> Snapshot:
 
 
 @pytest.fixture
-def snap_before_later_edit(cabinet: dc.Store) -> Iterator[Snapshot]:
+def snap_before_later_edit(cabinet: dc.Store) -> Iterator[dc.Snapshot]:
     """Yield a snapshot taken before quartz was renamed to Bergkristall and topaz added."""
     snapshot = _edit_after_snapshot(cabinet)
     yield snapshot
@@ -106,7 +105,7 @@ def snap_before_later_edit(cabinet: dc.Store) -> Iterator[Snapshot]:
 
 
 @pytest.fixture
-def snap_before_fluorite_and_quartz_delete(cabinet: dc.Store) -> Iterator[Snapshot]:
+def snap_before_fluorite_and_quartz_delete(cabinet: dc.Store) -> Iterator[dc.Snapshot]:
     """Yield a snapshot taken before fluorite was added and quartz deleted."""
     snapshot = cabinet.snapshot()
     cabinet.store(Mineral(qid="Q8", name="fluorite", crystal_system="cubic"))
@@ -130,7 +129,7 @@ def test_snapshot_pins_the_last_committed_tid(cabinet: dc.Store) -> None:
     assert tid == cabinet.last_tid
 
 
-def test_snapshot_lists_the_committed_minerals(snap: Snapshot) -> None:
+def test_snapshot_lists_the_committed_minerals(snap: dc.Snapshot) -> None:
     """Given a cabinet with quartz and azurite committed
     When all minerals are read from a snapshot
     Then they are Q43010 and Q193563
@@ -140,7 +139,7 @@ def test_snapshot_lists_the_committed_minerals(snap: Snapshot) -> None:
     assert _qid_set(views) == {"Q43010", "Q193563"}
 
 
-def test_snapshot_view_carries_the_field_values(snap: Snapshot) -> None:
+def test_snapshot_view_carries_the_field_values(snap: dc.Snapshot) -> None:
     """Given a cabinet with azurite (Mohs 3.8) committed
     When azurite's view is read from a snapshot
     Then its name is azurite
@@ -152,7 +151,7 @@ def test_snapshot_view_carries_the_field_values(snap: Snapshot) -> None:
     assert azurite.mohs == 3.8
 
 
-def test_snapshot_reference_is_an_explicit_ref_token(snap: Snapshot) -> None:
+def test_snapshot_reference_is_an_explicit_ref_token(snap: dc.Snapshot) -> None:
     """Given azurite typed at Tsumeb Mine
     When azurite's type_locality is read from a snapshot view
     Then it is a Ref token, not a live entity
@@ -162,7 +161,7 @@ def test_snapshot_reference_is_an_explicit_ref_token(snap: Snapshot) -> None:
     assert isinstance(azurite.type_locality, dc.Ref)
 
 
-def test_snapshot_resolves_a_ref_token_through_the_snapshot(snap: Snapshot) -> None:
+def test_snapshot_resolves_a_ref_token_through_the_snapshot(snap: dc.Snapshot) -> None:
     """Given azurite typed at Tsumeb Mine
     When its type_locality Ref is resolved through the snapshot
     Then the locality is named Tsumeb Mine
@@ -174,7 +173,7 @@ def test_snapshot_resolves_a_ref_token_through_the_snapshot(snap: Snapshot) -> N
     assert locality.name == "Tsumeb Mine"
 
 
-def test_snapshot_root_is_a_tuple_of_two_refs(snap: Snapshot) -> None:
+def test_snapshot_root_is_a_tuple_of_two_refs(snap: dc.Snapshot) -> None:
     """Given a store root holding two minerals
     When the snapshot's root is read
     Then it is a tuple
@@ -186,7 +185,7 @@ def test_snapshot_root_is_a_tuple_of_two_refs(snap: Snapshot) -> None:
     assert len(root) == 2
 
 
-def test_snapshot_root_refs_resolve_to_the_root_minerals(snap: Snapshot) -> None:
+def test_snapshot_root_refs_resolve_to_the_root_minerals(snap: dc.Snapshot) -> None:
     """Given a store root holding quartz and azurite
     When the snapshot's root refs are resolved
     Then they are Q43010 and Q193563
@@ -260,7 +259,7 @@ def test_view_carries_the_typename(quartz_view: dc.EntityView) -> None:
 
 
 def test_snapshot_keeps_its_watermark_after_later_commits(
-    cabinet: dc.Store, snap: Snapshot
+    cabinet: dc.Store, snap: dc.Snapshot
 ) -> None:
     """Given a snapshot taken before a later commit
     When the later commit has landed
@@ -276,7 +275,7 @@ def test_snapshot_keeps_its_watermark_after_later_commits(
     assert snap.tid == cabinet.last_tid - 1
 
 
-def test_snapshot_still_sees_the_world_at_its_watermark(snap_before_later_edit: Snapshot) -> None:
+def test_snapshot_still_sees_the_world_at_its_watermark(snap_before_later_edit: dc.Snapshot) -> None:
     """Given a snapshot taken before quartz was renamed and topaz added
     When its minerals' names are read
     Then they are quartz and azurite
@@ -287,7 +286,7 @@ def test_snapshot_still_sees_the_world_at_its_watermark(snap_before_later_edit: 
 
 
 def test_fresh_snapshot_sees_the_later_commit(
-    cabinet: dc.Store, snap_before_later_edit: Snapshot
+    cabinet: dc.Store, snap_before_later_edit: dc.Snapshot
 ) -> None:
     """Given quartz renamed and topaz added after an older snapshot
     When a fresh snapshot is taken
@@ -314,7 +313,7 @@ def test_snapshot_of_an_empty_store_is_empty(store: dc.Store) -> None:
         assert snap.types == ()
 
 
-def test_snapshot_get_of_an_unknown_oid_raises(snap: Snapshot) -> None:
+def test_snapshot_get_of_an_unknown_oid_raises(snap: dc.Snapshot) -> None:
     """Given a snapshot of a cabinet
     When an oid with no record is fetched
     Then DataCrystalError says there is no record
@@ -340,7 +339,7 @@ def _fields_by_typename(types: Iterable[tuple[int, str, Iterable[str]]]) -> dict
     return {typename: fields for _, typename, fields in types}
 
 
-def test_snapshot_types_expose_the_lineage_for_consumer_bootstrap(snap: Snapshot) -> None:
+def test_snapshot_types_expose_the_lineage_for_consumer_bootstrap(snap: dc.Snapshot) -> None:
     """Given a snapshot of a cabinet of minerals
     When its types are read
     Then the Mineral row lists the qid field
@@ -350,7 +349,7 @@ def test_snapshot_types_expose_the_lineage_for_consumer_bootstrap(snap: Snapshot
     assert "qid" in rows[MINERAL_T]
 
 
-def test_all_accepts_a_typename_string_for_engine_free_consumers(snap: Snapshot) -> None:
+def test_all_accepts_a_typename_string_for_engine_free_consumers(snap: dc.Snapshot) -> None:
     """Given a snapshot of a cabinet of minerals
     When all() is asked for by the typename string
     Then it returns Q43010 and Q193563
@@ -360,7 +359,7 @@ def test_all_accepts_a_typename_string_for_engine_free_consumers(snap: Snapshot)
     assert _qid_set(views) == {"Q43010", "Q193563"}
 
 
-def test_all_refuses_something_that_is_neither_a_class_nor_a_typename(snap: Snapshot) -> None:
+def test_all_refuses_something_that_is_neither_a_class_nor_a_typename(snap: dc.Snapshot) -> None:
     """Given a snapshot of a cabinet of minerals
     When all() is asked for the number 42
     Then TypeError says it wants an entity class or a typename
@@ -373,12 +372,12 @@ def test_all_refuses_something_that_is_neither_a_class_nor_a_typename(snap: Snap
 
 
 @pytest.fixture
-def mineral_indexes(snap: Snapshot) -> dc.SnapshotIndexes:
+def mineral_indexes(snap: dc.Snapshot) -> dc.SnapshotIndexes:
     """Return the snapshot's frozen index views for Mineral."""
     return snap.index_bitmaps(Mineral)
 
 
-def test_index_bitmaps_view_is_a_snapshot_indexes(snap: Snapshot) -> None:
+def test_index_bitmaps_view_is_a_snapshot_indexes(snap: dc.Snapshot) -> None:
     """Given a snapshot of a cabinet of two minerals
     When the Mineral index views are asked for
     Then they are a SnapshotIndexes
@@ -388,7 +387,7 @@ def test_index_bitmaps_view_is_a_snapshot_indexes(snap: Snapshot) -> None:
     assert isinstance(indexes, dc.SnapshotIndexes)
 
 
-def test_index_bitmaps_extent_covers_every_mineral(snap: Snapshot) -> None:
+def test_index_bitmaps_extent_covers_every_mineral(snap: dc.Snapshot) -> None:
     """Given a snapshot of a cabinet of two minerals
     When the Mineral index views are asked for
     Then the extent holds two oids
@@ -399,7 +398,7 @@ def test_index_bitmaps_extent_covers_every_mineral(snap: Snapshot) -> None:
 
 
 def test_index_bitmaps_posting_holds_the_matching_mineral(
-    snap: Snapshot, mineral_indexes: dc.SnapshotIndexes
+    snap: dc.Snapshot, mineral_indexes: dc.SnapshotIndexes
 ) -> None:
     """Given a snapshot where only quartz is trigonal
     When the crystal_system posting for "trigonal" is read
@@ -443,7 +442,7 @@ def test_index_bitmaps_mappings_reject_writes(mineral_indexes: dc.SnapshotIndexe
         mineral_indexes.eq["crystal_system"]["cubic"] = None  # type: ignore[index]
 
 
-def test_index_bitmaps_of_a_non_entity_raises(snap: Snapshot) -> None:
+def test_index_bitmaps_of_a_non_entity_raises(snap: dc.Snapshot) -> None:
     """Given a snapshot of a cabinet
     When the index views of str are asked for
     Then NotAnEntityError is raised
@@ -455,7 +454,7 @@ def test_index_bitmaps_of_a_non_entity_raises(snap: Snapshot) -> None:
 # -- query and count over a snapshot ----------------------------------------
 
 
-def test_snapshot_query_by_an_indexed_field_returns_views(snap: Snapshot) -> None:
+def test_snapshot_query_by_an_indexed_field_returns_views(snap: dc.Snapshot) -> None:
     """Given a snapshot where only azurite is monoclinic
     When minerals of crystal_system monoclinic are queried
     Then azurite is returned
@@ -465,7 +464,7 @@ def test_snapshot_query_by_an_indexed_field_returns_views(snap: Snapshot) -> Non
     assert _qids(hits) == ["Q193563"]
 
 
-def test_snapshot_query_returns_entity_views(snap: Snapshot) -> None:
+def test_snapshot_query_returns_entity_views(snap: dc.Snapshot) -> None:
     """Given a snapshot where only azurite is monoclinic
     When minerals of crystal_system monoclinic are queried
     Then every hit is an EntityView
@@ -475,7 +474,7 @@ def test_snapshot_query_returns_entity_views(snap: Snapshot) -> None:
     assert all(isinstance(view, dc.EntityView) for view in hits)
 
 
-def test_snapshot_query_evaluates_residuals_over_views(snap: Snapshot) -> None:
+def test_snapshot_query_evaluates_residuals_over_views(snap: dc.Snapshot) -> None:
     """Given a snapshot where only azurite has Mohs hardness 3.8
     When minerals with Mohs at least 3.0 are queried
     Then azurite is returned
@@ -485,7 +484,7 @@ def test_snapshot_query_evaluates_residuals_over_views(snap: Snapshot) -> None:
     assert _qid_set(hits) == {"Q193563"}
 
 
-def test_snapshot_query_plans_string_matching_on_index_keys(snap: Snapshot) -> None:
+def test_snapshot_query_plans_string_matching_on_index_keys(snap: dc.Snapshot) -> None:
     """Given a snapshot where only quartz has a crystal system starting with "tri"
     When minerals whose crystal_system starts with "tri" are queried
     Then quartz is returned
@@ -495,7 +494,7 @@ def test_snapshot_query_plans_string_matching_on_index_keys(snap: Snapshot) -> N
     assert _qid_set(hits) == {"Q43010"}
 
 
-def test_snapshot_count_of_a_type_is_its_extent(snap: Snapshot) -> None:
+def test_snapshot_count_of_a_type_is_its_extent(snap: dc.Snapshot) -> None:
     """Given a snapshot of a cabinet of two minerals
     When Mineral is counted
     Then the count is 2
@@ -503,7 +502,7 @@ def test_snapshot_count_of_a_type_is_its_extent(snap: Snapshot) -> None:
     assert snap.count(Mineral) == 2
 
 
-def test_snapshot_count_by_an_indexed_field(snap: Snapshot) -> None:
+def test_snapshot_count_by_an_indexed_field(snap: dc.Snapshot) -> None:
     """Given a snapshot where only quartz is trigonal
     When minerals of crystal_system trigonal are counted
     Then the count is 1
@@ -511,7 +510,7 @@ def test_snapshot_count_by_an_indexed_field(snap: Snapshot) -> None:
     assert snap.count(M.crystal_system == "trigonal") == 1
 
 
-def test_snapshot_count_of_a_conjunction(snap: Snapshot) -> None:
+def test_snapshot_count_of_a_conjunction(snap: dc.Snapshot) -> None:
     """Given a snapshot where only azurite is monoclinic with Mohs at least 3.0
     When such minerals are counted
     Then the count is 1
@@ -519,7 +518,7 @@ def test_snapshot_count_of_a_conjunction(snap: Snapshot) -> None:
     assert snap.count((M.crystal_system == "monoclinic") & (M.mohs >= 3.0)) == 1
 
 
-def test_snapshot_query_of_the_bare_class_is_the_full_extent(snap: Snapshot) -> None:
+def test_snapshot_query_of_the_bare_class_is_the_full_extent(snap: dc.Snapshot) -> None:
     """Given a snapshot of a cabinet of two minerals
     When the bare class Mineral is queried
     Then as many views come back as Mineral counts
@@ -530,7 +529,7 @@ def test_snapshot_query_of_the_bare_class_is_the_full_extent(snap: Snapshot) -> 
 
 
 def test_snapshot_query_matches_a_lazy_handle_against_the_frozen_ref(
-    cabinet: dc.Store, snap: Snapshot
+    cabinet: dc.Store, snap: dc.Snapshot
 ) -> None:
     """Given azurite typed at Tsumeb Mine, queried with a live Lazy handle to Tsumeb
     When minerals whose type_locality equals that Lazy are queried on the snapshot
@@ -543,7 +542,7 @@ def test_snapshot_query_matches_a_lazy_handle_against_the_frozen_ref(
     assert _qids(hits) == ["Q193563"]
 
 
-def test_snapshot_query_matches_a_live_list_against_the_frozen_tuple(snap: Snapshot) -> None:
+def test_snapshot_query_matches_a_live_list_against_the_frozen_tuple(snap: dc.Snapshot) -> None:
     """Given quartz stored with the tags ["common", "piezoelectric"]
     When minerals whose tags equal that list are queried on the snapshot
     Then quartz is returned, the list matching the frozen tuple
@@ -553,7 +552,7 @@ def test_snapshot_query_matches_a_live_list_against_the_frozen_tuple(snap: Snaps
     assert _qids(hits) == ["Q43010"]
 
 
-def test_snapshot_count_ignores_later_commits(snap_before_fluorite_and_quartz_delete: Snapshot) -> None:
+def test_snapshot_count_ignores_later_commits(snap_before_fluorite_and_quartz_delete: dc.Snapshot) -> None:
     """Given a snapshot taken before fluorite was added and quartz deleted
     When Mineral is counted on the snapshot
     Then the count is still 2
@@ -562,7 +561,7 @@ def test_snapshot_count_ignores_later_commits(snap_before_fluorite_and_quartz_de
 
 
 def test_snapshot_indexes_are_rebuilt_from_its_own_read_view(
-    snap_before_fluorite_and_quartz_delete: Snapshot,
+    snap_before_fluorite_and_quartz_delete: dc.Snapshot,
 ) -> None:
     """Given a snapshot taken before quartz was deleted
     When trigonal minerals are queried on the snapshot
@@ -574,7 +573,7 @@ def test_snapshot_indexes_are_rebuilt_from_its_own_read_view(
 
 
 def test_snapshot_does_not_see_a_later_added_mineral(
-    snap_before_fluorite_and_quartz_delete: Snapshot,
+    snap_before_fluorite_and_quartz_delete: dc.Snapshot,
 ) -> None:
     """Given a snapshot taken before fluorite was added
     When cubic minerals are queried on the snapshot
@@ -586,7 +585,7 @@ def test_snapshot_does_not_see_a_later_added_mineral(
 
 
 def test_fresh_snapshot_counts_the_added_and_the_deleted_mineral(
-    cabinet: dc.Store, snap_before_fluorite_and_quartz_delete: Snapshot
+    cabinet: dc.Store, snap_before_fluorite_and_quartz_delete: dc.Snapshot
 ) -> None:
     """Given fluorite added and quartz deleted after an older snapshot
     When a fresh snapshot counts Mineral
@@ -597,7 +596,7 @@ def test_fresh_snapshot_counts_the_added_and_the_deleted_mineral(
 
 
 def test_fresh_snapshot_finds_the_added_mineral(
-    cabinet: dc.Store, snap_before_fluorite_and_quartz_delete: Snapshot
+    cabinet: dc.Store, snap_before_fluorite_and_quartz_delete: dc.Snapshot
 ) -> None:
     """Given fluorite added after an older snapshot
     When a fresh snapshot queries cubic minerals
@@ -609,7 +608,7 @@ def test_fresh_snapshot_finds_the_added_mineral(
         assert _qids(hits) == ["Q8"]
 
 
-def test_snapshot_query_of_an_unseen_type_warns_and_finds_nothing(snap: Snapshot) -> None:
+def test_snapshot_query_of_an_unseen_type_warns_and_finds_nothing(snap: dc.Snapshot) -> None:
     """Given a snapshot that never saw a LogbookPage
     When logbook pages with heading "x" are queried
     Then UnseenTypeWarning says there are no committed records
@@ -621,7 +620,7 @@ def test_snapshot_query_of_an_unseen_type_warns_and_finds_nothing(snap: Snapshot
     assert hits == []
 
 
-def test_snapshot_count_of_an_unseen_type_warns_and_is_zero(snap: Snapshot) -> None:
+def test_snapshot_count_of_an_unseen_type_warns_and_is_zero(snap: dc.Snapshot) -> None:
     """Given a snapshot that never saw a LogbookPage
     When logbook pages are counted
     Then UnseenTypeWarning is raised
@@ -726,7 +725,7 @@ def test_thread_pool_snapshots_are_never_torn_during_a_commit_storm(store: dc.St
 # -- get_many: miss-tolerant batch read (#94, datacrystal[web] DataLoader) -----
 
 
-def test_get_many_preserves_the_input_order(cabinet: dc.Store, snap: Snapshot) -> None:
+def test_get_many_preserves_the_input_order(cabinet: dc.Store, snap: dc.Snapshot) -> None:
     """Given the oids of azurite and quartz, in that order
     When they are batch-read from a snapshot
     Then the views come back as azurite, quartz
@@ -736,7 +735,10 @@ def test_get_many_preserves_the_input_order(cabinet: dc.Store, snap: Snapshot) -
     assert quartz is not None
     assert azurite is not None
 
-    views = snap.get_many([cast("int", oid_of(azurite)), cast("int", oid_of(quartz))])
+    azurite_oid = cabinet.store(azurite)
+    quartz_oid = cabinet.store(quartz)
+
+    views = snap.get_many([azurite_oid, quartz_oid])
 
     assert _qids(views) == ["Q193563", "Q43010"]
 
@@ -748,15 +750,15 @@ def live_and_deleted_oids(cabinet: dc.Store) -> tuple[int, int]:
     azurite = cabinet.get(Mineral, qid="Q193563")
     if quartz is None or azurite is None:
         pytest.fail("the seeded cabinet lost a mineral")
-    live_oid = cast("int", oid_of(quartz))
-    gone_oid = cast("int", oid_of(azurite))
+    live_oid = cabinet.store(quartz)
+    gone_oid = cabinet.store(azurite)
     cabinet.delete(azurite)
     cabinet.commit()
     return live_oid, gone_oid
 
 
 def test_get_many_yields_none_in_the_slot_of_a_deleted_oid(
-    snap_after_delete: Snapshot, live_and_deleted_oids: tuple[int, int]
+    snap_after_delete: dc.Snapshot, live_and_deleted_oids: tuple[int, int]
 ) -> None:
     """Given the oids of a live and a deleted mineral
     When they are batch-read from a snapshot
@@ -772,7 +774,7 @@ def test_get_many_yields_none_in_the_slot_of_a_deleted_oid(
 
 
 @pytest.fixture
-def snap_after_delete(live_and_deleted_oids: tuple[int, int], cabinet: dc.Store) -> Iterator[Snapshot]:
+def snap_after_delete(live_and_deleted_oids: tuple[int, int], cabinet: dc.Store) -> Iterator[dc.Snapshot]:
     """Yield a snapshot taken after azurite was deleted."""
     snapshot = cabinet.snapshot()
     yield snapshot
@@ -780,7 +782,7 @@ def snap_after_delete(live_and_deleted_oids: tuple[int, int], cabinet: dc.Store)
 
 
 def test_get_many_yields_the_view_in_the_slot_of_a_live_oid(
-    snap_after_delete: Snapshot, live_and_deleted_oids: tuple[int, int]
+    snap_after_delete: dc.Snapshot, live_and_deleted_oids: tuple[int, int]
 ) -> None:
     """Given the oids of a live and a deleted mineral
     When they are batch-read from a snapshot
@@ -795,7 +797,7 @@ def test_get_many_yields_the_view_in_the_slot_of_a_live_oid(
     assert views[0].qid == "Q43010"
 
 
-def test_get_many_accepts_a_ref_and_an_entity_view_alike(snap: Snapshot) -> None:
+def test_get_many_accepts_a_ref_and_an_entity_view_alike(snap: dc.Snapshot) -> None:
     """Given a snapshot Ref to azurite and an already-materialized EntityView of quartz
     When they are batch-read together
     Then both minerals come back
@@ -808,7 +810,7 @@ def test_get_many_accepts_a_ref_and_an_entity_view_alike(snap: Snapshot) -> None
     assert _qid_set(view for view in out if view is not None) == {"Q43010", "Q193563"}
 
 
-def test_get_many_of_nothing_returns_nothing(snap: Snapshot) -> None:
+def test_get_many_of_nothing_returns_nothing(snap: dc.Snapshot) -> None:
     """Given a snapshot of a cabinet
     When an empty list is batch-read
     Then an empty list comes back
@@ -851,14 +853,14 @@ class _CountingReadView:
 
 
 def _oids_of_root(store: dc.Store) -> list[int]:
-    return [cast("int", oid_of(entity)) for entity in store.root]
+    return [store.store(entity) for entity in store.root]
 
 
 @pytest.fixture
-def counting_snapshot(cabinet: dc.Store) -> Iterator[tuple[Snapshot, _CountingReadView]]:
+def counting_snapshot(cabinet: dc.Store) -> Iterator[tuple[dc.Snapshot, _CountingReadView]]:
     """Yield a snapshot built directly over a counting read view of the cabinet."""
     counting = _CountingReadView(cabinet._backend.read_view())
-    snapshot = Snapshot(_SnapshotCore(counting), dc.Principal(uid=0))
+    snapshot = dc.Snapshot(_SnapshotCore(counting), dc.Principal(uid=0))
     yield snapshot, counting
     snapshot.close()
 
@@ -866,18 +868,18 @@ def counting_snapshot(cabinet: dc.Store) -> Iterator[tuple[Snapshot, _CountingRe
 @pytest.fixture
 def counting_snapshot_of_a_chunk_plus_five(
     store: dc.Store,
-) -> Iterator[tuple[Snapshot, _CountingReadView, list[int]]]:
+) -> Iterator[tuple[dc.Snapshot, _CountingReadView, list[int]]]:
     """Yield a counting snapshot of _VIEW_CHUNK + 5 minerals, and their oids."""
     store.root = [Mineral(qid=f"Q{i}", name=f"specimen {i}") for i in range(_VIEW_CHUNK + 5)]
     store.commit()
     counting = _CountingReadView(store._backend.read_view())
-    snapshot = Snapshot(_SnapshotCore(counting), dc.Principal(uid=0))
+    snapshot = dc.Snapshot(_SnapshotCore(counting), dc.Principal(uid=0))
     yield snapshot, counting, _oids_of_root(store)
     snapshot.close()
 
 
 def test_get_many_reads_all_chunks_in_one_batch_per_chunk(
-    counting_snapshot_of_a_chunk_plus_five: tuple[Snapshot, _CountingReadView, list[int]],
+    counting_snapshot_of_a_chunk_plus_five: tuple[dc.Snapshot, _CountingReadView, list[int]],
 ) -> None:
     """Given a snapshot of one chunk plus five minerals, over a counting read view
     When all of them are batch-read
@@ -894,7 +896,7 @@ def test_get_many_reads_all_chunks_in_one_batch_per_chunk(
 
 
 def test_get_many_first_pass_loads_every_oid(
-    cabinet: dc.Store, counting_snapshot: tuple[Snapshot, _CountingReadView]
+    cabinet: dc.Store, counting_snapshot: tuple[dc.Snapshot, _CountingReadView]
 ) -> None:
     """Given a snapshot over a counting read view, nothing materialized yet
     When two oids are batch-read
@@ -910,7 +912,7 @@ def test_get_many_first_pass_loads_every_oid(
 
 
 def test_get_many_second_pass_costs_no_further_round_trips(
-    cabinet: dc.Store, counting_snapshot: tuple[Snapshot, _CountingReadView]
+    cabinet: dc.Store, counting_snapshot: tuple[dc.Snapshot, _CountingReadView]
 ) -> None:
     """Given a snapshot where two oids were batch-read already
     When the same oids are batch-read again

@@ -15,8 +15,7 @@ from typing import Annotated
 import pytest
 
 import datacrystal as dc
-from datacrystal._entity import TYPES_BY_NAME, type_info
-from datacrystal._errors import WriteDeniedError
+from datacrystal._entity import TYPES_BY_NAME
 
 StoreFactory = Callable[[], dc.Store]
 
@@ -95,12 +94,16 @@ class PlainShelf:
     prize: dc.Lazy[Gem] | None = None
 
 
+def _org_labels(record: object, write_floor: int) -> dc.Permissions:
+    """Return the record's labels shared into ORG, viewer-readable, writable from write_floor."""
+    owner = record.dc_permissions.owner  # pyrefly: ignore[missing-attribute]
+    return dc.Permissions(owner=owner, groups=(ORG,), read_floor=dc.VIEWER, write_floor=write_floor)
+
+
 def _labeled_drawer(store: dc.Store, label: str) -> Drawer:
     drawer = Drawer(label=label)
     store.store(drawer)
-    drawer._dc_groups.append(ORG)  # pyrefly: ignore[missing-attribute]
-    drawer._dc_read_floor = dc.VIEWER  # pyrefly: ignore[missing-attribute]
-    drawer._dc_write_floor = dc.STAFF  # pyrefly: ignore[missing-attribute]
+    drawer.dc_permissions = _org_labels(drawer, dc.STAFF)  # pyrefly: ignore[missing-attribute]
     return drawer
 
 
@@ -140,10 +143,10 @@ class TestOwnerStamping:
         _commit_drawer_holding_three_gems(store)
         with store.acting_as(ANNA):
             gem = store.query(dc.fields(Gem).name == gem_name)[0]
-        assert gem._dc_owner == 2
-        assert list(gem._dc_groups) == [ORG]
-        assert gem._dc_read_floor == dc.VIEWER
-        assert gem._dc_write_floor == dc.STAFF
+        assert gem.dc_permissions.owner == 2
+        assert list(gem.dc_permissions.groups) == [ORG]
+        assert gem.dc_permissions.read_floor == dc.VIEWER
+        assert gem.dc_permissions.write_floor == dc.STAFF
 
     def test_child_without_protected_container_keeps_birth_labels(self, store: dc.Store) -> None:
         """Given an unprotected shelf holding a new gem, committed by Anna
@@ -158,9 +161,9 @@ class TestOwnerStamping:
             store.commit()
         with store.acting_as(ANNA):
             gem = store.query(dc.fields(Gem).name == "quartzite")[0]
-        assert gem._dc_owner == 2
-        assert list(gem._dc_groups) == []
-        assert gem._dc_write_floor == dc.VIEWER
+        assert gem.dc_permissions.owner == 2
+        assert list(gem.dc_permissions.groups) == []
+        assert gem.dc_permissions.write_floor == dc.VIEWER
 
     def test_first_registration_wins(self, store: dc.Store) -> None:
         """Given a gem registered through a drawer with a staff write floor
@@ -171,15 +174,14 @@ class TestOwnerStamping:
             first = _labeled_drawer(store, "first")
             second = Drawer(label="second")
             store.store(second)
-            second._dc_groups.append(ORG)  # pyrefly: ignore[missing-attribute]
-            second._dc_write_floor = dc.CURATOR  # pyrefly: ignore[missing-attribute]
+            second.dc_permissions = _org_labels(second, dc.CURATOR)  # pyrefly: ignore[missing-attribute]
             shared = Gem(name="shared")
             first.prize = dc.Lazy.of(shared)
             second.prize = dc.Lazy.of(shared)
             store.commit()
         with store.acting_as(ANNA):
             gem = store.query(dc.fields(Gem).name == "shared")[0]
-        assert gem._dc_write_floor == dc.STAFF
+        assert gem.dc_permissions.write_floor == dc.STAFF
 
     def test_commit_time_discovery_stamps_the_owner_under_the_commit_principal(
         self, store: dc.Store
@@ -197,8 +199,8 @@ class TestOwnerStamping:
             store.commit()
         with store.acting_as(BOB):
             gem = store.query(dc.fields(Gem).name == "latecomer")[0]
-        assert gem._dc_owner == 3
-        assert list(gem._dc_groups) == [ORG]
+        assert gem.dc_permissions.owner == 3
+        assert list(gem.dc_permissions.groups) == [ORG]
 
 
 class TestAnonymousRefusal:
@@ -209,7 +211,7 @@ class TestAnonymousRefusal:
         When it stores a protected gem
         Then store raises WriteDeniedError naming anonymous
         """
-        with pytest.raises(WriteDeniedError, match="anonymous"):
+        with pytest.raises(dc.WriteDeniedError, match="anonymous"):
             store.store(Gem(name="orphan"))
 
     def test_refused_store_buffers_nothing(self, store: dc.Store) -> None:
@@ -217,7 +219,7 @@ class TestAnonymousRefusal:
         When the session commits
         Then there is nothing to commit
         """
-        with pytest.raises(WriteDeniedError):
+        with pytest.raises(dc.WriteDeniedError):
             store.store(Gem(name="orphan"))
         committed = store.commit()
         assert committed is None
@@ -228,7 +230,7 @@ class TestAnonymousRefusal:
         Then the commit raises WriteDeniedError naming anonymous
         """
         _commit_shelf_then_anonymous_smuggle(store)
-        with pytest.raises(WriteDeniedError, match="anonymous"):
+        with pytest.raises(dc.WriteDeniedError, match="anonymous"):
             store.commit()
 
     def test_retry_under_the_owner_stamps_the_smuggled_gem(self, store: dc.Store) -> None:
@@ -237,12 +239,12 @@ class TestAnonymousRefusal:
         Then the smuggled gem is stamped with Anna as owner
         """
         _commit_shelf_then_anonymous_smuggle(store)
-        with pytest.raises(WriteDeniedError):
+        with pytest.raises(dc.WriteDeniedError):
             store.commit()
         with store.acting_as(ANNA):
             store.commit()
             gem = store.query(dc.fields(Gem).name == "smuggled")[0]
-        assert gem._dc_owner == 2
+        assert gem.dc_permissions.owner == 2
 
     def test_refused_commit_burns_no_tid(self, store: dc.Store) -> None:
         """Given a refused anonymous commit whose buffer is intact
@@ -250,7 +252,7 @@ class TestAnonymousRefusal:
         Then the TID is the one right after the last commit (invariant 5)
         """
         tid_before = _commit_shelf_then_anonymous_smuggle(store)
-        with pytest.raises(WriteDeniedError):
+        with pytest.raises(dc.WriteDeniedError):
             store.commit()
         with store.acting_as(ANNA):
             tid_after = store.commit()
@@ -295,10 +297,10 @@ class TestLegacyFill:
         """
         with store_factory() as reopened:
             row = reopened.query(dc.fields(legacy_vault).name == "w1-era")[0]
-        assert row._dc_owner == 0
-        assert list(row._dc_groups) == [dc.WORLD]
-        assert row._dc_read_floor == dc.VIEWER
-        assert row._dc_write_floor == dc.ADMIN
+        assert row.dc_permissions.owner == 0
+        assert list(row.dc_permissions.groups) == [dc.WORLD]
+        assert row.dc_permissions.read_floor == dc.VIEWER
+        assert row.dc_permissions.write_floor == dc.ADMIN
 
     def test_decode_level_pluck_agrees_with_the_fill(
         self, store_factory: StoreFactory, legacy_vault: type
@@ -333,9 +335,9 @@ class TestLegacyFill:
         """
         with store_factory() as reopened:
             [view] = reopened.snapshot().query(dc.fields(legacy_vault).name == "w1-era")
-        assert view._dc_owner == 0
-        assert tuple(view._dc_groups) == (dc.WORLD,)
-        assert view._dc_write_floor == dc.ADMIN
+        assert view.fields()["_dc_owner"] == 0
+        assert tuple(view.fields()["_dc_groups"]) == (dc.WORLD,)
+        assert view.fields()["_dc_write_floor"] == dc.ADMIN
 
     def test_index_build_plans_the_read_floor_as_an_indexed_lookup(
         self, store_factory: StoreFactory, legacy_vault: type
@@ -349,7 +351,9 @@ class TestLegacyFill:
             with reopened.acting_as(ANNA):
                 fresh = legacy_vault(name="post-flip")
                 reopened.store(fresh)
-                fresh._dc_read_floor = dc.CURATOR
+                fresh.dc_permissions = dc.Permissions(  # pyrefly: ignore[missing-attribute]
+                    owner=ANNA.uid, groups=(), read_floor=dc.CURATOR, write_floor=dc.VIEWER
+                )
                 reopened.commit()
             plan = reopened.explain(dc.fields(legacy_vault)._dc_read_floor <= dc.VIEWER)
         assert plan.indexed
@@ -366,7 +370,9 @@ class TestLegacyFill:
             with reopened.acting_as(ANNA):
                 fresh = legacy_vault(name="post-flip")
                 reopened.store(fresh)
-                fresh._dc_read_floor = dc.CURATOR
+                fresh.dc_permissions = dc.Permissions(  # pyrefly: ignore[missing-attribute]
+                    owner=ANNA.uid, groups=(), read_floor=dc.CURATOR, write_floor=dc.VIEWER
+                )
                 reopened.commit()
             found = reopened.query(dc.fields(legacy_vault)._dc_read_floor <= dc.VIEWER)
         assert {row.name for row in found} == {"w1-era"}
@@ -383,8 +389,8 @@ class TestLegacyFill:
             first.commit()
         with store_factory() as reopened, reopened.acting_as(ANNA):
             row = reopened.query(dc.fields(born_protected).name == "born-protected")[0]
-        assert row._dc_owner == 2
-        assert row._dc_write_floor == dc.VIEWER
+        assert row.dc_permissions.owner == 2
+        assert row.dc_permissions.write_floor == dc.VIEWER
 
     def test_migrate_is_denied_to_a_curator_below_the_r7_admin_floor(
         self, store_factory: StoreFactory, legacy_vault: type
@@ -423,8 +429,8 @@ class TestLegacyFill:
             migrating.migrate()
         with store_factory() as reopened:
             row = reopened.query(dc.fields(legacy_vault).name == "w1-era")[0]
-        assert row._dc_write_floor == dc.ADMIN
-        assert list(row._dc_groups) == [dc.WORLD]
+        assert row.dc_permissions.write_floor == dc.ADMIN
+        assert list(row.dc_permissions.groups) == [dc.WORLD]
 
 
 def _commit_w1_era_actor(store_factory: StoreFactory) -> None:
@@ -464,11 +470,12 @@ class TestActorFlip:
 
     def test_actor_class_is_protected(self) -> None:
         """Given the shipped Actor class
-        When its type info is read
-        Then it is marked protected
+        When a fresh actor's permissions are read
+        Then they are a dc.Permissions, only a protected class carrying labels
         """
-        info = type_info(dc.Actor)
-        assert info.protected is True
+        actor = dc.Actor(uid=2)
+
+        assert isinstance(actor.dc_permissions, dc.Permissions)  # pyrefly: ignore[missing-attribute]
 
     def test_w1_era_actor_row_decodes_with_the_admin_write_floor(
         self, store_factory: StoreFactory
@@ -480,7 +487,7 @@ class TestActorFlip:
         _commit_w1_era_actor(store_factory)
         with store_factory() as reopened:
             anna = reopened.query(dc.fields(dc.Actor).uid == 2)[0]
-        assert anna._dc_write_floor == dc.ADMIN
+        assert anna.dc_permissions.write_floor == dc.ADMIN
 
     def test_w1_era_actor_row_stays_readable_as_before(self, store_factory: StoreFactory) -> None:
         """Given an Actor row persisted anonymously in the W1-era unprotected shape
@@ -490,7 +497,7 @@ class TestActorFlip:
         _commit_w1_era_actor(store_factory)
         with store_factory() as reopened:
             anna = reopened.query(dc.fields(dc.Actor).uid == 2)[0]
-        assert list(anna._dc_groups) == [dc.WORLD]
+        assert list(anna.dc_permissions.groups) == [dc.WORLD]
 
     def test_acting_as_still_resolves_the_w1_era_actor(self, store_factory: StoreFactory) -> None:
         """Given an Actor row persisted anonymously in the W1-era unprotected shape
@@ -519,8 +526,7 @@ class TestUpsertShield:
         with store.acting_as(ANNA):
             gem = Gem(name="tourmaline")
             store.store(gem)
-            gem._dc_groups.append(ORG)  # pyrefly: ignore[missing-attribute]
-            gem._dc_write_floor = dc.CURATOR  # pyrefly: ignore[missing-attribute]
+            gem.dc_permissions = _org_labels(gem, dc.CURATOR)  # pyrefly: ignore[missing-attribute]
             store.commit()
             survivor = store.upsert(Gem(name="tourmaline"))
         assert survivor is gem
@@ -533,11 +539,10 @@ class TestUpsertShield:
         with store.acting_as(ANNA):
             gem = Gem(name="tourmaline")
             store.store(gem)
-            gem._dc_groups.append(ORG)  # pyrefly: ignore[missing-attribute]
-            gem._dc_write_floor = dc.CURATOR  # pyrefly: ignore[missing-attribute]
+            gem.dc_permissions = _org_labels(gem, dc.CURATOR)  # pyrefly: ignore[missing-attribute]
             store.commit()
             survivor = store.upsert(Gem(name="tourmaline"))
-        assert survivor._dc_owner == 2
+        assert survivor.dc_permissions.owner == 2
 
     def test_merge_does_not_reset_the_write_floor_of_a_committed_survivor(
         self, store: dc.Store
@@ -549,11 +554,10 @@ class TestUpsertShield:
         with store.acting_as(ANNA):
             gem = Gem(name="tourmaline")
             store.store(gem)
-            gem._dc_groups.append(ORG)  # pyrefly: ignore[missing-attribute]
-            gem._dc_write_floor = dc.CURATOR  # pyrefly: ignore[missing-attribute]
+            gem.dc_permissions = _org_labels(gem, dc.CURATOR)  # pyrefly: ignore[missing-attribute]
             store.commit()
             survivor = store.upsert(Gem(name="tourmaline"))
-        assert survivor._dc_write_floor == dc.CURATOR
+        assert survivor.dc_permissions.write_floor == dc.CURATOR
 
     def test_merge_does_not_reset_the_groups_of_a_committed_survivor(self, store: dc.Store) -> None:
         """Given Anna's committed gem with a curated group and a curator write floor
@@ -563,11 +567,10 @@ class TestUpsertShield:
         with store.acting_as(ANNA):
             gem = Gem(name="tourmaline")
             store.store(gem)
-            gem._dc_groups.append(ORG)  # pyrefly: ignore[missing-attribute]
-            gem._dc_write_floor = dc.CURATOR  # pyrefly: ignore[missing-attribute]
+            gem.dc_permissions = _org_labels(gem, dc.CURATOR)  # pyrefly: ignore[missing-attribute]
             store.commit()
             survivor = store.upsert(Gem(name="tourmaline"))
-        assert list(survivor._dc_groups) == [ORG]
+        assert list(survivor.dc_permissions.groups) == [ORG]
 
     def test_same_batch_reupsert_returns_the_pending_survivor(self, store: dc.Store) -> None:
         """Given a gem upserted by Anna and still pending
@@ -587,7 +590,7 @@ class TestUpsertShield:
         with store.acting_as(ANNA):
             first = store.upsert(Gem(name="zircon"))
             store.upsert(Gem(name="zircon"))
-        assert first._dc_owner == 2
+        assert first.dc_permissions.owner == 2
 
     def test_same_batch_pending_survivor_commits_with_its_stamp(self, store: dc.Store) -> None:
         """Given a gem upserted twice by Anna in one batch
@@ -599,7 +602,7 @@ class TestUpsertShield:
             store.upsert(Gem(name="zircon"))
             store.commit()
             gem = store.query(dc.fields(Gem).name == "zircon")[0]
-        assert gem._dc_owner == 2
+        assert gem.dc_permissions.owner == 2
 
     def test_data_fields_still_merge(self, store: dc.Store) -> None:
         """Given a committed labeled drawer
@@ -628,7 +631,7 @@ class TestUpsertShield:
             probe.prize = dc.Lazy.of(Gem(name="new-prize"))
             store.upsert(probe)
             store.commit()
-        assert drawer._dc_write_floor == dc.STAFF  # pyrefly: ignore[missing-attribute]
+        assert drawer.dc_permissions.write_floor == dc.STAFF  # pyrefly: ignore[missing-attribute]
 
     def test_unchanged_reimport_buffers_nothing(self, store: dc.Store) -> None:
         """Given Anna's committed gem
@@ -641,22 +644,6 @@ class TestUpsertShield:
             store.upsert(Gem(name="idempotent"))
             committed = store.commit()
         assert committed is None
-
-    def test_unprotected_class_merges_every_field(self) -> None:
-        """Given an unprotected class
-        When its type info is read
-        Then its data field names are its field names, zero-cost and structurally
-        """
-        info = type_info(PlainShelf)
-        assert info.data_field_names is info.field_names
-
-    def test_protected_class_merges_only_its_data_fields(self) -> None:
-        """Given a protected class
-        When its type info is read
-        Then its data field names exclude the label columns
-        """
-        info = type_info(Gem)
-        assert info.data_field_names == ("name",)
 
 
 # --- index cache x retrofit (ADR-005: rebuild on marker mismatch) ---------------

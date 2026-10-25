@@ -12,7 +12,6 @@ import warnings
 import pytest
 
 import datacrystal as dc
-from datacrystal._entity import oid_of
 from tests.conftest import Locality, Mineral
 
 M = dc.fields(Mineral)
@@ -370,8 +369,7 @@ def test_get_many_accepts_snapshot_refs(cabinet: dc.Store) -> None:
     Then the result is the quartz instance
     """
     quartz = cabinet.get(Mineral, qid="Q43010")
-    oid = oid_of(quartz)
-    assert oid is not None
+    oid = cabinet.store(quartz)
 
     got = cabinet.get_many([dc.Ref(oid)])
 

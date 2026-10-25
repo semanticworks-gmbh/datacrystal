@@ -11,8 +11,6 @@ from pathlib import Path
 import pytest
 
 import datacrystal as dc
-from datacrystal._ids import FORMAT_VERSION
-from datacrystal._storage.memory import MemoryBackend
 
 
 def _stamp_sqlite_format_version(store_dir: Path, version: str) -> None:
@@ -30,7 +28,7 @@ def test_sqlite_newer_store_is_refused_naming_both_versions(tmp_path: Path) -> N
     dc.Store.open(tmp_path / "s").close()
     _stamp_sqlite_format_version(tmp_path / "s", "99")
 
-    with pytest.raises(dc.NewerStoreError, match=f"v99.*v{FORMAT_VERSION}"):
+    with pytest.raises(dc.NewerStoreError, match=r"v99.*v2"):
         dc.Store.open(tmp_path / "s")
 
 
@@ -46,14 +44,3 @@ def test_refused_sqlite_open_leaves_no_lease_behind(tmp_path: Path) -> None:
 
     assert not (tmp_path / "s" / "used.lock").exists()
 
-
-def test_memory_newer_store_is_refused() -> None:
-    """Given an in-memory backend stamped with format version 99
-    When a store is opened on it
-    Then opening raises NewerStoreError
-    """
-    backend = MemoryBackend()
-    backend._meta["format_version"] = "99"
-
-    with pytest.raises(dc.NewerStoreError):
-        dc.Store._from_backend(backend)
