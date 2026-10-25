@@ -277,7 +277,7 @@ def test_owner_deref_after_a_denied_deref_loads_the_real_registered_record(
     """Given a reopened store where an outsider already derefed the record into a twin
     When the owner calls get on the same Lazy handle
     Then the owner gets the real record
-    And a later deref by OID returns that instance, so an outsider's twin was never cached
+    And a later deref by OID returns that same instance
     """
     hidden_oid = _commit_hidden_record(store_factory)
     reopened = store_factory()

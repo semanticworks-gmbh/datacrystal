@@ -271,7 +271,7 @@ def test_fresh_dc_permissions_view_holds_the_groups_as_a_tuple() -> None:
     """
     specimen = Specimen(label="topaz-05")
     specimen.dc_permissions = dc.Permissions(  # pyrefly: ignore[missing-attribute]
-        owner=0, groups=[7], read_floor=dc.VIEWER, write_floor=dc.VIEWER  # pyrefly: ignore[bad-argument-type]
+        owner=0, groups=(7,), read_floor=dc.VIEWER, write_floor=dc.VIEWER
     )
     fresh_view = specimen.dc_permissions  # pyrefly: ignore[missing-attribute]
     assert fresh_view.groups == (7,)

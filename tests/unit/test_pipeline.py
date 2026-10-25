@@ -86,12 +86,6 @@ def _type_names(applier: ReferenceApplier) -> set[str]:
     return {name for name, _ in applier.types.values()}
 
 
-def _lineage_typenames(store: dc.Store) -> set[str]:
-    """Return the typename of every lineage row the store holds."""
-    with store.snapshot() as snap:
-        return {typename for _cid, typename, _fields in snap.types}
-
-
 @pytest.fixture
 def collector_attached(store_factory: StoreFactory) -> tuple[dc.Store, _Collector]:
     """Attach a collector to a store that has committed nothing."""
@@ -802,5 +796,6 @@ def test_types_rows_precede_their_ops(store_factory: StoreFactory) -> None:
     store.commit()
 
     assert {"tests.conftest:Mineral", "tests.conftest:Locality"} <= _type_names(applier)
-    assert _type_names(applier) == _lineage_typenames(store)
+    with store.snapshot() as snap:
+        assert _type_names(applier) == {typename for _cid, typename, _fields in snap.types}
     store.close()

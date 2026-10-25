@@ -91,12 +91,6 @@ def _stored_v1_names_as_root(store_factory: StoreFactory, *names: str) -> None:
     store.close()
 
 
-def _lineage_typenames(store: dc.Store) -> list[str]:
-    """Return the typename of every lineage row the store holds, a shape's row each."""
-    with store.snapshot() as snap:
-        return [typename for _cid, typename, _fields in snap.types]
-
-
 def _names(records: Iterable[Any]) -> list[str]:
     return sorted(record.name for record in records)
 
@@ -459,9 +453,10 @@ def test_a_stored_shape_has_one_lineage_row(store_factory: StoreFactory) -> None
     _evolve(name=(str, REQUIRED), mohs=(float | None, None))
     reopened = store_factory()
 
-    typenames = _lineage_typenames(reopened)
-
-    assert typenames.count(f"{__name__}:Evolving") == 1
+    with reopened.snapshot() as snap:
+        assert [typename for _cid, typename, _fields in snap.types].count(
+            f"{__name__}:Evolving"
+        ) == 1
     reopened.close()
 
 
@@ -477,9 +472,10 @@ def test_a_new_shape_gets_its_own_lineage_row(store_factory: StoreFactory) -> No
 
     reopened.commit()
 
-    typenames = _lineage_typenames(reopened)
-
-    assert typenames.count(f"{__name__}:Evolving") == 2
+    with reopened.snapshot() as snap:
+        assert [typename for _cid, typename, _fields in snap.types].count(
+            f"{__name__}:Evolving"
+        ) == 2
     reopened.close()
 
 
