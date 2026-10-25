@@ -919,7 +919,6 @@ def test_upsert_with_an_identical_blob_does_not_restore_it(store_factory: StoreF
     first = store.get(Scan, qid="S1")
     assert first is not None
     oid1 = _handle(first.image).blob_oid
-    del first  # a live entity keeps raw bytes after a changed-blob upsert; the next get rehydrates a BlobHandle
     store.upsert(Scan(qid="S1", label="v2", image=IMG))
     store.commit()
 
@@ -962,7 +961,6 @@ def test_upsert_with_a_changed_blob_mints_a_fresh_blob_oid(store_factory: StoreF
     first = store.get(Scan, qid="S1")
     assert first is not None
     oid1 = _handle(first.image).blob_oid
-    del first  # a live entity keeps raw bytes after a changed-blob upsert; the next get rehydrates a BlobHandle
     store.upsert(Scan(qid="S1", label="v1", image=IMG + b"!"))
     store.commit()
 

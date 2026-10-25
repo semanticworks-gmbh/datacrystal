@@ -1007,7 +1007,6 @@ def test_upsert_of_an_identical_bytearray_blob_keeps_the_blob_oid(
     before = reopened.get(Specimen, qid="Q1")
     assert before is not None
     oid_before = _handle(before.scan).blob_oid
-    del before  # a live entity keeps raw bytes after a changed-blob assignment; the next get rehydrates a BlobHandle
     reopened.upsert(Specimen(qid="Q1", label="v2", scan=cast("bytes", bytearray(data))))
     reopened.commit()
 

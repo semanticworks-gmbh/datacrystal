@@ -982,66 +982,60 @@ def test_fts_search_returns_the_hit_for_owner_and_root(
 
 
 @pytest.fixture
-def reopened_with_blob(store_factory: Callable[[], dc.Store]) -> Iterator[tuple[dc.Store, int]]:
-    """Seed, close and reopen so the blob field reads back as a BlobHandle.
-
-    A live same-process assignment stays raw bytes until a fresh hydration.
-    """
-    first = store_factory()
-    hidden, _anchor, _cabinet = seed(first)
-    hidden_oid = oid_int(hidden)
-    first.close()
-    reopened = store_factory()
-    yield reopened, hidden_oid
-    reopened.close()
+def seeded_with_blob(store_factory: Callable[[], dc.Store]) -> Iterator[tuple[dc.Store, int]]:
+    """Seed a protected record with a scan blob and yield the store that committed it."""
+    seeded = store_factory()
+    hidden, _anchor, _cabinet = seed(seeded)
+    yield seeded, oid_int(hidden)
+    seeded.close()
 
 
 @pytest.fixture
-def owner_view(reopened_with_blob: tuple[dc.Store, int]) -> Specimen:
+def owner_view(seeded_with_blob: tuple[dc.Store, int]) -> Specimen:
     """Fetch the hidden record as its owner, holding the real entity and its blob handle."""
-    reopened, hidden_oid = reopened_with_blob
-    with reopened.acting_as(A):
-        [view] = reopened.get_many([hidden_oid])
+    store, hidden_oid = seeded_with_blob
+    with store.acting_as(A):
+        [view] = store.get_many([hidden_oid])
     return view
 
 
 def test_blob_handle_bytes_are_denied_to_a_reader_without_standing(
-    reopened_with_blob: tuple[dc.Store, int], owner_view: Specimen
+    seeded_with_blob: tuple[dc.Store, int], owner_view: Specimen
 ) -> None:
     """Given a blob handle the owner fetched
     When B reads the SAME handle's bytes
     Then the read is re-gated and denied
     """
-    reopened, _ = reopened_with_blob
+    store, _ = seeded_with_blob
 
-    with reopened.acting_as(B), pytest.raises(dc.ReadDeniedError):
+    with store.acting_as(B), pytest.raises(dc.ReadDeniedError):
         owner_view.scan.bytes()  # pyrefly: ignore[missing-attribute]
 
 
 def test_store_open_blob_is_denied_to_a_reader_holding_the_entity(
-    reopened_with_blob: tuple[dc.Store, int], owner_view: Specimen
+    seeded_with_blob: tuple[dc.Store, int], owner_view: Specimen
 ) -> None:
     """Given the real entity in B's hand, fetched by the owner
     When B opens its scan blob through the store
     Then the open is still denied
     """
-    reopened, _ = reopened_with_blob
+    store, _ = seeded_with_blob
 
-    with reopened.acting_as(B), pytest.raises(dc.ReadDeniedError):
-        reopened.open_blob(owner_view, "scan")
+    with store.acting_as(B), pytest.raises(dc.ReadDeniedError):
+        store.open_blob(owner_view, "scan")
 
 
 @READERS
 def test_blob_handle_bytes_are_readable_to_owner_and_root(
-    reopened_with_blob: tuple[dc.Store, int], owner_view: Specimen, principal: dc.Principal
+    seeded_with_blob: tuple[dc.Store, int], owner_view: Specimen, principal: dc.Principal
 ) -> None:
     """Given a blob handle the owner fetched
     When the owner or root reads the handle's bytes
     Then they are the scan
     """
-    reopened, _ = reopened_with_blob
+    store, _ = seeded_with_blob
 
-    with reopened.acting_as(principal):
+    with store.acting_as(principal):
         content = owner_view.scan.bytes()  # pyrefly: ignore[missing-attribute]
 
     assert content == SECRET_BYTES
@@ -1049,44 +1043,44 @@ def test_blob_handle_bytes_are_readable_to_owner_and_root(
 
 @READERS
 def test_store_open_blob_is_readable_to_owner_and_root(
-    reopened_with_blob: tuple[dc.Store, int], owner_view: Specimen, principal: dc.Principal
+    seeded_with_blob: tuple[dc.Store, int], owner_view: Specimen, principal: dc.Principal
 ) -> None:
     """Given the real entity fetched by the owner
     When the owner or root opens its scan blob through the store
     Then its bytes are the scan
     """
-    reopened, _ = reopened_with_blob
+    store, _ = seeded_with_blob
 
-    with reopened.acting_as(principal), reopened.open_blob(owner_view, "scan") as blob:
+    with store.acting_as(principal), store.open_blob(owner_view, "scan") as blob:
         content = blob.read()
 
     assert content == SECRET_BYTES
 
 
-def test_reopened_snapshot_open_blob_is_denied_to_a_reader_without_standing(
-    reopened_with_blob: tuple[dc.Store, int],
+def test_seeded_snapshot_open_blob_is_denied_to_a_reader_without_standing(
+    seeded_with_blob: tuple[dc.Store, int],
 ) -> None:
-    """Given a protected record with a scan blob, in a reopened store
+    """Given a protected record with a scan blob, in the committing store
     When B's snapshot opens the blob
     Then the open is denied
     """
-    reopened, hidden_oid = reopened_with_blob
+    store, hidden_oid = seeded_with_blob
 
-    with reopened.snapshot(principal=B) as snapshot, pytest.raises(dc.ReadDeniedError):
+    with store.snapshot(principal=B) as snapshot, pytest.raises(dc.ReadDeniedError):
         snapshot.open_blob(hidden_oid, "scan")
 
 
 @READERS
-def test_reopened_snapshot_open_blob_reads_the_scan_for_owner_and_root(
-    reopened_with_blob: tuple[dc.Store, int], principal: dc.Principal
+def test_seeded_snapshot_open_blob_reads_the_scan_for_owner_and_root(
+    seeded_with_blob: tuple[dc.Store, int], principal: dc.Principal
 ) -> None:
-    """Given a protected record with a scan blob, in a reopened store
+    """Given a protected record with a scan blob, in the committing store
     When the owner's or root's snapshot opens the blob
     Then its bytes are the scan
     """
-    reopened, hidden_oid = reopened_with_blob
+    store, hidden_oid = seeded_with_blob
 
-    with reopened.snapshot(principal=principal) as snapshot, snapshot.open_blob(
+    with store.snapshot(principal=principal) as snapshot, snapshot.open_blob(
         hidden_oid, "scan"
     ) as blob:
         content = blob.read()

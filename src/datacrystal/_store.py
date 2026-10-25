@@ -117,6 +117,7 @@ from datacrystal._registry import ObjectRegistry
 from datacrystal._snapshot import (
     Ref,
     Snapshot,
+    UnseenTypeLedger,
     _SnapshotCore,  # the per-watermark core ctor
 )
 from datacrystal._state import STATE_CLEAN, STATE_DELETED, STATE_DIRTY, STATE_NEW
@@ -405,6 +406,7 @@ class Store:
         # in P2 cannot leave later records pointing at a cid the store never
         # learned about.
         self._durable_cids: set[int] = set()
+        self._unseen_types = UnseenTypeLedger()  # one warning per type per Store, snapshots included
         for cid, typename, fields in boot.types:  # ordered by cid: last wins
             self._cid_by_typename[typename] = cid
             self._cids_by_typename.setdefault(typename, []).append(cid)
@@ -487,10 +489,10 @@ class Store:
     def committing(self, *, retries: int = 3) -> Iterator[_CommitAttempt]:
         """Run a block in a commit loop that retries on conflict, the same code on any topology.
 
-        Use ``for txn in store.committing(): with txn: ...``; a clean exit commits. A follower's
-        stale write re-runs the block on fresh state (``discard``, ``sync``) up to ``retries``
-        times, then raises ``ConflictError``. Never call :meth:`commit` inside;
-        ``WriteDeniedError`` is not retried (ADR-008).
+        Use ``for txn in store.committing(): with txn: ...``, the only supported form: a clean exit
+        commits, a stale follower write re-runs the block on fresh state up to ``retries`` times,
+        then ``ConflictError`` surfaces when the loop resumes, never from ``with txn:``.
+        Never call :meth:`commit` inside; ``WriteDeniedError`` is not retried (ADR-008).
         Details: docs/reference.md, "Behaviour notes".
         """
         self._enter()
@@ -1384,14 +1386,15 @@ class Store:
             self._fingerprints.pop(oid, None)
         self._pending_upserts.clear()  # the committed unique map takes over
         self._durable_cids.update(cid for cid, _, _ in capture.batch.new_types)
-        # A streamed-write source has now been consumed and durably stored; swap
-        # the live field from the opaque BlobSource to a readable BlobHandle so
-        # .bytes()/open_blob work without a reopen (ADR-007 §4). Untracked
-        # (set_field) — this is the post-commit rehydration, not a mutation. A
-        # plain bytes value is left as-is (it stays readable as itself).
+        # A written blob value (raw bytes or a streamed source) is now durably stored; swap
+        # the live field to a readable BlobHandle, as store.get returns it, so
+        # .size/.hash/.bytes()/open_blob work without a reopen (ADR-007 §4). Untracked
+        # (set_field) — this is the post-commit rehydration, not a mutation.
         for obj, field, boid, size, digest in capture.blob_swaps:
             # engine-only BlobHandle constructor (users never call _bind)
-            handle = BlobHandle._bind(boid, size, digest, self)
+            # a protected owner's handle re-gates .bytes() like a hydrated one (ADR-008 W4-3)
+            owner_oid = oid_of(obj) if type_info(obj).protected else None
+            handle = BlobHandle._bind(boid, size, digest, self, owner_oid=owner_oid)
             set_field(obj, field, handle)
         if self._debug:
             # A blob-bearing entity's stored payload carries the real blob OID but the sweep
@@ -1692,7 +1695,7 @@ class Store:
         if self._closed:
             raise StoreClosedError("this store has been closed")
         bound = principal if principal is not None else self.principal
-        core = _SnapshotCore(self._backend.read_view())
+        core = _SnapshotCore(self._backend.read_view(), self._unseen_types)
         return Snapshot(core, bound)
 
     def open_blob(self, entity: object, field: str) -> BinaryIO:
@@ -2214,6 +2217,8 @@ class Store:
     # -- engine internals ----------------------------------------------------
 
     def _warn_unseen(self, ti: TypeInfo) -> None:
+        if not self._unseen_types.first_sight(ti.typename):
+            return
         warnings.warn(
             UnseenTypeWarning(
                 f"the store has no committed records of {ti.cls.__name__} — "
@@ -3211,18 +3216,18 @@ def _note_streamed_swaps(
     payload: bytes,
     blob_swaps: list[tuple[Any, str, int, int, bytes]],
 ) -> None:
-    """Record the streamed-source fields of one encoded entity for the P3 swap.
+    """Record the raw-bytes and streamed-source fields of one encoded entity for the P3 swap.
 
     Each field's blob descriptor is read straight from the just-encoded payload, so two fields
     sharing ONE BlobSource each pick up their OWN blob OID (id(value) keying would alias both to
     the last-allocated one).
     """
-    streamed_positions = [
-        i for i in blob_positions if isinstance(values[i], BlobSource)
+    swap_positions = [
+        i for i in blob_positions if isinstance(values[i], (BlobSource, bytes, bytearray))
     ]
-    if streamed_positions:
+    if swap_positions:
         decoded = decode_payload(payload)
-        for i in streamed_positions:
+        for i in swap_positions:
             tok = cast("BlobToken", decoded[i])  # the field's BLOB_EXT descriptor
             blob_swaps.append(
                 (obj, ti.field_names[i], tok.blob_oid, tok.size, tok.hash)

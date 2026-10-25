@@ -48,6 +48,7 @@ store.close()                                  # or: with dc.Store.open(...) as 
 - `cache_index=True` (**on by default**, [ADR-005](design/ADR-005-index-cache.md)) **persists the built indexes to a watermark-stamped sidecar and loads them at boot instead of rescanning** — so a warm reopen of a large store skips that O(extent) first-query rebuild (measured **~14× faster** on a 6.2M-row store; the sidecar is ~2.5× smaller than a naïve one because a `Unique` field is stored as a flat key→oid map, not per-key bitmaps).
   The cache is **never authoritative** (invariant 11): any watermark or index-marker mismatch, or a stale/corrupt/newer sidecar, silently rebuilds from the records — it can never return a wrong answer (SIGKILL-tested).
   Pass `cache_index=False` for a scratch store, or one you never reopen.
+  Entity fields, a multivalued one such as `_dc_groups` included, keep their append order after a reopen over the cache; only the index's internal last-values list is rebuilt in postings-key order, which no read exposes.
 - `durability` is a triad. `"commit"` fsyncs every commit (plus `F_FULLFSYNC` on macOS — honest, so a commit costs ~4 ms there); an acked commit survives even power loss. `"interval"` (default) group-commits: fsync happens at WAL checkpoints, so a **process** crash (kill -9) loses nothing, while an OS crash or power loss may lose the last commits — but never corrupts the file. `"never"` skips fsync entirely: benchmarks and scratch stores only, an OS crash can corrupt it.
 - `close()` **discards uncommitted changes** — commit first.
   Closing releases the lock and the in-memory graph.
@@ -76,6 +77,8 @@ It works on any store (an uncommitted local graph is dropped); a live reference 
 **`store.committing(*, retries=3)`** is the recommended read-modify-write loop — *the same code on a single-node store and a follower*.
 Drive it with `for txn in store.committing(): with txn: ...`: the block reads and mutates and is committed when it exits cleanly.
 On a follower a stale write raises `ConflictError`; instead of surfacing it, `committing()` re-runs your block against fresh state (a `discard()` + `sync()` happen first), up to `retries` times, then re-raises if the conflict persists.
+The `for txn in store.committing(...)` loop is the **only supported form**: the final `ConflictError` is raised when the loop asks for the next attempt, never from `with txn:`.
+An attempt you enter by hand whose follower write conflicts, and that you never resume, sees no error, and its write does not land.
 On a single-node store a commit can never conflict, so the block runs exactly once.
 Keep the whole read-modify-write inside the block (the re-read runs each attempt, so a retry re-applies your *intent* to the winning value — never last-writer-wins) and do not call `commit()` yourself; `retries=0` is a single strict attempt.
 
@@ -295,6 +298,7 @@ Containers are by-value parts of their owner — after `e.tags = data`, mutate t
 | Value | Persisted as |
 |---|---|
 | `None`, `bool`, `int`, `float`, `str`, `bytes` | itself (msgpack) |
+| `bytearray` | stored as bytes and hydrates as **`bytes`**: the instance you committed keeps its `bytearray`, a reopened or fetched record holds `bytes` |
 | timezone-aware `datetime` | itself (msgpack timestamp; the instant is preserved, a non-UTC offset comes back as UTC) |
 | naive `datetime`, `date`, `time` | itself (datacrystal extension codes, format v2) |
 | `decimal.Decimal` | itself (datacrystal extension code 6 holding the exact text, so `Decimal("1.10")` stays `1.10`; `None`, negatives and any precision included) |
@@ -318,6 +322,7 @@ For large binaries (PDFs, scanned invoices, images) mark the field `Annotated[by
   A `query`/`count`/`pluck`/scan over the owning type **never touches the blob bytes**.
   On read the field hydrates to a **`dc.BlobHandle`** (`.size`/`.hash` free from the descriptor; `.bytes()` fetches the whole payload once; streamed via `store.open_blob()`).
   The streamed-write form assigns a `dc.BlobSource(size, open_chunks)` or `dc.blob_from_path(path)`.
+  After `commit()` the field on your instance is a `dc.BlobHandle` whichever form you assigned (`bytes`, `bytearray` or a source), the same object `store.get` returns; before the commit it still holds what you assigned.
 - **What it does NOT do.**
   No automatic spill threshold (mark it `dc.Blob` explicitly), no content-addressing/dedup in core (use a `Unique`-hash-field pattern), no in-place mutation (a blob is immutable — reassigning writes a *new* blob OID), no genuinely unbounded stream (the size must be known up front; a single v1 blob caps at SQLite's ~954 MiB cell limit and fails loudly past it; a chunked layout is `[planned — #76]`).
 - **Cost.**
@@ -412,6 +417,9 @@ Query semantics (the *theory* — planner, residual, candidate set — is in [ex
 - A condition uses fields of **one entity class** — cross-entity joins are `[planned — v1, on Arrow mirrors]`.
 - `query()` and `get()` reflect **committed** state; uncommitted buffered changes are not visible to them. `count()` and `pluck()` read committed state even more strictly: they decode records instead of hydrating entities, so they never see in-memory mutations at all (and never pay entity-construction RAM — that is the point).
 - Querying, counting or plucking a class the store has **no committed records of** returns empty and emits an `UnseenTypeWarning` — legitimate on a first run, a lifesaver when you forgot to `commit()` or opened the wrong store file. `get()` stays silent (`None` is the expected miss in get-or-create code).
+- **The warning fires once per type per `Store`.**
+  The store and every snapshot it opens share one record of the types already warned about, so the first read of an unseen type warns and every later read of it stays quiet, through any snapshot, on any thread; a route that opens a snapshot per request warns on its first request only.
+  A second `Store` over the same files starts with an empty record and warns again once, and a different unseen type warns on its own first read.
 - Type checkers cannot model the magic class-attribute access (they see `Mineral.mohs` as `float | None` and flag the comparison).
   Runtime is fine either way; for checker-clean code use the equivalent typed proxy `dc.fields(Mineral)` — see [Typing](#typing).
 
@@ -922,7 +930,7 @@ Everything derives from `dc.DataCrystalError`:
 Pipeline consumers can additionally raise the contract errors (`datacrystal.contract`): `DeltaGapError` (history missing — resync/rebuild; also raised by `attach()` on a watermark mismatch) and `DeltaFormatError` (malformed/newer-versioned delta).
 The extras add `datacrystal.fts.FtsConfigError` and `datacrystal.arrow.MirrorConfigError` (both `DataCrystalError`s): the sidecar file/directory contradicts the requested configuration or is newer than the installed extra — rebuild rather than guess.
 
-Four warnings live outside the exception family (all `UserWarning`s): `UntrackedMutationWarning`, emitted by the `debug=True` safety net when a mutation slipped past the dirty tracking — the entity is committed anyway; fix the write path it names; `DanglingDeleteWarning`, emitted under `debug=True` when a `commit()` deletes an entity another record still references — the commit proceeds (use `strict_deletes=True` to raise instead); `ConsumerDetachedWarning`, emitted when an attached delta consumer raised during delivery and was detached (the commit is durable; rebuild the sidecar and re-attach); and `UnseenTypeWarning`, emitted when `query()`/`count()`/`pluck()` run against a class the store has no committed records of (the result is empty — first run, or a forgotten `commit()`).
+Four warnings live outside the exception family (all `UserWarning`s): `UntrackedMutationWarning`, emitted by the `debug=True` safety net when a mutation slipped past the dirty tracking — the entity is committed anyway; fix the write path it names; `DanglingDeleteWarning`, emitted under `debug=True` when a `commit()` deletes an entity another record still references — the commit proceeds (use `strict_deletes=True` to raise instead); `ConsumerDetachedWarning`, emitted when an attached delta consumer raised during delivery and was detached (the commit is durable; rebuild the sidecar and re-attach); and `UnseenTypeWarning`, emitted when `query()`/`count()`/`pluck()` run against a class the store has no committed records of (the result is empty — first run, or a forgotten `commit()`), once per type per `Store`.
 
 ## Planned features and when they land
 

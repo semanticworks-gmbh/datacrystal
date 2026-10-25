@@ -602,6 +602,45 @@ def test_committing_with_no_retries_raises_the_unresolved_conflict(
     assert authoritative.mohs == 5.0
 
 
+def test_committing_raises_the_conflict_once_its_retries_are_exhausted(
+    coordinator: _CoordinatorServer,
+    connect_follower: Callable[[_CoordinatorServer], dc.Store],
+) -> None:
+    """Given f2 moves Calcite again during each of f1's attempts
+    When f1 makes both attempts of committing(retries=1)
+    Then the step after the second attempt raises ConflictError
+    And a fresh follower reads f2's last 6.0, never f1's 9.9
+    """
+    f1 = connect_follower(coordinator)
+    f2 = connect_follower(coordinator)
+    attempts = f1.committing(retries=1)
+    first_attempt = next(attempts)
+    with first_attempt:
+        m1 = f1.get(Mineral, qid="Q2")
+        assert m1 is not None
+        m1.mohs = 9.9
+        m2 = f2.get(Mineral, qid="Q2")
+        assert m2 is not None
+        m2.mohs = 5.0
+        f2.commit()
+    second_attempt = next(attempts)
+    with second_attempt:
+        m1 = f1.get(Mineral, qid="Q2")
+        assert m1 is not None
+        m1.mohs = 9.9
+        m2 = f2.get(Mineral, qid="Q2")
+        assert m2 is not None
+        m2.mohs = 6.0
+        f2.commit()
+
+    with pytest.raises(ConflictError):
+        next(attempts)
+
+    authoritative = connect_follower(coordinator).get(Mineral, qid="Q2")
+    assert authoritative is not None
+    assert authoritative.mohs == 6.0
+
+
 def test_lost_ack_reinsert_with_base_none_raises_conflict(
     coordinator: _CoordinatorServer,
     connect_follower: Callable[[_CoordinatorServer], dc.Store],
