@@ -135,7 +135,7 @@ def test_a_type_with_records_does_not_warn_in_any_snapshot(store: dc.Store) -> N
 
 
 def _count_minerals_from_sixteen_threads(store: dc.Store) -> list[int]:
-    """Concurrency harness: sixteen threads each count minerals in a snapshot of their own at once."""
+    """Concurrency harness: sixteen threads each count minerals in their own snapshot at once."""
     start = threading.Barrier(16)
 
     def count_in_own_snapshot() -> int:
