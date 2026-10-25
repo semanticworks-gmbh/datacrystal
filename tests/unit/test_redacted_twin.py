@@ -1,7 +1,7 @@
 """dc.Redacted (ADR-008 R14 variant (a)) — the redacted-twin deref checkpoint,
 epic #168 W3-4.
 
-``Store._load_oid_deref`` is the single CHECKED deref, judging COMMITTED
+``Store.get_many`` of an OID is the single CHECKED deref, judging COMMITTED
 labels (D1): the real instance (readable) | a ``dc.Redacted`` twin (exists,
 denied) | ``DanglingRefError`` (no record at all). ``Lazy.get()`` rides this
 checkpoint and never caches a protected target on the engine handle — the
@@ -14,12 +14,11 @@ protected corpus; the full multi-principal × surface matrix is W3-5.
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Annotated, cast
+from typing import Annotated
 
 import pytest
 
 import datacrystal as dc
-from datacrystal._entity import oid_of, type_info
 
 StoreFactory = Callable[[], dc.Store]
 
@@ -63,10 +62,6 @@ class Vault:
 
     label: Annotated[str, dc.Unique]
     secret: dc.Lazy[Dossier] | None = None
-
-
-def _oid(entity: object) -> int:
-    return cast("int", oid_of(entity))
 
 
 def _owner_only(store: dc.Store, label: str) -> Dossier:
@@ -115,8 +110,9 @@ def _commit_readable_hidden_and_deleted(store_factory: StoreFactory) -> tuple[in
 def twin(store: dc.Store) -> Dossier:
     """Return the redacted twin an outsider gets for an owner-only dossier."""
     dossier = _owner_only(store, "net")
+    dossier_oid = store.store(dossier)
     with store.acting_as(OUTSIDER):
-        return store._load_oid_deref(_oid(dossier))
+        return store.get_many([dossier_oid])[0]
 
 
 # --- twin shape (R14 variant (a)) --------------------------------------------
@@ -131,8 +127,9 @@ class TestTwinShape:
         Then the result is an instance of Dossier
         """
         dossier = _owner_only(store, "shape-1")
+        dossier_oid = store.store(dossier)
         with store.acting_as(OUTSIDER):
-            twin = store._load_oid_deref(_oid(dossier))
+            twin = store.get_many([dossier_oid])[0]
         assert isinstance(twin, Dossier)
 
     def test_twin_is_an_instance_of_redacted(self, store: dc.Store) -> None:
@@ -141,8 +138,9 @@ class TestTwinShape:
         Then the result is an instance of dc.Redacted
         """
         dossier = _owner_only(store, "shape-1")
+        dossier_oid = store.store(dossier)
         with store.acting_as(OUTSIDER):
-            twin = store._load_oid_deref(_oid(dossier))
+            twin = store.get_many([dossier_oid])[0]
         assert isinstance(twin, dc.Redacted)
 
     def test_twin_is_falsy(self, store: dc.Store) -> None:
@@ -151,8 +149,9 @@ class TestTwinShape:
         Then the result is falsy
         """
         dossier = _owner_only(store, "shape-1")
+        dossier_oid = store.store(dossier)
         with store.acting_as(OUTSIDER):
-            twin = store._load_oid_deref(_oid(dossier))
+            twin = store.get_many([dossier_oid])[0]
         assert bool(twin) is False
 
     def test_twin_keeps_the_typename_readable(self, store: dc.Store) -> None:
@@ -161,9 +160,10 @@ class TestTwinShape:
         Then the twin's typename is Dossier's
         """
         dossier = _owner_only(store, "shape-1")
+        dossier_oid = store.store(dossier)
         with store.acting_as(OUTSIDER):
-            twin = store._load_oid_deref(_oid(dossier))
-        assert twin.typename == type_info(Dossier).typename
+            twin = store.get_many([dossier_oid])[0]
+        assert twin.typename == "tests.unit.test_redacted_twin:Dossier"
 
     def test_reading_a_data_field_raises_read_denied(self, store: dc.Store) -> None:
         """Given the twin of an owner-only dossier
@@ -171,8 +171,9 @@ class TestTwinShape:
         Then the read raises ReadDeniedError
         """
         dossier = _owner_only(store, "shape-2")
+        dossier_oid = store.store(dossier)
         with store.acting_as(OUTSIDER):
-            twin = store._load_oid_deref(_oid(dossier))
+            twin = store.get_many([dossier_oid])[0]
         with pytest.raises(dc.ReadDeniedError):
             _ = twin.note
 
@@ -182,8 +183,9 @@ class TestTwinShape:
         Then the read raises ReadDeniedError
         """
         dossier = _owner_only(store, "shape-2")
+        dossier_oid = store.store(dossier)
         with store.acting_as(OUTSIDER):
-            twin = store._load_oid_deref(_oid(dossier))
+            twin = store.get_many([dossier_oid])[0]
         with pytest.raises(dc.ReadDeniedError):
             _ = twin.label
 
@@ -193,8 +195,9 @@ class TestTwinShape:
         Then the read raises ReadDeniedError, the labels of an unreadable record being a leak
         """
         dossier = _owner_only(store, "shape-3")
+        dossier_oid = store.store(dossier)
         with store.acting_as(OUTSIDER):
-            twin = store._load_oid_deref(_oid(dossier))
+            twin = store.get_many([dossier_oid])[0]
         with pytest.raises(dc.ReadDeniedError):
             _ = twin.dc_permissions
 
@@ -204,8 +207,9 @@ class TestTwinShape:
         Then the text names Redacted
         """
         dossier = _owner_only(store, "shape-4")
+        dossier_oid = store.store(dossier)
         with store.acting_as(OUTSIDER):
-            twin = store._load_oid_deref(_oid(dossier))
+            twin = store.get_many([dossier_oid])[0]
         assert "Redacted" in repr(twin)
 
 
@@ -273,19 +277,22 @@ def test_twin_never_registered(store_factory: StoreFactory) -> None:
     """Given a reopened store where nobody has loaded an owner-only dossier
     When an outsider derefs its OID
     Then the result is a twin
-    And the identity registry holds nothing for the OID
+    And the owner then derefs the real dossier, not a cached twin
     """
     with store_factory() as first, first.acting_as(OWNER):
         hidden_oid = first.store(Dossier(label="never-registered"))
         first.commit()
     with store_factory() as reopened:
         with reopened.acting_as(OUTSIDER):
-            twin = reopened._load_oid_deref(hidden_oid)
+            twin = reopened.get_many([hidden_oid])[0]
+        with reopened.acting_as(OWNER):
+            owner_view = reopened.get_many([hidden_oid])[0]
         assert isinstance(twin, dc.Redacted)
-        assert reopened._registry.get(hidden_oid) is None
+        assert not isinstance(owner_view, dc.Redacted)
+        assert owner_view.label == "never-registered"
 
 
-# --- _load_oid_deref: three distinguishable outcomes -------------------------
+# --- OID deref: three distinguishable outcomes -------------------------
 
 
 def test_readable_dossier_derefs_to_the_real_instance(store_factory: StoreFactory) -> None:
@@ -296,7 +303,7 @@ def test_readable_dossier_derefs_to_the_real_instance(store_factory: StoreFactor
     """
     readable_oid, _hidden_oid, _doomed_oid = _commit_readable_hidden_and_deleted(store_factory)
     with store_factory() as reopened, reopened.acting_as(OUTSIDER):
-        real = reopened._load_oid_deref(readable_oid)
+        real = reopened.get_many([readable_oid])[0]
     assert not isinstance(real, dc.Redacted)
     assert real.label == "readable"
 
@@ -308,7 +315,7 @@ def test_hidden_dossier_derefs_to_a_twin(store_factory: StoreFactory) -> None:
     """
     _readable_oid, hidden_oid, _doomed_oid = _commit_readable_hidden_and_deleted(store_factory)
     with store_factory() as reopened, reopened.acting_as(OUTSIDER):
-        twin = reopened._load_oid_deref(hidden_oid)
+        twin = reopened.get_many([hidden_oid])[0]
     assert isinstance(twin, dc.Redacted)
 
 
@@ -323,7 +330,7 @@ def test_deleted_dossier_deref_raises_dangling(store_factory: StoreFactory) -> N
         reopened.acting_as(OUTSIDER),
         pytest.raises(dc.DanglingRefError),
     ):
-        reopened._load_oid_deref(doomed_oid)
+        reopened.get_many([doomed_oid])
 
 
 def test_root_bypasses_the_checkpoint(store: dc.Store) -> None:
@@ -333,8 +340,9 @@ def test_root_bypasses_the_checkpoint(store: dc.Store) -> None:
     And it carries its label
     """
     hidden = _owner_only(store, "root-sees-all")
+    hidden_oid = store.store(hidden)
     with store.acting_as(ROOT):
-        seen = store._load_oid_deref(_oid(hidden))
+        seen = store.get_many([hidden_oid])[0]
     assert not isinstance(seen, dc.Redacted)
     assert seen.label == "root-sees-all"
 
@@ -346,13 +354,16 @@ def test_denied_deref_leaves_the_registered_instance_in_the_registry(store: dc.S
     """Given an owner-only dossier registered live
     When an outsider derefs its OID
     Then the outsider gets a twin
-    And the registry still holds the real dossier
+    And the real dossier is still the instance a later deref returns
     """
     dossier = _owner_only(store, "poison")
+    dossier_oid = store.store(dossier)
     with store.acting_as(OUTSIDER):
-        twin = store._load_oid_deref(_oid(dossier))
+        twin = store.get_many([dossier_oid])[0]
+    with store.acting_as(OWNER):
+        real_again = store.get_many([dossier_oid])[0]
     assert isinstance(twin, dc.Redacted)
-    assert store._registry.get(_oid(dossier)) is dossier
+    assert real_again is dossier
 
 
 def test_owner_deref_after_a_denied_deref_yields_the_same_instance(store: dc.Store) -> None:
@@ -361,10 +372,11 @@ def test_owner_deref_after_a_denied_deref_yields_the_same_instance(store: dc.Sto
     Then the owner gets the identical live instance, never re-materialized or poisoned
     """
     dossier = _owner_only(store, "poison")
+    dossier_oid = store.store(dossier)
     with store.acting_as(OUTSIDER):
-        store._load_oid_deref(_oid(dossier))
+        store.get_many([dossier_oid])[0]
     with store.acting_as(OWNER):
-        real_again = store._load_oid_deref(_oid(dossier))
+        real_again = store.get_many([dossier_oid])[0]
     assert real_again is dossier
 
 

@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 import datacrystal as dc
-from datacrystal._entity import oid_of, type_info
+from datacrystal._entity import type_info
 from datacrystal._indexes import plan
 from tests.conftest import Locality, Mineral
 
@@ -36,13 +36,6 @@ def cabinet(store: dc.Store) -> dc.Store:
 
 def _names(hits: Iterable[Mineral]) -> list[str]:
     return sorted(m.name for m in hits)
-
-
-def _oid(entity: object) -> int:
-    oid = oid_of(entity)
-    if oid is None:
-        raise LookupError("entity has no oid yet")
-    return oid
 
 
 def _three_minerals() -> list[Mineral]:
@@ -890,7 +883,7 @@ def test_query_iter_yields_the_oids_query_returns(cabinet: dc.Store) -> None:
     # pyrefly: ignore[bad-argument-type]
     queried = cabinet.query(Mineral.crystal_system == "monoclinic")
 
-    assert {_oid(m) for m in streamed} == {_oid(m) for m in queried}
+    assert {cabinet.store(m) for m in streamed} == {cabinet.store(m) for m in queried}
 
 
 def test_query_iter_of_the_full_extent_yields_every_oid_once(cabinet: dc.Store) -> None:
@@ -899,10 +892,12 @@ def test_query_iter_of_the_full_extent_yields_every_oid_once(cabinet: dc.Store) 
     Then the oids equal those of query(Mineral)
     And none repeats
     """
-    streamed_oids = list(map(_oid, cabinet.query_iter(Mineral)))
+    streamed = list(cabinet.query_iter(Mineral))
     queried = cabinet.query(Mineral)
+    streamed_oids = [cabinet.store(m) for m in streamed]
+    queried_oids = [cabinet.store(m) for m in queried]
 
-    assert sorted(streamed_oids) == sorted(map(_oid, queried))
+    assert sorted(streamed_oids) == sorted(queried_oids)
     assert len(streamed_oids) == len(set(streamed_oids))
 
 

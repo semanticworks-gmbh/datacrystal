@@ -40,7 +40,6 @@ from typing import Annotated
 import pytest
 
 import datacrystal as dc
-from datacrystal._entity import oid_of
 
 TEAM = 5
 OTHER_TEAM = 6
@@ -191,8 +190,9 @@ def test_denied_principal_derefing_get_many_gets_a_twin(
     And reading the twin's label raises ReadDeniedError
     """
     hidden, _anchor, _cabinet = _seed(store)
+    hidden_oid = store.store(hidden)
     with store.acting_as(PRINCIPALS[principal_name]):
-        [via_get_many] = store.get_many([oid_of(hidden)])
+        [via_get_many] = store.get_many([hidden_oid])
     assert isinstance(via_get_many, dc.Redacted)
     assert isinstance(via_get_many, Specimen)
     with pytest.raises(dc.ReadDeniedError):
@@ -246,8 +246,9 @@ def test_readable_principal_derefing_get_many_gets_the_real_record(
     And the record carries its label
     """
     hidden, _anchor, _cabinet = _seed(store)
+    hidden_oid = store.store(hidden)
     with store.acting_as(PRINCIPALS[principal_name]):
-        [via_get_many] = store.get_many([oid_of(hidden)])
+        [via_get_many] = store.get_many([hidden_oid])
     assert not isinstance(via_get_many, dc.Redacted)
     assert via_get_many.label == LABEL
 

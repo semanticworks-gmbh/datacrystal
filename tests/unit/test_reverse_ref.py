@@ -17,7 +17,6 @@ from typing import Annotated, Any
 import pytest
 
 import datacrystal as dc
-from datacrystal._entity import oid_of
 from tests.conftest import Locality, Mineral
 
 StoreFactory = Callable[[], dc.Store]
@@ -30,13 +29,6 @@ class Collector:
     name: Annotated[str, dc.Unique]
     favorites: list[dc.Lazy[Mineral]] = field(default_factory=list)  # lazy adjacency
     home: Locality | None = None  # eager scalar ref
-
-
-def _oid(entity: object) -> int:
-    oid = oid_of(entity)
-    if oid is None:
-        raise LookupError("entity has no oid yet")
-    return oid
 
 
 def _localities(count: int) -> list[Locality]:
@@ -437,7 +429,7 @@ def test_snapshot_incoming_accepts_an_entity_view(
     Then it names M0 to M4
     """
     with store.snapshot() as snap:
-        loc_view = snap.get(_oid(loc_with_five_minerals))
+        loc_view = snap.get(store.store(loc_with_five_minerals))
 
         by_view = snap.incoming(loc_view)
 
@@ -450,7 +442,7 @@ def test_snapshot_incoming_accepts_a_ref(store: dc.Store, loc_with_five_minerals
     Then it names M0 to M4
     """
     with store.snapshot() as snap:
-        by_ref = snap.incoming(dc.Ref(_oid(loc_with_five_minerals)))
+        by_ref = snap.incoming(dc.Ref(store.store(loc_with_five_minerals)))
 
         assert sorted(v.qid for v in by_ref) == ["M0", "M1", "M2", "M3", "M4"]
 
@@ -463,7 +455,7 @@ def test_snapshot_incoming_accepts_a_raw_oid(
     Then it names M0 to M4
     """
     with store.snapshot() as snap:
-        by_oid = snap.incoming(_oid(loc_with_five_minerals))
+        by_oid = snap.incoming(store.store(loc_with_five_minerals))
 
         assert sorted(v.qid for v in by_oid) == ["M0", "M1", "M2", "M3", "M4"]
 
@@ -482,7 +474,7 @@ def test_snapshot_incoming_excludes_referrers_committed_later(store: dc.Store) -
     with store.snapshot() as snap:
         store.store(Mineral(qid="M2", name="m2", type_locality=dc.Lazy.of(loc)))
         store.commit()
-        loc_view = snap.get(_oid(loc))
+        loc_view = snap.get(store.store(loc))
 
         pinned = snap.incoming(loc_view)
 
@@ -513,7 +505,7 @@ def deleted_locality_oid(store: dc.Store) -> int:
     loc = Locality(qid="L", name="loc")
     _store_all(store, [loc, Mineral(qid="M", name="m", type_locality=dc.Lazy.of(loc))])
     store.commit()
-    loc_oid = _oid(loc)
+    loc_oid = store.store(loc)
     store.delete(loc)
     store.commit()
     return loc_oid
@@ -555,7 +547,7 @@ def test_snapshot_incoming_is_callable_from_a_foreign_thread(store: dc.Store) ->
     loc = Locality(qid="L", name="loc")
     _store_all(store, [loc, Mineral(qid="M", name="m", type_locality=dc.Lazy.of(loc))])
     store.commit()
-    loc_oid = _oid(loc)
+    loc_oid = store.store(loc)
     with store.snapshot() as snap, ThreadPoolExecutor(max_workers=1) as pool:
         views = pool.submit(snap.incoming, loc_oid).result(timeout=10)
 

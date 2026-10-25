@@ -13,12 +13,11 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from types import MappingProxyType
-from typing import BinaryIO, cast
+from typing import BinaryIO
 
 import pytest
 
 import datacrystal as dc
-from datacrystal._entity import oid_of
 from datacrystal._snapshot import _VIEW_CHUNK, Snapshot, _SnapshotCore
 from datacrystal._storage.protocol import BootInfo, StorageReadView, StoredBlob, StoredRecord
 from tests.conftest import Locality, Mineral
@@ -736,7 +735,10 @@ def test_get_many_preserves_the_input_order(cabinet: dc.Store, snap: Snapshot) -
     assert quartz is not None
     assert azurite is not None
 
-    views = snap.get_many([cast("int", oid_of(azurite)), cast("int", oid_of(quartz))])
+    azurite_oid = cabinet.store(azurite)
+    quartz_oid = cabinet.store(quartz)
+
+    views = snap.get_many([azurite_oid, quartz_oid])
 
     assert _qids(views) == ["Q193563", "Q43010"]
 
@@ -748,8 +750,8 @@ def live_and_deleted_oids(cabinet: dc.Store) -> tuple[int, int]:
     azurite = cabinet.get(Mineral, qid="Q193563")
     if quartz is None or azurite is None:
         pytest.fail("the seeded cabinet lost a mineral")
-    live_oid = cast("int", oid_of(quartz))
-    gone_oid = cast("int", oid_of(azurite))
+    live_oid = cabinet.store(quartz)
+    gone_oid = cabinet.store(azurite)
     cabinet.delete(azurite)
     cabinet.commit()
     return live_oid, gone_oid
@@ -851,7 +853,7 @@ class _CountingReadView:
 
 
 def _oids_of_root(store: dc.Store) -> list[int]:
-    return [cast("int", oid_of(entity)) for entity in store.root]
+    return [store.store(entity) for entity in store.root]
 
 
 @pytest.fixture

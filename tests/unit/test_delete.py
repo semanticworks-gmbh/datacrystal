@@ -16,19 +16,11 @@ from typing import Any
 import pytest
 
 import datacrystal as dc
-from datacrystal._entity import oid_of
 from datacrystal.contract import ReferenceApplier
 from tests.conftest import Locality, LogEntry, Mineral
 
 StoreFactory = Callable[[], dc.Store]
 M = dc.fields(Mineral)
-
-
-def _oid(entity: object) -> int:
-    oid = oid_of(entity)
-    if oid is None:
-        raise LookupError("entity has no oid yet")
-    return oid
 
 
 def _quartz() -> Mineral:
@@ -423,11 +415,10 @@ def test_the_root_holder_cannot_be_deleted(store: dc.Store) -> None:
     When the root holder is deleted
     Then DataCrystalError says it is the root holder
     """
-    store.root = [_quartz()]
+    quartz = _quartz()
+    store.root = [quartz]
     store.commit()
-    assert store._root_oid is not None
-    holder = store._registry.get(store._root_oid)
-    assert holder is not None
+    [holder] = store.incoming(quartz)
 
     with pytest.raises(dc.DataCrystalError, match="root holder"):
         store.delete(holder)
@@ -606,7 +597,7 @@ def test_get_many_with_a_dead_oid_raises_dangling(
     When quartz's old oid is passed to get_many
     Then DanglingRefError is raised
     """
-    dead_oid = _oid(committed_quartz)
+    dead_oid = store.store(committed_quartz)
     store.delete(committed_quartz)
     store.commit()
 
@@ -621,7 +612,7 @@ def test_snapshot_of_a_dead_oid_raises_dangling(
     When quartz's old oid is read from a snapshot
     Then DanglingRefError is raised
     """
-    dead_oid = _oid(committed_quartz)
+    dead_oid = store.store(committed_quartz)
     store.delete(committed_quartz)
     store.commit()
 
@@ -718,13 +709,13 @@ class _Tombstoned:
         applier: ReferenceApplier,
         collector: _Collector,
         doomed_oid: int,
-        azurite: Mineral,
+        azurite_oid: int,
         payload_before_update: bytes,
     ) -> None:
         self.applier = applier
         self.collector = collector
         self.doomed_oid = doomed_oid
-        self.azurite = azurite
+        self.azurite_oid = azurite_oid
         self.payload_before_update = payload_before_update
 
 
@@ -736,15 +727,14 @@ def updated_quartz_stream(store: dc.Store) -> _Tombstoned:
     store.attach(applier)
     store.attach(collector)
     quartz = _quartz()
-    store.store(quartz)
+    doomed_oid = store.store(quartz)
     store.commit()
-    doomed_oid = _oid(quartz)
     payload_before_update = applier.objects[doomed_oid]
     quartz.mohs = 6.9
     azurite = _azurite()
-    store.store(azurite)
+    azurite_oid = store.store(azurite)
     store.commit()
-    return _Tombstoned(applier, collector, doomed_oid, azurite, payload_before_update)
+    return _Tombstoned(applier, collector, doomed_oid, azurite_oid, payload_before_update)
 
 
 @pytest.fixture
@@ -782,7 +772,7 @@ def test_applier_keeps_the_surviving_object(
     store.delete(Mineral, qid="Q43010")
     store.commit()
 
-    assert oid_of(updated_quartz_stream.azurite) in updated_quartz_stream.applier.objects
+    assert updated_quartz_stream.azurite_oid in updated_quartz_stream.applier.objects
 
 
 def test_tombstone_delta_holds_one_delete_op(tombstoned: _Tombstoned) -> None:

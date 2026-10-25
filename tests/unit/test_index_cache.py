@@ -17,7 +17,7 @@ import pytest
 
 import datacrystal as dc
 import datacrystal._indexes as _idx
-from datacrystal._entity import oid_of, type_info
+from datacrystal._entity import type_info
 from datacrystal._indexes import ClassIndexes, plan
 from datacrystal._records import decode_scalar_tree, encode_scalar_tree
 
@@ -111,14 +111,11 @@ def cabinet_of_rocks_a_and_b(tmp_path: Path) -> tuple[Path, int]:
     path = tmp_path / "cabinet"
     s = dc.Store.open(path, cache_index=True)
     a = Rock(name="a")
-    s.store(a)
+    oid_a = s.store(a)
     s.store(Rock(name="b"))
     s.commit()
-    oid_a = oid_of(a)
     s.count(Rock)
     s.close()
-    if oid_a is None:
-        pytest.fail("the committed rock has no oid")
     return path, oid_a
 
 
