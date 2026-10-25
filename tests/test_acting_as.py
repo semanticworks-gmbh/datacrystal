@@ -17,7 +17,6 @@ from typing import cast
 import pytest
 
 import datacrystal as dc
-from datacrystal._async import AsyncStore
 from tests.conftest import Mineral
 
 ORG, TEAM = 1, 2
@@ -239,7 +238,7 @@ async def _principal_across_an_await(store: dc.Store) -> tuple[int, int]:
     The await hands control to the event loop for one tick and back, through an event the loop
     sets itself, so it waits on a condition and not on time.
     """
-    astore = AsyncStore(store)
+    astore = dc.AsyncStore(store)
     resumed = asyncio.Event()
     with astore.acting_as(dc.Principal(uid=7)):
         asyncio.get_running_loop().call_soon(resumed.set)
@@ -250,7 +249,7 @@ async def _principal_across_an_await(store: dc.Store) -> tuple[int, int]:
 
 async def _identities_of_interleaved_tasks(store: dc.Store) -> dict[str, int]:
     """Run task A, holding a uid-7 scope across an await, beside task B and report each uid seen."""
-    astore = AsyncStore(store)
+    astore = dc.AsyncStore(store)
     seen: dict[str, int] = {}
     entered = asyncio.Event()
     release = asyncio.Event()

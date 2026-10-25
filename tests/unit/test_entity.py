@@ -10,14 +10,9 @@ from typing import Annotated, Any
 import pytest
 
 import datacrystal as dc
-from datacrystal._entity import FieldSpec, type_info
 from tests.conftest import Locality, LogEntry, Mineral
 
 StoreFactory = Callable[[], dc.Store]
-
-
-def _specs_by_name(entity: type) -> dict[str, FieldSpec]:
-    return {spec.name: spec for spec in type_info(entity).specs}
 
 
 def _same_record(old: Mapping[str, Any]) -> Mapping[str, Any]:
