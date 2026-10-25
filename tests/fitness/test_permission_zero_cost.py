@@ -11,15 +11,14 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import Annotated, cast
+from typing import Annotated
 
 import pytest
 
 import datacrystal as dc
 import datacrystal._snapshot as snapshot_module
 import datacrystal._store as store_module
-from datacrystal._entity import oid_of as _oid_of
-from datacrystal._snapshot import Snapshot
+from datacrystal import Snapshot
 from datacrystal._storage.memory import MemoryBackend
 from tests.fitness._counting_backend import CountingBackend
 
@@ -50,10 +49,8 @@ class Cabinet:
     counting: CountingBackend
     plain: list[PlainRow]
     fenced: list[FencedRow]
-
-
-def _oids_of(rows: list[PlainRow]) -> list[int]:
-    return [cast(int, _oid_of(row)) for row in rows]
+    plain_oids: list[int]
+    fenced_oids: list[int]
 
 
 @pytest.fixture
@@ -63,11 +60,11 @@ def cabinet() -> Iterator[Cabinet]:
     store = dc.Store._from_backend(counting, principal=OWNER)
     plain = [PlainRow(tag=f"p{i}") for i in range(4)]
     fenced = [FencedRow(tag=f"f{i}") for i in range(3)]
-    for row in (*plain, *fenced):
-        store.store(row)
+    plain_oids = [store.store(row) for row in plain]
+    fenced_oids = [store.store(row) for row in fenced]
     store.commit()
     counting.reset()
-    yield Cabinet(store, counting, plain, fenced)
+    yield Cabinet(store, counting, plain, fenced, plain_oids, fenced_oids)
     store.close()
 
 
@@ -380,9 +377,7 @@ def test_unprotected_snapshot_get_never_fires_can_read_row(
     When the snapshot gets it by oid
     Then the row with tag p0 is returned
     """
-    oid = cast(int, _oid_of(cabinet.plain[0]))
-
-    row = snapshot.get(oid)
+    row = snapshot.get(cabinet.plain_oids[0])
 
     assert row.tag == "p0"
 
@@ -395,9 +390,7 @@ def test_unprotected_snapshot_get_many_never_fires_can_read_row(
     When the snapshot gets them by oid in one batch
     Then the first one is found
     """
-    oids = _oids_of(cabinet.plain)
-
-    rows = snapshot.get_many(oids)
+    rows = snapshot.get_many(cabinet.plain_oids)
 
     assert rows[0] is not None
 
@@ -448,24 +441,25 @@ def test_protected_snapshot_get_fires_can_read_row(snapshot: Snapshot, cabinet: 
     When the snapshot gets it by oid
     Then the deref reaches can_read_row and raises
     """
-    oid = cast(int, _oid_of(cabinet.fenced[0]))
-
     with pytest.raises(AssertionError, match="can_read_row ran"):
-        snapshot.get(oid)
+        snapshot.get(cabinet.fenced_oids[0])
 
 
 # R15 economics: a sibling handle builds nothing and shares every index / cache / reverse posting
 # with the origin, so the pool stays O(n)/commit, not O(n)/principal.
 
 
-def test_for_principal_shares_the_core_of_the_origin(snapshot: Snapshot) -> None:
-    """Given an OWNER snapshot
-    When a sibling handle is made for another principal
-    Then both handles share one core
+def test_closing_the_origin_closes_a_for_principal_sibling(snapshot: Snapshot) -> None:
+    """Given an OWNER snapshot and a sibling handle made for another principal
+    When the origin is closed
+    Then the sibling's count raises StoreClosedError, as both handles share one core
     """
     sibling = snapshot.for_principal(dc.Principal(uid=7, memberships={dc.WORLD: dc.STAFF}))
 
-    assert snapshot._core is sibling._core
+    snapshot.close()
+
+    with pytest.raises(dc.StoreClosedError):
+        sibling.count(PlainRow)
 
 
 def test_for_principal_returns_a_distinct_handle(snapshot: Snapshot) -> None:

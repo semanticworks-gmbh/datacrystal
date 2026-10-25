@@ -21,7 +21,7 @@ from typing import Annotated
 import pytest
 
 import datacrystal as dc
-from datacrystal._snapshot import Snapshot
+from datacrystal import Snapshot
 from datacrystal.contract.applier import DeltaFormatError, DeltaGapError, ReferenceApplier
 from datacrystal.deltalog import DeltaLog, DeltaLogConfigError
 from datacrystal.testing import check_delta_consumer
@@ -234,10 +234,11 @@ def log_with_torn_tail(store: dc.Store, open_log: OpenLog, tmp_path: Path) -> tu
     store.root = [Cabinet(qid="C1", name="a")]
     store.commit()
     log.close()
-    segment = tmp_path / "torn.deltalog" / "data" / log._segments[-1].name
+    segment = max((tmp_path / "torn.deltalog" / "data").glob("seg-*.dlog"))
+    committed_length = segment.stat().st_size
     with open(segment, "ab") as debris:
         debris.write(b"\x00\x00\x00\x00\x00\x00\x00\x05hello")
-    return segment, log._segments[-1].nbytes
+    return segment, committed_length
 
 
 @pytest.fixture
@@ -553,12 +554,12 @@ def test_rolling_reaches_the_last_commit_in_the_watermark(rolled_log: DeltaLog) 
     assert watermark == 20
 
 
-def test_tiny_segments_force_the_log_to_roll(rolled_log: DeltaLog) -> None:
+def test_tiny_segments_force_the_log_to_roll(rolled_log: DeltaLog, tmp_path: Path) -> None:
     """Given a log with 64-byte segments after twenty commits
-    When its segments are counted
+    When its segment files are counted
     Then there is more than one
     """
-    segment_count = len(rolled_log._segments)
+    segment_count = len(list((tmp_path / "rolled.deltalog" / "data").glob("seg-*.dlog")))
 
     assert segment_count > 1
 

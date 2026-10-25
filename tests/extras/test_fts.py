@@ -19,9 +19,7 @@ import pytest
 pytest.importorskip("snowballstemmer", reason="datacrystal[fts] extra not installed")
 
 import datacrystal as dc
-from datacrystal._entity import oid_of, type_info
-from datacrystal._snapshot import Snapshot
-from datacrystal._storage.memory import MemoryBackend
+from datacrystal import Snapshot
 from datacrystal.contract.applier import DeltaGapError
 from datacrystal.fts import FtsConfigError, FullTextIndex
 from datacrystal.testing import STREAM_TYPENAME, check_delta_consumer
@@ -52,21 +50,13 @@ GEM_FULLTEXT = {
     "tests.extras.test_fts:Gemstone": {"notes": "de", "description": "en"},
     "tests.extras.test_fts:Vendor": {"motto": None},
 }
-GEM_TYPENAME = type_info(Gemstone).typename
+GEM_TYPENAME = "tests.extras.test_fts:Gemstone"
 VENDOR_TYPENAME = "tests.extras.test_fts:Vendor"
 
 
 def content_probe(idx: FullTextIndex) -> object:
     """Return the derived state for the conformance kit: every stored doc row."""
     return sorted(tuple(row) for row in idx._conn.execute("SELECT rowid, * FROM docs"))
-
-
-def committed_oid(entity: object) -> int:
-    """Return the oid of a committed entity."""
-    oid = oid_of(entity)
-    if oid is None:
-        raise LookupError("entity was not committed")
-    return oid
 
 
 class IndexShop:
@@ -384,7 +374,7 @@ def statin_world(store: dc.Store, shop: IndexShop) -> StatinWorld:
     off_topic = Gemstone(qid="Q3", name="off-topic", description="hexagonal prisms in clear quartz")
     store.root = [full, partial, off_topic]
     store.commit()
-    qid_by_oid = {committed_oid(gem): gem.qid for gem in (full, partial, off_topic)}
+    qid_by_oid = {store.store(gem): gem.qid for gem in (full, partial, off_topic)}
     return StatinWorld(idx, qid_by_oid)
 
 
@@ -970,12 +960,14 @@ def test_failed_sidecar_cannot_silently_rejoin(store: dc.Store, failed_commit: F
 
 
 @pytest.fixture
-def indexed_corpus(shop: IndexShop) -> Iterator[Callable[[int], tuple[dc.Store, FullTextIndex]]]:
-    """Return a factory for a committed, indexed in-memory corpus; close the stores after."""
+def indexed_corpus(
+    shop: IndexShop, tmp_path: Path
+) -> Iterator[Callable[[int], tuple[dc.Store, FullTextIndex]]]:
+    """Return a factory for a committed, indexed corpus; close the stores after."""
     stores: list[dc.Store] = []
 
     def build(size: int) -> tuple[dc.Store, FullTextIndex]:
-        corpus_store = dc.Store._from_backend(MemoryBackend())
+        corpus_store = dc.Store.open(tmp_path / f"corpus-{size}", durability="never")
         stores.append(corpus_store)
         idx = shop.open(fulltext=GEM_FULLTEXT)
         corpus_store.attach(idx)
@@ -1043,12 +1035,12 @@ def secrets_world(store: dc.Store, shop: IndexShop) -> SecretsWorld:
     store.attach(idx)
     with store.acting_as(OWNER):
         shared = Secret(label="shared", body="the crystal lattice diagram")
-        store.store(shared)
+        shared_oid = store.store(shared)
         dc.share(shared, TEAM, read=dc.AGENT, write=dc.CURATOR)
         secret = Secret(label="secret", body="the crystal vault combination")
-        store.store(secret)
+        secret_oid = store.store(secret)
         store.commit()
-    return SecretsWorld(idx, committed_oid(shared), committed_oid(secret))
+    return SecretsWorld(idx, shared_oid, secret_oid)
 
 
 def test_search_without_a_snapshot_over_a_protected_class_is_refused(shop: IndexShop) -> None:
@@ -1165,10 +1157,10 @@ def crowded_secrets(store: dc.Store, shop: IndexShop) -> CrowdedSecrets:
         for i in range(8):
             store.store(Secret(label=f"d{i}", body="crystal"))
         shared = Secret(label="shared", body="crystal " + " ".join(f"w{j}" for j in range(40)))
-        store.store(shared)
+        shared_oid = store.store(shared)
         dc.share(shared, TEAM, read=dc.AGENT, write=dc.CURATOR)
         store.commit()
-    return CrowdedSecrets(idx, committed_oid(shared))
+    return CrowdedSecrets(idx, shared_oid)
 
 
 def test_over_fetch_fills_the_page_past_denied_top_hits(

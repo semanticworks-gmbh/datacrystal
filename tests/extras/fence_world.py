@@ -6,10 +6,9 @@ register under one typename.
 
 from __future__ import annotations
 
-from typing import Annotated
+from typing import Annotated, NamedTuple
 
 import datacrystal as dc
-from datacrystal._entity import type_info
 
 TEAM = 5
 OTHER = 6
@@ -53,11 +52,21 @@ class Cabinet:
     holds: dc.Lazy[Specimen] | None = None
 
 
-SPECIMEN_TYPENAME = type_info(Specimen).typename
+SPECIMEN_TYPENAME = "tests.extras.fence_world:Specimen"
 CAPSTONE_FULLTEXT = {SPECIMEN_TYPENAME: {"note": "en"}}
 
 
-def seed(store: dc.Store) -> tuple[Specimen, Specimen, Cabinet]:
+class Seeded(NamedTuple):
+    """The seeded world: hidden record, WORLD-readable anchor, holding cabinet and the two oids."""
+
+    hidden: Specimen
+    anchor: Specimen
+    cabinet: Cabinet
+    hidden_oid: int
+    anchor_oid: int
+
+
+def seed(store: dc.Store) -> Seeded:
     """Commit the anchor, the hidden record that links to it, and a cabinet holding it.
 
     ``anchor`` is WORLD-readable, ``hidden`` is shared to nobody so only ``A`` and ``ROOT`` may
@@ -65,7 +74,7 @@ def seed(store: dc.Store) -> tuple[Specimen, Specimen, Cabinet]:
     """
     with store.acting_as(A):
         anchor = Specimen(label=ANCHOR)
-        store.store(anchor)
+        anchor_oid = store.store(anchor)
         dc.share(anchor, dc.WORLD, read=dc.VIEWER, write=dc.VIEWER)
 
         hidden = Specimen(
@@ -74,9 +83,9 @@ def seed(store: dc.Store) -> tuple[Specimen, Specimen, Cabinet]:
             scan=SECRET_BYTES,
             linked=dc.Lazy.of(anchor),
         )
-        store.store(hidden)  # owner-only — the record under test
+        hidden_oid = store.store(hidden)  # owner-only — the record under test
 
         cabinet = Cabinet(tag="drawer-1", holds=dc.Lazy.of(hidden))
         store.store(cabinet)
         store.commit()
-    return hidden, anchor, cabinet
+    return Seeded(hidden, anchor, cabinet, hidden_oid, anchor_oid)

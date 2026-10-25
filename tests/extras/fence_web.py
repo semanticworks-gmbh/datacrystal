@@ -6,6 +6,7 @@ Imports the ``datacrystal[web]`` extra at module level, so a test module imports
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Annotated, Any
 
 import strawberry
@@ -15,8 +16,7 @@ from strawberry.tools import create_type
 from strawberry.types import Info
 
 import datacrystal as dc
-from datacrystal._snapshot import Snapshot
-from datacrystal._storage.memory import MemoryBackend
+from datacrystal import Snapshot
 from datacrystal.web import SNAPSHOT_CONTEXT_KEY as SNAP_KEY
 from datacrystal.web import (
     StrawberryReflector,
@@ -30,14 +30,14 @@ from tests.extras.fence_world import LABEL, A, Cabinet, Specimen
 OPERATOR = dc.Principal(uid=1, memberships={dc.WORLD: dc.ADMIN})
 
 
-def seed_web_store() -> dc.Store:
-    """Build an in-memory store holding the hidden specimen and a cabinet that refers to it.
+def seed_web_store(directory: Path) -> dc.Store:
+    """Open a store in ``directory`` holding the hidden specimen and a cabinet that refers to it.
 
     No blob value here: the web tier exercises the discovery and deref fence (the blob tier owns
     blobs). A populated dc.Blob field projects to its OID, an orthogonal to_pydantic/Blob
     modeling gap.
     """
-    store = dc.Store._from_backend(MemoryBackend(), principal=OPERATOR)
+    store = dc.Store.open(directory, durability="never", principal=OPERATOR)
     with store.acting_as(A):
         secret = Specimen(label=LABEL, note="the crystal lattice diagram")
         store.store(secret)  # owner-only — B never reads it

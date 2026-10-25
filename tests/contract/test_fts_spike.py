@@ -23,8 +23,6 @@ import pytest
 
 import datacrystal as dc
 from datacrystal import testing as dct
-from datacrystal._entity import oid_of, type_info
-from datacrystal._storage.memory import MemoryBackend
 from datacrystal.contract import DeltaFormatError
 from tests.contract.fts_consumer import FtsSidecar, fts5_available
 
@@ -64,9 +62,8 @@ class _CrashMidApply(FtsSidecar):
 
 
 def _fulltext_config() -> dict[str, list[str]]:
-    """Return the sidecar config straight from the entity's dc.FullText field specs."""
-    ti = type_info(Specimen)
-    return {ti.typename: [s.name for s in ti.specs if s.fulltext]}
+    """Return the sidecar config naming Specimen's two dc.FullText fields."""
+    return {"tests.contract.test_fts_spike:Specimen": ["notes", "description"]}
 
 
 def _cabinet() -> list[Specimen]:
@@ -82,17 +79,16 @@ def _cabinet() -> list[Specimen]:
     ]
 
 
-def _oid(specimen: Specimen) -> int:
-    """Return the oid of a committed specimen."""
-    oid = oid_of(specimen)
-    if oid is None:
-        raise LookupError("specimen was not committed")
-    return oid
+class _DeltaRecorder(dct.CountingConsumer):
+    """A consumer that keeps every delta it applies, to read the wire form of a commit."""
 
+    def __init__(self) -> None:
+        super().__init__()
+        self.deltas: list[dict] = []
 
-def _cid_of(sidecar: FtsSidecar, typename: str) -> int:
-    """Return the class id the sidecar recorded for a typename."""
-    return next(cid for cid, (name, _) in sidecar._types.items() if name == typename)
+    def apply(self, delta: dict) -> bool:
+        self.deltas.append(delta)
+        return super().apply(delta)
 
 
 def _kit_upsert(oid: int, notes: str) -> dict:
@@ -136,28 +132,19 @@ def indexed_bergkristall(store: dc.Store, sidecar: FtsSidecar) -> Specimen:
 
 @pytest.fixture
 def tombstone(store: dc.Store, sidecar: FtsSidecar) -> dict:
-    """Index azurite, detach the sidecar, and hand-craft the delete that carries azurite's prior.
-
-    v0.x emits no deletes (spec §3.1, reserved), so the tombstone is built by hand.
-    """
+    """Index azurite, detach the sidecar, delete azurite; return the real delete op as a delta."""
+    recorder = _DeltaRecorder()
     store.attach(sidecar)
+    store.attach(recorder)
     specimen = Specimen(catalog_no="DC-001", label="Azurit", notes=AZURIT_NOTES)
     store.root = [specimen]
     store.commit()
-    oid = _oid(specimen)
-    prior = store._backend.load_many([oid])[oid].payload
     store.detach(sidecar)
-    cid = _cid_of(sidecar, type_info(Specimen).typename)
-    return {
-        "f": "datacrystal-delta",
-        "v": 2,
-        "tid": sidecar.watermark + 1,
-        "actor": 0,
-        "at": 0,
-        "ops": [{"op": "delete", "oid": oid, "cid": cid, "payload": None, "prior": prior}],
-        "types": [],
-        "root": None,
-    }
+    store.root = []
+    store.delete(specimen)
+    store.commit()
+    [delete] = [op for op in recorder.deltas[-1]["ops"] if op["op"] == "delete"]
+    return {**recorder.deltas[-1], "ops": [delete]}
 
 
 @pytest.fixture
@@ -251,7 +238,7 @@ def corpus_factory(
     opened: list[tuple[dc.Store, FtsSidecar]] = []
 
     def build(corpus_size: int) -> tuple[dc.Store, FtsSidecar, list[Specimen]]:
-        store = dc.Store._from_backend(MemoryBackend())
+        store = dc.Store.open(tmp_path / f"store-{corpus_size}", durability="never")
         indexed = FtsSidecar(str(tmp_path / f"size-{corpus_size}.sqlite"), fulltext=_fulltext_config())
         store.attach(indexed)
         specimens = [
@@ -301,7 +288,11 @@ def test_sidecar_follows_the_store_watermark_after_a_commit(
     ],
 )
 def test_search_finds_the_specimen_whose_prose_has_the_term(
-    query: str, position: int, indexed_cabinet: list[Specimen], sidecar: FtsSidecar
+    query: str,
+    position: int,
+    indexed_cabinet: list[Specimen],
+    sidecar: FtsSidecar,
+    store: dc.Store,
 ) -> None:
     """Given German and English prose committed live to a store with the sidecar attached
     When the cabinet is searched for a term of one specimen, in any letter case
@@ -309,7 +300,7 @@ def test_search_finds_the_specimen_whose_prose_has_the_term(
     """
     hits = sidecar.search(query)
 
-    assert hits == {_oid(indexed_cabinet[position])}
+    assert hits == {store.store(indexed_cabinet[position])}
 
 
 def test_search_does_not_stem_the_singular_to_the_indexed_plural(
@@ -351,7 +342,7 @@ def test_update_indexes_the_new_prose_with_case_and_diacritic_folding(
 
     store.commit()
 
-    assert sidecar.search(query) == {_oid(indexed_bergkristall)}
+    assert sidecar.search(query) == {store.store(indexed_bergkristall)}
 
 
 def test_search_does_not_fold_the_ue_transliteration_to_the_umlaut(
@@ -370,7 +361,7 @@ def test_search_does_not_fold_the_ue_transliteration_to_the_umlaut(
 
 
 def test_delete_tombstone_unindexes_via_prior(sidecar: FtsSidecar, tombstone: dict) -> None:
-    """Given an indexed azurite and a hand-crafted tombstone carrying its prior
+    """Given an indexed azurite and the delete delta the store emitted for it, carrying its prior
     When the sidecar applies the tombstone
     Then it is accepted
     And no search finds azurite's prose
@@ -441,7 +432,7 @@ def test_reopened_sidecar_indexes_an_update_after_reattaching(
 
     store.commit()
 
-    assert reopened_sidecar.search("Sammler") == {_oid(reopened_specimen)}
+    assert reopened_sidecar.search("Sammler") == {store.store(reopened_specimen)}
 
 
 def test_crash_mid_apply_rolls_back_the_whole_delta(crashed_sidecar: _CrashMidApply) -> None:

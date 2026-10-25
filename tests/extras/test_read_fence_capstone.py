@@ -49,12 +49,12 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from types import ModuleType
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING
 
 import pytest
 
 import datacrystal as dc
-from datacrystal._entity import TYPES_BY_NAME, oid_of, type_info
+from datacrystal._entity import TYPES_BY_NAME
 from tests.extras.fence_world import (
     CAPSTONE_FULLTEXT,
     LABEL,
@@ -65,7 +65,7 @@ from tests.extras.fence_world import (
     TERM,
     A,
     B,
-    Cabinet,
+    Seeded,
     Specimen,
     seed,
 )
@@ -78,26 +78,10 @@ if TYPE_CHECKING:
 READERS = pytest.mark.parametrize("who", ["A", "ROOT"])
 
 
-class Seeded(NamedTuple):
-    """The seeded world: the hidden record, its WORLD-readable anchor and the holding cabinet."""
-
-    hidden: Specimen
-    anchor: Specimen
-    cabinet: Cabinet
-
-
-def oid_int(entity: object) -> int:
-    """Return the oid of a committed entity."""
-    oid = oid_of(entity)
-    if oid is None:
-        raise LookupError("entity was not committed")
-    return oid
-
-
 @pytest.fixture
 def seeded(store: dc.Store) -> Seeded:
     """Seed the protected world into the store."""
-    return Seeded(*seed(store))
+    return seed(store)
 
 
 @pytest.fixture
@@ -368,7 +352,7 @@ def test_get_many_by_oid_hands_a_denied_reader_a_masked_twin(
     And reading the twin's note is denied
     """
     with store.acting_as(B):
-        [twin] = store.get_many([oid_int(seeded.hidden)])
+        [twin] = store.get_many([seeded.hidden_oid])
 
     assert isinstance(twin, dc.Redacted)
     assert isinstance(twin, Specimen)
@@ -402,7 +386,7 @@ def test_get_many_by_oid_hands_owner_and_root_the_real_record(
     And it carries its label
     """
     with store.acting_as(principal):
-        [record] = store.get_many([oid_int(seeded.hidden)])
+        [record] = store.get_many([seeded.hidden_oid])
 
     assert not isinstance(record, dc.Redacted)
     assert record.label == LABEL
@@ -460,7 +444,7 @@ def test_snapshot_get_denies_a_reader_without_standing(store: dc.Store, seeded: 
     Then the strict deref is denied
     """
     with store.snapshot(principal=B) as snapshot, pytest.raises(dc.ReadDeniedError):
-        snapshot.get(oid_int(seeded.hidden))
+        snapshot.get(seeded.hidden_oid)
 
 
 def test_snapshot_get_many_hands_a_denied_reader_a_twin_slot(
@@ -473,10 +457,10 @@ def test_snapshot_get_many_hands_a_denied_reader_a_twin_slot(
     And reading the twin's note is denied
     """
     with store.snapshot(principal=B) as snapshot:
-        [twin] = snapshot.get_many([oid_int(seeded.hidden)])
+        [twin] = snapshot.get_many([seeded.hidden_oid])
 
     assert isinstance(twin, dc.Redacted)
-    assert twin.oid == oid_int(seeded.hidden)
+    assert twin.oid == seeded.hidden_oid
     with pytest.raises(dc.ReadDeniedError):
         _ = twin.note
 
@@ -552,7 +536,7 @@ def test_snapshot_incoming_drops_the_denied_referrer(store: dc.Store, seeded: Se
     Then the record is not among them
     """
     with store.snapshot(principal=B) as snapshot:
-        referrers = snapshot.incoming(oid_int(seeded.anchor))
+        referrers = snapshot.incoming(seeded.anchor_oid)
 
     assert LABEL not in {getattr(referrer, "label", None) for referrer in referrers}
 
@@ -565,7 +549,7 @@ def test_snapshot_open_blob_denies_a_reader_without_standing(
     Then the open is denied
     """
     with store.snapshot(principal=B) as snapshot, pytest.raises(dc.ReadDeniedError):
-        snapshot.open_blob(oid_int(seeded.hidden), "scan")
+        snapshot.open_blob(seeded.hidden_oid, "scan")
 
 
 def test_snapshot_index_bitmaps_refuses_a_denied_reader(store: dc.Store, seeded: Seeded) -> None:
@@ -595,7 +579,7 @@ def test_snapshot_get_shows_owner_and_root_the_record(
     Then the view carries its label
     """
     with store.snapshot(principal=principal) as snapshot:
-        view = snapshot.get(oid_int(seeded.hidden))
+        view = snapshot.get(seeded.hidden_oid)
 
     assert view.label == LABEL  # pyrefly: ignore[missing-attribute]
 
@@ -610,7 +594,7 @@ def test_snapshot_get_many_shows_owner_and_root_the_real_record(
     And it carries its label
     """
     with store.snapshot(principal=principal) as snapshot:
-        [record] = snapshot.get_many([oid_int(seeded.hidden)])
+        [record] = snapshot.get_many([seeded.hidden_oid])
 
     assert not isinstance(record, dc.Redacted)
     assert record.label == LABEL  # pyrefly: ignore[missing-attribute]
@@ -681,7 +665,7 @@ def test_snapshot_incoming_keeps_the_readable_referrer_for_owner_and_root(
     Then the record is among them
     """
     with store.snapshot(principal=principal) as snapshot:
-        referrers = snapshot.incoming(oid_int(seeded.anchor))
+        referrers = snapshot.incoming(seeded.anchor_oid)
 
     assert LABEL in {getattr(referrer, "label", None) for referrer in referrers}
 
@@ -695,7 +679,7 @@ def test_snapshot_open_blob_reads_the_scan_for_owner_and_root(
     Then its bytes are the scan
     """
     with store.snapshot(principal=principal) as snapshot, snapshot.open_blob(
-        oid_int(seeded.hidden), "scan"
+        seeded.hidden_oid, "scan"
     ) as blob:
         content = blob.read()
 
@@ -728,7 +712,7 @@ def test_snapshot_stream_gives_root_the_protected_mirror(store: dc.Store, seeded
 @pytest.fixture
 def without_live_specimen_class(seeded: Seeded, monkeypatch: pytest.MonkeyPatch) -> None:
     """Remove the live Specimen class from the type registry, leaving its persisted lineage."""
-    monkeypatch.delitem(TYPES_BY_NAME, type_info(Specimen).typename)
+    monkeypatch.delitem(TYPES_BY_NAME, SPECIMEN_TYPENAME)
 
 
 @pytest.mark.usefixtures("without_live_specimen_class")
@@ -769,9 +753,9 @@ def fence_web() -> ModuleType:
 
 
 @pytest.fixture
-def web_store(fence_web: ModuleType) -> Iterator[dc.Store]:
-    """Open the web tier's in-memory store holding the hidden record, and close it afterwards."""
-    store = fence_web.seed_web_store()
+def web_store(fence_web: ModuleType, tmp_path: Path) -> Iterator[dc.Store]:
+    """Open the web tier's store holding the hidden record, and close it afterwards."""
+    store = fence_web.seed_web_store(tmp_path / "web-store")
     yield store
     store.close()
 
@@ -975,7 +959,7 @@ def test_fts_search_returns_the_hit_for_owner_and_root(
     with store.snapshot(principal=principal) as snapshot:
         hits = index.search(TERM, snapshot=snapshot)
 
-    assert {hit.oid for hit in hits} == {oid_int(seeded.hidden)}
+    assert {hit.oid for hit in hits} == {seeded.hidden_oid}
 
 
 # === BLOBS ===================================================================
@@ -985,8 +969,8 @@ def test_fts_search_returns_the_hit_for_owner_and_root(
 def seeded_with_blob(store_factory: Callable[[], dc.Store]) -> Iterator[tuple[dc.Store, int]]:
     """Seed a protected record with a scan blob and yield the store that committed it."""
     seeded = store_factory()
-    hidden, _anchor, _cabinet = seed(seeded)
-    yield seeded, oid_int(hidden)
+    world = seed(seeded)
+    yield seeded, world.hidden_oid
     seeded.close()
 
 

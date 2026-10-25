@@ -44,8 +44,7 @@ from strawberry.tools import create_type
 from strawberry.types.field import StrawberryField
 
 import datacrystal as dc
-from datacrystal._entity import oid_of
-from datacrystal._snapshot import Snapshot
+from datacrystal import Snapshot
 from datacrystal._storage.memory import MemoryBackend
 from datacrystal._storage.protocol import (
     BootInfo,
@@ -367,7 +366,7 @@ def _build_alteration_tree(store: dc.Store, depth: int, fanout: int) -> int:
 
     root = build(0)
     store.commit()
-    return cast(int, oid_of(root))
+    return store.store(root)
 
 
 def _list_nested_selection(depth: int) -> str:
