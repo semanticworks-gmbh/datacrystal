@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Iterator
+from pathlib import Path
 from typing import Annotated, Any
 
 import pytest
@@ -34,8 +35,7 @@ from strawberry.tools import create_type
 from strawberry.types import Info
 
 import datacrystal as dc
-from datacrystal._snapshot import EntityView, Snapshot
-from datacrystal._storage.memory import MemoryBackend
+from datacrystal import EntityView, Snapshot
 from datacrystal.web import (
     SNAPSHOT_CONTEXT_KEY as SNAP_KEY,
 )
@@ -74,13 +74,13 @@ class Doc:
 
 
 @pytest.fixture
-def seeded_store() -> Iterator[dc.Store]:
+def seeded_store(tmp_path: Path) -> Iterator[dc.Store]:
     """Provide a store opened by the OPERATOR with one TEAM-fenced Secret and a Doc on it.
 
     BEA (CURATOR in TEAM) owns and fences the Secret to ``read=VIEWER``: any TEAM
     member may read it, a non-member cannot.
     """
-    store = dc.Store._from_backend(MemoryBackend(), principal=OPERATOR)
+    store = dc.Store.open(tmp_path / "cabinet", durability="never", principal=OPERATOR)
     with store.acting_as(BEA):
         secret = Secret(label="s1", body="classified")
         store.store(secret)
@@ -333,7 +333,7 @@ def test_two_principals_at_one_watermark_share_the_pooled_core(seeded_store: dc.
     """Given requests resolved as Anna and then as a non-member at one watermark
     When the client GETs /whoami twice
     Then exactly two handles were served
-    And both handles share one pooled core, the index built once per commit
+    And closing one handle closes the pooled core the other shares
     """
     captured: list[Snapshot] = []
     app = _rest_app(seeded_store, captured)
@@ -343,7 +343,9 @@ def test_two_principals_at_one_watermark_share_the_pooled_core(seeded_store: dc.
     _send(app, "GET", "/whoami")
 
     assert len(captured) == 2
-    assert captured[0]._core is captured[1]._core
+    captured[0].close()
+    with pytest.raises(dc.StoreClosedError):
+        captured[1].count(Secret)
 
 
 def test_create_face_has_no_lib_managed_floor_fields() -> None:
@@ -371,5 +373,5 @@ def test_from_pydantic_cannot_spoof_lib_managed_dc_labels() -> None:
 
     entity = from_pydantic(dto, Secret)
 
-    assert entity._dc_owner != 999  # pyrefly: ignore[missing-attribute]
-    assert entity._dc_read_floor != dc.EXECUTIVE  # pyrefly: ignore[missing-attribute]
+    assert entity.dc_permissions.owner != 999  # pyrefly: ignore[missing-attribute]
+    assert entity.dc_permissions.read_floor != dc.EXECUTIVE  # pyrefly: ignore[missing-attribute]
