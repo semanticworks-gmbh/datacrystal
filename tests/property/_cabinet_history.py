@@ -6,9 +6,11 @@ Small domains, so collisions, misses and None all actually happen.
 from __future__ import annotations
 
 import operator
+import tempfile
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Annotated, Any
 
@@ -16,7 +18,6 @@ from hypothesis import strategies as st
 
 import datacrystal as dc
 from datacrystal._conditions import Condition
-from datacrystal._storage.memory import MemoryBackend
 
 
 @dc.entity
@@ -131,8 +132,14 @@ class CabinetHistory:
 
 @contextmanager
 def replayed(ops: list[tuple[Any, ...]]) -> Generator[CabinetHistory]:
-    """Replay a script on a memory-backed store, commit, yield it with its oracle rows."""
-    store = dc.Store._from_backend(MemoryBackend())
+    """Replay a script on a scratch store, commit, yield it with its oracle rows."""
+    with tempfile.TemporaryDirectory() as directory:
+        yield from _replayed_in(Path(directory), ops)
+
+
+def _replayed_in(directory: Path, ops: list[tuple[Any, ...]]) -> Generator[CabinetHistory]:
+    """Replay the script on a store opened in ``directory``; close it after the yield."""
+    store = dc.Store.open(directory, durability="never")
     live: dict[str, Any] = {}  # sid -> canonical live entity
     rows: dict[str, dict[str, Any]] = {}  # sid -> expected field values (the oracle)
     for op in ops:
