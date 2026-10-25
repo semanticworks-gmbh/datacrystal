@@ -1400,8 +1400,9 @@ class Store:
             self._registry.discard(oid)
             self._fingerprints.pop(oid, None)
         self._pending_upserts.clear()  # the committed unique map takes over
-        for oid, _, _ in capture.flipped:
-            self._prestamp_labels.pop(oid, None)
+        if self._prestamp_labels:  # protected NEW records only; nothing to do otherwise
+            for oid, _, _ in capture.flipped:
+                self._prestamp_labels.pop(oid, None)
         self._durable_cids.update(cid for cid, _, _ in capture.batch.new_types)
         # A written blob value (raw bytes or a streamed source) is now durably stored; swap
         # the live field to a readable BlobHandle, as store.get returns it, so
