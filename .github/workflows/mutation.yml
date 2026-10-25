@@ -34,53 +34,39 @@ jobs:
         run: uv sync --all-extras
 
       - name: Find the changed functions
-        id: changed
         run: |
           uv run scripts/mutation_changed.py "$BASE" > patterns.txt
           cat patterns.txt
-          if [ -s patterns.txt ]; then
-            echo "any=true" >> "$GITHUB_OUTPUT"
-          else
+          if [ ! -s patterns.txt ]; then
             echo "::notice::No function in src/datacrystal/ changed, nothing to mutate."
           fi
 
-      # Unchanged functions keep their results: mutmut hashes each function and re-runs only the changed ones.
-      - name: Restore mutants of the base branch
-        if: steps.changed.outputs.any == 'true'
-        uses: actions/cache@v4
-        with:
-          path: mutants
-          key: mutation-${{ github.base_ref }}-${{ github.run_id }}
-          restore-keys: mutation-${{ github.base_ref }}-
-
+      # No mutants/ cache: a restored one keeps stale test stats and stale copies of deleted files.
+      # A cold run of the changed functions is minutes, well inside the timeout.
       - name: Run mutmut on the changed functions
-        id: run
-        if: steps.changed.outputs.any == 'true'
         run: |
+          [ -s patterns.txt ] || exit 0
           set +e
-          uv run mutmut run $(cat patterns.txt) 2>&1 | tee mutmut.log
+          OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES uv run mutmut run $(cat patterns.txt) 2>&1 | tee mutmut.log
           status=${PIPESTATUS[0]}
           set -e
           if grep -q "nothing matches" mutmut.log; then
             echo "::notice::The changed functions have no mutants (for example, only trivial bodies)."
+            : > patterns.txt
           elif [ "$status" -ne 0 ]; then
             echo "::error::mutmut failed to run (exit $status): a broken setup, not a survivor."
             exit "$status"
-          else
-            echo "mutated=true" >> "$GITHUB_OUTPUT"
           fi
 
+      # Runs in every outcome: an empty patterns file gives the "no mutants" body that replaces an old comment.
       - name: Summarize the survivors
-        if: steps.run.outputs.mutated == 'true'
-        run: uv run scripts/mutation_summary.py patterns.txt > comment.md
-
-      - name: Show the summary on the run
-        if: steps.run.outputs.mutated == 'true'
-        run: cat comment.md >> "$GITHUB_STEP_SUMMARY"
+        run: |
+          uv run scripts/mutation_summary.py patterns.txt > comment.md
+          cat comment.md >> "$GITHUB_STEP_SUMMARY"
 
       # A fork's token cannot write: its PR gets the run summary only.
       - name: Post or update the PR comment
-        if: steps.run.outputs.mutated == 'true' && github.event.pull_request.head.repo.full_name == github.repository
+        if: github.event.pull_request.head.repo.full_name == github.repository
         env:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ github.event.pull_request.number }}
@@ -90,6 +76,6 @@ jobs:
             --jq '[.[] | select(.body | contains("<!-- mutation-check -->")) | .id][0] // empty')
           if [ -n "$existing" ]; then
             gh api --method PATCH "$comments/comments/$existing" -F body=@comment.md > /dev/null
-          else
+          elif [ -s patterns.txt ]; then
             gh api --method POST "$comments/$PR/comments" -F body=@comment.md > /dev/null
           fi

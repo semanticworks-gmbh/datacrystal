@@ -9,8 +9,10 @@ Usage:
     uv run scripts/mutation_changed.py origin/main      # one pattern per line
     mutmut run $(uv run scripts/mutation_changed.py origin/main)
 
-A function counts as changed when a line the diff added or deleted lies inside it,
-decorators included.
+A function counts as changed when a line the diff added or deleted lies inside it.
+Mutmut skips a decorated function, unless its one decorator is @staticmethod or @classmethod.
+It never mutates __new__, __setattr__ or __getattribute__.
+Those functions get no pattern.
 Mutmut mutates module-level functions and the methods of module-level classes,
 so a nested function belongs to its outer function.
 Edits outside any function (constants, imports, class attributes) have no mutants.
@@ -57,15 +59,29 @@ def module_name(path: str) -> str:
     return ".".join(parts)
 
 
+NEVER_MUTATED_NAMES = {"__new__", "__setattr__", "__getattribute__"}
+PLAIN_DECORATORS = {"staticmethod", "classmethod"}
+
+
+def _has_mutants(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    if node.name in NEVER_MUTATED_NAMES:
+        return False
+    if not node.decorator_list:
+        return True
+    only = node.decorator_list[0]
+    return len(node.decorator_list) == 1 and isinstance(only, ast.Name) and only.id in PLAIN_DECORATORS
+
+
 def function_spans(source: str) -> list[tuple[str, int, int]]:
     """Return the mangled name stem, first and last line of each function mutmut mutates."""
     spans = []
     for node in ast.parse(source).body:
         if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
-            spans.append((f"x_{node.name}", _first_line(node), node.end_lineno or node.lineno))
+            if _has_mutants(node):
+                    spans.append((f"x_{node.name}", _first_line(node), node.end_lineno or node.lineno))
         elif isinstance(node, ast.ClassDef):
             for member in node.body:
-                if isinstance(member, ast.FunctionDef | ast.AsyncFunctionDef):
+                if isinstance(member, ast.FunctionDef | ast.AsyncFunctionDef) and _has_mutants(member):
                     stem = f"x{CLASS_SEPARATOR}{node.name}{CLASS_SEPARATOR}{member.name}"
                     spans.append((stem, _first_line(member), member.end_lineno or member.lineno))
     return spans

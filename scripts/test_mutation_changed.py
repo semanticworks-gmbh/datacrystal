@@ -44,6 +44,14 @@ class Box:
 
     async def fetch(self):
         return 1
+
+    @staticmethod
+    def make():
+        return 2
+
+    @property
+    def size(self):
+        return 3
 '''
 # free: 4-5, decorated: 8-10 (decorator on 8), Box.put: 15-19 (inner on 16-17), Box.fetch: 21-22
 MODULE = "datacrystal._box"
@@ -61,12 +69,20 @@ def test_a_changed_line_in_a_module_function_names_that_function() -> None:
     assert patterns(5) == ["datacrystal._box.x_free__mutmut_*"]
 
 
-def test_a_changed_decorator_names_the_decorated_function() -> None:
-    """Given a decorated function
-    When only its decorator line changed
-    Then its pattern is listed
+def test_a_decorated_function_has_no_mutants_and_no_pattern() -> None:
+    """Given a function with a decorator that mutmut does not mutate through
+    When its decorator line changed
+    Then no pattern is listed
     """
-    assert patterns(8) == ["datacrystal._box.x_decorated__mutmut_*"]
+    assert patterns(8) == []
+
+
+def test_a_lone_staticmethod_decorator_keeps_the_pattern_and_a_property_has_none() -> None:
+    """Given a @staticmethod and a @property method
+    When their lines changed
+    Then only the staticmethod is listed, decorator line included
+    """
+    assert patterns(25, 30) == ["datacrystal._box.xǁBoxǁmake__mutmut_*"]
 
 
 def test_a_changed_line_in_a_method_names_the_method_with_its_class() -> None:
@@ -227,13 +243,58 @@ def test_survivors_beyond_the_limit_are_counted_not_shown() -> None:
     assert "2 more survivors not shown." in comment
 
 
-def test_a_run_without_survivors_says_so() -> None:
+def test_a_run_where_every_mutant_was_killed_says_so() -> None:
     """Given results where every mutant was killed
     When the comment is written
-    Then it says no survivor was found
+    Then it says the tests catch every mutant
     """
     results = "    datacrystal._box.x_free__mutmut_1: killed\n"
-    assert "No survivor" in mutation_summary.summarize(results, FREE, show)
+    assert "catch every mutant" in mutation_summary.summarize(results, FREE, show)
+
+
+def test_mutants_without_tests_are_listed_and_not_called_caught() -> None:
+    """Given a mutant with no tests, one timeout and one not checked, and no survivor
+    When the comment is written
+    Then none is called caught and each is listed by name
+    """
+    results = (
+        "    datacrystal._box.x_free__mutmut_1: no tests\n"
+        "    datacrystal._box.x_free__mutmut_2: timeout\n"
+        "    datacrystal._box.x_free__mutmut_3: not checked\n"
+    )
+    comment = mutation_summary.summarize(results, FREE, show)
+    assert "catch every mutant" not in comment
+    assert "diff of datacrystal._box.x_free__mutmut_1" in comment
+    assert "diff of datacrystal._box.x_free__mutmut_2" in comment
+    assert "diff of datacrystal._box.x_free__mutmut_3" in comment
+
+
+def test_only_patterns_that_matched_a_mutant_count_as_functions() -> None:
+    """Given two patterns of which one matches no mutant
+    When the comment is written
+    Then it counts one function
+    """
+    results = "    datacrystal._box.x_free__mutmut_1: killed\n"
+    patterns = [*FREE, "datacrystal._box.x_gone__mutmut_*"]
+    assert "1 changed functions, 1 mutants" in mutation_summary.summarize(results, patterns, show)
+
+
+def test_mutmut_is_run_through_uv_so_the_project_environment_is_used() -> None:
+    """Given a script that runs in an isolated environment without mutmut on PATH
+    When it builds the mutmut command
+    Then the command starts with uv run
+    """
+    assert mutation_summary.mutmut_command("results")[:3] == ["uv", "run", "mutmut"]
+
+
+def test_the_report_for_a_run_without_mutants_replaces_an_old_comment() -> None:
+    """Given a push after which no function has mutants
+    When the empty comment is written
+    Then it carries the marker so the old comment is updated
+    """
+    comment = mutation_summary.empty_comment()
+    assert comment.startswith("<!-- mutation-check -->\n")
+    assert "No mutants" in comment
 
 
 def main() -> int:
