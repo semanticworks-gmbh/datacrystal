@@ -18,8 +18,8 @@ import pytest
 import datacrystal as dc
 import datacrystal._snapshot as snapshot_module
 import datacrystal._store as store_module
-from datacrystal._entity import oid_of as _oid_of
 from datacrystal import Snapshot
+from datacrystal._entity import oid_of as _oid_of
 from datacrystal._storage.memory import MemoryBackend
 from tests.fitness._counting_backend import CountingBackend
 

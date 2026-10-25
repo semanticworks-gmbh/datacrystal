@@ -58,19 +58,19 @@ def test_import_loads_no_extra_dependency_and_no_sqlite() -> None:
     assert "ISOLATION-OK" in result.stdout
 
 
-def test_follower_profile_reaches_contribute_serializer() -> None:
+def test_follower_profile_contributes_without_fastapi_or_strawberry() -> None:
     """Given an interpreter that blocks fastapi and strawberry at import
-    When it imports the contribute serializer to_pydantic
-    Then the import succeeds and neither blocked module is loaded
+    When a follower contributes a new entity through a fake coordinator client
+    Then the contribution is sent and neither blocked module is loaded
 
     The ``datacrystal[follower]`` install (pydantic + httpx, NO fastapi / strawberry) must be
-    able to import the contribute serializer. A follower's ``commit()`` reaches
-    ``datacrystal.web._pydantic.to_pydantic``, which first runs the ``datacrystal.web`` package
-    init; that barrel lazily imports its fastapi-/strawberry-backed submodules (PEP 562), so a
-    follower-only install does not crash on the first contribute (#153 peer-review fix).
+    able to commit on a follower. The first contribute reaches the pydantic serializer through
+    the ``datacrystal.web`` package init, which lazily imports its fastapi-/strawberry-backed
+    submodules (PEP 562), so a follower-only install does not crash on it (#153 peer-review fix).
     """
     probe = (
         "import sys, importlib.abc\n"
+        "from typing import Annotated\n"
         "BLOCKED = {'fastapi', 'strawberry'}\n"
         "class _Blocker(importlib.abc.MetaPathFinder):\n"
         "    def find_spec(self, name, path, target=None):\n"
@@ -78,10 +78,30 @@ def test_follower_profile_reaches_contribute_serializer() -> None:
         "            raise ModuleNotFoundError(f'blocked for follower-profile test: {name}')\n"
         "        return None\n"
         "sys.meta_path.insert(0, _Blocker())\n"
-        "from datacrystal.web._pydantic import to_pydantic\n"
+        "import datacrystal as dc\n"
+        "@dc.entity\n"
+        "class Mineral:\n"
+        "    qid: Annotated[str, dc.Unique]\n"
+        "    name: str\n"
+        "class Reply:\n"
+        "    content = b'{\"applied_tid\": 1}'\n"
+        "    status_code = 200\n"
+        "    def raise_for_status(self): return None\n"
+        "    def json(self): return {'applied_tid': 1}\n"
+        "class NoDeltas(Reply):\n"
+        "    content = b''\n"
+        "submitted = []\n"
+        "class Coordinator:\n"
+        "    def get(self, url, /, *, params): return NoDeltas()\n"
+        "    def post(self, url, /, *, json):\n"
+        "        submitted.append(json)\n"
+        "        return Reply()\n"
+        "follower = dc.Store.follower('http://coordinator', client=Coordinator())\n"
+        "follower.store(Mineral(qid='Q1', name='quartz'))\n"
+        "follower.commit()\n"
+        "assert len(submitted) == 1, submitted\n"
         "assert 'fastapi' not in sys.modules, 'fastapi leaked into the follower path'\n"
         "assert 'strawberry' not in sys.modules, 'strawberry leaked into the follower path'\n"
-        "assert callable(to_pydantic)\n"
         "print('FOLLOWER-PROFILE-OK')\n"
     )
 
