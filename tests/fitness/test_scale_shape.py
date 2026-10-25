@@ -27,6 +27,7 @@ import pytest
 
 import datacrystal as dc
 from datacrystal._storage.memory import MemoryBackend
+from datacrystal._storage.protocol import StoredRecord
 from datacrystal._store import _RAW_CHUNK
 from tests.fitness._counting_backend import CountingBackend
 
@@ -40,6 +41,24 @@ class GateSpecimen:
     mohs: float | None = None
 
 
+class ScanCountingBackend(CountingBackend):
+    """A counting backend that also counts the ``scan_type`` calls an index build costs."""
+
+    def __init__(self, inner: MemoryBackend) -> None:
+        super().__init__(inner)
+        self.scans = 0
+
+    def reset(self) -> None:
+        """Zero the load counters and the scan counter."""
+        super().reset()
+        self.scans = 0
+
+    def scan_type(self, cid: int) -> Iterator[StoredRecord]:
+        """Count the scan, then delegate."""
+        self.scans += 1
+        return super().scan_type(cid)
+
+
 HITS = 500  # fixed across both extents: only the haystack grows
 SMALL = 25_000  # the other extent, 100_000, is 4x larger
 
@@ -49,7 +68,7 @@ class Cabinet:
     """A committed store of ``extent`` specimens, 500 of them cubic, over a counting backend."""
 
     store: dc.Store
-    backend: CountingBackend
+    backend: ScanCountingBackend
     extent: int
     mohs_nine_and_up: int
     live_baseline: int
@@ -63,7 +82,7 @@ def _grow(store: dc.Store, upto: int) -> None:
 
 
 def _open_cabinet(extent: int, mohs_nine_and_up: int) -> Cabinet:
-    backend = CountingBackend(MemoryBackend())
+    backend = ScanCountingBackend(MemoryBackend())
     store = dc.Store._from_backend(backend)
     _grow(store, extent)
     store.count(GateSpecimen)  # force the one-time index build (scan_type)
@@ -83,6 +102,21 @@ def cabinet(request: pytest.FixtureRequest) -> Iterator[Cabinet]:
     opened = _open_cabinet(extent, mohs_nine_and_up)
     yield opened
     opened.store.close()
+
+
+GROWN_CUBIC = 100  # specimens added after the index exists, on top of the 500 already cubic
+GROWN_OTHER = 100
+
+
+@pytest.fixture
+def grown_cabinet(cabinet: Cabinet) -> Cabinet:
+    """Grow the cabinet by 200 specimens, 100 of them cubic, once its index is built."""
+    for i in range(GROWN_CUBIC):
+        cabinet.store.store(GateSpecimen(qid=f"N{i}", crystal_system="cubic", mohs=1.0))
+    for i in range(GROWN_OTHER):
+        cabinet.store.store(GateSpecimen(qid=f"M{i}", crystal_system="trigonal", mohs=1.0))
+    cabinet.store.commit()
+    return cabinet
 
 
 @pytest.fixture
@@ -219,6 +253,82 @@ def test_unindexed_count_constructs_no_live_entity(cabinet: Cabinet) -> None:
     gc.collect()
 
     assert len(cabinet.store._registry) == cabinet.live_baseline
+
+
+# Commit-time index maintenance: a store that keeps growing after its index is built updates the
+# index in the commit, never by rebuilding it from a scan of the extent.
+
+
+def test_growing_a_built_index_loads_no_record_at_commit(grown_cabinet: Cabinet) -> None:
+    """Given a cabinet whose index is built, grown by 200 specimens in one commit
+    When the commit's backend traffic is read
+    Then no record was loaded, new rows needing no prior
+    """
+    loaded = grown_cabinet.backend.records_loaded
+
+    assert loaded == 0
+
+
+def test_growing_a_built_index_triggers_no_rebuild_scan(grown_cabinet: Cabinet) -> None:
+    """Given a cabinet whose index is built, grown by 200 specimens in one commit
+    When the cubic specimens are counted afterwards
+    Then the count includes the 100 new cubic specimens
+    And no scan of the extent rebuilt the index
+    """
+    cubic = grown_cabinet.store.count(dc.fields(GateSpecimen).crystal_system == "cubic")
+
+    assert cubic == HITS + GROWN_CUBIC
+    assert grown_cabinet.backend.scans == 0
+
+
+def test_indexed_query_after_growth_loads_exactly_the_hits(grown_cabinet: Cabinet) -> None:
+    """Given a cabinet whose index is built, grown by 200 specimens in one commit
+    When the cubic specimens are queried
+    Then 600 hits are returned
+    And exactly 600 records were loaded, never the grown extent
+    """
+    grown_cabinet.backend.reset()
+
+    hits = grown_cabinet.store.query(dc.fields(GateSpecimen).crystal_system == "cubic")
+
+    assert len(hits) == HITS + GROWN_CUBIC
+    assert grown_cabinet.backend.records_loaded == HITS + GROWN_CUBIC
+
+
+def test_unique_lookup_of_a_specimen_added_after_the_build_loads_one_record(
+    grown_cabinet: Cabinet,
+) -> None:
+    """Given a cabinet whose index is built, grown by 200 specimens in one commit
+    When one new specimen is fetched by its unique qid
+    Then it is found
+    And exactly one record was loaded
+    """
+    grown_cabinet.backend.reset()
+
+    found = grown_cabinet.store.get(GateSpecimen, qid="N7")
+
+    assert found is not None
+    assert grown_cabinet.backend.records_loaded == 1
+
+
+def test_recrystallised_specimen_moves_between_index_postings_without_a_scan(
+    grown_cabinet: Cabinet,
+) -> None:
+    """Given a cabinet whose index is built, grown by 200 specimens in one commit
+    When one of the new cubic specimens is changed to trigonal and committed
+    Then the cubic count drops by one
+    And no scan of the extent rebuilt the index
+    """
+    grown_cabinet.backend.reset()
+    moved = grown_cabinet.store.get(GateSpecimen, qid="N7")
+    assert moved is not None
+    moved.crystal_system = "trigonal"
+    grown_cabinet.store.commit()
+
+    cubic = grown_cabinet.store.count(dc.fields(GateSpecimen).crystal_system == "cubic")
+
+    assert cubic == HITS + GROWN_CUBIC - 1
+    assert grown_cabinet.backend.scans == 0
 
 
 def test_limit_stops_a_query_early(small_cabinet: Cabinet) -> None:

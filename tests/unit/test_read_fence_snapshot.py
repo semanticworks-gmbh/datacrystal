@@ -61,6 +61,14 @@ class Plain:
     n: int = 0
 
 
+@dc.entity(protected=True)
+class Memo:
+    """A protected memo that refers to a plain record (R11: the ref is Lazy)."""
+
+    label: Annotated[str, dc.Unique]
+    about: dc.Lazy[Plain] | None = None
+
+
 def _seed_shared(store: dc.Store) -> tuple[int, int]:
     """Store a team-readable dossier (floor AGENT) and an owner-only one; return their OIDs."""
     with store.acting_as(OWNER):
@@ -259,6 +267,93 @@ def test_incoming_of_a_readable_target_without_referrers_is_empty(store: dc.Stor
     with store.snapshot(principal=MEMBER) as member_snap:
         referrers = member_snap.incoming(target_oid)
     assert referrers == []
+
+
+def _seed_memos_about_a_plain_record(store: dc.Store) -> int:
+    """Store a plain record with a team-shared memo and an owner-only memo about it; return its OID."""
+    with store.acting_as(OWNER):
+        target = Plain(label="target")
+        target_oid = store.store(target)
+        shared = Memo(label="shared-memo", about=dc.Lazy.of(target))
+        store.store(shared)
+        dc.share(shared, TEAM, read=dc.AGENT, write=dc.CURATOR)
+        store.store(Memo(label="secret-memo", about=dc.Lazy.of(target)))
+        store.commit()
+    return target_oid
+
+
+def test_incoming_drops_a_referrer_the_principal_cannot_read(store: dc.Store) -> None:
+    """Given a plain record referred to by a team-shared memo and an owner-only memo
+    When the member's snapshot asks for the record's incoming referrers
+    Then only the shared memo comes back
+    """
+    target_oid = _seed_memos_about_a_plain_record(store)
+    with store.snapshot(principal=MEMBER) as member_snap:
+        referrers = member_snap.incoming(target_oid)
+    assert [v.label for v in referrers] == ["shared-memo"]
+
+
+def test_incoming_keeps_every_referrer_for_the_owner(store: dc.Store) -> None:
+    """Given a plain record referred to by a team-shared memo and an owner-only memo
+    When the owner's snapshot asks for the record's incoming referrers
+    Then both memos come back
+    """
+    target_oid = _seed_memos_about_a_plain_record(store)
+    with store.snapshot(principal=OWNER) as owner_snap:
+        referrers = owner_snap.incoming(target_oid)
+    assert {v.label for v in referrers} == {"shared-memo", "secret-memo"}
+
+
+def test_incoming_for_a_sibling_drops_what_the_owner_already_cached(store: dc.Store) -> None:
+    """Given the owner's snapshot has already listed both memos into the shared cache
+    When the outsider's sibling on the same core asks for the incoming referrers
+    Then none comes back
+    """
+    target_oid = _seed_memos_about_a_plain_record(store)
+    with store.snapshot(principal=OWNER) as owner_snap:
+        owner_snap.incoming(target_oid)
+        referrers = owner_snap.for_principal(OUTSIDER).incoming(target_oid)
+    assert referrers == []
+
+
+# --- _stream: root-bound for a protected class (docs/reference.md) -----------
+
+
+def test_stream_refuses_a_non_root_on_a_protected_class(store: dc.Store) -> None:
+    """Given a team-shared dossier and an owner-only dossier
+    When the member's snapshot streams the dossiers for a mirror bootstrap
+    Then the stream raises ReadDeniedError rather than yield a partial mirror
+    """
+    _seed_shared(store)
+    typename = type_info(Dossier).typename
+    with store.snapshot(principal=MEMBER) as member_snap, pytest.raises(dc.ReadDeniedError):
+        list(member_snap._stream(typename))
+
+
+def test_stream_yields_every_row_of_a_protected_class_to_root(store: dc.Store) -> None:
+    """Given a team-shared dossier and an owner-only dossier
+    When the root snapshot streams the dossiers
+    Then both rows stream
+    """
+    _seed_shared(store)
+    typename = type_info(Dossier).typename
+    with store.snapshot(principal=ROOT) as root_snap:
+        streamed = list(root_snap._stream(typename))
+    assert len(streamed) == 2
+
+
+def test_stream_yields_every_row_of_an_unprotected_class_to_a_non_root(store: dc.Store) -> None:
+    """Given two plain records
+    When an outsider's snapshot streams them
+    Then both rows stream, no fence applying to an unprotected class
+    """
+    with store.acting_as(OWNER):
+        store.store(Plain(label="p1"))
+        store.store(Plain(label="p2"))
+        store.commit()
+    with store.snapshot(principal=OUTSIDER) as outsider_snap:
+        streamed = list(outsider_snap._stream(type_info(Plain).typename))
+    assert len(streamed) == 2
 
 
 # --- deref: get raises, get_many twins (R14) ---------------------------------
