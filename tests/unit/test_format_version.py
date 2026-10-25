@@ -28,7 +28,7 @@ def test_sqlite_newer_store_is_refused_naming_both_versions(tmp_path: Path) -> N
     dc.Store.open(tmp_path / "s").close()
     _stamp_sqlite_format_version(tmp_path / "s", "99")
 
-    with pytest.raises(dc.NewerStoreError, match="v99.*v2"):
+    with pytest.raises(dc.NewerStoreError, match=r"v99.*v2"):
         dc.Store.open(tmp_path / "s")
 
 

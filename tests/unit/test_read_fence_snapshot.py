@@ -16,14 +16,18 @@ fenced with their owning record (W4-3). Mirrors the live-store fence tests.
 from __future__ import annotations
 
 from collections.abc import Callable
+from pathlib import Path
 from typing import Annotated
 
 import pytest
 
 import datacrystal as dc
-from datacrystal._entity import TYPES_BY_NAME, type_info
+from datacrystal._entity import TYPES_BY_NAME
 
 StoreFactory = Callable[[], dc.Store]
+
+DOSSIER_TYPENAME = "tests.unit.test_read_fence_snapshot:Dossier"
+PLAIN_TYPENAME = "tests.unit.test_read_fence_snapshot:Plain"
 
 TEAM = 5
 OTHER = 6
@@ -94,17 +98,34 @@ def _commit_vault(store_factory: StoreFactory) -> int:
 # --- R15: one shared core, per-principal handles -----------------------------
 
 
-def test_for_principal_derives_siblings_over_the_same_core(store: dc.Store) -> None:
-    """Given a snapshot bound to the owner
-    When siblings are derived for a member and an outsider
-    Then both siblings share the owner snapshot's core, for_principal building nothing
+def test_closing_the_owner_snapshot_closes_its_member_sibling(store: dc.Store) -> None:
+    """Given a snapshot bound to the owner and a sibling derived for a member
+    When the owner snapshot is closed
+    Then the member sibling raises StoreClosedError, the two sharing one core
     """
     _seed_shared(store)
-    with store.snapshot(principal=OWNER) as owner_snap:
-        member_snap = owner_snap.for_principal(MEMBER)
-        outsider_snap = owner_snap.for_principal(OUTSIDER)
-        assert member_snap._core is owner_snap._core
-        assert outsider_snap._core is owner_snap._core
+    owner_snap = store.snapshot(principal=OWNER)
+    member_snap = owner_snap.for_principal(MEMBER)
+
+    owner_snap.close()
+
+    with pytest.raises(dc.StoreClosedError):
+        member_snap.count(Dossier)
+
+
+def test_closing_the_owner_snapshot_closes_its_outsider_sibling(store: dc.Store) -> None:
+    """Given a snapshot bound to the owner and a sibling derived for an outsider
+    When the owner snapshot is closed
+    Then the outsider sibling raises StoreClosedError, the two sharing one core
+    """
+    _seed_shared(store)
+    owner_snap = store.snapshot(principal=OWNER)
+    outsider_snap = owner_snap.for_principal(OUTSIDER)
+
+    owner_snap.close()
+
+    with pytest.raises(dc.StoreClosedError):
+        outsider_snap.count(Dossier)
 
 
 def test_for_principal_binds_the_sibling_to_its_own_principal(store: dc.Store) -> None:
@@ -325,35 +346,44 @@ def test_stream_refuses_a_non_root_on_a_protected_class(store: dc.Store) -> None
     Then the stream raises ReadDeniedError rather than yield a partial mirror
     """
     _seed_shared(store)
-    typename = type_info(Dossier).typename
+    typename = DOSSIER_TYPENAME
     with store.snapshot(principal=MEMBER) as member_snap, pytest.raises(dc.ReadDeniedError):
         list(member_snap._stream(typename))
 
 
-def test_stream_yields_every_row_of_a_protected_class_to_root(store: dc.Store) -> None:
+def test_bootstrap_mirrors_every_row_of_a_protected_class_for_root(
+    store: dc.Store, tmp_path: Path
+) -> None:
     """Given a team-shared dossier and an owner-only dossier
-    When the root snapshot streams the dossiers
-    Then both rows stream
+    When the root snapshot bootstraps an Arrow mirror
+    Then both rows are in the mirror
     """
+    arrow = pytest.importorskip("datacrystal.arrow")
     _seed_shared(store)
-    typename = type_info(Dossier).typename
     with store.snapshot(principal=ROOT) as root_snap:
-        streamed = list(root_snap._stream(typename))
-    assert len(streamed) == 2
+        mirror = arrow.ArrowMirror.bootstrap(tmp_path / "mirror", root_snap)
+
+    assert mirror.table(Dossier).num_rows == 2
+    mirror.close()
 
 
-def test_stream_yields_every_row_of_an_unprotected_class_to_a_non_root(store: dc.Store) -> None:
+def test_bootstrap_mirrors_every_row_of_an_unprotected_class_for_a_non_root(
+    store: dc.Store, tmp_path: Path
+) -> None:
     """Given two plain records
-    When an outsider's snapshot streams them
-    Then both rows stream, no fence applying to an unprotected class
+    When an outsider's snapshot bootstraps an Arrow mirror of them
+    Then both rows are in the mirror, no fence applying to an unprotected class
     """
+    arrow = pytest.importorskip("datacrystal.arrow")
     with store.acting_as(OWNER):
         store.store(Plain(label="p1"))
         store.store(Plain(label="p2"))
         store.commit()
     with store.snapshot(principal=OUTSIDER) as outsider_snap:
-        streamed = list(outsider_snap._stream(type_info(Plain).typename))
-    assert len(streamed) == 2
+        mirror = arrow.ArrowMirror.bootstrap(tmp_path / "mirror", outsider_snap, only=[Plain])
+
+    assert mirror.table(Plain).num_rows == 2
+    mirror.close()
 
 
 # --- deref: get raises, get_many twins (R14) ---------------------------------
@@ -563,7 +593,7 @@ def test_all_by_name_raises_when_the_protected_class_has_no_live_code(
     Then the listing raises ReadDeniedError
     """
     _seed_shared(store)
-    typename = type_info(Dossier).typename
+    typename = DOSSIER_TYPENAME
     monkeypatch.delitem(TYPES_BY_NAME, typename)
     with store.snapshot(principal=MEMBER) as member_snap, pytest.raises(dc.ReadDeniedError):
         member_snap.all(typename)
@@ -577,7 +607,7 @@ def test_get_raises_when_the_protected_class_has_no_live_code(
     Then the get raises ReadDeniedError
     """
     shared_oid, _secret_oid = _seed_shared(store)
-    monkeypatch.delitem(TYPES_BY_NAME, type_info(Dossier).typename)
+    monkeypatch.delitem(TYPES_BY_NAME, DOSSIER_TYPENAME)
     with store.snapshot(principal=MEMBER) as member_snap, pytest.raises(dc.ReadDeniedError):
         member_snap.get(shared_oid)
 
@@ -590,7 +620,7 @@ def test_get_many_fails_closed_with_none_when_the_protected_class_has_no_live_co
     Then both come back None, no twin being buildable without a live class
     """
     shared_oid, secret_oid = _seed_shared(store)
-    monkeypatch.delitem(TYPES_BY_NAME, type_info(Dossier).typename)
+    monkeypatch.delitem(TYPES_BY_NAME, DOSSIER_TYPENAME)
     with store.snapshot(principal=MEMBER) as member_snap:
         found = member_snap.get_many([shared_oid, secret_oid])
     assert found == [None, None]
@@ -604,7 +634,7 @@ def test_stream_refuses_a_non_root_when_the_protected_class_has_no_live_code(
     Then the stream raises ReadDeniedError, guarding against a silently partial mirror
     """
     _seed_shared(store)
-    typename = type_info(Dossier).typename
+    typename = DOSSIER_TYPENAME
     monkeypatch.delitem(TYPES_BY_NAME, typename)
     with store.snapshot(principal=MEMBER) as member_snap, pytest.raises(dc.ReadDeniedError):
         list(member_snap._stream(typename))
@@ -618,7 +648,7 @@ def test_root_lists_all_rows_when_the_protected_class_has_no_live_code(
     Then both rows come back, root running ops dumps (R9)
     """
     _seed_shared(store)
-    typename = type_info(Dossier).typename
+    typename = DOSSIER_TYPENAME
     monkeypatch.delitem(TYPES_BY_NAME, typename)
     with store.snapshot(principal=ROOT) as root_snap:
         rows = root_snap.all(typename)
@@ -633,25 +663,27 @@ def test_root_gets_by_oid_when_the_protected_class_has_no_live_code(
     Then the dossier carries its label
     """
     shared_oid, _secret_oid = _seed_shared(store)
-    monkeypatch.delitem(TYPES_BY_NAME, type_info(Dossier).typename)
+    monkeypatch.delitem(TYPES_BY_NAME, DOSSIER_TYPENAME)
     with store.snapshot(principal=ROOT) as root_snap:
         found = root_snap.get(shared_oid)
     assert found.label == "shared"
 
 
-def test_root_streams_all_rows_when_the_protected_class_has_no_live_code(
-    store: dc.Store, monkeypatch: pytest.MonkeyPatch
+def test_root_bootstraps_all_rows_when_the_protected_class_has_no_live_code(
+    store: dc.Store, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """Given persisted protected dossiers whose live class was removed
-    When the root snapshot streams them by type name
-    Then both rows stream
+    When the root snapshot bootstraps an Arrow mirror of them by type name
+    Then both rows are in the mirror
     """
+    arrow = pytest.importorskip("datacrystal.arrow")
     _seed_shared(store)
-    typename = type_info(Dossier).typename
-    monkeypatch.delitem(TYPES_BY_NAME, typename)
+    monkeypatch.delitem(TYPES_BY_NAME, DOSSIER_TYPENAME)
     with store.snapshot(principal=ROOT) as root_snap:
-        streamed = list(root_snap._stream(typename))
-    assert len(streamed) == 2
+        mirror = arrow.ArrowMirror.bootstrap(tmp_path / "mirror", root_snap, only=[DOSSIER_TYPENAME])
+
+    assert mirror.table(DOSSIER_TYPENAME).num_rows == 2
+    mirror.close()
 
 
 # --- blobs fenced with their owning record (W4-3) ----------------------------
