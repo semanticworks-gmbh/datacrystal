@@ -20,7 +20,6 @@ import datacrystal as dc
 from datacrystal._storage.memory import MemoryBackend
 from tests.conftest import Mineral
 
-
 StoreOpener = Callable[..., dc.Store]
 
 

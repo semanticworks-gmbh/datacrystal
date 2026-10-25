@@ -44,6 +44,8 @@ def _seeded_backend() -> MemoryBackend:
     store = dc.Store._from_backend(backend)
     tsumeb = Locality(qid="L1", name="Tsumeb Mine")
     store.store(Mineral(qid="Q1", name="azurite", type_locality=dc.Lazy.of(tsumeb)))
+    broken_hill = Locality(qid="L2", name="Broken Hill")
+    store.store(Mineral(qid="Q2", name="cerussite", type_locality=dc.Lazy.of(broken_hill)))
     store.commit()
     store.close()
     return backend
@@ -116,21 +118,6 @@ def test_demoted_handle_reloads_through_the_store(
     assert reloaded.name == "Tsumeb Mine"
 
 
-def test_one_demotion_is_counted(
-    lazy_store: dc.Store, clock: _Clock, loaded_handle: dc.Lazy[Locality]
-) -> None:
-    """Given a handle loaded at t=0 with a 10 s timeout
-    When an owner API call sweeps at t=11
-    Then the manager counts one demotion
-    """
-    clock.now = 11.0
-
-    lazy_store.get(Mineral, qid="Q1")
-
-    assert lazy_store._lazyman is not None
-    assert lazy_store._lazyman.demoted_total == 1
-
-
 def test_access_refreshes_the_idle_clock(
     lazy_store: dc.Store, clock: _Clock, loaded_handle: dc.Lazy[Locality]
 ) -> None:
@@ -150,34 +137,36 @@ def test_access_refreshes_the_idle_clock(
 def test_owner_calls_right_after_a_sweep_do_not_sweep_again(
     lazy_store: dc.Store, clock: _Clock, loaded_handle: dc.Lazy[Locality]
 ) -> None:
-    """Given a handle demoted by a sweep at t=11
-    When an owner API call follows at t=12, inside the sweep interval
-    Then the manager still counts one demotion
+    """Given azurite's handle loaded at t=0 and cerussite's loaded at t=2, with a 10 s timeout
+    And an owner API call sweeping at t=11, which demotes azurite's handle
+    When an owner API call follows at t=12.5, inside the sweep interval of 2.5 s
+    Then cerussite's handle is still loaded, idle 10.5 s because no second sweep ran
     """
+    clock.now = 2.0
+    cerussite_handle = _present(_present(lazy_store.get(Mineral, qid="Q2")).type_locality)
+    cerussite_handle.get()
     clock.now = 11.0
     lazy_store.get(Mineral, qid="Q1")
-    clock.now = 12.0
+    clock.now = 12.5
 
     lazy_store.get(Mineral, qid="Q1")
 
-    assert lazy_store._lazyman is not None
-    assert lazy_store._lazyman.demoted_total == 1
+    assert cerussite_handle.loaded
 
 
 def test_user_made_lazy_of_never_demotes(clock: _Clock) -> None:
     """Lazy.of(entity) without an OID cannot reload itself, so the manager leaves it alone.
 
     Given a handle made with Lazy.of(Broken Hill) and a 1 s timeout
-    When the clock is at t=100 and the manager sweeps
+    When the clock is at t=100 and the owner runs pending work
     Then the handle still returns the identical locality
     """
     store = dc.Store._from_backend(MemoryBackend(), lazy_timeout=1.0, lazy_clock=clock)
     keepsake = Locality(qid="L9", name="Broken Hill")
     handle = dc.Lazy.of(keepsake)
     clock.now = 100.0
-    assert store._lazyman is not None
 
-    store._lazyman.sweep()
+    store.run_pending()
 
     assert handle.get() is keepsake
     store.close()
@@ -188,15 +177,15 @@ def test_demotion_records_the_owner_thread(
 ) -> None:
     """Given a handle loaded at t=0 with a 10 s timeout
     When the owner runs pending work at t=11
-    Then the manager demoted at least one handle
+    Then the handle is no longer loaded
     And the last demotion ran on the owner's thread
     """
     clock.now = 11.0
 
     lazy_store.run_pending()
 
+    assert not loaded_handle.loaded
     assert lazy_store._lazyman is not None
-    assert lazy_store._lazyman.demoted_total >= 1
     assert lazy_store._lazyman.last_demotion_thread == threading.get_ident()
 
 
