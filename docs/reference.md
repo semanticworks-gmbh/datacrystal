@@ -73,6 +73,9 @@ Identity is by OID, so **re-query after a sync** — a live reference read *befo
 
 **`store.discard()`** drops all buffered (uncommitted) writes and re-reads the committed state from the backend, returning the current watermark — the rollback the `sync()` "buffered writes" error names.
 It works on any store (an uncommitted local graph is dropped); a live reference held across it is detached, so re-`get()` for fresh values.
+A new entity that was stored but never committed is untracked again: it loses its OID, so `store()` on it allocates a fresh OID and buffers it for the next commit (#213).
+An edit to such an entity is not tracked, like an edit to any entity never stored: the next `commit()` writes nothing for it until you `store()` it again.
+A committed entity edited before the discard keeps its OID and reads its committed values again.
 
 **`store.committing(*, retries=3)`** is the recommended read-modify-write loop — *the same code on a single-node store and a follower*.
 Drive it with `for txn in store.committing(): with txn: ...`: the block reads and mutates and is committed when it exits cleanly.

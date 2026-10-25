@@ -45,6 +45,7 @@ from datacrystal._containers import PersistentDict, PersistentList, wrap_value
 from datacrystal._entity import (
     TYPES_BY_NAME,
     TypeInfo,
+    detach,
     entity,
     is_entity,
     oid_of,
@@ -481,8 +482,11 @@ class Store:
         The rollback that :meth:`sync` names: a rejected follower ``commit()`` leaves its buffer
         held. OCC recovery loop: discard, sync, re-read, re-apply, commit (#153); works on any
         store. A live reference read before the discard is detached: re-read for current values.
+        A discarded NEW entity is untracked again (no OID): ``store()`` it to write it.
         """
         self._enter()
+        for new_entity in self._new.values():
+            detach(new_entity)
         self._refresh_from_backend()
         return self._last_tid
 
