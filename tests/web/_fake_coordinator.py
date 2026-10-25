@@ -69,7 +69,8 @@ class FakeResponse:
 class FakeCoordinator:
     """A ``dc.HttpClient`` serving ``deltas`` on ``GET`` and answering ``POST`` with a fixed reply.
 
-    ``deltas`` may be reassigned between calls; ``posts`` records every ``/v1/submit`` body.
+    ``deltas`` may be reassigned between calls.
+    ``posts`` records every submitted body and ``post_urls`` the URL each went to.
     """
 
     def __init__(
@@ -83,6 +84,7 @@ class FakeCoordinator:
         self.submit_status = submit_status
         self.submit_body = submit_body if submit_body is not None else {"applied_tid": 1, "keys": {}}
         self.posts: list[dict[str, Any]] = []
+        self.post_urls: list[str] = []
 
     def get(self, url: str, /, *, params: dict[str, int]) -> FakeResponse:
         """Serve the frames of every delta after ``params["after"]``."""
@@ -92,6 +94,7 @@ class FakeCoordinator:
 
     def post(self, url: str, /, *, json: dict[str, Any]) -> FakeResponse:
         """Record the submitted body and answer the configured reply."""
+        self.post_urls.append(url)
         self.posts.append(json)
         return FakeResponse(self.submit_status, _dump(self.submit_body))
 

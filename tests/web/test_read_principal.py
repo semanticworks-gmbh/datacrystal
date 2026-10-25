@@ -333,7 +333,6 @@ def test_two_principals_at_one_watermark_share_the_pooled_core(seeded_store: dc.
     """Given requests resolved as Anna and then as a non-member at one watermark
     When the client GETs /whoami twice
     Then exactly two handles were served
-    And closing one handle closes the pooled core the other shares
     """
     captured: list[Snapshot] = []
     app = _rest_app(seeded_store, captured)
@@ -343,7 +342,21 @@ def test_two_principals_at_one_watermark_share_the_pooled_core(seeded_store: dc.
     _send(app, "GET", "/whoami")
 
     assert len(captured) == 2
+
+
+def test_closing_one_pooled_handle_closes_the_core_its_sibling_shares(seeded_store: dc.Store) -> None:
+    """Given two handles served as Anna and as a non-member at one watermark
+    When the first handle is closed
+    Then the second handle refuses reads with StoreClosedError
+    """
+    captured: list[Snapshot] = []
+    app = _rest_app(seeded_store, captured)
+    app.dependency_overrides[get_principal] = _requests_as_in_turn(ANNA, DENY)
+    _send(app, "GET", "/whoami")
+    _send(app, "GET", "/whoami")
+
     captured[0].close()
+
     with pytest.raises(dc.StoreClosedError):
         captured[1].count(Secret)
 

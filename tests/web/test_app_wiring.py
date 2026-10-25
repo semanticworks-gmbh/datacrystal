@@ -219,15 +219,14 @@ def _make_probe_app(path: str, recorded: dict[str, int]) -> FastAPI:
 def test_a_route_needing_the_store_fails_before_the_lifespan_runs(seeded_path: str) -> None:
     """Given an app created over a seeded store path with a route depending on get_store
     When a client calls the route without entering the lifespan
-    Then the response is a 500
+    Then the route raises the missing-store RuntimeError
     """
     app = create_app(seeded_path)
     _add_store_route(app, [])
-    client = TestClient(app, raise_server_exceptions=False)
+    client = TestClient(app)
 
-    resp = client.get("/store")
-
-    assert resp.status_code == 500
+    with pytest.raises(RuntimeError, match=r"no datacrystal store on app\.state"):
+        client.get("/store")
 
 
 def test_lifespan_opens_the_store_on_startup(seeded_path: str) -> None:

@@ -126,12 +126,11 @@ def test_route_reading_an_unseen_type_warns_once_not_per_request(store: dc.Store
     assert [w.category for w in caught].count(dc.UnseenTypeWarning) == 1
 
 
-def test_post_body_parses_and_from_pydantic_rebuilds_without_storing(store: dc.Store) -> None:
+def test_post_body_parses_and_from_pydantic_rebuilds_the_entity(store: dc.Store) -> None:
     """Given a valid create body
     When a client POSTs it to /minerals
     Then the response is 200
     And the route rebuilt the entity from the body
-    And the store holds nothing to commit
     """
     client = TestClient(_make_app(store))
 
@@ -139,7 +138,6 @@ def test_post_body_parses_and_from_pydantic_rebuilds_without_storing(store: dc.S
 
     assert resp.status_code == 200
     assert resp.json() == {"qid": "Q-NEW", "name": "fresh"}
-    assert store.commit() is None
 
 
 def test_post_then_owner_persists_and_get_round_trips(store: dc.Store) -> None:

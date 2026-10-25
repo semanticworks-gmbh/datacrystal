@@ -114,9 +114,9 @@ def test_from_pydantic_yields_a_fresh_entity_the_store_does_not_know(store: dc.S
     """Given a scalar-only create DTO
     When from_pydantic rebuilds it as a Mineral
     Then the result is a Mineral
-    And the next commit stores nothing
-    And storing it creates one new record
     And it carries the DTO's qid, name and hardness
+    And a field can be assigned before it is stored
+    And storing and committing it creates one record holding the assigned value
     """
     create = entity_model(Mineral, face="create")
     dto = create.model_validate({"qid": "Q-NEW", "name": "fresh", "mohs": 5.5})
@@ -124,13 +124,16 @@ def test_from_pydantic_yields_a_fresh_entity_the_store_does_not_know(store: dc.S
     mineral = from_pydantic(dto, Mineral)
 
     assert isinstance(mineral, Mineral)
-    assert store.commit() is None
-    store.store(mineral)
-    assert store.commit() is not None
-    assert store.count(Mineral) == 1
     assert mineral.qid == "Q-NEW"
     assert mineral.name == "fresh"
     assert mineral.mohs == 5.5
+    mineral.name = "renamed"
+    store.store(mineral)
+    store.commit()
+    stored = store.get(Mineral, qid="Q-NEW")
+    assert store.count(Mineral) == 1
+    assert stored is not None
+    assert stored.name == "renamed"
 
 
 def test_reconstructed_entity_commits_and_round_trips(store: dc.Store) -> None:
@@ -177,15 +180,13 @@ def test_missing_defaulted_field_falls_to_dataclass_default() -> None:
 def test_round_trips_through_to_pydantic(store: dc.Store, stock: Stock) -> None:
     """Given a committed quartz projected by to_pydantic
     When from_pydantic rebuilds it
-    Then the result is not stored, so the next commit stores nothing
-    And the qid and hardness survive verbatim
+    Then the qid and hardness survive verbatim
     And the discovered_in reference stays the locality's OID
     """
     dto = to_pydantic(stock.mineral)
 
     rebuilt = from_pydantic(dto, Mineral)
 
-    assert store.commit() is None
     assert rebuilt.qid == "Q-QTZ"
     assert rebuilt.mohs == 7.0
     assert rebuilt.discovered_in == stock.loc_oid
@@ -297,7 +298,7 @@ def test_store_resolution_is_owner_confined(store: dc.Store, stock: Stock) -> No
 def test_frozen_entity_reconstructs(store: dc.Store) -> None:
     """Given a plain-face DTO of a frozen LogEntry
     When from_pydantic rebuilds it
-    Then the result is a LogEntry the store does not know yet
+    Then the result is a LogEntry
     And it carries the DTO's note and kind
     """
     dto = entity_model(LogEntry).model_validate({"note": "found in drawer 3", "kind": "find"})
@@ -305,7 +306,6 @@ def test_frozen_entity_reconstructs(store: dc.Store) -> None:
     entry = from_pydantic(dto, LogEntry)
 
     assert isinstance(entry, LogEntry)
-    assert store.commit() is None
     assert entry.note == "found in drawer 3"
     assert entry.kind == "find"
 

@@ -190,7 +190,7 @@ def test_sync_catchup_refuses_a_gap_no_partial_apply(
         with pytest.raises(DeltaGapError):
             follower.sync()
 
-        assert follower.last_tid == 1
+        assert follower.discard() == 1
         assert {m.qid for m in follower.query(Mineral)} == {"Q1"}
 
 
@@ -339,7 +339,7 @@ def test_catchup_refuses_a_delta_that_predates_the_contract() -> None:
         with pytest.raises(DeltaFormatError, match="predates"):
             follower.sync()
 
-        assert follower.last_tid == 0
+        assert follower.discard() == 0
 
 
 def test_catchup_refuses_a_delta_newer_than_the_contract() -> None:
@@ -355,7 +355,7 @@ def test_catchup_refuses_a_delta_newer_than_the_contract() -> None:
         with pytest.raises(DeltaFormatError, match="newer"):
             follower.sync()
 
-        assert follower.last_tid == 0
+        assert follower.discard() == 0
 
 
 def test_catchup_refuses_a_frame_that_is_not_a_delta() -> None:
@@ -371,7 +371,7 @@ def test_catchup_refuses_a_frame_that_is_not_a_delta() -> None:
         with pytest.raises(DeltaFormatError, match="not a datacrystal delta"):
             follower.sync()
 
-        assert follower.last_tid == 0
+        assert follower.discard() == 0
 
 
 def test_catchup_still_applies_a_well_formed_empty_delta() -> None:

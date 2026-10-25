@@ -222,7 +222,7 @@ def lagging_follower(
     coordinator: _CoordinatorServer,
     connect_follower: Callable[[_CoordinatorServer], dc.Store],
     connect_http: Callable[[_CoordinatorServer], httpx.Client],
-) -> dc.Store:
+) -> Iterator[dc.Store]:
     """Open a follower whose catch-up loses its first frame, two commits behind the coordinator."""
     lossy = FrameDroppingClient(connect_http(coordinator))
     follower = dc.open_follower(coordinator.base_url, client=lossy, path=None)
@@ -232,7 +232,8 @@ def lagging_follower(
     contributor.upsert(Mineral(qid="QG2", name="Gapstone2"))
     contributor.commit()
     lossy.drop_first_frame = True
-    return follower
+    yield follower
+    follower.close()
 
 
 # --- §3.a bootstrap-read -----------------------------------------------------
@@ -650,7 +651,7 @@ def test_lost_ack_reinsert_with_base_none_raises_conflict(
     connect_http: Callable[[_CoordinatorServer], httpx.Client],
 ) -> None:
     """Given an untracked Quartz with base None, the wire shape of a lost-ack re-insert
-    When it is POSTed to /v1/submit although Q1 is already present
+    When it is POSTed to /v1/submit although Q1 is already present and the follower syncs
     Then the response is a 409 conflict
     And the coordinator's head is unchanged
     And exactly one Quartz remains, with the original hardness
@@ -667,6 +668,7 @@ def test_lost_ack_reinsert_with_base_none_raises_conflict(
 
     head_after = int(http.get("/v1/head").json()["tid"])
     follower.sync()
+
     assert resp.status_code == 409
     assert resp.json()["detail"]["error"] == "conflict"
     assert head_after == head_before

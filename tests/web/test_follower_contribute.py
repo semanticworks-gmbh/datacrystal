@@ -68,7 +68,6 @@ def test_commit_contributes_new_entity_with_no_base(follower_path: Path | None) 
     Then the commit returns TID 7
     And exactly one op was sent
     And the op is the new mineral with base None
-    And a second commit sends nothing more
     """
     coordinator = FakeCoordinator(submit_body={"applied_tid": 7, "keys": {"QN": 1}})
     with dc.open_follower("http://coord", client=coordinator, path=follower_path) as follower:
@@ -81,7 +80,22 @@ def test_commit_contributes_new_entity_with_no_base(follower_path: Path | None) 
         op = coordinator.posts[0]["ops"][0]
         assert op["fields"]["qid"] == "QN"
         assert op["base"] is None
-        assert follower.commit() is None
+
+
+def test_a_second_commit_with_nothing_new_sends_nothing(follower_path: Path | None) -> None:
+    """Given a follower that committed one new mineral
+    When it commits again
+    Then the commit returns None
+    And no further body is posted
+    """
+    coordinator = FakeCoordinator(submit_body={"applied_tid": 7, "keys": {"QN": 1}})
+    with dc.open_follower("http://coord", client=coordinator, path=follower_path) as follower:
+        follower.upsert(Mineral(qid="QN", name="New"))
+        follower.commit()
+
+        tid = follower.commit()
+
+        assert tid is None
         assert len(coordinator.posts) == 1
 
 
@@ -130,7 +144,7 @@ def test_contribute_returns_the_applied_tid(follower_path: Path | None) -> None:
 def test_contribute_posts_one_serialized_op_to_submit(follower_path: Path | None) -> None:
     """Given a coordinator answering 200
     When a quartz is upserted and committed
-    Then one body is posted
+    Then one body is posted to /v1/submit
     And the op names the Mineral type and the qid key
     And the op fields hold the quartz's qid and hardness
     """
@@ -140,7 +154,7 @@ def test_contribute_posts_one_serialized_op_to_submit(follower_path: Path | None
 
         follower.commit()
 
-        assert len(coordinator.posts) == 1
+        assert coordinator.post_urls == ["/v1/submit"]
         op = coordinator.posts[0]["ops"][0]
         assert op["type"].endswith(":Mineral")
         assert op["key"] == "qid"
