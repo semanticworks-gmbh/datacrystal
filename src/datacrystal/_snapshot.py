@@ -294,6 +294,25 @@ class SnapshotIndexes:
         )
 
 
+class UnseenTypeLedger:
+    """The types a Store and its snapshots already warned about, shared and thread-safe (#201).
+
+    Snapshots may be read from other threads, so the check-and-add runs under one lock.
+    """
+
+    def __init__(self) -> None:
+        self._warned: set[str] = set()
+        self._lock = threading.Lock()
+
+    def first_sight(self, typename: str) -> bool:
+        """Record ``typename`` and return True only the first time it is seen."""
+        with self._lock:
+            if typename in self._warned:
+                return False
+            self._warned.add(typename)
+            return True
+
+
 class _SnapshotCore:
     """The principal-free shared state of one snapshot watermark (ADR-008 R15, W4 amendment).
 
@@ -302,8 +321,9 @@ class _SnapshotCore:
     O(n) per commit, never O(n) per principal.
     """
 
-    def __init__(self, view: StorageReadView) -> None:
+    def __init__(self, view: StorageReadView, unseen: UnseenTypeLedger | None = None) -> None:
         self.view = view
+        self.unseen = unseen if unseen is not None else UnseenTypeLedger()
         boot = view.boot()
         # tid semantics: the watermark this view pins. If a commit's P2 has
         # landed but its P3 has not yet run on the owner, this may be one
@@ -428,6 +448,8 @@ class _SnapshotCore:
         return [self.cache.get(oid) for oid in oids]
 
     def warn_unseen(self, ti: TypeInfo) -> None:
+        if not self.unseen.first_sight(ti.typename):
+            return
         warnings.warn(
             UnseenTypeWarning(
                 f"this snapshot has no committed records of {ti.cls.__name__} "

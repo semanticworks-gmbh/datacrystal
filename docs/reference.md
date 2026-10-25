@@ -48,6 +48,7 @@ store.close()                                  # or: with dc.Store.open(...) as 
 - `cache_index=True` (**on by default**, [ADR-005](design/ADR-005-index-cache.md)) **persists the built indexes to a watermark-stamped sidecar and loads them at boot instead of rescanning** — so a warm reopen of a large store skips that O(extent) first-query rebuild (measured **~14× faster** on a 6.2M-row store; the sidecar is ~2.5× smaller than a naïve one because a `Unique` field is stored as a flat key→oid map, not per-key bitmaps).
   The cache is **never authoritative** (invariant 11): any watermark or index-marker mismatch, or a stale/corrupt/newer sidecar, silently rebuilds from the records — it can never return a wrong answer (SIGKILL-tested).
   Pass `cache_index=False` for a scratch store, or one you never reopen.
+  After a reopen over the cache a multivalued field such as `_dc_groups` comes back in the cache's postings-key order, not the order you appended; treat it as a set.
 - `durability` is a triad. `"commit"` fsyncs every commit (plus `F_FULLFSYNC` on macOS — honest, so a commit costs ~4 ms there); an acked commit survives even power loss. `"interval"` (default) group-commits: fsync happens at WAL checkpoints, so a **process** crash (kill -9) loses nothing, while an OS crash or power loss may lose the last commits — but never corrupts the file. `"never"` skips fsync entirely: benchmarks and scratch stores only, an OS crash can corrupt it.
 - `close()` **discards uncommitted changes** — commit first.
   Closing releases the lock and the in-memory graph.
@@ -297,6 +298,7 @@ Containers are by-value parts of their owner — after `e.tags = data`, mutate t
 | Value | Persisted as |
 |---|---|
 | `None`, `bool`, `int`, `float`, `str`, `bytes` | itself (msgpack) |
+| `bytearray` | stored as bytes and hydrates as **`bytes`**: the instance you committed keeps its `bytearray`, a reopened or fetched record holds `bytes` |
 | timezone-aware `datetime` | itself (msgpack timestamp; the instant is preserved, a non-UTC offset comes back as UTC) |
 | naive `datetime`, `date`, `time` | itself (datacrystal extension codes, format v2) |
 | `decimal.Decimal` | itself (datacrystal extension code 6 holding the exact text, so `Decimal("1.10")` stays `1.10`; `None`, negatives and any precision included) |
@@ -415,6 +417,9 @@ Query semantics (the *theory* — planner, residual, candidate set — is in [ex
 - A condition uses fields of **one entity class** — cross-entity joins are `[planned — v1, on Arrow mirrors]`.
 - `query()` and `get()` reflect **committed** state; uncommitted buffered changes are not visible to them. `count()` and `pluck()` read committed state even more strictly: they decode records instead of hydrating entities, so they never see in-memory mutations at all (and never pay entity-construction RAM — that is the point).
 - Querying, counting or plucking a class the store has **no committed records of** returns empty and emits an `UnseenTypeWarning` — legitimate on a first run, a lifesaver when you forgot to `commit()` or opened the wrong store file. `get()` stays silent (`None` is the expected miss in get-or-create code).
+- **The warning fires once per type per `Store`.**
+  The store and every snapshot it opens share one record of the types already warned about, so the first read of an unseen type warns and every later read of it stays quiet, through any snapshot, on any thread; a route that opens a snapshot per request warns on its first request only.
+  A second `Store` over the same files starts with an empty record and warns again once, and a different unseen type warns on its own first read.
 - Type checkers cannot model the magic class-attribute access (they see `Mineral.mohs` as `float | None` and flag the comparison).
   Runtime is fine either way; for checker-clean code use the equivalent typed proxy `dc.fields(Mineral)` — see [Typing](#typing).
 
@@ -925,7 +930,7 @@ Everything derives from `dc.DataCrystalError`:
 Pipeline consumers can additionally raise the contract errors (`datacrystal.contract`): `DeltaGapError` (history missing — resync/rebuild; also raised by `attach()` on a watermark mismatch) and `DeltaFormatError` (malformed/newer-versioned delta).
 The extras add `datacrystal.fts.FtsConfigError` and `datacrystal.arrow.MirrorConfigError` (both `DataCrystalError`s): the sidecar file/directory contradicts the requested configuration or is newer than the installed extra — rebuild rather than guess.
 
-Four warnings live outside the exception family (all `UserWarning`s): `UntrackedMutationWarning`, emitted by the `debug=True` safety net when a mutation slipped past the dirty tracking — the entity is committed anyway; fix the write path it names; `DanglingDeleteWarning`, emitted under `debug=True` when a `commit()` deletes an entity another record still references — the commit proceeds (use `strict_deletes=True` to raise instead); `ConsumerDetachedWarning`, emitted when an attached delta consumer raised during delivery and was detached (the commit is durable; rebuild the sidecar and re-attach); and `UnseenTypeWarning`, emitted when `query()`/`count()`/`pluck()` run against a class the store has no committed records of (the result is empty — first run, or a forgotten `commit()`).
+Four warnings live outside the exception family (all `UserWarning`s): `UntrackedMutationWarning`, emitted by the `debug=True` safety net when a mutation slipped past the dirty tracking — the entity is committed anyway; fix the write path it names; `DanglingDeleteWarning`, emitted under `debug=True` when a `commit()` deletes an entity another record still references — the commit proceeds (use `strict_deletes=True` to raise instead); `ConsumerDetachedWarning`, emitted when an attached delta consumer raised during delivery and was detached (the commit is durable; rebuild the sidecar and re-attach); and `UnseenTypeWarning`, emitted when `query()`/`count()`/`pluck()` run against a class the store has no committed records of (the result is empty — first run, or a forgotten `commit()`), once per type per `Store`.
 
 ## Planned features and when they land
 

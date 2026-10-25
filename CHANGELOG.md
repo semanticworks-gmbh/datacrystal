@@ -20,6 +20,8 @@ purely **additive** surface — the v0.1.0 freeze is never broken. PyPI publicat
 
 - After a commit a `dc.Blob` field on the caller's instance is a `dc.BlobHandle` whether `bytes`, a `bytearray` or a `dc.BlobSource` was assigned, as `store.get` returns it (#197): `.size`, `.hash` and `.bytes()` work without a reopen.
   The handle of a `protected=True` owner re-gates `.bytes()` under the current principal, streamed sources included.
+- `UnseenTypeWarning` fires once per type per `Store` (#201): the store and every snapshot it opens share one thread-safe record of the types already warned about, so a web route that reads an unseen type warns on its first request only.
+  The message is unchanged, a second `Store` over the same files warns again, and the reference now also states that a `bytearray` field hydrates as `bytes` and that a multivalued field such as `_dc_groups` comes back in postings-key order after an index-cache reopen.
 - The reference and the `Store.committing()` docstring name the `for txn in store.committing(...)` loop as the only supported form: the final `ConflictError` surfaces when the loop resumes, never from `with txn:` (#200, documentation only).
 - The vector generator moved from the private `datacrystal.contract.vectors._generate` module to `scripts/generate_vectors.py`, so it no longer ships in the wheel (#191).
   The vectors themselves are byte-identical.

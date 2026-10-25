@@ -117,6 +117,7 @@ from datacrystal._registry import ObjectRegistry
 from datacrystal._snapshot import (
     Ref,
     Snapshot,
+    UnseenTypeLedger,
     _SnapshotCore,  # the per-watermark core ctor
 )
 from datacrystal._state import STATE_CLEAN, STATE_DELETED, STATE_DIRTY, STATE_NEW
@@ -405,6 +406,7 @@ class Store:
         # in P2 cannot leave later records pointing at a cid the store never
         # learned about.
         self._durable_cids: set[int] = set()
+        self._unseen_types = UnseenTypeLedger()  # one warning per type per Store, snapshots included
         for cid, typename, fields in boot.types:  # ordered by cid: last wins
             self._cid_by_typename[typename] = cid
             self._cids_by_typename.setdefault(typename, []).append(cid)
@@ -1693,7 +1695,7 @@ class Store:
         if self._closed:
             raise StoreClosedError("this store has been closed")
         bound = principal if principal is not None else self.principal
-        core = _SnapshotCore(self._backend.read_view())
+        core = _SnapshotCore(self._backend.read_view(), self._unseen_types)
         return Snapshot(core, bound)
 
     def open_blob(self, entity: object, field: str) -> BinaryIO:
@@ -2215,6 +2217,8 @@ class Store:
     # -- engine internals ----------------------------------------------------
 
     def _warn_unseen(self, ti: TypeInfo) -> None:
+        if not self._unseen_types.first_sight(ti.typename):
+            return
         warnings.warn(
             UnseenTypeWarning(
                 f"the store has no committed records of {ti.cls.__name__} — "

@@ -21,6 +21,7 @@ and the duckdb-in-arrow-tests precedent).
 
 from __future__ import annotations
 
+import warnings
 from typing import Annotated
 
 import pytest
@@ -112,6 +113,22 @@ def test_get_missing_is_404(store: dc.Store) -> None:
     resp = client.get("/minerals/NOPE")
 
     assert resp.status_code == 404
+
+
+def test_route_reading_an_unseen_type_warns_once_not_per_request(store: dc.Store) -> None:
+    """Given an empty store behind a snapshot-backed route
+    When a client GETs a missing mineral three times
+    Then UnseenTypeWarning was raised exactly once
+    """
+    client = TestClient(_make_app(store))
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        client.get("/minerals/NOPE")
+        client.get("/minerals/NOPE")
+        client.get("/minerals/NOPE")
+
+    assert [w.category for w in caught].count(dc.UnseenTypeWarning) == 1
 
 
 def test_post_body_parses_and_from_pydantic_yields_state_new(store: dc.Store) -> None:
