@@ -18,13 +18,11 @@ import operator
 import sqlite3
 from collections.abc import Callable, Iterable
 from pathlib import Path
-from typing import Annotated, Any, cast
+from typing import Annotated, Any
 
 import pytest
 
 import datacrystal as dc
-from datacrystal._entity import type_info
-from datacrystal._storage.sqlite import SqliteBackend
 
 REQUIRED = object()
 StoreFactory = Callable[[], dc.Store]
@@ -91,6 +89,12 @@ def _stored_v1_names_as_root(store_factory: StoreFactory, *names: str) -> None:
     store.root = [v1(name=name) for name in names]
     store.commit()
     store.close()
+
+
+def _lineage_typenames(store: dc.Store) -> list[str]:
+    """Return the typename of every lineage row the store holds, a shape's row each."""
+    with store.snapshot() as snap:
+        return [typename for _cid, typename, _fields in snap.types]
 
 
 def _names(records: Iterable[Any]) -> list[str]:
@@ -421,18 +425,26 @@ def _legacy_store_directory(tmp_path: Path) -> Path:
 
 def test_legacy_unique_types_table_is_migrated(tmp_path: Path) -> None:
     """Given a store created before schema evolution, its types table UNIQUE on name
-    When it is opened
-    Then the types table is rebuilt without UNIQUE, so lineage rows can share a name
+    And a quartz committed in it under one field shape
+    When a class with an added mohs field commits an azurite of the new shape and the store reopens
+    Then the root holds azurite and quartz, the lineage rows having shared a name
     """
-    store = dc.Store.open(_legacy_store_directory(tmp_path))
-    backend = cast("SqliteBackend", store._backend)
+    directory = _legacy_store_directory(tmp_path)
+    v1 = _evolve(name=(str, REQUIRED))
+    first = dc.Store.open(directory)
+    first.root = [v1(name="quartz")]
+    first.commit()
+    first.close()
+    v2 = _evolve(name=(str, REQUIRED), mohs=(float | None, None))
+    second = dc.Store.open(directory)
+    second.root.append(v2(name="azurite", mohs=3.5))
+    second.commit()
+    second.close()
 
-    (sql,) = backend._conn.execute(
-        "SELECT sql FROM sqlite_master WHERE type='table' AND name='types'"
-    ).fetchone()
+    reopened = dc.Store.open(directory)
 
-    assert "UNIQUE" not in sql
-    store.close()
+    assert _names(reopened.root) == ["azurite", "quartz"]
+    reopened.close()
 
 
 # -- the lineage ---------------------------------------------------------------
@@ -447,9 +459,9 @@ def test_a_stored_shape_has_one_lineage_row(store_factory: StoreFactory) -> None
     _evolve(name=(str, REQUIRED), mohs=(float | None, None))
     reopened = store_factory()
 
-    cids = reopened._cids_by_typename[f"{__name__}:Evolving"]
+    typenames = _lineage_typenames(reopened)
 
-    assert len(cids) == 1
+    assert typenames.count(f"{__name__}:Evolving") == 1
     reopened.close()
 
 
@@ -465,7 +477,9 @@ def test_a_new_shape_gets_its_own_lineage_row(store_factory: StoreFactory) -> No
 
     reopened.commit()
 
-    assert len(reopened._cids_by_typename[f"{__name__}:Evolving"]) == 2
+    typenames = _lineage_typenames(reopened)
+
+    assert typenames.count(f"{__name__}:Evolving") == 2
     reopened.close()
 
 
@@ -790,10 +804,10 @@ def test_verify_names_the_evolving_type_for_each_failure(store_factory: StoreFac
     Then every failure names the Evolving type
     """
     _stored_v1_names(store_factory, "quartz", "azurite")
-    v2 = _evolve(name=(str, REQUIRED), crystal_system=(str, REQUIRED))
+    _evolve(name=(str, REQUIRED), crystal_system=(str, REQUIRED))
     verified = store_factory()
 
     failures = verified.verify()
 
-    assert {typename for typename, _ in failures} == {type_info(v2).typename}
+    assert {typename for typename, _ in failures} == {f"{__name__}:Evolving"}
     verified.close()
