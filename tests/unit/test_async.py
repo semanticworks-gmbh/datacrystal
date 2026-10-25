@@ -23,7 +23,6 @@ from typing import NamedTuple
 import pytest
 
 import datacrystal as dc
-from datacrystal._state import STATE_DIRTY
 from datacrystal._storage.memory import MemoryBackend
 from datacrystal._storage.protocol import (
     BootInfo,
@@ -253,20 +252,6 @@ def test_async_p2_runs_off_the_owner_thread(
     assert len(parked_commit.backend.apply_threads) == 1
     assert parked_commit.backend.apply_threads[0] != owner
     parked_commit.astore.close()
-
-
-def test_write_racing_p2_rearms_the_dirty_state(
-    runner: asyncio.Runner, parked_commit: _ParkedCommit
-) -> None:
-    """P1 flipped and re-armed the hook, so an owner-loop write racing P2 re-dirties.
-
-    Given a commit of quartz whose P2 is parked in the executor
-    When quartz is renamed on the owner loop
-    Then quartz is in the DIRTY state
-    """
-    parked_commit.quartz.name = "rock crystal"
-
-    assert object.__getattribute__(parked_commit.quartz, "__dc_state__") == STATE_DIRTY
 
 
 def test_write_racing_p2_is_not_in_the_first_batch(

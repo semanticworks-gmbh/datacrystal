@@ -113,10 +113,12 @@ def _seed(store: dc.Store) -> None:
                 note=row["note"],
             )
             store.store(record)
-            record._dc_owner = row["owner"]  # pyrefly: ignore[missing-attribute]
-            for group in row["groups"]:
-                record._dc_groups.append(group)  # pyrefly: ignore[missing-attribute]
-            record._dc_read_floor = row["floor"]  # pyrefly: ignore[missing-attribute]
+            record.dc_permissions = dc.Permissions(  # pyrefly: ignore[missing-attribute]
+                owner=row["owner"],
+                groups=tuple(row["groups"]),
+                read_floor=row["floor"],
+                write_floor=dc.VIEWER,
+            )
         for row in ROWS:
             store.store(
                 SpecimenControl(
