@@ -9,6 +9,7 @@ It is written outside the commit transaction, by temp file and rename.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any, cast
 
@@ -22,6 +23,8 @@ from datacrystal._records import decode_scalar_tree, encode_scalar_tree
 # sidecar (format 1) is silently ignored and the index rebuilds — never
 # authoritative (invariant 11), so a format bump is just a one-time rebuild.
 _CACHE_FORMAT = 2
+
+logger = logging.getLogger(__name__)
 
 
 class IndexCache:
@@ -50,7 +53,12 @@ class IndexCache:
         if not isinstance(decoded, dict):
             return None
         doc = cast("dict[str, Any]", decoded)
-        if doc.get("format") != _CACHE_FORMAT or doc.get("watermark") != watermark:
+        if doc.get("format") != _CACHE_FORMAT:
+            return None
+        if doc.get("watermark") != watermark:
+            logger.info("index_cache_discarded", extra={
+                "reason": "watermark_mismatch", "cached_watermark": doc.get("watermark"),
+                "store_watermark": watermark})
             return None
         classes = doc.get("classes")
         if not isinstance(classes, dict):

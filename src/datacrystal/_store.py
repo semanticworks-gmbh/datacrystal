@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import logging
 import threading
 import time
 import warnings
@@ -131,6 +132,8 @@ from datacrystal.contract.applier import DeltaGapError
 if TYPE_CHECKING:
     from datacrystal._follower import HttpClient
     from datacrystal._storage.lock import LeaseLock  # imported lazily at runtime (see Store.open)
+
+logger = logging.getLogger(__name__)
 
 # Exact-type membership for the hydration fast path (decode produces exact
 # builtin types, never subclasses — subclass-shaped values still take _resolve).
@@ -253,7 +256,7 @@ class _CommitAttempt:
             # so recover so the loop can re-run: drop the rejected edit, then pull
             # the coordinator's change that moved the entity under us.
             self._store.discard()
-            self._store.sync()
+            self._store._resync("conflict")
             self.conflict = conflict
             return True  # swallow — committing() retries or re-raises after exhaustion
         self.committed = True
@@ -453,6 +456,10 @@ class Store:
         writes. The OCC recovery loop: docs/design/COMMIT-DELTA-v2.md, section 8.
         """
         self._enter()
+        return self._resync("requested")
+
+    def _resync(self, reason: str | None) -> int:
+        """Pull the coordinator's deltas; with a ``reason``, log ``follower_resynced``."""
         if self._sync_fn is None:
             raise RuntimeError("sync() needs a follower store — see dc.open_follower")
         if self._new or self._dirty or self._deleted:
@@ -461,6 +468,9 @@ class Store:
         applied = self._sync_fn(before)
         if applied > before:
             self._refresh_from_backend()
+            if reason is not None:
+                logger.info("follower_resynced", extra={
+                    "reason": reason, "from_watermark": before, "to_watermark": self._last_tid})
         return self._last_tid
 
     def discard(self) -> int:
@@ -986,7 +996,7 @@ class Store:
         self._new.clear()
         self._dirty.clear()
         if self._sync_fn is not None:
-            self.sync()  # read-your-writes: pull the committed delta back
+            self._resync(None)  # read-your-writes: the commit's own delta, not an event
         return applied_tid
 
     # -- the three commit phases (ADR-001 bound decision 2) ------------------
@@ -2039,6 +2049,7 @@ class Store:
             if not stale:
                 continue
             oids = [rec.oid for c in stale for rec in self._backend.scan_type(c)]
+            migrated_before = migrated
             for start in range(0, len(oids), batch):
                 # write plumbing (ADR-008 W3-3 bypass): migrate must see and
                 # re-persist EVERY stale record regardless of the migrating
@@ -2049,6 +2060,9 @@ class Store:
                     self.mark_dirty(obj)
                 self.commit()
                 migrated += len(chunk)
+            if migrated > migrated_before:
+                logger.info("records_migrated", extra={
+                    "type_name": typename, "count": migrated - migrated_before})
         return migrated
 
     def explain(self, target: type | Condition) -> QueryPlan:

@@ -10,6 +10,12 @@ purely **additive** surface — the v0.1.0 freeze is never broken. PyPI publicat
 
 ## [Unreleased]
 
+### Added
+
+- Operational events through stdlib logging (#195): the `datacrystal` logger carries a `NullHandler` and the library configures nothing else.
+  Five events log, each with its fields in `extra=`: `index_cache_discarded`, `records_migrated`, `stale_lease_reclaimed`, `fts_sidecar_rebuilt` and `follower_resynced`; the commit path logs nothing.
+  A new how-to shows a structlog app rendering the fields, and the reference lists every event.
+
 ### Changed
 
 - The vector generator moved from the private `datacrystal.contract.vectors._generate` module to `scripts/generate_vectors.py`, so it no longer ships in the wheel (#191).

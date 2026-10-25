@@ -48,6 +48,7 @@ with dc.Store.open("cabinet.store") as store:
 - [Search by vector and fuse rankings](docs/how-to/vector-search.md): your embeddings, exact top-k and RRF.
 - [Run analytics on Arrow mirrors](docs/how-to/analytics.md): `datacrystal[arrow]` and DuckDB.
 - [Read from any thread, follow the commit stream and keep an audit log](docs/how-to/snapshots-and-delta-log.md): snapshots, consumers and `DeltaLog`.
+- [See datacrystal's operational events in your log](docs/how-to/logging.md): the `datacrystal` logger, its events and a structlog setup.
 
 ## Reference and explanation
 
