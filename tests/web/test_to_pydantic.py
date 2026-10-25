@@ -20,6 +20,7 @@ import functools
 import threading
 from collections.abc import Callable, Iterator
 from dataclasses import field
+from itertools import pairwise
 from typing import Annotated
 
 import pytest
@@ -538,7 +539,7 @@ def test_nested_over_view_stays_oid(store: dc.Store, stock: tuple[Mineral, Local
 def _vein_chain(store: dc.Store, length: int) -> list[Vein]:
     """Commit a chain of veins, each branching into the next; return them from the top."""
     veins = [Vein(qid=f"V{i}") for i in range(length)]
-    for upper, lower in zip(veins, veins[1:]):
+    for upper, lower in pairwise(veins):
         upper.deeper = lower
     store.root = veins
     store.commit()

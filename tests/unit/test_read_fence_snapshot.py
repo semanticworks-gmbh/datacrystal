@@ -270,7 +270,7 @@ def test_incoming_of_a_readable_target_without_referrers_is_empty(store: dc.Stor
 
 
 def _seed_memos_about_a_plain_record(store: dc.Store) -> int:
-    """Store a plain record with a team-shared memo and an owner-only memo about it; return its OID."""
+    """Store a plain record, a team-shared memo and an owner-only memo about it; return its OID."""
     with store.acting_as(OWNER):
         target = Plain(label="target")
         target_oid = store.store(target)

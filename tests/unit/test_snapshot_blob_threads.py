@@ -88,9 +88,12 @@ def test_open_blob_opened_on_the_owner_can_be_read_on_another_thread(
     Then the worker reads the scan bytes
     """
     azurite_oid, _ = _commit_specimens(store_factory)
-    with store_factory() as store, store.snapshot() as snap:
-        with snap.open_blob(azurite_oid, "scan") as fh:
-            scan = worker.submit(_read_open_stream, fh).result(timeout=30)
+    with (
+        store_factory() as store,
+        store.snapshot() as snap,
+        snap.open_blob(azurite_oid, "scan") as fh,
+    ):
+        scan = worker.submit(_read_open_stream, fh).result(timeout=30)
     assert scan == AZURITE_SCAN
 
 
@@ -117,9 +120,8 @@ def test_open_blob_on_another_thread_reads_the_pinned_scan_after_a_commit(
     Then the worker reads the scan the snapshot pinned
     """
     azurite_oid, _ = _commit_specimens(store_factory)
-    with store_factory() as store:
-        with store.snapshot() as snap:
-            store.get_many([azurite_oid])[0].scan = b"replaced"  # pyrefly: ignore[missing-attribute]
-            store.commit()
-            scan = worker.submit(_open_and_read, snap, azurite_oid).result(timeout=30)
+    with store_factory() as store, store.snapshot() as snap:
+        store.get_many([azurite_oid])[0].scan = b"replaced"  # pyrefly: ignore[missing-attribute]
+        store.commit()
+        scan = worker.submit(_open_and_read, snap, azurite_oid).result(timeout=30)
     assert scan == AZURITE_SCAN
