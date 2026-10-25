@@ -143,16 +143,22 @@ def cabinet_of_dated_finds(tmp_path: Path, kind: str) -> Path:
     return path
 
 
-def test_reload_keeps_the_extent(cached_cabinet_of_six_rocks: Path) -> None:
+def test_reload_keeps_the_extent(
+    cached_cabinet_of_six_rocks: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Given six committed rocks whose indexes were cached on close
     When the cabinet is reopened and the rocks are counted
     Then the count is six
+    And no class index was built again
     """
+    built: list[int] = []
+    monkeypatch.setattr(_idx, "build_class_indexes", _counting_build_class_indexes(built))
     reopened = dc.Store.open(cached_cabinet_of_six_rocks, cache_index=True)
 
     counted = reopened.count(Rock)
 
     assert counted == 6
+    assert built == []
     reopened.close()
 
 
@@ -169,33 +175,45 @@ def test_reload_keeps_the_extent(cached_cabinet_of_six_rocks: Path) -> None:
     ids=["color-eq", "hardness-ge", "hardness-lt", "name-eq", "tags-igneous", "tags-g1"],
 )
 def test_reload_answers_each_query_like_the_original(
-    cabinet_of_six_rocks: Path, field_name: str, method: str, argument: object, expected: str
+    cabinet_of_six_rocks: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field_name: str,
+    method: str,
+    argument: object,
+    expected: str,
 ) -> None:
     """Given six committed rocks, the first session's indexes built from scratch and cached on close
     When the cabinet is reopened and the same condition is queried
     Then the reloaded indexes answer with the same rocks as the first session
     And those are the expected rocks
+    And the reopened session built no class index
     """
     condition = getattr(getattr(F, field_name), method)(argument)
     first = dc.Store.open(cabinet_of_six_rocks, cache_index=True)
     built_answer = _names(first.query(condition))
     first.close()
+    built: list[int] = []
+    monkeypatch.setattr(_idx, "build_class_indexes", _counting_build_class_indexes(built))
     reopened = dc.Store.open(cabinet_of_six_rocks, cache_index=True)
 
     reloaded_answer = _names(reopened.query(condition))
 
     assert reloaded_answer == built_answer
     assert ", ".join(reloaded_answer) == expected
+    assert built == []
     reopened.close()
 
 
 def test_updating_a_loaded_index_un_indexes_the_old_color(
-    cached_cabinet_of_six_rocks: Path,
+    cached_cabinet_of_six_rocks: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Given a reloaded index where rock r1 is red
     When r1 is re-indexed as green
     Then r1 is no longer among the red rocks
+    And the reloaded index was not rebuilt
     """
+    built: list[int] = []
+    monkeypatch.setattr(_idx, "build_class_indexes", _counting_build_class_indexes(built))
     reopened = dc.Store.open(cached_cabinet_of_six_rocks, cache_index=True)
     r1 = reopened.get(Rock, name="r1")
     assert r1 is not None
@@ -205,16 +223,20 @@ def test_updating_a_loaded_index_un_indexes_the_old_color(
     red = reopened.query(F.color == "red")
 
     assert _names(red) == ["r3", "r5"]
+    assert built == []
     reopened.close()
 
 
 def test_updating_a_loaded_index_indexes_the_new_color(
-    cached_cabinet_of_six_rocks: Path,
+    cached_cabinet_of_six_rocks: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Given a reloaded index where rock r1 is red
     When r1 is re-indexed as green
     Then r1 is among the green rocks
+    And the reloaded index was not rebuilt
     """
+    built: list[int] = []
+    monkeypatch.setattr(_idx, "build_class_indexes", _counting_build_class_indexes(built))
     reopened = dc.Store.open(cached_cabinet_of_six_rocks, cache_index=True)
     r1 = reopened.get(Rock, name="r1")
     assert r1 is not None
@@ -224,16 +246,20 @@ def test_updating_a_loaded_index_indexes_the_new_color(
     green = reopened.query(F.color == "green")
 
     assert _names(green) == ["r1"]
+    assert built == []
     reopened.close()
 
 
 def test_updating_a_loaded_index_updates_the_sorted_run(
-    cached_cabinet_of_six_rocks: Path,
+    cached_cabinet_of_six_rocks: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Given a reloaded index where rock r1 has hardness 1.0
     When r1 is re-indexed with hardness 99.0
     Then r1 is among the rocks of hardness at least 99.0
+    And the reloaded index was not rebuilt
     """
+    built: list[int] = []
+    monkeypatch.setattr(_idx, "build_class_indexes", _counting_build_class_indexes(built))
     reopened = dc.Store.open(cached_cabinet_of_six_rocks, cache_index=True)
     r1 = reopened.get(Rock, name="r1")
     assert r1 is not None
@@ -243,16 +269,20 @@ def test_updating_a_loaded_index_updates_the_sorted_run(
     hardest = reopened.query(F.hardness >= 99.0)
 
     assert _names(hardest) == ["r1"]
+    assert built == []
     reopened.close()
 
 
 def test_updating_a_loaded_index_re_indexes_the_tags(
-    cached_cabinet_of_six_rocks: Path,
+    cached_cabinet_of_six_rocks: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Given a reloaded index where rock r1 is tagged igneous and g1
     When r1 is re-indexed with the tags ["meta"]
     Then r1 is among the rocks tagged meta
+    And the reloaded index was not rebuilt
     """
+    built: list[int] = []
+    monkeypatch.setattr(_idx, "build_class_indexes", _counting_build_class_indexes(built))
     reopened = dc.Store.open(cached_cabinet_of_six_rocks, cache_index=True)
     r1 = reopened.get(Rock, name="r1")
     assert r1 is not None
@@ -262,6 +292,7 @@ def test_updating_a_loaded_index_re_indexes_the_tags(
     meta = reopened.query(F.tags.contains("meta"))
 
     assert _names(meta) == ["r1"]
+    assert built == []
     reopened.close()
 
 
