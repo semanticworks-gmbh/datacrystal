@@ -51,6 +51,21 @@ class InTxnRows:
     blobs_added: int = 0
 
 
+class DeltaRecorder:
+    """A consumer that keeps every delta it is handed."""
+
+    def __init__(self, watermark: int) -> None:
+        """Start at the store's last TID, as ``Store.attach`` requires."""
+        self.watermark = watermark
+        self.deltas: list[dict] = []
+
+    def apply(self, delta: dict) -> bool:
+        """Record the delta and move the watermark to its TID."""
+        self.deltas.append(delta)
+        self.watermark = delta["tid"]
+        return True
+
+
 @dataclass
 class StagedBatch:
     """A store with two new minerals staged and ``apply`` faulted before ``COMMIT``."""
@@ -231,6 +246,24 @@ def test_retry_on_the_same_store_takes_the_tid_the_failed_commit_burned(
     retry_tid = staged_batch.store.commit()
 
     assert retry_tid == FIRST_TID + 1
+
+
+def test_retry_delta_creates_both_minerals_with_no_prior_payload(
+    staged_batch: StagedBatch,
+) -> None:
+    """Given two staged minerals, an attached consumer and an apply that faulted once
+    When the same store commits again
+    Then the one delta the consumer sees upserts both minerals as new, with no prior payload
+    """
+    recorder = DeltaRecorder(FIRST_TID)
+    staged_batch.store.attach(recorder)
+    with pytest.raises(OSError, match="injected fault mid-apply"):
+        staged_batch.store.commit()
+
+    staged_batch.store.commit()
+
+    assert [op["prior"] for op in recorder.deltas[0]["ops"]] == [None, None]
+    assert len(recorder.deltas) == 1
 
 
 def test_retry_on_the_same_store_persists_both_minerals(staged_batch: StagedBatch) -> None:

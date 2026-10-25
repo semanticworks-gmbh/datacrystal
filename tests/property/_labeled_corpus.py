@@ -111,13 +111,6 @@ def owned_rows(draw: st.DrawFn) -> dict[str, Any]:
     return row
 
 
-def _labels_of(row: dict[str, Any]) -> Labels:
-    return (row["owner"], row["groups"], row["read_floor"])
-
-
-labels = st.one_of(labeled_rows().map(_labels_of), st.just(LEGACY_LABELS))
-
-
 @st.composite
 def _drawn_principals(draw: st.DrawFn) -> dc.Principal:
     kind = draw(st.sampled_from(["anonymous", "uid_only", "single", "multi", "root"]))

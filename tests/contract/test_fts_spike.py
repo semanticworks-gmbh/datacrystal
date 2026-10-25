@@ -62,7 +62,7 @@ class _CrashMidApply(FtsSidecar):
 
 
 def _fulltext_config() -> dict[str, list[str]]:
-    """Return the sidecar config straight from the entity's dc.FullText field specs."""
+    """Return the sidecar config naming Specimen's two dc.FullText fields."""
     return {"tests.contract.test_fts_spike:Specimen": ["notes", "description"]}
 
 
@@ -361,7 +361,7 @@ def test_search_does_not_fold_the_ue_transliteration_to_the_umlaut(
 
 
 def test_delete_tombstone_unindexes_via_prior(sidecar: FtsSidecar, tombstone: dict) -> None:
-    """Given an indexed azurite and a hand-crafted tombstone carrying its prior
+    """Given an indexed azurite and the delete delta the store emitted for it, carrying its prior
     When the sidecar applies the tombstone
     Then it is accepted
     And no search finds azurite's prose

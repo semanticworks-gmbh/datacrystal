@@ -294,8 +294,6 @@ CACHED_ROCK_LABELS: list[Labels] = [
 class ReopenedCache:
     """A store reopened over an on-disk index cache, the rocks committed before and their labels."""
 
-    store: dc.Store
-    rock: type[Any]
     index: ClassIndexes
     corpus: Corpus
 
@@ -322,7 +320,7 @@ def reopened_cache(tmp_path: Path) -> Iterator[ReopenedCache]:
 
     store = dc.Store.open(path, cache_index=True)
     index = store._index.ensure(type_info(rock_class))
-    yield ReopenedCache(store, rock_class, index, Corpus(store, rock_class, oracle, oids))
+    yield ReopenedCache(index, Corpus(store, rock_class, oracle, oids))
     store.close()
 
 
