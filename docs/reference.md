@@ -318,6 +318,7 @@ For large binaries (PDFs, scanned invoices, images) mark the field `Annotated[by
   A `query`/`count`/`pluck`/scan over the owning type **never touches the blob bytes**.
   On read the field hydrates to a **`dc.BlobHandle`** (`.size`/`.hash` free from the descriptor; `.bytes()` fetches the whole payload once; streamed via `store.open_blob()`).
   The streamed-write form assigns a `dc.BlobSource(size, open_chunks)` or `dc.blob_from_path(path)`.
+  After `commit()` the field on your instance is a `dc.BlobHandle` whichever form you assigned (`bytes`, `bytearray` or a source), the same object `store.get` returns; before the commit it still holds what you assigned.
 - **What it does NOT do.**
   No automatic spill threshold (mark it `dc.Blob` explicitly), no content-addressing/dedup in core (use a `Unique`-hash-field pattern), no in-place mutation (a blob is immutable — reassigning writes a *new* blob OID), no genuinely unbounded stream (the size must be known up front; a single v1 blob caps at SQLite's ~954 MiB cell limit and fails loudly past it; a chunked layout is `[planned — #76]`).
 - **Cost.**

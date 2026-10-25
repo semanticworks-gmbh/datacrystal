@@ -1384,14 +1384,15 @@ class Store:
             self._fingerprints.pop(oid, None)
         self._pending_upserts.clear()  # the committed unique map takes over
         self._durable_cids.update(cid for cid, _, _ in capture.batch.new_types)
-        # A streamed-write source has now been consumed and durably stored; swap
-        # the live field from the opaque BlobSource to a readable BlobHandle so
-        # .bytes()/open_blob work without a reopen (ADR-007 §4). Untracked
-        # (set_field) — this is the post-commit rehydration, not a mutation. A
-        # plain bytes value is left as-is (it stays readable as itself).
+        # A written blob value (raw bytes or a streamed source) is now durably stored; swap
+        # the live field to a readable BlobHandle, as store.get returns it, so
+        # .size/.hash/.bytes()/open_blob work without a reopen (ADR-007 §4). Untracked
+        # (set_field) — this is the post-commit rehydration, not a mutation.
         for obj, field, boid, size, digest in capture.blob_swaps:
             # engine-only BlobHandle constructor (users never call _bind)
-            handle = BlobHandle._bind(boid, size, digest, self)
+            # a protected owner's handle re-gates .bytes() like a hydrated one (ADR-008 W4-3)
+            owner_oid = oid_of(obj) if type_info(obj).protected else None
+            handle = BlobHandle._bind(boid, size, digest, self, owner_oid=owner_oid)
             set_field(obj, field, handle)
         if self._debug:
             # A blob-bearing entity's stored payload carries the real blob OID but the sweep
@@ -3211,14 +3212,14 @@ def _note_streamed_swaps(
     payload: bytes,
     blob_swaps: list[tuple[Any, str, int, int, bytes]],
 ) -> None:
-    """Record the streamed-source fields of one encoded entity for the P3 swap.
+    """Record the raw-bytes and streamed-source fields of one encoded entity for the P3 swap.
 
     Each field's blob descriptor is read straight from the just-encoded payload, so two fields
     sharing ONE BlobSource each pick up their OWN blob OID (id(value) keying would alias both to
     the last-allocated one).
     """
     streamed_positions = [
-        i for i in blob_positions if isinstance(values[i], BlobSource)
+        i for i in blob_positions if isinstance(values[i], (BlobSource, bytes, bytearray))
     ]
     if streamed_positions:
         decoded = decode_payload(payload)
