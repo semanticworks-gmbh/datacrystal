@@ -16,13 +16,11 @@ from __future__ import annotations
 from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Annotated, Any, cast
+from typing import Annotated, Any, Protocol
 
 from hypothesis import strategies as st
 
 import datacrystal as dc
-from datacrystal._entity import oid_of, type_info
-from datacrystal._indexes import ClassIndexes
 from datacrystal._storage.memory import MemoryBackend
 
 ROOT = dc.Principal(uid=1, memberships={dc.WORLD: dc.EXECUTIVE})
@@ -149,14 +147,31 @@ principals = st.one_of(_drawn_principals(), st.just(ANONYMOUS), st.just(OUTSIDE_
 class Corpus:
     """A memory-backed store of Rock rows and the labels each was INTENDED to carry.
 
-    ``oracle`` maps oid to labels; it is the independent ground truth, never derived from
-    ``committed_labels`` / ``_prior_labels``, which are also under test.
+    ``oracle`` maps a row's name to its labels; it is the independent ground truth, never read
+    back from the store.
+    ``oids`` maps the same names to the rows' OIDs, in the order the rows were created.
     """
 
     store: dc.Store
     rock: type[Any]
-    index: ClassIndexes
-    oracle: dict[int, Labels]
+    oracle: dict[str, Labels]
+    oids: dict[str, int]
+
+
+class Relabelable(Protocol):
+    """A protected record whose labels ``dc_permissions`` reads and assigns."""
+
+    dc_permissions: dc.Permissions
+
+
+def seed_labels(rec: Relabelable, owner: int, groups: list[int], read_floor: int) -> None:
+    """Relabel a stored Rock through ``dc_permissions``, keeping its write floor."""
+    rec.dc_permissions = dc.Permissions(
+        owner=owner,
+        groups=tuple(groups),
+        read_floor=read_floor,
+        write_floor=rec.dc_permissions.write_floor,
+    )
 
 
 @contextmanager
@@ -173,41 +188,40 @@ def labeled_corpus(n_legacy: int, labeled: list[dict[str, Any]]) -> Generator[Co
 
     rock_class = protected_rock()
     store = dc.Store._from_backend(backend)
-    oracle: dict[int, Labels] = {}
+    oracle: dict[str, Labels] = {}
+    oids: dict[str, int] = {}
     for i in range(n_legacy):
-        legacy_rock = store.get(rock_class, name=f"legacy-{i}")
-        oracle[cast(int, oid_of(legacy_rock))] = LEGACY_LABELS
+        name = f"legacy-{i}"
+        oids[name] = store.store(store.get(rock_class, name=name))
+        oracle[name] = LEGACY_LABELS
 
     with store.acting_as(ROOT):
         for i, row in enumerate(labeled):
-            rec = rock_class(name=f"post-{i}")
-            oid = store.store(rec)
-            rec._dc_owner = row["owner"]
-            for g in row["groups"]:
-                rec._dc_groups.append(g)
-            rec._dc_read_floor = row["read_floor"]
-            oracle[oid] = (row["owner"], list(row["groups"]), row["read_floor"])
+            name = f"post-{i}"
+            rec = rock_class(name=name)
+            oids[name] = store.store(rec)
+            seed_labels(rec, row["owner"], row["groups"], row["read_floor"])
+            oracle[name] = (row["owner"], list(row["groups"]), row["read_floor"])
         store.commit()
 
     try:
-        yield Corpus(store, rock_class, store._index.ensure(type_info(rock_class)), oracle)
+        yield Corpus(store, rock_class, oracle, oids)
     finally:
         store.close()
 
 
-def readable_oids_by_oracle(corpus: Corpus, principal: dc.Principal) -> set[int]:
-    """Return the oids of the corpus rows the oracle lets the principal read."""
-    return {oid for oid, row in corpus.oracle.items() if oracle_can_read(principal, *row)}
+def readable_names_by_oracle(corpus: Corpus, principal: dc.Principal) -> set[str]:
+    """Return the names of the corpus rows the oracle lets the principal read."""
+    return {name for name, row in corpus.oracle.items() if oracle_can_read(principal, *row)}
 
 
-def committed_labels_by_oid(corpus: Corpus) -> dict[int, tuple[int, list[int], int] | None]:
-    """Return the index's committed labels of every corpus row."""
-    return {oid: corpus.index.committed_labels(oid) for oid in corpus.oracle}
+def names_of(rows: list[Any]) -> set[str]:
+    """Return the names of the rock rows a query returned."""
+    return {row.name for row in rows}
 
 
-def prior_labels_by_oid(corpus: Corpus) -> dict[int, tuple[Any, ...]]:
-    """Return the store's prior labels, decoded from the backend record, of every corpus row."""
-    backend = corpus.store._backend
+def names_dereferenced(corpus: Corpus, slots: list[Any]) -> set[str]:
+    """Return the names whose OID, dereferenced in the corpus's order, came back as the real row."""
     return {
-        oid: corpus.store._prior_labels(backend.load_many([oid])[oid])[:3] for oid in corpus.oracle
+        name for name, slot in zip(corpus.oids, slots, strict=True) if not isinstance(slot, dc.Redacted)
     }
