@@ -47,7 +47,8 @@ jobs:
         run: |
           [ -s patterns.txt ] || exit 0
           set +e
-          OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES uv run mutmut run $(cat patterns.txt) 2>&1 | tee mutmut.log
+          mapfile -t patterns < patterns.txt  # one pattern per line, never glob-expanded by the shell
+          OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES uv run mutmut run "${patterns[@]}" 2>&1 | tee mutmut.log
           status=${PIPESTATUS[0]}
           set -e
           if grep -q "nothing matches" mutmut.log; then
