@@ -21,7 +21,7 @@ import threading
 from collections.abc import Callable, Iterator
 from dataclasses import field
 from itertools import pairwise
-from typing import Annotated
+from typing import Annotated, NamedTuple
 
 import pytest
 
@@ -30,7 +30,6 @@ pytest.importorskip("pydantic", reason="datacrystal[web] extra not installed")
 import pydantic
 
 import datacrystal as dc
-from datacrystal._entity import oid_of
 from datacrystal._snapshot import EntityView
 from datacrystal.web import entity_model, to_pydantic
 
@@ -95,16 +94,17 @@ def _dump_view_in_thread(out: list[dict[str, object]], view: EntityView) -> None
     out.append(to_pydantic(view).model_dump())
 
 
-def _oid(entity: object) -> int:
-    """Return the OID of a committed entity."""
-    oid = oid_of(entity)
-    if oid is None:
-        raise ValueError(f"{entity!r} has no OID, it was never committed")
-    return oid
+class Stock(NamedTuple):
+    """A committed quartz-from-Brazil pair with the OIDs the store gave them."""
+
+    mineral: Mineral
+    loc: Locality
+    mineral_oid: int
+    loc_oid: int
 
 
-def _stock_in(store: dc.Store) -> tuple[Mineral, Locality]:
-    """Commit a quartz-from-Brazil pair into ``store`` and return the live (mineral, locality)."""
+def _stock_in(store: dc.Store) -> Stock:
+    """Commit a quartz-from-Brazil pair into ``store`` and return it with its OIDs."""
     loc = Locality(qid="Q-BR", name="Brazil")
     mineral = Mineral(
         qid="Q-QTZ",
@@ -117,12 +117,12 @@ def _stock_in(store: dc.Store) -> tuple[Mineral, Locality]:
     )
     store.root = [mineral, loc]
     store.commit()
-    return mineral, loc
+    return Stock(mineral, loc, store.store(mineral), store.store(loc))
 
 
 @pytest.fixture
-def stock(store: dc.Store) -> tuple[Mineral, Locality]:
-    """Commit a quartz-from-Brazil pair and return the live (mineral, locality)."""
+def stock(store: dc.Store) -> Stock:
+    """Commit a quartz-from-Brazil pair and return it with its OIDs."""
     return _stock_in(store)
 
 
@@ -130,8 +130,7 @@ def stock(store: dc.Store) -> tuple[Mineral, Locality]:
 def reopened_stock(store_factory: Callable[[], dc.Store]) -> Iterator[tuple[dc.Store, int]]:
     """Provide a store reopened after the stock was committed, with Brazil's OID."""
     first = store_factory()
-    _, brazil = _stock_in(first)
-    brazil_oid = _oid(brazil)
+    brazil_oid = _stock_in(first).loc_oid
     first.close()
     reopened = store_factory()
     yield reopened, brazil_oid
@@ -141,14 +140,14 @@ def reopened_stock(store_factory: Callable[[], dc.Store]) -> Iterator[tuple[dc.S
 # --- live-entity input (both backends) ---------------------------------------
 
 
-def test_live_entity_to_validated_dto(stock: tuple[Mineral, Locality]) -> None:
+def test_live_entity_to_validated_dto(stock: Stock) -> None:
     """Given a committed live quartz
     When to_pydantic projects it
     Then the DTO is an instance of the Mineral model
     And it is a pydantic BaseModel
     And it carries the qid, name, crystal system and hardness
     """
-    mineral, _ = stock
+    mineral = stock.mineral
 
     dto = to_pydantic(mineral)
 
@@ -160,29 +159,29 @@ def test_live_entity_to_validated_dto(stock: tuple[Mineral, Locality]) -> None:
     assert dto.mohs == 7.0  # pyrefly: ignore[missing-attribute]
 
 
-def test_refs_cross_as_oid(stock: tuple[Mineral, Locality]) -> None:
+def test_refs_cross_as_oid(stock: Stock) -> None:
     """Given a committed quartz with a Lazy and a directly-typed reference to Brazil
     When to_pydantic projects it
     Then the Lazy reference is Brazil's OID
     And the directly-typed reference is Brazil's OID
     And the Lazy reference is an int
     """
-    mineral, loc = stock
+    mineral = stock.mineral
 
     dto = to_pydantic(mineral)
 
-    assert dto.type_locality == oid_of(loc)  # pyrefly: ignore[missing-attribute]
-    assert dto.discovered_in == oid_of(loc)  # pyrefly: ignore[missing-attribute]
+    assert dto.type_locality == stock.loc_oid  # pyrefly: ignore[missing-attribute]
+    assert dto.discovered_in == stock.loc_oid  # pyrefly: ignore[missing-attribute]
     assert isinstance(dto.type_locality, int)
 
 
-def test_containers_decay_to_plain_list(stock: tuple[Mineral, Locality]) -> None:
+def test_containers_decay_to_plain_list(stock: Stock) -> None:
     """Given a committed quartz whose tags are a persistent list
     When to_pydantic projects it
     Then the DTO's tags equal the two tags
     And they are a plain list, not the owner-bound container
     """
-    mineral, _ = stock
+    mineral = stock.mineral
 
     dto = to_pydantic(mineral)
 
@@ -213,14 +212,12 @@ def test_dict_field_and_temporals_pass_native(store: dc.Store) -> None:
 
 
 @pytest.mark.parametrize("engine_attribute", ["__dc_oid__", "__dc_store__", "__dc_state__"])
-def test_dto_holds_no_live_reference(
-    stock: tuple[Mineral, Locality], engine_attribute: str
-) -> None:
+def test_dto_holds_no_live_reference(stock: Stock, engine_attribute: str) -> None:
     """Given a committed live quartz
     When to_pydantic projects it
     Then the DTO carries no engine slot, no stamp, no store, no state
     """
-    mineral, _ = stock
+    mineral = stock.mineral
 
     dto = to_pydantic(mineral)
 
@@ -258,76 +255,67 @@ def test_frozen_entity_projects_to_frozen_dto(store: dc.Store) -> None:
 # --- snapshot-view input (the preferred, store-free path) --------------------
 
 
-def test_entity_view_to_dto(store: dc.Store, stock: tuple[Mineral, Locality]) -> None:
+def test_entity_view_to_dto(store: dc.Store, stock: Stock) -> None:
     """Given a committed quartz read as a snapshot view
     When to_pydantic projects the view
     Then the DTO is an instance of the Mineral model
     And it carries the qid
     """
-    mineral, _ = stock
-
     with store.snapshot() as snap:
-        dto = to_pydantic(snap.get(_oid(mineral)))
+        dto = to_pydantic(snap.get(stock.mineral_oid))
 
     assert isinstance(dto, entity_model(Mineral))
     assert dto.qid == "Q-QTZ"  # pyrefly: ignore[missing-attribute]
 
 
-def test_view_refs_decay_to_oids(store: dc.Store, stock: tuple[Mineral, Locality]) -> None:
+def test_view_refs_decay_to_oids(store: dc.Store, stock: Stock) -> None:
     """Given a committed quartz read as a snapshot view
     When to_pydantic projects the view
     Then the discovered_in Ref is Brazil's OID
     And the type_locality Ref is Brazil's OID
     """
-    mineral, loc = stock
-
     with store.snapshot() as snap:
-        dto = to_pydantic(snap.get(_oid(mineral)))
+        dto = to_pydantic(snap.get(stock.mineral_oid))
 
-    assert dto.discovered_in == oid_of(loc)  # pyrefly: ignore[missing-attribute]
-    assert dto.type_locality == oid_of(loc)  # pyrefly: ignore[missing-attribute]
+    assert dto.discovered_in == stock.loc_oid  # pyrefly: ignore[missing-attribute]
+    assert dto.type_locality == stock.loc_oid  # pyrefly: ignore[missing-attribute]
 
 
-def test_view_frozen_tuple_decays_to_plain_list(
-    store: dc.Store, stock: tuple[Mineral, Locality]
-) -> None:
+def test_view_frozen_tuple_decays_to_plain_list(store: dc.Store, stock: Stock) -> None:
     """Given a committed quartz read as a snapshot view whose tags are a frozen tuple
     When to_pydantic projects the view
     Then the DTO's tags equal the two tags
     And they are a plain list
     """
-    mineral, _ = stock
-
     with store.snapshot() as snap:
-        dto = to_pydantic(snap.get(_oid(mineral)))
+        dto = to_pydantic(snap.get(stock.mineral_oid))
 
     assert dto.tags == ["display", "drawer-3"]  # pyrefly: ignore[missing-attribute]
     assert type(dto.tags) is list
 
 
-def test_view_dto_matches_live_dto(store: dc.Store, stock: tuple[Mineral, Locality]) -> None:
+def test_view_dto_matches_live_dto(store: dc.Store, stock: Stock) -> None:
     """Given a committed quartz projected from a snapshot view and from the live entity
     When both DTOs are dumped
     Then the dumps are equal
     """
-    mineral, _ = stock
+    mineral = stock.mineral
     with store.snapshot() as snap:
-        view_dto = to_pydantic(snap.get(_oid(mineral)))
+        view_dto = to_pydantic(snap.get(stock.mineral_oid))
 
     live_dto = to_pydantic(mineral)
 
     assert view_dto.model_dump() == live_dto.model_dump()
 
 
-def test_view_dto_survives_snapshot_close(store: dc.Store, stock: tuple[Mineral, Locality]) -> None:
+def test_view_dto_survives_snapshot_close(store: dc.Store, stock: Stock) -> None:
     """Given a DTO projected from a snapshot view whose snapshot has since closed
     When the DTO is read
     Then it still carries the qid
     And it still carries the tags
     """
-    mineral, _ = stock
     with store.snapshot() as snap:
-        dto = to_pydantic(snap.get(_oid(mineral)))
+        dto = to_pydantic(snap.get(stock.mineral_oid))
 
     assert dto.qid == "Q-QTZ"  # pyrefly: ignore[missing-attribute]
     assert dto.tags == ["display", "drawer-3"]  # pyrefly: ignore[missing-attribute]
@@ -337,7 +325,7 @@ def test_view_dto_survives_snapshot_close(store: dc.Store, stock: tuple[Mineral,
 
 
 def test_unloaded_lazy_projects_oid_without_loading(reopened_stock: tuple[dc.Store, int]) -> None:
-    """Given a quartz fetched from a reopened store whose Lazy referent was dropped
+    """Given a quartz fetched from a reopened store whose Lazy referent is not loaded
     When to_pydantic projects it
     Then type_locality is Brazil's OID
     And the Lazy handle is still unloaded
@@ -347,7 +335,6 @@ def test_unloaded_lazy_projects_oid_without_loading(reopened_stock: tuple[dc.Sto
     assert fetched is not None
     handle = fetched.type_locality
     assert handle is not None
-    handle._obj = None
     assert not handle.loaded
 
     dto = to_pydantic(fetched)
@@ -402,12 +389,12 @@ def test_rejects_a_dict() -> None:
 # --- owner confinement (ADR-001) ---------------------------------------------
 
 
-def test_foreign_thread_raises_before_read(stock: tuple[Mineral, Locality]) -> None:
+def test_foreign_thread_raises_before_read(stock: Stock) -> None:
     """Given a live committed quartz owned by this thread
     When a foreign thread projects it with to_pydantic
     Then the call raises WrongThreadError
     """
-    mineral, _ = stock
+    mineral = stock.mineral
     captured: list[type[BaseException]] = []
     worker = threading.Thread(
         target=_record_error_type, args=(captured, functools.partial(to_pydantic, mineral))
@@ -419,18 +406,17 @@ def test_foreign_thread_raises_before_read(stock: tuple[Mineral, Locality]) -> N
     assert captured == [dc.WrongThreadError]
 
 
-def test_view_is_thread_safe(store: dc.Store, stock: tuple[Mineral, Locality]) -> None:
+def test_view_is_thread_safe(store: dc.Store, stock: Stock) -> None:
     """Given a snapshot view of a committed quartz
     When a foreign thread projects it with to_pydantic
     Then the thread produced one DTO dump
     And the dump carries the qid
     """
-    mineral, _ = stock
     out: list[dict[str, object]] = []
 
     with store.snapshot() as snap:
         worker = threading.Thread(
-            target=_dump_view_in_thread, args=(out, snap.get(_oid(mineral)))
+            target=_dump_view_in_thread, args=(out, snap.get(stock.mineral_oid))
         )
         worker.start()
         worker.join(timeout=10)
@@ -441,27 +427,27 @@ def test_view_is_thread_safe(store: dc.Store, stock: tuple[Mineral, Locality]) -
 # --- bounded nested recursion (opt-in) ---------------------------------------
 
 
-def test_default_never_hydrates_resident_referent(stock: tuple[Mineral, Locality]) -> None:
+def test_default_never_hydrates_resident_referent(stock: Stock) -> None:
     """Given a committed quartz whose discovered_in holds the live resident locality
     When to_pydantic projects it with the default nested=0
     Then discovered_in is Brazil's OID
     And it is not a nested DTO
     """
-    mineral, loc = stock
+    mineral = stock.mineral
 
     dto = to_pydantic(mineral)
 
-    assert dto.discovered_in == oid_of(loc)  # pyrefly: ignore[missing-attribute]
+    assert dto.discovered_in == stock.loc_oid  # pyrefly: ignore[missing-attribute]
     assert not isinstance(dto.discovered_in, pydantic.BaseModel)
 
 
-def test_nested_recurses_directly_held_resident_referent(stock: tuple[Mineral, Locality]) -> None:
+def test_nested_recurses_directly_held_resident_referent(stock: Stock) -> None:
     """Given a committed quartz holding the resident locality directly
     When to_pydantic projects it with nested=1
     Then discovered_in is a nested Locality DTO
     And its name is Brazil
     """
-    mineral, _ = stock
+    mineral = stock.mineral
 
     dto = to_pydantic(mineral, nested=1)
 
@@ -469,13 +455,13 @@ def test_nested_recurses_directly_held_resident_referent(stock: tuple[Mineral, L
     assert dto.discovered_in.name == "Brazil"  # pyrefly: ignore[missing-attribute]
 
 
-def test_nested_recurses_loaded_lazy_referent(stock: tuple[Mineral, Locality]) -> None:
+def test_nested_recurses_loaded_lazy_referent(stock: Stock) -> None:
     """Given a committed quartz whose Lazy referent is loaded
     When to_pydantic projects it with nested=1
     Then type_locality is a nested Locality DTO
     And its qid is Q-BR
     """
-    mineral, _ = stock
+    mineral = stock.mineral
 
     dto = to_pydantic(mineral, nested=1)
 
@@ -502,7 +488,7 @@ def test_nested_depth_one_terminates_at_a_leaf_referent(store: dc.Store) -> None
 
 
 def test_nested_unloaded_lazy_stays_oid(reopened_stock: tuple[dc.Store, int]) -> None:
-    """Given a quartz fetched from a reopened store whose Lazy referent was dropped
+    """Given a quartz fetched from a reopened store whose Lazy referent is not loaded
     When to_pydantic projects it with nested=2
     Then type_locality stays an int OID
     And the Lazy handle is still unloaded
@@ -512,7 +498,6 @@ def test_nested_unloaded_lazy_stays_oid(reopened_stock: tuple[dc.Store, int]) ->
     assert fetched is not None
     handle = fetched.type_locality
     assert handle is not None
-    handle._obj = None
     assert not handle.loaded
 
     dto = to_pydantic(fetched, nested=2)
@@ -521,19 +506,17 @@ def test_nested_unloaded_lazy_stays_oid(reopened_stock: tuple[dc.Store, int]) ->
     assert not handle.loaded
 
 
-def test_nested_over_view_stays_oid(store: dc.Store, stock: tuple[Mineral, Locality]) -> None:
+def test_nested_over_view_stays_oid(store: dc.Store, stock: Stock) -> None:
     """Given a committed quartz read as a snapshot view
     When to_pydantic projects the view with nested=3
     Then discovered_in is Brazil's OID
     And type_locality is Brazil's OID
     """
-    mineral, loc = stock
-
     with store.snapshot() as snap:
-        dto = to_pydantic(snap.get(_oid(mineral)), nested=3)
+        dto = to_pydantic(snap.get(stock.mineral_oid), nested=3)
 
-    assert dto.discovered_in == oid_of(loc)  # pyrefly: ignore[missing-attribute]
-    assert dto.type_locality == oid_of(loc)  # pyrefly: ignore[missing-attribute]
+    assert dto.discovered_in == stock.loc_oid  # pyrefly: ignore[missing-attribute]
+    assert dto.type_locality == stock.loc_oid  # pyrefly: ignore[missing-attribute]
 
 
 def _vein_chain(store: dc.Store, length: int) -> list[Vein]:
@@ -567,7 +550,7 @@ def test_nested_depth_bound_stops_at_an_oid_past_the_requested_levels(store: dc.
 
     dto = to_pydantic(veins[0], nested=2)
 
-    assert dto.deeper.deeper.deeper == oid_of(veins[3])  # pyrefly: ignore[missing-attribute]
+    assert dto.deeper.deeper.deeper == store.store(veins[3])  # pyrefly: ignore[missing-attribute]
 
 
 def test_nested_depth_bound_ends_a_reference_cycle(store: dc.Store) -> None:
@@ -582,4 +565,4 @@ def test_nested_depth_bound_ends_a_reference_cycle(store: dc.Store) -> None:
 
     dto = to_pydantic(first, nested=3)
 
-    assert dto.deeper.deeper.deeper.deeper == oid_of(first)  # pyrefly: ignore[missing-attribute]
+    assert dto.deeper.deeper.deeper.deeper == store.store(first)  # pyrefly: ignore[missing-attribute]

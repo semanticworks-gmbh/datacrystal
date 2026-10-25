@@ -39,7 +39,6 @@ import strawberry
 from strawberry.tools import create_type
 
 import datacrystal as dc
-from datacrystal._entity import oid_of
 from datacrystal._snapshot import EntityView, Snapshot
 from datacrystal.web import (
     StrawberryReflector,
@@ -95,16 +94,9 @@ def _collector(name: str, minerals: list[Mineral]) -> Collector:
     return Collector(name=name, favorites=[dc.Lazy.of(m) for m in minerals])
 
 
-def _oid(entity: object) -> int:
-    """Return the OID of a committed entity."""
-    oid = oid_of(entity)
-    if oid is None:
-        raise ValueError(f"{entity!r} has no OID, it was never committed")
-    return oid
-
-
-def _oids_of(entities: list[Mineral]) -> list[int]:
-    return [_oid(entity) for entity in entities]
+def _oids_of(store: dc.Store, entities: list[Mineral]) -> list[int]:
+    """Return the OIDs the store holds for committed ``entities``."""
+    return [store.store(entity) for entity in entities]
 
 
 def _live_minerals(store: dc.Store, count: int) -> list[Mineral]:
@@ -166,7 +158,7 @@ def test_list_ref_resolves_off_a_real_snapshot(store: dc.Store) -> None:
     gql = StrawberryReflector().reflect(Collector)
 
     with store.snapshot() as snap:
-        schema = _schema_exposing(gql, snap.get(_oid(collector)))
+        schema = _schema_exposing(gql, snap.get(store.store(collector)))
         query = "{ root { name favorites { qid name } } }"
 
         result = asyncio.run(schema.execute(query, context_value=snapshot_context(snap)))
@@ -196,7 +188,7 @@ def test_empty_list_ref_resolves_to_empty_list(store: dc.Store) -> None:
     gql = StrawberryReflector().reflect(Collector)
 
     with store.snapshot() as snap:
-        schema = _schema_exposing(gql, snap.get(_oid(collector)))
+        schema = _schema_exposing(gql, snap.get(store.store(collector)))
         query = "{ root { name favorites { qid } } }"
 
         result = asyncio.run(schema.execute(query, context_value=snapshot_context(snap)))
@@ -217,7 +209,7 @@ def test_empty_list_ref_never_asks_the_loader(store: dc.Store) -> None:
 
     with store.snapshot() as snap:
         batches = _spy_on_get_many(snap)
-        schema = _schema_exposing(gql, snap.get(_oid(collector)))
+        schema = _schema_exposing(gql, snap.get(store.store(collector)))
         query = "{ root { name favorites { qid } } }"
 
         asyncio.run(schema.execute(query, context_value=snapshot_context(snap)))
@@ -242,7 +234,7 @@ def test_dangling_list_element_resolves_to_null_not_an_error(store: dc.Store) ->
     gql = StrawberryReflector().reflect(Collector)
 
     with store.snapshot() as snap:
-        schema = _schema_exposing(gql, snap.get(_oid(collector)))
+        schema = _schema_exposing(gql, snap.get(store.store(collector)))
         query = "{ root { name favorites { qid name } } }"
 
         result = asyncio.run(schema.execute(query, context_value=snapshot_context(snap)))
@@ -267,7 +259,7 @@ def test_sibling_lists_batch_into_one_get_many(store: dc.Store) -> None:
 
     with store.snapshot() as snap:
         batches = _spy_on_get_many(snap)
-        schema = _schema_exposing(list[gql], _views_of(snap, [_oid(c1), _oid(c2)]))
+        schema = _schema_exposing(list[gql], _views_of(snap, [store.store(c1), store.store(c2)]))
         query = "{ root { name favorites { qid } } }"
 
         result = asyncio.run(schema.execute(query, context_value=snapshot_context(snap)))
@@ -305,7 +297,7 @@ def test_to_pydantic_projects_a_list_edge_as_list_of_oids(store: dc.Store) -> No
 
     dto = to_pydantic(collector)
 
-    assert dto.favorites == _oids_of(minerals)  # pyrefly: ignore[missing-attribute]
+    assert dto.favorites == _oids_of(store, minerals)  # pyrefly: ignore[missing-attribute]
 
 
 def test_to_pydantic_projects_an_empty_list_edge_as_empty_list(store: dc.Store) -> None:
@@ -333,9 +325,9 @@ def test_to_pydantic_projects_a_list_edge_off_a_view(store: dc.Store) -> None:
     store.commit()
 
     with store.snapshot() as snap:
-        dto = to_pydantic(snap.get(_oid(collector)))
+        dto = to_pydantic(snap.get(store.store(collector)))
 
-    assert dto.favorites == _oids_of(minerals)  # pyrefly: ignore[missing-attribute]
+    assert dto.favorites == _oids_of(store, minerals)  # pyrefly: ignore[missing-attribute]
 
 
 # === REST in: from_pydantic ====================================================
@@ -350,12 +342,12 @@ def test_from_pydantic_keeps_list_oids_without_store(store: dc.Store) -> None:
     store.root = minerals
     store.commit()
     dto = entity_model(Collector).model_validate(
-        {"name": "C1", "favorites": _oids_of(minerals)}
+        {"name": "C1", "favorites": _oids_of(store, minerals)}
     )
 
     rebuilt = from_pydantic(dto, Collector)
 
-    assert list(rebuilt.favorites) == _oids_of(minerals)
+    assert list(rebuilt.favorites) == _oids_of(store, minerals)
 
 
 def test_from_pydantic_resolves_list_oids_with_store(store: dc.Store) -> None:
@@ -367,7 +359,7 @@ def test_from_pydantic_resolves_list_oids_with_store(store: dc.Store) -> None:
     store.root = _minerals(0, 3)
     store.commit()
     live = _live_minerals(store, 3)
-    dto = entity_model(Collector).model_validate({"name": "C2", "favorites": _oids_of(live)})
+    dto = entity_model(Collector).model_validate({"name": "C2", "favorites": _oids_of(store, live)})
 
     rebuilt = from_pydantic(dto, Collector, store=store)
 
@@ -384,15 +376,15 @@ def test_resolved_collector_commits_and_reads_back_its_favorites(store: dc.Store
     store.root = _minerals(0, 3)
     store.commit()
     live = _live_minerals(store, 3)
-    dto = entity_model(Collector).model_validate({"name": "C2", "favorites": _oids_of(live)})
+    dto = entity_model(Collector).model_validate({"name": "C2", "favorites": _oids_of(store, live)})
     rebuilt = from_pydantic(dto, Collector, store=store)
 
     store.upsert(rebuilt)
     store.commit()
 
     fetched = store.get(Collector, name="C2")
-    assert oid_of(rebuilt) is not None
     assert fetched is not None
+    assert store.get_many([store.store(rebuilt)])[0] is fetched
     assert [f.get().qid for f in fetched.favorites] == ["Q0", "Q1", "Q2"]
 
 
