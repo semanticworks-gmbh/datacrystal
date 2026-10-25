@@ -353,7 +353,10 @@ def test_reference_applier_tracks_the_root_oid(
     azurite.mohs = 3.8
     store.commit()
 
-    assert applier.root_oid == store._root_oid
+    with store.snapshot() as snap:
+        [holder] = snap.incoming(snap.root[0])
+
+    assert applier.root_oid == holder.oid
     store.close()
 
 

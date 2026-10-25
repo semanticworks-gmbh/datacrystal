@@ -271,33 +271,13 @@ def test_readable_principal_derefing_a_lazy_handle_gets_the_real_record(
     assert via_lazy.label == LABEL
 
 
-def test_denied_deref_before_anyone_loaded_the_record_registers_nothing(
-    store_factory: StoreFactory,
-) -> None:
-    """Given a reopened store where nobody has loaded the owner-only record
-    When an outsider calls get on a Lazy handle onto it
-    Then the outsider gets a twin
-    And the identity registry holds nothing for the record
-    """
-    hidden_oid = _commit_hidden_record(store_factory)
-    reopened = store_factory()
-    with reopened.acting_as(OUTSIDER):
-        cabinet = reopened.query(Cabinet)[0]
-        handle = cabinet.holds
-        assert handle is not None
-        first_twin = handle.get()
-    assert isinstance(first_twin, dc.Redacted)
-    assert reopened._registry.get(hidden_oid) is None
-    reopened.close()
-
-
 def test_owner_deref_after_a_denied_deref_loads_the_real_registered_record(
     store_factory: StoreFactory,
 ) -> None:
     """Given a reopened store where an outsider already derefed the record into a twin
     When the owner calls get on the same Lazy handle
     Then the owner gets the real record
-    And the identity registry holds that instance
+    And a later deref by OID returns that instance, so an outsider's twin was never cached
     """
     hidden_oid = _commit_hidden_record(store_factory)
     reopened = store_factory()
@@ -309,17 +289,19 @@ def test_owner_deref_after_a_denied_deref_loads_the_real_registered_record(
         real = handle.get()
     assert not isinstance(real, dc.Redacted)
     assert real.label == LABEL
-    assert reopened._registry.get(hidden_oid) is real
+    with reopened.acting_as(OWNER):
+        [again] = reopened.get_many([hidden_oid])
+    assert again is real
     reopened.close()
 
 
-def test_denied_deref_after_the_owner_loaded_the_record_leaves_the_registry_alone(
+def test_denied_deref_after_the_owner_loaded_the_record_leaves_the_real_instance_in_place(
     store_factory: StoreFactory,
 ) -> None:
     """Given a reopened store where the owner already loaded the real record
     When an outsider calls get on the same Lazy handle
     Then the outsider gets a twin
-    And the identity registry still holds the real instance
+    And a later deref by OID still returns the real instance
     """
     hidden_oid = _commit_hidden_record(store_factory)
     reopened = store_factory()
@@ -329,8 +311,10 @@ def test_denied_deref_after_the_owner_loaded_the_record_leaves_the_registry_alon
         real = handle.get()
     with reopened.acting_as(OUTSIDER):
         second_twin = handle.get()
+    with reopened.acting_as(OWNER):
+        [again] = reopened.get_many([hidden_oid])
     assert isinstance(second_twin, dc.Redacted)
-    assert reopened._registry.get(hidden_oid) is real
+    assert again is real
     reopened.close()
 
 
