@@ -48,7 +48,7 @@ store.close()                                  # or: with dc.Store.open(...) as 
 - `cache_index=True` (**on by default**, [ADR-005](design/ADR-005-index-cache.md)) **persists the built indexes to a watermark-stamped sidecar and loads them at boot instead of rescanning** — so a warm reopen of a large store skips that O(extent) first-query rebuild (measured **~14× faster** on a 6.2M-row store; the sidecar is ~2.5× smaller than a naïve one because a `Unique` field is stored as a flat key→oid map, not per-key bitmaps).
   The cache is **never authoritative** (invariant 11): any watermark or index-marker mismatch, or a stale/corrupt/newer sidecar, silently rebuilds from the records — it can never return a wrong answer (SIGKILL-tested).
   Pass `cache_index=False` for a scratch store, or one you never reopen.
-  After a reopen over the cache a multivalued field such as `_dc_groups` comes back in the cache's postings-key order, not the order you appended; treat it as a set.
+  Entity fields, a multivalued one such as `_dc_groups` included, keep their append order after a reopen over the cache; only the index's internal last-values list is rebuilt in postings-key order, which no read exposes.
 - `durability` is a triad. `"commit"` fsyncs every commit (plus `F_FULLFSYNC` on macOS — honest, so a commit costs ~4 ms there); an acked commit survives even power loss. `"interval"` (default) group-commits: fsync happens at WAL checkpoints, so a **process** crash (kill -9) loses nothing, while an OS crash or power loss may lose the last commits — but never corrupts the file. `"never"` skips fsync entirely: benchmarks and scratch stores only, an OS crash can corrupt it.
 - `close()` **discards uncommitted changes** — commit first.
   Closing releases the lock and the in-memory graph.
@@ -78,7 +78,7 @@ It works on any store (an uncommitted local graph is dropped); a live reference 
 Drive it with `for txn in store.committing(): with txn: ...`: the block reads and mutates and is committed when it exits cleanly.
 On a follower a stale write raises `ConflictError`; instead of surfacing it, `committing()` re-runs your block against fresh state (a `discard()` + `sync()` happen first), up to `retries` times, then re-raises if the conflict persists.
 The `for txn in store.committing(...)` loop is the **only supported form**: the final `ConflictError` is raised when the loop asks for the next attempt, never from `with txn:`.
-An attempt you enter by hand and never resume sees no error, and its write does not land.
+An attempt you enter by hand whose follower write conflicts, and that you never resume, sees no error, and its write does not land.
 On a single-node store a commit can never conflict, so the block runs exactly once.
 Keep the whole read-modify-write inside the block (the re-read runs each attempt, so a retry re-applies your *intent* to the winning value — never last-writer-wins) and do not call `commit()` yourself; `retries=0` is a single strict attempt.
 

@@ -7,6 +7,7 @@ Also pins that a bytearray field hydrates as bytes (#201).
 
 from __future__ import annotations
 
+import threading
 import warnings
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -15,7 +16,6 @@ from typing import Annotated, cast
 import pytest
 
 import datacrystal as dc
-from datacrystal._snapshot import UnseenTypeLedger
 from tests.conftest import Locality, Mineral
 
 StoreFactory = Callable[[], dc.Store]
@@ -134,16 +134,32 @@ def test_a_type_with_records_does_not_warn_in_any_snapshot(store: dc.Store) -> N
     assert counted == 1
 
 
-def test_concurrent_first_sights_of_one_type_admit_exactly_one_warner() -> None:
-    """Given a ledger shared by sixteen threads that all meet Mineral at once
-    When each asks whether it is the first to see the type
-    Then exactly one is told yes
-    """
-    ledger = UnseenTypeLedger()
-    with ThreadPoolExecutor(max_workers=16) as pool:
-        answers = list(pool.map(ledger.first_sight, ["Mineral"] * 64))
+def _count_minerals_from_sixteen_threads(store: dc.Store) -> list[int]:
+    """Concurrency harness: sixteen threads each count minerals in a snapshot of their own at once."""
+    start = threading.Barrier(16)
 
-    assert answers.count(True) == 1
+    def count_in_own_snapshot() -> int:
+        start.wait()
+        with store.snapshot() as snap:
+            return snap.count(Mineral)
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        futures = [pool.submit(count_in_own_snapshot) for _ in range(16)]
+        return [future.result() for future in futures]
+
+
+def test_snapshots_read_from_sixteen_threads_warn_exactly_once(store: dc.Store) -> None:
+    """Given a store with no minerals and sixteen threads, each opening its own snapshot
+    When all of them count minerals at the same moment
+    Then exactly one UnseenTypeWarning is raised
+    The check-and-add is too short for the GIL to split, so this pins the behaviour, not the lock.
+    """
+    with warnings.catch_warnings(record=True) as recorded:
+        warnings.simplefilter("always")
+        counts = _count_minerals_from_sixteen_threads(store)
+
+    assert [w.category for w in recorded] == [dc.UnseenTypeWarning]
+    assert counts == [0] * 16
 
 
 def test_a_bytearray_field_hydrates_as_bytes_after_reopen(store_factory: StoreFactory) -> None:
