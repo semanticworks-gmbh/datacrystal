@@ -45,6 +45,7 @@ from datacrystal._containers import PersistentDict, PersistentList, wrap_value
 from datacrystal._entity import (
     TYPES_BY_NAME,
     TypeInfo,
+    detach,
     entity,
     is_entity,
     oid_of,
@@ -287,6 +288,12 @@ class Store:
         # _stamp_perm_labels, read by _check_write_gate, cleared with the buffer (kept across a
         # denied commit so a fixed-up retry still has it).
         self._birth_labels: dict[int, _Labels] = {}
+        # The labels a protected record held before registration stamped it, so discard() can
+        # return the entity to the untracked state. Dropped once the record is durable.
+        self._prestamp_labels: dict[int, _Labels] = {}
+        # NEW entities whose insert delete() cancelled: out of _new, but still holding an OID that
+        # a discard() rewinds the allocator past. Cleared with the buffer.
+        self._cancelled_new: dict[int, Any] = {}
         # delete() buffer (ADR-003): oid → (TypeInfo, live instance or None).
         # The strong reference keeps the doomed instance alive until P3 so a
         # pre-commit read cannot rehydrate a mutable CLEAN twin beside it.
@@ -443,6 +450,8 @@ class Store:
         self._new.clear()
         self._dirty.clear()
         self._birth_labels.clear()
+        self._prestamp_labels.clear()
+        self._cancelled_new.clear()
         self._deleted.clear()
         self._pending_upserts.clear()
         self._fingerprints.clear()
@@ -481,8 +490,12 @@ class Store:
         The rollback that :meth:`sync` names: a rejected follower ``commit()`` leaves its buffer
         held. OCC recovery loop: discard, sync, re-read, re-apply, commit (#153); works on any
         store. A live reference read before the discard is detached: re-read for current values.
+        A discarded NEW entity is untracked again (no OID): ``store()`` it to write it.
         """
         self._enter()
+        for oid, new_entity in [*self._new.items(), *self._cancelled_new.items()]:
+            detach(new_entity)
+            self._restore_prestamp_labels(oid, new_entity)
         self._refresh_from_backend()
         return self._last_tid
 
@@ -849,6 +862,7 @@ class Store:
             # reaches storage, the indexes, or the delta stream.
             self._new.pop(oid, None)
             self._dirty.pop(oid, None)
+            self._cancelled_new[oid] = obj
             set_state(obj, STATE_DELETED)
             return True
         self._dirty.pop(oid, None)  # ADR-003 precedence: the delete wins
@@ -1046,6 +1060,7 @@ class Store:
         self._dirty.clear()
         self._deleted.clear()
         self._birth_labels.clear()  # baselines consumed; a retry re-stamps
+        self._cancelled_new.clear()  # the cancelled inserts are final once a commit captured
         return _Capture(tid, batch, index_entries, ref_entries, flipped, delta,
                         deletes, encoded.blob_swaps)
 
@@ -1385,6 +1400,9 @@ class Store:
             self._registry.discard(oid)
             self._fingerprints.pop(oid, None)
         self._pending_upserts.clear()  # the committed unique map takes over
+        if self._prestamp_labels:  # protected NEW records only; nothing to do otherwise
+            for oid, _, _ in capture.flipped:
+                self._prestamp_labels.pop(oid, None)
         self._durable_cids.update(cid for cid, _, _ in capture.batch.new_types)
         # A written blob value (raw bytes or a streamed source) is now durably stored; swap
         # the live field to a readable BlobHandle, as store.get returns it, so
@@ -2361,6 +2379,10 @@ class Store:
         See docs/design/ADR-008-permissions-contract.md, "Birth labels and the write fence".
         """
         uid = self.principal.uid
+        oid = oid_of(obj)
+        assert oid is not None  # _stamp_perm_labels runs only after stamping
+        self._prestamp_labels[oid] = (obj._dc_owner, list(obj._dc_groups),
+                                      obj._dc_read_floor, obj._dc_write_floor)
         object.__setattr__(obj, "_dc_owner", uid)
         # The gate baseline is what inheritance/birth GIVES — independent of any
         # labels the user staged with verbs before store() (those ARE the
@@ -2380,9 +2402,18 @@ class Store:
             object.__setattr__(obj, "_dc_write_floor", base_write)
         else:
             base_groups, base_read, base_write = [], VIEWER, VIEWER
-        oid = oid_of(obj)
-        assert oid is not None  # _stamp_perm_labels runs only after stamping
         self._birth_labels[oid] = (uid, base_groups, base_read, base_write)
+
+    def _restore_prestamp_labels(self, oid: int, obj: object) -> None:
+        """Put a discarded protected entity's labels back to what they were before registration."""
+        before = self._prestamp_labels.pop(oid, None)
+        if before is None:
+            return
+        owner, groups, read_floor, write_floor = before
+        object.__setattr__(obj, "_dc_owner", owner)
+        object.__setattr__(obj, "_dc_groups", wrap_value(groups, obj))
+        object.__setattr__(obj, "_dc_read_floor", read_floor)
+        object.__setattr__(obj, "_dc_write_floor", write_floor)
 
     def _discover_new_graphs(self) -> None:
         """P1 discovery: dirty/new objects may reference brand-new entities."""

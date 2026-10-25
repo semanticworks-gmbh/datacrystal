@@ -28,6 +28,13 @@ purely **additive** surface — the v0.1.0 freeze is never broken. PyPI publicat
 - Public annotations narrowed from `Any` to `object`, a Protocol or a concrete type (#192): for example `Store.store`, `delete`, `upsert`, `get_many`, `AsyncStore`, `open_follower(client: HttpClient | None)`, the `Snapshot.bootstrap` of the consumers, the `**open_kwargs` of `create_app` and the return of `from_pydantic`, now `T` for a `cls: type[T]`; runtime behaviour is unchanged.
 - `HttpClient` (the protocol of the follower's `client=`) is exported from `datacrystal` and `StoreOpenOptions` (the `**open_kwargs` of `create_app` and `store_lifespan`) from `datacrystal.web`, so a caller can name both without importing a private module (#192).
 
+### Fixed
+
+- `store.discard()` returns a new, never-committed entity to the untracked state (#213): it loses its OID, so a later `store()` allocates a fresh one and the next commit writes it.
+  Before, the entity kept its OID while the allocator rewound, the next new entity took the same OID, and re-storing the discarded entity returned that OID and wrote nothing.
+  The same holds for a new entity stored, deleted and then discarded, and a protected one gets back the labels it held before `store()` stamped or inherited them.
+  An edit to a discarded entity that is not stored again is untracked like any never-stored entity; a committed entity keeps its OID on discard.
+
 ## [0.10.0] — 2026-10-20
 
 ### Added

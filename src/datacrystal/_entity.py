@@ -493,6 +493,13 @@ def stamp(obj: object, oid: int, store: Store, state: int) -> None:
     object.__setattr__(obj, "__dc_state__", state)
 
 
+def detach(obj: object) -> None:
+    """Return a stamped NEW entity to the untracked state: no OID, no store, state NEW."""
+    object.__delattr__(obj, "__dc_oid__")
+    object.__delattr__(obj, "__dc_store__")
+    object.__setattr__(obj, "__dc_state__", STATE_NEW)
+
+
 def set_state(obj: object, state: int) -> None:
     object.__setattr__(obj, "__dc_state__", state)
 
