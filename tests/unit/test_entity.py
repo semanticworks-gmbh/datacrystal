@@ -10,7 +10,6 @@ from typing import Annotated, Any
 import pytest
 
 import datacrystal as dc
-from datacrystal._conditions import FieldExpr, Pred
 from datacrystal._entity import FieldSpec, type_info
 from tests.conftest import Locality, LogEntry, Mineral
 
@@ -111,24 +110,28 @@ def test_frozen_entity_rejects_mutation() -> None:
         entry.note = "edited"  # pyrefly: ignore[read-only]
 
 
-def test_class_access_yields_a_field_expr() -> None:
-    """Given the Mineral class
-    When its name attribute is read on the class
-    Then it is a FieldExpr
-    """
-    expr = Mineral.name
-
-    assert isinstance(expr, FieldExpr)
-
-
-def test_comparing_class_access_yields_a_pred() -> None:
+def test_comparing_class_access_yields_a_condition() -> None:
     """Given the Mineral class
     When Mineral.name is compared with "quartz"
-    Then the result is a Pred
+    Then the result is a dc.Condition
     """
-    pred = Mineral.name == "quartz"
+    condition = Mineral.name == "quartz"
 
-    assert isinstance(pred, Pred)
+    assert isinstance(condition, dc.Condition)
+
+
+def test_combining_conditions_yields_a_condition() -> None:
+    """Given the conditions name == "quartz" and mohs >= 7.0 over dc.fields(Mineral)
+    When they are combined with &, | and ~
+    Then each result is a dc.Condition
+    """
+    fields = dc.fields(Mineral)
+    is_quartz = fields.name == "quartz"
+    is_hard = fields.mohs >= 7.0
+
+    assert isinstance(is_quartz & is_hard, dc.Condition)
+    assert isinstance(is_quartz | is_hard, dc.Condition)
+    assert isinstance(~is_quartz, dc.Condition)
 
 
 def test_instance_access_is_plain_slot_access() -> None:

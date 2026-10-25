@@ -23,7 +23,7 @@ from datacrystal._actors import (
     Principal,
     root_principal,
 )
-from datacrystal._conditions import fields
+from datacrystal._conditions import Condition, fields
 from datacrystal._containers import PersistentDict, PersistentList
 from datacrystal._entity import (
     Blob,
@@ -107,6 +107,7 @@ __all__ = [
     "Blob",
     "BlobHandle",
     "BlobSource",
+    "Condition",
     "ConflictError",
     "ConsumerDetachedWarning",
     "CorruptRecordError",

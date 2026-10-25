@@ -24,7 +24,6 @@ from typing import Annotated, Any
 import pytest
 
 import datacrystal as dc
-from datacrystal._conditions import Condition
 
 TEAM = 5
 OTHER_TEAM = 6
@@ -146,28 +145,28 @@ def _bare_class(cls: type) -> type:
     return cls
 
 
-def _indexed_eq(cls: type) -> Condition:
+def _indexed_eq(cls: type) -> dc.Condition:
     return dc.fields(cls).category == "gem"
 
 
-def _indexed_in(cls: type) -> Condition:
+def _indexed_in(cls: type) -> dc.Condition:
     return dc.fields(cls).category.in_(["gem", "rock"])
 
 
-def _sorted_ge(cls: type) -> Condition:
+def _sorted_ge(cls: type) -> dc.Condition:
     return dc.fields(cls).mass_g >= 50.0
 
 
-def _sorted_between(cls: type) -> Condition:
+def _sorted_between(cls: type) -> dc.Condition:
     return (dc.fields(cls).mass_g >= 20.0) & (dc.fields(cls).mass_g <= 60.0)
 
 
-def _residual(cls: type) -> Condition:
+def _residual(cls: type) -> dc.Condition:
     """Build the one shape no bitmap answers: ``note`` carries no Index/SortedIndex marker."""
     return dc.fields(cls).note == "flag"
 
 
-def _contains(cls: type) -> Condition:
+def _contains(cls: type) -> dc.Condition:
     return dc.fields(cls).tags.contains("rare")
 
 
@@ -183,7 +182,7 @@ CONDITION_BUILDERS = {
 CONDITION_NAMES = list(CONDITION_BUILDERS)
 
 
-def _target_for(condition_name: str, cls: type) -> type | Condition:
+def _target_for(condition_name: str, cls: type) -> type | dc.Condition:
     return CONDITION_BUILDERS[condition_name](cls)
 
 

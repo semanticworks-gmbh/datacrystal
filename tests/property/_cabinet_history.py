@@ -17,7 +17,6 @@ from typing import Annotated, Any
 from hypothesis import strategies as st
 
 import datacrystal as dc
-from datacrystal._conditions import Condition
 
 
 @dc.entity
@@ -81,7 +80,7 @@ def scripts(draw: st.DrawFn) -> list[tuple[Any, ...]]:
 
 
 @st.composite
-def _predicates(draw: st.DrawFn) -> Condition:
+def _predicates(draw: st.DrawFn) -> dc.Condition:
     field = draw(st.sampled_from(["sid", "quality", "system", "mass", "note"]))
     expr = getattr(S, field)
     if field == "mass":
@@ -102,19 +101,19 @@ def _predicates(draw: st.DrawFn) -> Condition:
     return _ORDERING[op](expr, draw(values))
 
 
-def _both(pair: tuple[Condition, Condition]) -> Condition:
+def _both(pair: tuple[dc.Condition, dc.Condition]) -> dc.Condition:
     return pair[0] & pair[1]
 
 
-def _either(pair: tuple[Condition, Condition]) -> Condition:
+def _either(pair: tuple[dc.Condition, dc.Condition]) -> dc.Condition:
     return pair[0] | pair[1]
 
 
-def _negated(condition: Condition) -> Condition:
+def _negated(condition: dc.Condition) -> dc.Condition:
     return ~condition
 
 
-def _combined(kids: st.SearchStrategy[Condition]) -> st.SearchStrategy[Condition]:
+def _combined(kids: st.SearchStrategy[dc.Condition]) -> st.SearchStrategy[dc.Condition]:
     pairs = st.tuples(kids, kids)
     return st.one_of(pairs.map(_both), pairs.map(_either), kids.map(_negated))
 
@@ -165,6 +164,6 @@ def _replayed_in(directory: Path, ops: list[tuple[Any, ...]]) -> Generator[Cabin
         store.close()
 
 
-def matching_sids(rows: dict[str, dict[str, Any]], condition: Condition) -> set[str]:
+def matching_sids(rows: dict[str, dict[str, Any]], condition: dc.Condition) -> set[str]:
     """Return the sids whose plain row satisfies the condition, by brute-force sweep."""
     return {sid for sid, row in rows.items() if condition.evaluate(SimpleNamespace(**row))}

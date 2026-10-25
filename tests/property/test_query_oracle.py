@@ -1,7 +1,7 @@
 """The M4 exit gate: query vs a brute-force oracle (KICKOFF M4).
 
 Hypothesis builds a random cabinet history — upserts, field updates,
-deletions, interleaved commits — then a random Condition tree over indexed
+deletions, interleaved commits — then a random dc.Condition tree over indexed
 and non-indexed fields (every operator, including the M4 contains/
 startswith), and demands that the planner's answer equal a brute-force
 ``cond.evaluate`` sweep over plain rows. One oracle checks five surfaces:
@@ -23,7 +23,7 @@ from typing import Any
 import pytest
 from hypothesis import given, settings
 
-from datacrystal._conditions import Condition
+import datacrystal as dc
 from tests.property._cabinet_history import conditions, matching_sids, replayed, scripts
 
 pytestmark = pytest.mark.filterwarnings("ignore::datacrystal.UnseenTypeWarning")
@@ -31,7 +31,7 @@ pytestmark = pytest.mark.filterwarnings("ignore::datacrystal.UnseenTypeWarning")
 
 @settings(deadline=None)
 @given(ops=scripts(), cond=conditions)
-def test_query_returns_the_rows_the_oracle_matches(ops: list[tuple[Any, ...]], cond: Condition) -> None:
+def test_query_returns_the_rows_the_oracle_matches(ops: list[tuple[Any, ...]], cond: dc.Condition) -> None:
     """Given a random committed cabinet history and a random condition tree
     When the store queries the condition
     Then it returns the sids a brute-force sweep over plain rows matches
@@ -45,7 +45,7 @@ def test_query_returns_the_rows_the_oracle_matches(ops: list[tuple[Any, ...]], c
 @settings(deadline=None)
 @given(ops=scripts(), cond=conditions)
 def test_count_equals_the_number_of_rows_the_oracle_matches(
-    ops: list[tuple[Any, ...]], cond: Condition
+    ops: list[tuple[Any, ...]], cond: dc.Condition
 ) -> None:
     """Given a random committed cabinet history and a random condition tree
     When the store counts the condition
@@ -59,7 +59,7 @@ def test_count_equals_the_number_of_rows_the_oracle_matches(
 
 @settings(deadline=None)
 @given(ops=scripts(), cond=conditions)
-def test_pluck_returns_the_sids_the_oracle_matches(ops: list[tuple[Any, ...]], cond: Condition) -> None:
+def test_pluck_returns_the_sids_the_oracle_matches(ops: list[tuple[Any, ...]], cond: dc.Condition) -> None:
     """Given a random committed cabinet history and a random condition tree
     When the store plucks the sids of the condition
     Then it returns the sids a brute-force sweep matches
@@ -73,7 +73,7 @@ def test_pluck_returns_the_sids_the_oracle_matches(ops: list[tuple[Any, ...]], c
 @settings(deadline=None)
 @given(ops=scripts(), cond=conditions)
 def test_snapshot_query_returns_the_rows_the_oracle_matches(
-    ops: list[tuple[Any, ...]], cond: Condition
+    ops: list[tuple[Any, ...]], cond: dc.Condition
 ) -> None:
     """Given a random committed cabinet history, a snapshot of it and a random condition tree
     When the snapshot queries the condition
@@ -88,7 +88,7 @@ def test_snapshot_query_returns_the_rows_the_oracle_matches(
 @settings(deadline=None)
 @given(ops=scripts(), cond=conditions)
 def test_snapshot_count_equals_the_number_of_rows_the_oracle_matches(
-    ops: list[tuple[Any, ...]], cond: Condition
+    ops: list[tuple[Any, ...]], cond: dc.Condition
 ) -> None:
     """Given a random committed cabinet history, a snapshot of it and a random condition tree
     When the snapshot counts the condition

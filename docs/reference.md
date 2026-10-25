@@ -393,6 +393,7 @@ Query semantics (the *theory* — planner, residual, candidate set — is in [ex
 - Operators on class-level fields: `==`, `!=`, `<`, `<=`, `>`, `>=`, `.in_([...])`, `.contains("sub")`, `.startswith("pre")`; combine with `&`, `|`, `~`.
   **Parenthesize predicates** — `&` binds tighter than `==` (you get a helpful `QueryError` if you forget).
 - Every read API takes an entity class **or** a Condition (symmetry, 2026-06-12): `query(Mineral)` hydrates the **full extent** — the expensive shape, same cost as any non-indexed predicate; prefer `count()`/`pluck()` when you don't need live entities.
+- **`dc.Condition`** — The query AST a read takes in place of an entity class; `dc.fields(C)` comparisons and `&`, `|`, `~` build it.
 - `query()`/`pluck()` (and `snap.query()`/`snap.all()`) take `limit=`/`offset=` to window the result.
   On a fully-indexed read the slice hits the candidate OIDs **before** hydration — `query(C, limit=10)` loads 10 records, not the extent.
   A residual predicate must decode-to-filter first, so there the window only trims the materialized result (it cannot prune the scan).
@@ -820,7 +821,7 @@ This section is the single, authoritative list — meet them once here, apply th
 ### 1. Class-attribute conditions read as the field's value type
 
 `Mineral.mohs >= 6.0` is the documented primary query form, but a checker sees `Mineral.mohs` as `float | None` and reads the whole thing as `float >= float -> bool`, not a `Condition`.
-The **workaround** is the typed field proxy `dc.fields(C)` — it returns a `FieldProxy` whose attributes are `FieldExpr`s, so the comparison types as a `Condition`:
+The **workaround** is the typed field proxy `dc.fields(C)` — it returns a `FieldProxy` whose attributes are `FieldExpr`s, so the comparison types as a [`dc.Condition`](#reading-api):
 
 ```python
 M = dc.fields(Mineral)
