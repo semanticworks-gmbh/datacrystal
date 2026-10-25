@@ -132,7 +132,7 @@ def indexed_bergkristall(store: dc.Store, sidecar: FtsSidecar) -> Specimen:
 
 @pytest.fixture
 def tombstone(store: dc.Store, sidecar: FtsSidecar) -> dict:
-    """Index azurite, detach the sidecar, then delete azurite and return the real delete delta, reduced to its delete op."""
+    """Index azurite, detach the sidecar, delete azurite; return the real delete op as a delta."""
     recorder = _DeltaRecorder()
     store.attach(sidecar)
     store.attach(recorder)
