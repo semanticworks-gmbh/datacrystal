@@ -112,12 +112,12 @@ def test_two_threads_read_two_scans_through_one_snapshot(
     assert scans == (AZURITE_SCAN, MALACHITE_SCAN)
 
 
-def test_open_blob_on_another_thread_reads_the_pinned_scan_after_a_commit(
+def test_open_blob_on_another_thread_reads_the_scan_version_the_snapshot_pinned(
     store_factory: StoreFactory, worker: ThreadPoolExecutor
 ) -> None:
     """Given a snapshot of a committed azurite scan and a later commit that replaces the scan
     When a worker thread opens the scan through the older snapshot
-    Then the worker reads the scan the snapshot pinned
+    Then the worker reads the bytes of the scan version the snapshot pinned
     """
     azurite_oid, _ = _commit_specimens(store_factory)
     with store_factory() as store, store.snapshot() as snap:

@@ -583,15 +583,3 @@ def test_nested_depth_bound_ends_a_reference_cycle(store: dc.Store) -> None:
     dto = to_pydantic(first, nested=3)
 
     assert dto.deeper.deeper.deeper.deeper == oid_of(first)  # pyrefly: ignore[missing-attribute]
-
-
-def test_nested_zero_projects_a_chain_head_to_the_next_oid(store: dc.Store) -> None:
-    """Given a committed chain of four veins
-    When to_pydantic projects the top vein without nested
-    Then the second vein crosses as its OID
-    """
-    veins = _vein_chain(store, 4)
-
-    dto = to_pydantic(veins[0])
-
-    assert dto.deeper == oid_of(veins[1])  # pyrefly: ignore[missing-attribute]

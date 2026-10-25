@@ -62,8 +62,8 @@ class Plain:
 
 
 @dc.entity(protected=True)
-class Memo:
-    """A protected memo that refers to a plain record (R11: the ref is Lazy)."""
+class Appraisal:
+    """A protected specimen appraisal that refers to a plain record (R11: the ref is Lazy)."""
 
     label: Annotated[str, dc.Unique]
     about: dc.Lazy[Plain] | None = None
@@ -269,47 +269,47 @@ def test_incoming_of_a_readable_target_without_referrers_is_empty(store: dc.Stor
     assert referrers == []
 
 
-def _seed_memos_about_a_plain_record(store: dc.Store) -> int:
-    """Store a plain record, a team-shared memo and an owner-only memo about it; return its OID."""
+def _seed_appraisals_about_a_plain_record(store: dc.Store) -> int:
+    """Store a plain record and two appraisals of it, team-shared and owner-only; return its OID."""
     with store.acting_as(OWNER):
         target = Plain(label="target")
         target_oid = store.store(target)
-        shared = Memo(label="shared-memo", about=dc.Lazy.of(target))
+        shared = Appraisal(label="shared-appraisal", about=dc.Lazy.of(target))
         store.store(shared)
         dc.share(shared, TEAM, read=dc.AGENT, write=dc.CURATOR)
-        store.store(Memo(label="secret-memo", about=dc.Lazy.of(target)))
+        store.store(Appraisal(label="secret-appraisal", about=dc.Lazy.of(target)))
         store.commit()
     return target_oid
 
 
 def test_incoming_drops_a_referrer_the_principal_cannot_read(store: dc.Store) -> None:
-    """Given a plain record referred to by a team-shared memo and an owner-only memo
+    """Given a plain record referred to by a team-shared appraisal and an owner-only appraisal
     When the member's snapshot asks for the record's incoming referrers
-    Then only the shared memo comes back
+    Then only the shared appraisal comes back
     """
-    target_oid = _seed_memos_about_a_plain_record(store)
+    target_oid = _seed_appraisals_about_a_plain_record(store)
     with store.snapshot(principal=MEMBER) as member_snap:
         referrers = member_snap.incoming(target_oid)
-    assert [v.label for v in referrers] == ["shared-memo"]
+    assert [v.label for v in referrers] == ["shared-appraisal"]
 
 
 def test_incoming_keeps_every_referrer_for_the_owner(store: dc.Store) -> None:
-    """Given a plain record referred to by a team-shared memo and an owner-only memo
+    """Given a plain record referred to by a team-shared appraisal and an owner-only appraisal
     When the owner's snapshot asks for the record's incoming referrers
-    Then both memos come back
+    Then both appraisals come back
     """
-    target_oid = _seed_memos_about_a_plain_record(store)
+    target_oid = _seed_appraisals_about_a_plain_record(store)
     with store.snapshot(principal=OWNER) as owner_snap:
         referrers = owner_snap.incoming(target_oid)
-    assert {v.label for v in referrers} == {"shared-memo", "secret-memo"}
+    assert {v.label for v in referrers} == {"shared-appraisal", "secret-appraisal"}
 
 
 def test_incoming_for_a_sibling_drops_what_the_owner_already_cached(store: dc.Store) -> None:
-    """Given the owner's snapshot has already listed both memos into the shared cache
+    """Given the owner's snapshot has already listed both appraisals into the shared cache
     When the outsider's sibling on the same core asks for the incoming referrers
     Then none comes back
     """
-    target_oid = _seed_memos_about_a_plain_record(store)
+    target_oid = _seed_appraisals_about_a_plain_record(store)
     with store.snapshot(principal=OWNER) as owner_snap:
         owner_snap.incoming(target_oid)
         referrers = owner_snap.for_principal(OUTSIDER).incoming(target_oid)

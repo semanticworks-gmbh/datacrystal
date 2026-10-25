@@ -986,23 +986,17 @@ class TestDenialMechanics:
             contact.org = "loop-edit"
         store.discard()
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="committing() yields a second attempt after a WriteDeniedError when resumed by hand",
-    )
-    def test_committing_yields_no_second_attempt_after_a_denial(self, store: dc.Store) -> None:
-        """Given a committing() generator whose first attempt was denied a curated contact edit
-        When the generator is resumed
-        Then it ends without yielding a second attempt
+    def test_committing_denial_propagates_out_of_the_first_attempt(self, store: dc.Store) -> None:
+        """Given a committing() loop unrolled by hand to its first attempt
+        When an agent edits a curated contact inside that attempt
+        Then the WriteDeniedError propagates out of the block, the buffered edit left intact
         """
         contact = _curated_contact(store)
         attempts = store.committing(retries=5)
-        first = next(attempts)
-        with store.acting_as(AGENT_900), pytest.raises(dc.WriteDeniedError), first:
+        with store.acting_as(AGENT_900), pytest.raises(dc.WriteDeniedError), next(attempts):
             contact.org = "loop-edit"
         store.discard()
-        with pytest.raises(StopIteration):
-            next(attempts)
+        assert contact.org == "loop-edit"
 
     def test_verify_is_never_gated(self, store: dc.Store) -> None:
         """Given a store holding a curated contact

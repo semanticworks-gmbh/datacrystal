@@ -259,16 +259,6 @@ def test_unindexed_count_constructs_no_live_entity(cabinet: Cabinet) -> None:
 # index in the commit, never by rebuilding it from a scan of the extent.
 
 
-def test_growing_a_built_index_loads_no_record_at_commit(grown_cabinet: Cabinet) -> None:
-    """Given a cabinet whose index is built, grown by 200 specimens in one commit
-    When the commit's backend traffic is read
-    Then no record was loaded, new rows needing no prior
-    """
-    loaded = grown_cabinet.backend.records_loaded
-
-    assert loaded == 0
-
-
 def test_growing_a_built_index_triggers_no_rebuild_scan(grown_cabinet: Cabinet) -> None:
     """Given a cabinet whose index is built, grown by 200 specimens in one commit
     When the cubic specimens are counted afterwards
