@@ -36,6 +36,7 @@ directory — the second run must find the first run's data.
 
 - **Small, logical commits**, one concern each.
 - Keep the gates green: `ruff`, `pyrefly` and `pytest` must pass; the rules are in [STANDARDS.md](STANDARDS.md).
+- The `mutation` workflow comments the survivors of the functions your PR changed (a change no test notices, advisory, never a failure); reproduce it with `OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES uv run mutmut run $(uv run scripts/mutation_changed.py origin/main)`, then `uv run mutmut results` and `uv run mutmut show <name>`.
 - Engine behavior is tested against **both backends** (memory and SQLite) via the
   `store_factory` fixture — they must behave identically.
 - **Documentation honesty rule:** document only what exists. A feature that isn't built yet is

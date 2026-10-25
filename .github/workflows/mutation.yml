@@ -1,0 +1,95 @@
+# Advisory mutation check (#193): mutmut on the functions a PR changes, survivors in ONE PR comment.
+# The job fails only on a broken setup, never on survivors. The full run: mutation/baseline-summary.md.
+name: mutation
+
+on:
+  pull_request:
+    paths:
+      - "src/datacrystal/**"
+
+concurrency:
+  group: mutation-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  mutation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      BASE: origin/${{ github.base_ref }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Sync environment (extras for their tests)
+        run: uv sync --all-extras
+
+      - name: Find the changed functions
+        id: changed
+        run: |
+          uv run scripts/mutation_changed.py "$BASE" > patterns.txt
+          cat patterns.txt
+          if [ -s patterns.txt ]; then
+            echo "any=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::No function in src/datacrystal/ changed, nothing to mutate."
+          fi
+
+      # Unchanged functions keep their results: mutmut hashes each function and re-runs only the changed ones.
+      - name: Restore mutants of the base branch
+        if: steps.changed.outputs.any == 'true'
+        uses: actions/cache@v4
+        with:
+          path: mutants
+          key: mutation-${{ github.base_ref }}-${{ github.run_id }}
+          restore-keys: mutation-${{ github.base_ref }}-
+
+      - name: Run mutmut on the changed functions
+        id: run
+        if: steps.changed.outputs.any == 'true'
+        run: |
+          set +e
+          uv run mutmut run $(cat patterns.txt) 2>&1 | tee mutmut.log
+          status=${PIPESTATUS[0]}
+          set -e
+          if grep -q "nothing matches" mutmut.log; then
+            echo "::notice::The changed functions have no mutants (for example, only trivial bodies)."
+          elif [ "$status" -ne 0 ]; then
+            echo "::error::mutmut failed to run (exit $status): a broken setup, not a survivor."
+            exit "$status"
+          else
+            echo "mutated=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Summarize the survivors
+        if: steps.run.outputs.mutated == 'true'
+        run: uv run scripts/mutation_summary.py patterns.txt > comment.md
+
+      - name: Show the summary on the run
+        if: steps.run.outputs.mutated == 'true'
+        run: cat comment.md >> "$GITHUB_STEP_SUMMARY"
+
+      # A fork's token cannot write: its PR gets the run summary only.
+      - name: Post or update the PR comment
+        if: steps.run.outputs.mutated == 'true' && github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          comments="repos/${{ github.repository }}/issues"
+          existing=$(gh api "$comments/$PR/comments" --paginate \
+            --jq '[.[] | select(.body | contains("<!-- mutation-check -->")) | .id][0] // empty')
+          if [ -n "$existing" ]; then
+            gh api --method PATCH "$comments/comments/$existing" -F body=@comment.md > /dev/null
+          else
+            gh api --method POST "$comments/$PR/comments" -F body=@comment.md > /dev/null
+          fi
