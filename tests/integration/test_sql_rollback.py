@@ -25,9 +25,7 @@ from typing import Annotated
 import pytest
 
 import datacrystal as dc
-from datacrystal._ids import TID_BASE
 from datacrystal._records import crc as _crc
-from datacrystal._state import STATE_NEW
 from datacrystal._storage.protocol import CommitBatch
 from datacrystal._storage.sqlite import SqliteBackend
 
@@ -41,6 +39,7 @@ class Mineral:
     photo: Annotated[bytes | None, dc.Blob] = None
 
 
+FIRST_TID = 1
 PHOTO = b"\x89PNG fake bytes"
 
 
@@ -79,20 +78,27 @@ def _watermark(db: Path) -> int:
         row = conn.execute("SELECT value FROM meta WHERE key='next_tid'").fetchone()
     finally:
         conn.close()
-    next_tid = int(row[0]) if row is not None else TID_BASE
+    next_tid = int(row[0]) if row is not None else FIRST_TID
     return next_tid - 1
 
 
 def _fault_apply_after_inserts(backend: SqliteBackend, seen: InTxnRows) -> None:
-    """Patch ``apply`` to run the real INSERTs inside ``BEGIN IMMEDIATE``, then raise.
+    """Patch ``apply``: the first call runs the real INSERTs in ``BEGIN IMMEDIATE``, then raises.
 
     The fault comes before ``COMMIT`` (at the deletes/meta step). It mirrors the production
     statements so the fault exercises a genuinely half-written batch; the
     ``except: ROLLBACK; raise`` is the production one. What it saw inside the transaction goes
     to ``seen``.
     """
+    real_apply = backend.apply
+    faulted = False
 
     def faulting_apply(batch: CommitBatch) -> None:
+        nonlocal faulted
+        if faulted:
+            real_apply(batch)
+            return
+        faulted = True
         conn = backend._conn
         conn.execute("BEGIN IMMEDIATE")
         try:
@@ -183,7 +189,7 @@ def test_baseline_commit_takes_the_first_tid(baseline_db: Path) -> None:
     When the file is read back
     Then its watermark is the first TID
     """
-    assert _watermark(baseline_db) == TID_BASE
+    assert _watermark(baseline_db) == FIRST_TID
 
 
 def test_faulted_apply_had_both_records_live_inside_its_transaction(
@@ -212,26 +218,32 @@ def test_faulted_apply_had_the_blob_live_inside_its_transaction(
     assert staged_batch.seen.blobs_added == 1
 
 
-def test_failed_commit_rebuffers_the_azurite_as_new(staged_batch: StagedBatch) -> None:
-    """Given two staged minerals and an apply faulted before COMMIT
-    When the store commits
-    Then the azurite is NEW again, as it never became durable
+def test_retry_on_the_same_store_takes_the_tid_the_failed_commit_burned(
+    staged_batch: StagedBatch,
+) -> None:
+    """Given two staged minerals and an apply that faulted once before COMMIT
+    When the same store commits again
+    Then the retry takes the TID right after the baseline one, as both minerals are buffered again
     """
     with pytest.raises(OSError, match="injected fault mid-apply"):
         staged_batch.store.commit()
 
-    assert object.__getattribute__(staged_batch.azurite, "__dc_state__") == STATE_NEW
+    retry_tid = staged_batch.store.commit()
+
+    assert retry_tid == FIRST_TID + 1
 
 
-def test_failed_commit_rebuffers_the_beryl_as_new(staged_batch: StagedBatch) -> None:
-    """Given two staged minerals and an apply faulted before COMMIT
-    When the store commits
-    Then the beryl is NEW again, as it never became durable
+def test_retry_on_the_same_store_persists_both_minerals(staged_batch: StagedBatch) -> None:
+    """Given two staged minerals and an apply that faulted once before COMMIT
+    When the same store commits again
+    Then the file holds the baseline record and both retried ones
     """
     with pytest.raises(OSError, match="injected fault mid-apply"):
         staged_batch.store.commit()
 
-    assert object.__getattribute__(staged_batch.beryl, "__dc_state__") == STATE_NEW
+    staged_batch.store.commit()
+
+    assert _count_rows(staged_batch.db, "objects") == 3
 
 
 def test_failed_commit_does_not_consume_the_tid(staged_batch: StagedBatch) -> None:
@@ -242,7 +254,7 @@ def test_failed_commit_does_not_consume_the_tid(staged_batch: StagedBatch) -> No
     with pytest.raises(OSError, match="injected fault mid-apply"):
         staged_batch.store.commit()
 
-    assert staged_batch.store.last_tid == TID_BASE
+    assert staged_batch.store.last_tid == FIRST_TID
 
 
 # --- the SQL-layer truth, read straight from the file --------------------------
@@ -269,7 +281,7 @@ def test_rollback_keeps_the_pre_batch_watermark_in_the_file(rolled_back_db: Path
     When the file is read back after the store closed
     Then the watermark is still the baseline one
     """
-    assert _watermark(rolled_back_db) == TID_BASE
+    assert _watermark(rolled_back_db) == FIRST_TID
 
 
 # --- gapless: a fresh open commits the same batch and reuses the burned TID ----
@@ -298,7 +310,7 @@ def test_retry_reuses_the_tid_the_torn_batch_burned(reopened_store: dc.Store) ->
 
     retry_tid = reopened_store.commit()
 
-    assert retry_tid == TID_BASE + 1
+    assert retry_tid == FIRST_TID + 1
 
 
 def test_retried_batch_keeps_the_azurite(reopened_store: dc.Store) -> None:
