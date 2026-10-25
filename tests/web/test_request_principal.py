@@ -28,7 +28,6 @@ import httpx
 from fastapi import Depends, FastAPI
 
 import datacrystal as dc
-from datacrystal._storage.memory import MemoryBackend
 from datacrystal.deltalog import DeltaLog
 from datacrystal.web import federation_router, get_principal, submit_write
 from datacrystal.web._app import _OwnerWriter
@@ -147,9 +146,9 @@ def _commit_from_a_foreign_thread(store: dc.Store) -> None:
 
 
 @pytest.fixture
-def operator_store() -> Iterator[dc.Store]:
+def operator_store(tmp_path: Path) -> Iterator[dc.Store]:
     """Provide a store opened by the OPERATOR: web writes must not inherit that identity."""
-    store = dc.Store._from_backend(MemoryBackend(), principal=OPERATOR)
+    store = dc.Store.open(tmp_path / "cabinet", durability="never", principal=OPERATOR)
     yield store
     store.close()
 

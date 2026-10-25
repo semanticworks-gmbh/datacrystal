@@ -13,9 +13,7 @@ pytest.importorskip("httpx", reason="pip install httpx (TestClient transport)")
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from datacrystal._follower import open_follower
-from datacrystal._storage.memory import MemoryBackend
-from datacrystal._store import Store
+from datacrystal import Store, open_follower
 from datacrystal.deltalog import DeltaLog
 from datacrystal.web import federation_router
 from tests.conftest import Mineral
@@ -38,7 +36,7 @@ def follower_path(request: pytest.FixtureRequest, tmp_path: Path) -> Path | None
 @pytest.fixture
 def coordinator(tmp_path: Path) -> Iterator[tuple[Store, DeltaLog]]:
     """Provide a coordinator with a DeltaLog and one committed quartz."""
-    coord = Store._from_backend(MemoryBackend())
+    coord = Store.open(tmp_path / "coord", durability="never")
     log = DeltaLog(tmp_path / "coordlog")
     coord.attach(log)
     coord.store(Mineral(qid="Q1", name="quartz"))

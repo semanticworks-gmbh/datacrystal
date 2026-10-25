@@ -319,8 +319,8 @@ def test_from_pydantic_gives_a_protected_create_face_inert_birth_labels(
     rec = from_pydantic(dto, CuratedContact, store=store)
 
     assert rec.name == "Meyer Solartechnik GmbH"
-    assert rec._dc_owner == 0  # pyrefly: ignore[missing-attribute]
-    assert list(rec._dc_groups) == []  # pyrefly: ignore[missing-attribute]
+    assert rec.dc_permissions.owner == 0  # pyrefly: ignore[missing-attribute]
+    assert list(rec.dc_permissions.groups) == []  # pyrefly: ignore[missing-attribute]
 
 
 def test_protected_create_face_record_is_stored_and_read_by_its_owner(

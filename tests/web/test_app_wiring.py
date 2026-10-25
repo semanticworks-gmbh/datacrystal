@@ -50,9 +50,7 @@ from strawberry.tools import create_type
 from strawberry.types import Info
 
 import datacrystal as dc
-from datacrystal import WrongThreadError
-from datacrystal._snapshot import EntityView, Snapshot
-from datacrystal._store import Store
+from datacrystal import EntityView, Snapshot, Store, StoreClosedError, WrongThreadError
 from datacrystal.web import (
     SNAPSHOT_CONTEXT_KEY as SNAP_KEY,
 )
@@ -65,7 +63,7 @@ from datacrystal.web import (
     store_lifespan,
     submit_write,
 )
-from datacrystal.web._app import STORE_STATE_KEY, _OwnerWriter, _StoreLifespan
+from datacrystal.web._app import _OwnerWriter
 
 # --- a self-contained slice of the mineral cabinet (reference) ----------------
 
@@ -159,6 +157,18 @@ def _add_peek_route(app: FastAPI, seen: list[Snapshot]) -> None:
         return {"tid": snap.tid}
 
 
+def _add_store_route(app: FastAPI, seen: list[Store]) -> None:
+    """Add GET /store, which records the store behind get_store and reports its mineral count.
+
+    The route is async so it runs on the owner loop thread, where the store may be read.
+    """
+
+    @app.get("/store")
+    async def store_route(store: Annotated[Store, Depends(get_store)]) -> dict[str, int]:
+        seen.append(store)
+        return {"minerals": store.count(Mineral)}
+
+
 def _make_graphql_app(path: str) -> FastAPI:
     """Build a FastAPI + Strawberry app with a ``mineral(qid)`` query.
 
@@ -206,41 +216,48 @@ def _make_probe_app(path: str, recorded: dict[str, int]) -> FastAPI:
 # --- the REST app: lifespan + read + write dependencies -----------------------
 
 
-def test_app_state_holds_no_store_before_the_lifespan_runs(seeded_path: str) -> None:
-    """Given an app created over a seeded store path
-    When nothing has entered the lifespan yet
-    Then app.state holds no store
+def test_a_route_needing_the_store_fails_before_the_lifespan_runs(seeded_path: str) -> None:
+    """Given an app created over a seeded store path with a route depending on get_store
+    When a client calls the route without entering the lifespan
+    Then the route raises the missing-store RuntimeError
     """
     app = create_app(seeded_path)
+    _add_store_route(app, [])
+    client = TestClient(app)
 
-    store_before_startup = getattr(app.state, STORE_STATE_KEY, None)
-
-    assert store_before_startup is None
+    with pytest.raises(RuntimeError, match=r"no datacrystal store on app\.state"):
+        client.get("/store")
 
 
 def test_lifespan_opens_the_store_on_startup(seeded_path: str) -> None:
     """Given an app created over a seeded store path
-    When a client enters the app's lifespan
-    Then app.state holds an open Store
+    When a client enters the app's lifespan and calls a route depending on get_store
+    Then the response is 200
+    And the store holds the seeded quartz
     """
     app = create_app(seeded_path)
+    _add_store_route(app, [])
 
-    with TestClient(app):
-        store = getattr(app.state, STORE_STATE_KEY, None)
+    with TestClient(app) as client:
+        resp = client.get("/store")
 
-        assert isinstance(store, Store)
+    assert resp.status_code == 200
+    assert resp.json() == {"minerals": 1}
 
 
 def test_lifespan_closes_the_store_on_shutdown(seeded_path: str) -> None:
     """Given an app whose lifespan opened the store
     When the client leaves the lifespan
-    Then the store is closed
+    Then counting the store's minerals raises StoreClosedError
     """
+    seen: list[Store] = []
     app = create_app(seeded_path)
-    with TestClient(app):
-        store = getattr(app.state, STORE_STATE_KEY)
+    _add_store_route(app, seen)
+    with TestClient(app) as client:
+        client.get("/store")
 
-    assert store._closed
+    with pytest.raises(StoreClosedError):
+        seen[0].count(Mineral)
 
 
 def test_snapshot_get_reads_committed_state(seeded_path: str) -> None:
@@ -374,13 +391,13 @@ def test_read_snapshot_is_pooled_per_watermark(seeded_path: str) -> None:
 
         assert len(seen) == 2
         assert seen[0] is seen[1]
-        assert not seen[0]._core.closed
+        assert seen[0].count(Mineral) == 1
 
 
 def test_pooled_snapshot_is_closed_on_shutdown(seeded_path: str) -> None:
     """Given a pooled snapshot handed to a /peek request
     When the client leaves the lifespan
-    Then the snapshot is closed
+    Then counting the snapshot's minerals raises StoreClosedError
     """
     seen: list[Snapshot] = []
     app = create_app(seeded_path)
@@ -388,7 +405,8 @@ def test_pooled_snapshot_is_closed_on_shutdown(seeded_path: str) -> None:
     with TestClient(app) as client:
         client.get("/peek")
 
-    assert seen[0]._core.closed
+    with pytest.raises(StoreClosedError):
+        seen[0].count(Mineral)
 
 
 def test_snapshot_pool_refreshes_when_a_commit_advances_the_watermark(seeded_path: str) -> None:
@@ -408,22 +426,27 @@ def test_snapshot_pool_refreshes_when_a_commit_advances_the_watermark(seeded_pat
 
         client.get("/peek")
 
-    assert len(seen) == 2
-    assert seen[0] is not seen[1]
-    assert seen[0].tid < seen[1].tid
-    assert seen[0]._core.closed
+        assert len(seen) == 2
+        assert seen[0] is not seen[1]
+        assert seen[0].tid < seen[1].tid
+        with pytest.raises(StoreClosedError):
+            seen[0].count(Mineral)
 
 
-def test_store_lifespan_factory_builds_the_lifespan_cm(seeded_path: str) -> None:
-    """Given the factory store_lifespan returns for a store path
-    When it is called with an app
-    Then it returns the store-lifespan context manager
+def test_store_lifespan_factory_serves_the_store_to_a_plain_app(seeded_path: str) -> None:
+    """Given a plain FastAPI app built with the lifespan store_lifespan returns for a path
+    When a client enters it and calls a route depending on get_store
+    Then the response is 200
+    And the store holds the seeded quartz
     """
-    factory = store_lifespan(seeded_path)
+    app = FastAPI(lifespan=store_lifespan(seeded_path))
+    _add_store_route(app, [])
 
-    cm = factory(FastAPI())
+    with TestClient(app) as client:
+        resp = client.get("/store")
 
-    assert isinstance(cm, _StoreLifespan)
+    assert resp.status_code == 200
+    assert resp.json() == {"minerals": 1}
 
 
 def test_submit_write_runs_on_the_owner_not_the_caller_thread(seeded_path: str) -> None:

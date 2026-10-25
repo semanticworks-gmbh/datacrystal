@@ -25,10 +25,10 @@ import httpx
 from fastapi import FastAPI
 
 import datacrystal as dc
-from datacrystal._entity import oid_of, type_info
 from datacrystal.deltalog import DeltaLog
 from datacrystal.web import federation_router
 from tests.conftest import Mineral
+from tests.web._fake_coordinator import occ_base_of
 
 _MINERAL = f"{Mineral.__module__}:{Mineral.__qualname__}"
 _STALE_BASE = "0" * 64
@@ -56,9 +56,9 @@ def _op(qid: str, base: str | None = None, **fields: object) -> dict[str, Any]:
     return {"type": _MINERAL, "key": "qid", "fields": {"qid": qid, **fields}, "base": base}
 
 
-def _digest(store: dc.Store, qid: str) -> str | None:
-    """Return the current OCC base for a Mineral, what a follower carries on update."""
-    return store._payload_digest(type_info(Mineral), "qid", qid)
+def _digest(log: DeltaLog, oid: int) -> str | None:
+    """Return the current OCC base for ``oid``, what a follower carries on update."""
+    return occ_base_of(log.replay(), oid)
 
 
 @pytest.fixture
@@ -93,7 +93,7 @@ def test_submit_update_with_the_current_base_keeps_the_oid(store: dc.Store, log:
     """
     created = _post_submit(store, log, {"ops": [_op("Q1", name="Quartz", mohs=7.0)]})
     oid = created.json()["keys"]["Q1"]
-    base = _digest(store, "Q1")
+    base = _digest(log, oid)
     assert base is not None
 
     resp = _post_submit(store, log, {"ops": [_op("Q1", base=base, name="Quartz", mohs=7.5)]})
@@ -103,7 +103,7 @@ def test_submit_update_with_the_current_base_keeps_the_oid(store: dc.Store, log:
     assert resp.json()["keys"]["Q1"] == oid
     assert quartz is not None
     assert quartz.mohs == 7.5
-    assert oid_of(quartz) == oid
+    assert store.store(quartz) == oid
 
 
 def test_submit_batch_with_an_unknown_type_is_refused_whole(store: dc.Store, log: DeltaLog) -> None:
@@ -327,7 +327,7 @@ def test_submit_reinsert_is_refused_and_commits_nothing(store: dc.Store, log: De
 
     assert retry.status_code == 409, retry.text
     assert store.last_tid == 1
-    assert [oid_of(m) for m in store.query(Mineral)] == [oid]
+    assert [store.store(m) for m in store.query(Mineral)] == [oid]
 
 
 def test_submit_conflict_envelope_carries_bases(store: dc.Store, log: DeltaLog) -> None:
