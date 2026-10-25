@@ -1057,7 +1057,7 @@ def test_store_open_blob_is_readable_to_owner_and_root(
     assert content == SECRET_BYTES
 
 
-def test_snapshot_open_blob_is_denied_to_a_reader_without_standing(
+def test_seeded_snapshot_open_blob_is_denied_to_a_reader_without_standing(
     seeded_with_blob: tuple[dc.Store, int],
 ) -> None:
     """Given a protected record with a scan blob, in the committing store
@@ -1071,7 +1071,7 @@ def test_snapshot_open_blob_is_denied_to_a_reader_without_standing(
 
 
 @READERS
-def test_snapshot_open_blob_reads_the_scan_for_owner_and_root(
+def test_seeded_snapshot_open_blob_reads_the_scan_for_owner_and_root(
     seeded_with_blob: tuple[dc.Store, int], principal: dc.Principal
 ) -> None:
     """Given a protected record with a scan blob, in the committing store
