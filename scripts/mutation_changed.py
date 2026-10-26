@@ -7,7 +7,9 @@
 
 Usage:
     uv run scripts/mutation_changed.py origin/main      # one pattern per line
-    mutmut run $(uv run scripts/mutation_changed.py origin/main)
+
+The branch is its commits since the merge base plus the uncommitted edits.
+`scripts/mutation_check.py` runs mutmut on these patterns.
 
 A function counts as changed when a line the diff added or deleted lies inside it.
 Mutmut skips a decorated function, unless its one decorator is @staticmethod or @classmethod.
@@ -105,18 +107,24 @@ def git(*args: str) -> str:
     return subprocess.run(["git", *args], capture_output=True, text=True, check=True).stdout
 
 
+def changed_patterns(base: str) -> list[str]:
+    """Return the patterns of the functions changed since the merge base, edits included."""
+    merge_base = git("merge-base", base, "HEAD").strip()
+    diff = git("diff", "-U0", "--diff-filter=d", merge_base, "--", f"{PACKAGE_DIR}/*.py")
+    patterns = []
+    for path, lines in sorted(changed_lines(diff).items()):
+        source = Path(path).read_text(encoding="utf-8")
+        patterns += patterns_for(module_name(path), source, lines)
+    return patterns
+
+
 def main() -> int:
     """Print the patterns of the functions changed since the base ref."""
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("base", help="git ref the branch is compared with (merge base to HEAD)")
-    parser.add_argument("--worktree", action="store_true", help="compare the base with the working tree instead of HEAD")
+    parser.add_argument("base", help="git ref the branch is compared with, from the merge base")
     args = parser.parse_args()
-    range_args = [args.base] if args.worktree else [f"{args.base}...HEAD"]
-    diff = git("diff", "-U0", "--diff-filter=d", *range_args, "--", f"{PACKAGE_DIR}/*.py")
-    for path, lines in sorted(changed_lines(diff).items()):
-        source = Path(path).read_text(encoding="utf-8")
-        for pattern in patterns_for(module_name(path), source, lines):
-            print(pattern)
+    for pattern in changed_patterns(args.base):
+        print(pattern)
     return 0
 
 

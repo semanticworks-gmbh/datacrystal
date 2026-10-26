@@ -33,6 +33,9 @@ jobs:
           uv run scripts/test_check_suppressions.py
           uv run scripts/check_suppressions.py
 
+      - name: Mutation check script (its self-tests; the check itself runs locally, #193)
+        run: uv run scripts/test_mutation_changed.py
+
       - name: Type check (Pyrefly — src, examples, benchmarks, tests)
         run: uv run pyrefly check
 

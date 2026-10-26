@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = []
 # ///
-"""Tests for mutation_changed.py — small fixture sources and diffs, one behaviour each.
+"""Tests for mutation_changed.py and mutation_check.py — small fixtures, one behaviour each.
 
 Run: `uv run scripts/test_mutation_changed.py` — exits non-zero on failure.
 
@@ -18,7 +18,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import mutation_changed
-import mutation_summary
+import mutation_check
 
 SOURCE = '''\
 LIMIT = 3
@@ -204,79 +204,81 @@ def test_only_mutants_of_the_given_patterns_are_counted() -> None:
     When the statuses of one pattern are read
     Then the other function is left out
     """
-    assert mutation_summary.statuses(RESULTS, FREE) == {
+    assert mutation_check.statuses(RESULTS, FREE) == {
         "datacrystal._box.x_free__mutmut_1": "survived",
         "datacrystal._box.x_free__mutmut_2": "killed",
         "datacrystal._box.x_free__mutmut_3": "survived",
     }
 
 
-def test_the_comment_starts_with_the_marker_and_counts_by_status() -> None:
+def test_the_report_counts_the_mutants_by_status() -> None:
     """Given one function with two survivors and one kill
-    When the comment is written
-    Then it starts with the marker and counts the statuses
+    When the report is written
+    Then its first line counts the statuses
     """
-    comment = mutation_summary.summarize(RESULTS, FREE, show)
-    assert comment.startswith("<!-- mutation-check -->\n")
-    assert "1 changed functions, 3 mutants: 1 killed, 2 survived." in comment
+    report = mutation_check.report(RESULTS, FREE, show)
+    assert report.startswith("Mutation check: 1 changed functions, 3 mutants: 1 killed, 2 survived.\n")
 
 
 def test_each_survivor_shows_its_diff_and_the_killed_mutant_does_not() -> None:
     """Given a function with two survivors and one kill
-    When the comment is written
+    When the report is written
     Then the survivors' diffs are in it and the kill's is not
     """
-    comment = mutation_summary.summarize(RESULTS, FREE, show)
-    assert "diff of datacrystal._box.x_free__mutmut_1" in comment
-    assert "diff of datacrystal._box.x_free__mutmut_3" in comment
-    assert "diff of datacrystal._box.x_free__mutmut_2" not in comment
-
-
-def test_survivors_beyond_the_limit_are_counted_not_shown() -> None:
-    """Given 32 survivors
-    When the comment is written
-    Then 30 diffs are shown and the other 2 are counted
-    """
-    results = "".join(f"    datacrystal._box.x_free__mutmut_{n}: survived\n" for n in range(1, 33))
-    comment = mutation_summary.summarize(results, FREE, show)
-    assert comment.count("<details>") == 30
-    assert "2 more survivors not shown." in comment
+    report = mutation_check.report(RESULTS, FREE, show)
+    assert "diff of datacrystal._box.x_free__mutmut_1" in report
+    assert "diff of datacrystal._box.x_free__mutmut_3" in report
+    assert "diff of datacrystal._box.x_free__mutmut_2" not in report
 
 
 def test_a_run_where_every_mutant_was_killed_says_so() -> None:
     """Given results where every mutant was killed
-    When the comment is written
+    When the report is written
     Then it says the tests catch every mutant
     """
     results = "    datacrystal._box.x_free__mutmut_1: killed\n"
-    assert "catch every mutant" in mutation_summary.summarize(results, FREE, show)
+    assert "catch every mutant" in mutation_check.report(results, FREE, show)
 
 
 def test_mutants_without_tests_are_listed_and_not_called_caught() -> None:
-    """Given a mutant with no tests, one timeout and one not checked, and no survivor
-    When the comment is written
-    Then none is called caught and each is listed by name
+    """Given a mutant with no tests and one timeout, and no survivor
+    When the report is written
+    Then neither is called caught and each is listed by name
     """
     results = (
         "    datacrystal._box.x_free__mutmut_1: no tests\n"
         "    datacrystal._box.x_free__mutmut_2: timeout\n"
+    )
+    report = mutation_check.report(results, FREE, show)
+    assert "catch every mutant" not in report
+    assert "diff of datacrystal._box.x_free__mutmut_1" in report
+    assert "diff of datacrystal._box.x_free__mutmut_2" in report
+
+
+def test_mutants_of_a_stopped_run_are_counted_not_shown_as_survivors() -> None:
+    """Given a run that killed one mutant and stopped before two others
+    When the report is written
+    Then the two are counted as not run, not shown, and the run is not called complete
+    """
+    results = (
+        "    datacrystal._box.x_free__mutmut_1: killed\n"
+        "    datacrystal._box.x_free__mutmut_2: not checked\n"
         "    datacrystal._box.x_free__mutmut_3: not checked\n"
     )
-    comment = mutation_summary.summarize(results, FREE, show)
-    assert "catch every mutant" not in comment
-    assert "diff of datacrystal._box.x_free__mutmut_1" in comment
-    assert "diff of datacrystal._box.x_free__mutmut_2" in comment
-    assert "diff of datacrystal._box.x_free__mutmut_3" in comment
+    report = mutation_check.report(results, FREE, show)
+    assert "2 mutants not run" in report
+    assert "diff of datacrystal._box.x_free__mutmut_2" not in report
+    assert "catch every mutant" not in report
 
 
 def test_only_patterns_that_matched_a_mutant_count_as_functions() -> None:
     """Given two patterns of which one matches no mutant
-    When the comment is written
+    When the report is written
     Then it counts one function
     """
     results = "    datacrystal._box.x_free__mutmut_1: killed\n"
     patterns = [*FREE, "datacrystal._box.x_gone__mutmut_*"]
-    assert "1 changed functions, 1 mutants" in mutation_summary.summarize(results, patterns, show)
+    assert "1 changed functions, 1 mutants" in mutation_check.report(results, patterns, show)
 
 
 def test_mutmut_is_run_through_uv_so_the_project_environment_is_used() -> None:
@@ -284,17 +286,15 @@ def test_mutmut_is_run_through_uv_so_the_project_environment_is_used() -> None:
     When it builds the mutmut command
     Then the command starts with uv run
     """
-    assert mutation_summary.mutmut_command("results")[:3] == ["uv", "run", "mutmut"]
+    assert mutation_check.mutmut_command("results")[:3] == ["uv", "run", "mutmut"]
 
 
-def test_the_report_for_a_run_without_mutants_replaces_an_old_comment() -> None:
-    """Given a push after which no function has mutants
-    When the empty comment is written
-    Then it carries the marker so the old comment is updated
+def test_a_branch_without_mutants_says_so() -> None:
+    """Given a branch whose changed functions have no mutants
+    When the report is written
+    Then it says there are none
     """
-    comment = mutation_summary.empty_comment()
-    assert comment.startswith("<!-- mutation-check -->\n")
-    assert "No mutants" in comment
+    assert "no mutants" in mutation_check.no_mutants_report()
 
 
 def main() -> int:
