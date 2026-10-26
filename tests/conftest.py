@@ -9,11 +9,12 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator
 from dataclasses import field
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Protocol
 
 import pytest
 
 import datacrystal as dc
+from datacrystal import Principal
 from datacrystal._storage.memory import MemoryBackend
 
 
@@ -46,20 +47,51 @@ class LogEntry:
     kind: Annotated[str, dc.Index] = "misc"
 
 
+class DevStoreOpener(Protocol):
+    """Opens the same store each call, with the dev flags of :meth:`dc.Store.open`."""
+
+    def __call__(
+        self,
+        *,
+        debug: bool = False,
+        strict_deletes: bool = False,
+        principal: Principal | None = None,
+    ) -> dc.Store:
+        """Open the store with these flags."""
+
+
 @pytest.fixture(params=["memory", "sqlite"])
-def store_factory(request: pytest.FixtureRequest, tmp_path: Path) -> Callable[[], dc.Store]:
-    """Return a zero-arg callable that opens the *same* store each call."""
+def dev_store_factory(request: pytest.FixtureRequest, tmp_path: Path) -> DevStoreOpener:
+    """Return an opener of the *same* store on each backend; the dev flags are chosen per call."""
     if request.param == "memory":
         backend = MemoryBackend()
 
-        def open_store() -> dc.Store:
-            return dc.Store._from_backend(backend)
+        def open_store(
+            *, debug: bool = False, strict_deletes: bool = False, principal: Principal | None = None
+        ) -> dc.Store:
+            return dc.Store._from_backend(
+                backend, debug=debug, strict_deletes=strict_deletes, principal=principal
+            )
     else:
 
-        def open_store() -> dc.Store:
-            return dc.Store.open(tmp_path / "store", lock_ttl=0.5)
+        def open_store(
+            *, debug: bool = False, strict_deletes: bool = False, principal: Principal | None = None
+        ) -> dc.Store:
+            return dc.Store.open(
+                tmp_path / "store",
+                lock_ttl=0.5,
+                debug=debug,
+                strict_deletes=strict_deletes,
+                principal=principal,
+            )
 
     return open_store
+
+
+@pytest.fixture
+def store_factory(dev_store_factory: DevStoreOpener) -> Callable[[], dc.Store]:
+    """Return a zero-arg callable that opens the *same* store each call."""
+    return dev_store_factory
 
 
 @pytest.fixture

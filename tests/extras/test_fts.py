@@ -504,6 +504,44 @@ def test_bare_fulltext_does_not_stem(indexed_vendor: FullTextIndex) -> None:
     assert hits == []
 
 
+@pytest.fixture
+def indexed_vendor_from_registry(store: dc.Store, shop: IndexShop) -> FullTextIndex:
+    """Commit a vendor whose bare motto is Glänzende Steine into an index without config."""
+    idx = shop.open()
+    store.attach(idx)
+    store.root = [Vendor(name="AG", motto="Glänzende Steine")]
+    store.commit()
+    return idx
+
+
+def test_zero_config_index_does_not_stem_a_bare_field(
+    store: dc.Store, indexed_vendor_from_registry: FullTextIndex,
+) -> None:
+    """Given an index derived from the registry, where Vendor.motto is a bare dc.FullText
+    And the motto Glänzende Steine is committed
+    When the index is searched for the stem Stein through a root snapshot
+    Then nothing is found
+    """
+    with store.snapshot(principal=ROOT) as snap:
+        hits = indexed_vendor_from_registry.search("Stein", cls=Vendor, snapshot=snap)
+
+    assert hits == []
+
+
+def test_zero_config_index_folds_case_and_accent_of_a_bare_field(
+    store: dc.Store, indexed_vendor_from_registry: FullTextIndex,
+) -> None:
+    """Given an index derived from the registry, where Vendor.motto is a bare dc.FullText
+    And the motto Glänzende Steine is committed
+    When the index is searched for GLANZENDE through a root snapshot
+    Then the vendor is found
+    """
+    with store.snapshot(principal=ROOT) as snap:
+        hits = indexed_vendor_from_registry.search("GLANZENDE", cls=Vendor, snapshot=snap)
+
+    assert [hit.typename for hit in hits] == [VENDOR_TYPENAME]
+
+
 # -- linguistics regressions (2026-06-12 adversarial review) --------------------
 
 

@@ -393,6 +393,7 @@ Query semantics (the *theory* — planner, residual, candidate set — is in [ex
 - Operators on class-level fields: `==`, `!=`, `<`, `<=`, `>`, `>=`, `.in_([...])`, `.contains("sub")`, `.startswith("pre")`; combine with `&`, `|`, `~`.
   **Parenthesize predicates** — `&` binds tighter than `==` (you get a helpful `QueryError` if you forget).
 - Every read API takes an entity class **or** a Condition (symmetry, 2026-06-12): `query(Mineral)` hydrates the **full extent** — the expensive shape, same cost as any non-indexed predicate; prefer `count()`/`pluck()` when you don't need live entities.
+- **`dc.Condition`** — The query AST a read takes in place of an entity class; `dc.fields(C)` comparisons and `&`, `|`, `~` build it.
 - `query()`/`pluck()` (and `snap.query()`/`snap.all()`) take `limit=`/`offset=` to window the result.
   On a fully-indexed read the slice hits the candidate OIDs **before** hydration — `query(C, limit=10)` loads 10 records, not the extent.
   A residual predicate must decode-to-filter first, so there the window only trims the materialized result (it cannot prune the scan).
@@ -666,7 +667,7 @@ The frameworks live only inside `datacrystal.web` — a bare `import datacrystal
 
 ```python
 from datacrystal.web import (
-    create_app, store_lifespan, StoreOpenOptions, read_snapshot, submit_write, get_store,
+    create_app, store_lifespan, StoreOpenOptions, read_snapshot, submit_write, Writer, get_store,
     graphql_context_getter,
     entity_model, to_pydantic, from_pydantic,        # REST: @entity ↔ Pydantic DTO
     reflect_strawberry_type, StrawberryReflector,    # GraphQL: @entity → Strawberry type
@@ -685,7 +686,8 @@ from datacrystal.web import (
   REST and GraphQL reads both ride this snapshot pool, so they inherit its read fence (W4-4): a protected row the principal cannot read is filtered from discovery and a denied reference projects to **wire-null** (no 500, no existence leak), and no `_dc_*` column ever reaches the wire (reflection drops them).
   Distinct request principals at one watermark share the *same* pooled core — the index is built once per commit, never per principal or per request (R15).
   See the [Snapshots](#snapshots) permissions note.
-- **`submit_write`** — a dependency yielding an awaitable that ships a closure to the owner thread (via `store.submit()`); the mutation **and** commit run on the owner and `await write(fn)` resolves only once durable.
+- **`submit_write`** — a dependency yielding a `Writer`, an awaitable that ships a closure to the owner thread (via `store.submit()`); the mutation **and** commit run on the owner and `await write(fn)` resolves only once durable.
+  **`Writer`** is the `typing.Protocol` of that awaitable, `async def __call__[T](self, fn: Callable[[Store], T], /) -> T`: annotate a route with `write: Annotated[Writer, Depends(submit_write)]`.
   Return plain data from the closure — a live entity raises `EntityEscapeError`.
   Each shipped closure runs under the **request principal** (below) — the `acting_as` wrap sits inside the closure body, so identities never leak between queued writes.
 - **`get_principal`** — the per-request identity seam (ADR-008).
@@ -820,7 +822,7 @@ This section is the single, authoritative list — meet them once here, apply th
 ### 1. Class-attribute conditions read as the field's value type
 
 `Mineral.mohs >= 6.0` is the documented primary query form, but a checker sees `Mineral.mohs` as `float | None` and reads the whole thing as `float >= float -> bool`, not a `Condition`.
-The **workaround** is the typed field proxy `dc.fields(C)` — it returns a `FieldProxy` whose attributes are `FieldExpr`s, so the comparison types as a `Condition`:
+The **workaround** is the typed field proxy `dc.fields(C)` — it returns a `FieldProxy` whose attributes are `FieldExpr`s, so the comparison types as a [`dc.Condition`](#reading-api):
 
 ```python
 M = dc.fields(Mineral)

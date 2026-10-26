@@ -30,6 +30,9 @@ if TYPE_CHECKING:
         StoreOpenOptions as StoreOpenOptions,
     )
     from datacrystal.web._app import (
+        Writer as Writer,
+    )
+    from datacrystal.web._app import (
         create_app as create_app,
     )
     from datacrystal.web._app import (
@@ -78,6 +81,7 @@ _LAZY: dict[str, str] = {
     # _app: FastAPI app wiring (#92) — needs fastapi
     "SNAPSHOT_CONTEXT_KEY": "_app",
     "StoreOpenOptions": "_app",
+    "Writer": "_app",
     "create_app": "_app",
     "get_principal": "_app",
     "get_store": "_app",
@@ -117,6 +121,7 @@ __all__ = [
     "SnapshotLoader",
     "StoreOpenOptions",
     "StrawberryReflector",
+    "Writer",
     "create_app",
     "entity_model",
     "federation_router",

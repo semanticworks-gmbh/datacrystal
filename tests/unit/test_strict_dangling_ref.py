@@ -16,36 +16,12 @@ both sides must behave identically.
 from __future__ import annotations
 
 import warnings
-from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
 import datacrystal as dc
-from datacrystal._storage.memory import MemoryBackend
-from tests.conftest import Locality, Mineral
-
-# ``store_factory`` (conftest) opens with the defaults; this story needs the
-# dev-mode flags, so build a parametrized factory that threads them through.
-StoreOpener = Callable[..., dc.Store]
-
-
-@pytest.fixture(params=["memory", "sqlite"])
-def dev_store_factory(request: pytest.FixtureRequest, tmp_path: Path) -> StoreOpener:
-    """Return an opener threading the dev-mode flags `strict_deletes` and `debug` through."""
-    if request.param == "memory":
-        backend = MemoryBackend()
-
-        def open_store(*, strict_deletes: bool = False, debug: bool = False) -> dc.Store:
-            return dc.Store._from_backend(backend, strict_deletes=strict_deletes, debug=debug)
-    else:
-
-        def open_store(*, strict_deletes: bool = False, debug: bool = False) -> dc.Store:
-            return dc.Store.open(
-                tmp_path / "store", lock_ttl=0.5, strict_deletes=strict_deletes, debug=debug
-            )
-
-    return open_store
+from tests.conftest import DevStoreOpener, Locality, Mineral
 
 
 def _quartz() -> Mineral:
@@ -63,7 +39,7 @@ def _azurite_at(locality: Locality) -> Mineral:
 # -- strict_deletes raises, naming the dangling referrer ----------------------
 
 
-def test_strict_commit_names_a_referrer_from_a_prior_commit(dev_store_factory: StoreOpener) -> None:
+def test_strict_commit_names_a_referrer_from_a_prior_commit(dev_store_factory: DevStoreOpener) -> None:
     """Given azurite pointing at Tsumeb Mine, committed earlier, in a strict_deletes store
     When Tsumeb Mine is deleted and the store commits
     Then DanglingRefError names Mineral
@@ -80,7 +56,7 @@ def test_strict_commit_names_a_referrer_from_a_prior_commit(dev_store_factory: S
     store.close()
 
 
-def test_warn_mode_commit_goes_through(dev_store_factory: StoreOpener) -> None:
+def test_warn_mode_commit_goes_through(dev_store_factory: DevStoreOpener) -> None:
     """Given azurite pointing at Tsumeb Mine, committed earlier, in a debug store
     When Tsumeb Mine is deleted and the store commits
     Then DanglingDeleteWarning names Mineral
@@ -99,7 +75,7 @@ def test_warn_mode_commit_goes_through(dev_store_factory: StoreOpener) -> None:
     store.close()
 
 
-def test_warn_mode_dangle_is_real(dev_store_factory: StoreOpener) -> None:
+def test_warn_mode_dangle_is_real(dev_store_factory: DevStoreOpener) -> None:
     """Given azurite pointing at Tsumeb Mine, committed earlier, in a debug store
     When Tsumeb Mine is deleted and the store commits with a warning
     Then Tsumeb Mine is gone from the store
@@ -118,7 +94,7 @@ def test_warn_mode_dangle_is_real(dev_store_factory: StoreOpener) -> None:
     store.close()
 
 
-def test_strict_flags_a_referrer_new_in_the_same_commit(dev_store_factory: StoreOpener) -> None:
+def test_strict_flags_a_referrer_new_in_the_same_commit(dev_store_factory: DevStoreOpener) -> None:
     """A referrer NEW in the same commit as the delete is not yet in the P1-stale reverse map.
 
     The check must union this commit's harvested refs: AC1 says the flagged set is
@@ -142,7 +118,7 @@ def test_strict_flags_a_referrer_new_in_the_same_commit(dev_store_factory: Store
     store.close()
 
 
-def test_strict_rejection_consumes_no_tid(dev_store_factory: StoreOpener) -> None:
+def test_strict_rejection_consumes_no_tid(dev_store_factory: DevStoreOpener) -> None:
     """The check raises in P1 before the TID is allocated (invariant 5).
 
     Given azurite pointing at Tsumeb Mine committed as the first TID, in a strict_deletes store
@@ -167,7 +143,7 @@ def test_strict_rejection_consumes_no_tid(dev_store_factory: StoreOpener) -> Non
     store.close()
 
 
-def test_strict_rejection_keeps_the_delete_buffered(dev_store_factory: StoreOpener) -> None:
+def test_strict_rejection_keeps_the_delete_buffered(dev_store_factory: DevStoreOpener) -> None:
     """Given azurite pointing at Tsumeb Mine, committed, in a strict_deletes store
     And Tsumeb Mine deleted, with the commit rejected
     When azurite is deleted too and the store commits
@@ -191,7 +167,7 @@ def test_strict_rejection_keeps_the_delete_buffered(dev_store_factory: StoreOpen
     store.close()
 
 
-def test_strict_flags_a_referrer_dirtied_in_the_same_commit(dev_store_factory: StoreOpener) -> None:
+def test_strict_flags_a_referrer_dirtied_in_the_same_commit(dev_store_factory: DevStoreOpener) -> None:
     """A referrer that gains the ref by being mutated in the delete's commit is folded in by P3.
 
     Given committed Tsumeb Mine and azurite without a ref, in a strict_deletes store
@@ -217,7 +193,7 @@ def test_strict_flags_a_referrer_dirtied_in_the_same_commit(dev_store_factory: S
 # -- the co-deleted / cancelled-new exemptions (AC3) --------------------------
 
 
-def test_co_deleted_referrer_is_silent(dev_store_factory: StoreOpener) -> None:
+def test_co_deleted_referrer_is_silent(dev_store_factory: DevStoreOpener) -> None:
     """A referrer also deleted in the same commit is not a dangle: its outgoing edges vanish.
 
     Given azurite pointing at Tsumeb Mine, committed, in a strict_deletes store
@@ -240,7 +216,7 @@ def test_co_deleted_referrer_is_silent(dev_store_factory: StoreOpener) -> None:
     store.close()
 
 
-def test_cancelled_new_referrer_is_never_flagged(dev_store_factory: StoreOpener) -> None:
+def test_cancelled_new_referrer_is_never_flagged(dev_store_factory: DevStoreOpener) -> None:
     """Deleting a never-committed NEW entity cancels its pending insert (ADR-003 rule 1).
 
     It is gone from both buffers, so it can never be flagged as a surviving referrer.
@@ -267,7 +243,7 @@ def test_cancelled_new_referrer_is_never_flagged(dev_store_factory: StoreOpener)
     store.close()
 
 
-def test_delete_with_no_surviving_referrer_is_silent(dev_store_factory: StoreOpener) -> None:
+def test_delete_with_no_surviving_referrer_is_silent(dev_store_factory: DevStoreOpener) -> None:
     """Given a committed quartz nothing points at, in a strict_deletes store
     When quartz is deleted and the store commits with all warnings turned into errors
     Then a TID is returned
@@ -289,7 +265,7 @@ def test_delete_with_no_surviving_referrer_is_silent(dev_store_factory: StoreOpe
 # -- unarmed: the commit path is unchanged and pays nothing -------------------
 
 
-def test_unarmed_store_commits_a_dangling_delete_silently(dev_store_factory: StoreOpener) -> None:
+def test_unarmed_store_commits_a_dangling_delete_silently(dev_store_factory: DevStoreOpener) -> None:
     """AC2: without dev mode the dangle stays deferred to dereference: no warning, no raise.
 
     Given azurite pointing at Tsumeb Mine, committed, in a default (non-dev) store
@@ -310,7 +286,7 @@ def test_unarmed_store_commits_a_dangling_delete_silently(dev_store_factory: Sto
     store.close()
 
 
-def test_unarmed_store_leaves_reverse_index_unbuilt(dev_store_factory: StoreOpener) -> None:
+def test_unarmed_store_leaves_reverse_index_unbuilt(dev_store_factory: DevStoreOpener) -> None:
     """The eager check never forced ensure_reverse(): the unwatched store pays nothing.
 
     Given azurite pointing at Tsumeb Mine, committed, in a default (non-dev) store

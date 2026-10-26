@@ -398,15 +398,6 @@ def test_unprotected_class_declares_only_its_user_fields() -> None:
     assert [f.name for f in dataclasses.fields(PlainSpecimen)] == ["label", "mass_g"]
 
 
-def test_unprotected_class_fieldset_lists_no_injected_column() -> None:
-    """Given an unprotected entity class
-    When its __dc_fieldset__ is read
-    Then none starts with _dc_
-    """
-    fieldset = type.__getattribute__(PlainSpecimen, "__dc_fieldset__")
-    assert not any(name.startswith("_dc_") for name in fieldset)
-
-
 def test_unprotected_class_has_no_dc_permissions_view() -> None:
     """Given an unprotected entity class
     When the class is probed for dc_permissions

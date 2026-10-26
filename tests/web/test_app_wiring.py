@@ -56,6 +56,7 @@ from datacrystal.web import (
 )
 from datacrystal.web import (
     StrawberryReflector,
+    Writer,
     create_app,
     get_store,
     graphql_context_getter,
@@ -63,7 +64,6 @@ from datacrystal.web import (
     store_lifespan,
     submit_write,
 )
-from datacrystal.web._app import _OwnerWriter
 
 # --- a self-contained slice of the mineral cabinet (reference) ----------------
 
@@ -124,7 +124,7 @@ def _make_rest_app(path: str) -> FastAPI:
 
     @app.post("/minerals/{qid}")
     async def add_mineral(
-        qid: str, name: str, writer: Annotated[_OwnerWriter, Depends(submit_write)]
+        qid: str, name: str, writer: Annotated[Writer, Depends(submit_write)]
     ) -> dict[str, object]:
         def do_write(store: Store) -> int:
             # Plain data (the new TID) crosses back: a live entity would EntityEscapeError.
@@ -199,7 +199,7 @@ def _make_probe_app(path: str, recorded: dict[str, int]) -> FastAPI:
     app = create_app(path)
 
     @app.post("/probe")
-    async def probe(writer: Annotated[_OwnerWriter, Depends(submit_write)]) -> dict[str, bool]:
+    async def probe(writer: Annotated[Writer, Depends(submit_write)]) -> dict[str, bool]:
         route_thread = threading.get_ident()
 
         def on_owner(store: Store) -> int:

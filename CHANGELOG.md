@@ -12,6 +12,8 @@ purely **additive** surface — the v0.1.0 freeze is never broken. PyPI publicat
 
 ### Added
 
+- `dc.Condition`, the query AST that every read takes in place of an entity class, and `datacrystal.web.Writer`, the `typing.Protocol` of the awaitable `submit_write` returns (#199).
+  Both are annotation names: `Pred`, `And`, `Or`, `Not` and the owner-thread writer class stay private, and a route types its writer as `Annotated[Writer, Depends(submit_write)]`.
 - Operational events through stdlib logging (#195): the `datacrystal` logger carries a `NullHandler` and the library configures nothing else.
   Five events log, each with its fields in `extra=`: `index_cache_discarded`, `records_migrated`, `stale_lease_reclaimed`, `fts_sidecar_rebuilt` and `follower_resynced`; the commit path logs nothing.
   A new how-to shows a structlog app rendering the fields, and the reference lists every event.
