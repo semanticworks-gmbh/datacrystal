@@ -36,7 +36,7 @@ directory — the second run must find the first run's data.
 
 - **Small, logical commits**, one concern each.
 - Keep the gates green: `ruff`, `pyrefly` and `pytest` must pass; the rules are in [STANDARDS.md](STANDARDS.md).
-- **Before you push a change to `src/`, run `uv run scripts/mutation_check.py`:** it mutates the functions your branch changed and lists the survivors, the changes no test notices; write the test that fails on each, or mark the line `# pragma: no mutate` with the reason, and put its first line in the PR's Status.
+- **Before you push a change to `src/`, run `uv run scripts/mutation_check.py`:** it mutates the functions your branch changed and lists the survivors, the changes no test notices; write the test that fails on each, or mark the line `# pragma: no mutate` with the reason (a change to a `cast()` type string or to a message's wording needs neither), and put its first line in the PR's Status.
   The first run takes about 8 minutes, later ones about 3; it is advice, never a gate.
 - Engine behavior is tested against **both backends** (memory and SQLite) via the
   `store_factory` fixture — they must behave identically.

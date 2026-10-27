@@ -33,7 +33,8 @@ CAUGHT = {"killed", "caught by type check"}
 NOT_RUN = "not checked"  # the run stopped before this mutant
 MEANING = (
     "A survivor is a change to the function that no test notices: "
-    "write the test that fails on it, or mark the line `# pragma: no mutate` with the reason."
+    "write the test that fails on it, or mark the line `# pragma: no mutate` with the reason; "
+    "a change to a cast() type string or to a message's wording needs neither."
 )
 # macOS aborts a forked child that touches Objective-C state; mutmut forks one per mutant
 FORK_SAFE_ENV = {"OBJC_DISABLE_INITIALIZE_FORK_SAFETY": "YES"}
